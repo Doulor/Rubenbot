@@ -196,6 +196,16 @@ class Config:
         data = yaml.safe_load(file.read_text(encoding="utf-8")) or {}
         if not isinstance(data, dict):
             raise ValueError(f"配置文件格式错误：{file}")
+        return cls.from_raw(data)
+
+    @classmethod
+    def from_raw(cls, data: dict[str, Any]) -> "Config":
+        """从已解析的 YAML 数据构造配置（展开 ``${ENV}``）。
+
+        WebUI 结构化保存时先用它校验合并后的字典，通过了才写盘。
+        """
+        if not isinstance(data, dict):
+            raise ValueError("配置的顶层必须是键值对（YAML mapping）")
         return cls.from_dict(_expand_env(data))
 
     @classmethod

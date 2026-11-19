@@ -332,6 +332,17 @@ class DecisionEngine:
         self._alias_patterns = [(_compile_alias(a), a) for a in cleaned]
         self._last_reply_at: dict[str, float] = {}
 
+    def set_aliases(self, aliases: Iterable[str]) -> None:
+        """替换硬触发的名字/别名（配置热更新用，不改评分逻辑）。"""
+        cleaned: list[str] = []
+        for alias in aliases:
+            if not alias or not alias.strip():
+                continue
+            if alias.strip() not in cleaned:
+                cleaned.append(alias.strip())
+        self.aliases = cleaned
+        self._alias_patterns = [(_compile_alias(a), a) for a in cleaned]
+
     # ---- 硬触发 ----
 
     def match_alias(self, text: str) -> str | None:

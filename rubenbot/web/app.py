@@ -42,12 +42,18 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from ..config import GroupDecisionConfig, is_loopback_host
+from ..config import Config, GroupDecisionConfig, is_loopback_host
 from ..decision import parse_quiet_hours
 from ..memory.store import make_person_id
 from .auth import COOKIE_NAME, BindSecurityError, check_bind_security, mask_secret
+from .config_schema import (
+    ConfigValidationError,
+    merge_config,
+    structured_config,
+    validate_structured,
+)
 from .logbuffer import records as log_records
-from .state import WebState, save_config_text
+from .state import WebState, describe_restart_fields, restart_fields, save_config_text
 
 logger = logging.getLogger(__name__)
 
@@ -68,10 +74,11 @@ MEMORY_CATEGORIES = {
 class ApiError(Exception):
     """业务校验失败；由异常处理器统一转成 JSON 错误。"""
 
-    def __init__(self, status: int, message: str):
+    def __init__(self, status: int, message: str, *, fields: list | None = None):
         super().__init__(message)
         self.status = status
         self.message = message
+        self.fields = fields or []
 
 
 def _require_text(value: Any, field: str, *, max_len: int = 500) -> str:
@@ -152,10 +159,12 @@ def _group_decision_payload(config, chat_id: str) -> dict[str, Any]:
     }
 
 
-def _write_group_decision(config, config_path: Path, chat_id: str, body: dict[str, Any]) -> dict[str, Any]:
+def _write_group_decision(state, chat_id: str, body: dict[str, Any]) -> dict[str, Any]:
     """把群覆盖写回 config.yaml 的 ``decision.groups``，保留其余内容与顺序。"""
     import yaml
 
+    config = state.config
+    config_path = state.config_path
     path = Path(config_path)
     if path.exists():
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
@@ -201,7 +210,7 @@ def _write_group_decision(config, config_path: Path, chat_id: str, body: dict[st
 
     if bool(body.get("remove")):
         groups.pop(str(chat_id), None)
-        _apply_groups(config, data)
+        _apply_groups(state, data)
         save_config_text(path, yaml.safe_dump(data, allow_unicode=True, sort_keys=False))
         return _group_decision_payload(config, chat_id)
 
@@ -211,16 +220,23 @@ def _write_group_decision(config, config_path: Path, chat_id: str, body: dict[st
     if quiet:
         entry["quiet_hours"] = quiet
     groups[str(chat_id)] = entry
-    _apply_groups(config, data)
+    _apply_groups(state, data)
     save_config_text(path, yaml.safe_dump(data, allow_unicode=True, sort_keys=False))
     return _group_decision_payload(config, chat_id)
 
 
-def _apply_groups(config, data: dict[str, Any]) -> None:
-    """保存成功后同步内存中的配置，页面立即看到新值。"""
+def _apply_groups(state, data: dict[str, Any]) -> None:
+    """保存成功后同步内存中的配置，页面与意愿引擎立即看到新值。"""
     from ..config import _load_decision
 
+    config = state.config
     config.decision = _load_decision(data.get("decision") or {})
+    bot = getattr(state, "bot", None)
+    if bot is not None and hasattr(bot, "apply_config"):
+        try:
+            bot.apply_config(config, rebuild_llm=False)
+        except Exception as exc:  # noqa: BLE001 - 热应用失败不影响已写盘的配置
+            logger.warning("群决策配置热应用失败：%s", exc)
 
 
 def _mask_config(data: Any) -> Any:
@@ -280,7 +296,10 @@ def create_app(state: WebState):
 
     @app.exception_handler(ApiError)
     async def _api_error_handler(request: Request, exc: ApiError):
-        return JSONResponse({"ok": False, "error": exc.message}, status_code=exc.status)
+        payload = {"ok": False, "error": exc.message}
+        if exc.fields:
+            payload["fields"] = exc.fields
+        return JSONResponse(payload, status_code=exc.status)
 
     @app.exception_handler(sqlite3.Error)
     async def _db_error_handler(request: Request, exc: sqlite3.Error):
@@ -562,7 +581,7 @@ def create_app(state: WebState):
     async def put_chat_decision(chat_id: str, request: Request):
         require_session(request)
         body = await _json_body(request)
-        payload = _write_group_decision(state.config, state.config_path, chat_id, body)
+        payload = _write_group_decision(state, chat_id, body)
         logger.info("WebUI 更新群 %s 的决策配置", chat_id)
         return {"ok": True, **payload, "restart_required": False}
 
@@ -623,12 +642,17 @@ def create_app(state: WebState):
             "text": text,
             "exists": path.exists(),
             "effective": _mask_config(_config_to_dict(state.config)),
+            "structured": structured_config(state.config),
+            "restart_fields": _pending_restart_fields(state),
         }
 
     @app.put("/api/config")
     async def put_config(request: Request):
         require_session(request)
         body = await _json_body(request)
+        if "config" in body:
+            return await _save_structured_config(state, body.get("config"))
+        # 兼容旧的原始 YAML 文本模式
         text = str(body.get("text") or "")
         try:
             backup = save_config_text(state.config_path, text)
@@ -637,9 +661,27 @@ def create_app(state: WebState):
         logger.info("WebUI 保存配置到 %s", state.config_path)
         return {
             "ok": True,
+            "mode": "text",
             "restart_required": True,
-            "message": "配置已保存。v1 需要重启 bot 才能生效。",
+            "requires_restart": ["全部字段（原始 YAML 模式）"],
+            "applied": [],
+            "message": "配置已保存。原始 YAML 文本模式下需要重启 bot 才能生效。",
             "backup": str(backup) if backup else None,
+        }
+
+    @app.post("/api/restart")
+    async def restart(request: Request):
+        require_session(request)
+        try:
+            command = state.request_restart()
+        except Exception as exc:  # noqa: BLE001 - 启动命令构造失败要说清楚
+            raise ApiError(500, f"重启失败：{exc}") from exc
+        logger.info("WebUI 请求立即重启：%s", " ".join(command))
+        return {
+            "ok": True,
+            "message": "进程正在重启，稍后会自动刷新页面。",
+            "command": command,
+            "webui_only": state.webui_only,
         }
 
     # ------------------------------------------------------------------
@@ -663,6 +705,189 @@ async def _json_body(request: Request) -> dict[str, Any]:
     if not isinstance(body, dict):
         raise ApiError(400, "请求体必须是 JSON 对象")
     return body
+
+
+def _read_raw_config(path: Path) -> dict[str, Any]:
+    """读取 config.yaml 的原始字典；不存在或为空返回 ``{}``。"""
+    import yaml
+
+    if not path.exists():
+        return {}
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(data, dict):
+        raise ApiError(500, "config.yaml 顶层不是键值对，无法写入")
+    return data
+
+
+def _pending_restart_fields(state: WebState) -> list[str]:
+    """还没重启生效的字段：本次保存记下的 + 磁盘与内存的差异。"""
+    fields = list(state.extras.get("pending_restart") or [])
+    if state.config_path.exists():
+        try:
+            disk = Config.load(state.config_path)
+        except Exception:  # noqa: BLE001 - 文件坏了不阻塞查看页面
+            disk = None
+        if disk is not None:
+            for field in restart_fields(state.config, disk):
+                if field not in fields:
+                    fields.append(field)
+    return fields
+
+
+async def _save_structured_config(state: WebState, payload: Any) -> dict[str, Any]:
+    """结构化保存：校验 → 合并 → 写盘 → 热应用 → 返回生效方式。"""
+    import yaml
+
+    try:
+        update = validate_structured(payload)
+    except ConfigValidationError as exc:
+        raise ApiError(422, f"配置校验失败：{exc}", fields=exc.fields) from exc
+
+    path = state.config_path
+    base = _read_raw_config(path)
+    merged = merge_config(base, update)
+    try:
+        new_config = Config.from_raw(merged)
+    except (TypeError, ValueError) as exc:
+        raise ApiError(
+            422, f"配置校验失败：{exc}", fields=[{"field": "config", "message": str(exc)}]
+        ) from exc
+
+    # 安全底线与启动时一致：绑非本地地址必须有口令，不允许通过表单绕过
+    try:
+        check_bind_security(new_config.webui)
+    except BindSecurityError as exc:
+        raise ApiError(
+            422, str(exc), fields=[{"field": "webui.password", "message": str(exc)}]
+        ) from exc
+
+    text = yaml.safe_dump(merged, allow_unicode=True, sort_keys=False)
+    try:
+        backup = save_config_text(path, text)
+    except ValueError as exc:
+        raise ApiError(422, f"配置校验失败：{exc}") from exc
+
+    # 先把旧配置的快照留下（apply_config 会改 state.config）
+    before = _config_snapshot(state.config)
+    requires_restart = state.apply_config(new_config)
+    after = _config_snapshot(new_config)
+
+    # 逐个提交字段判定生效方式：只看真正改过的叶子，避免「全部已生效」的误导
+    resolution: dict[str, str] = {}
+    applied_groups: list[str] = []
+
+    def _is_restart(field: str) -> bool:
+        return any(
+            field == item or field.startswith(item + ".") for item in requires_restart
+        )
+
+    for group, value in update.items():
+        if group == "persona":
+            leaves = ["persona.path"]
+        elif group == "database_path":
+            leaves = ["database_path"]
+        else:
+            leaves = _leaf_paths(group, value)
+        if not leaves:
+            continue
+        hot_changed = False
+        for leaf in leaves:
+            if _is_restart(leaf):
+                resolution[leaf] = "restart"
+                continue
+            resolution[leaf] = "hot"
+            if _get_path(before, leaf) != _get_path(after, leaf):
+                hot_changed = True
+        if hot_changed:
+            applied_groups.append(group)
+
+    old_password = before.get("webui.password")
+    logger.info(
+        "WebUI 保存结构化配置到 %s（热生效：%s；需重启：%s）",
+        path,
+        ", ".join(applied_groups) or "无",
+        ", ".join(requires_restart) or "无",
+    )
+    payload: dict[str, Any] = {
+        "ok": True,
+        "mode": "structured",
+        "applied": applied_groups,
+        "requires_restart": requires_restart,
+        "restart_required": bool(requires_restart),
+        "resolution": resolution,
+        "message": _save_message(applied_groups, requires_restart),
+        "backup": str(backup) if backup else None,
+        "structured": structured_config(new_config),
+        # 口令改了当前会话会失效，提示前端重新登录
+        "relogin": bool(
+            "webui.password" in resolution
+            and old_password != new_config.webui.password
+        ),
+    }
+    return payload
+
+
+def _leaf_paths(prefix: str, value: Any) -> list[str]:
+    """把嵌套字典展开成点分字段路径；列表/标量视为叶子。"""
+    if isinstance(value, dict) and value:
+        paths: list[str] = []
+        for key, item in value.items():
+            paths.extend(_leaf_paths(f"{prefix}.{key}", item))
+        return paths
+    return [prefix]
+
+
+def _config_snapshot(config: Config) -> dict[str, Any]:
+    """把 Config 摊平成点分路径 → 值的字典，替代字段可以直接比较。"""
+    from dataclasses import asdict
+
+    data = asdict(config)
+    flat: dict[str, Any] = {"persona.path": config.persona_path}
+    for section, value in data.items():
+        if not isinstance(value, dict):
+            flat[section] = value
+            continue
+        for key, item in value.items():
+            path = f"{section}.{key}"
+            if isinstance(item, dict) and item:
+                for sub_key, sub_item in item.items():
+                    flat[f"{path}.{sub_key}"] = sub_item
+            else:
+                flat[path] = item
+    return flat
+
+
+def _get_path(flat: dict[str, Any], path: str) -> Any:
+    """按点分路径从摊平字典取值；没这个键时按前缀取（例如整段 groups）。"""
+    if path in flat:
+        return flat[path]
+    prefix = path + "."
+    matches = {key: value for key, value in flat.items() if key.startswith(prefix)}
+    return matches or flat.get(path)
+
+
+def _save_message(applied: list[str], requires_restart: list[str]) -> str:
+    groups = {
+        "llm": "模型与接口",
+        "memory": "记忆",
+        "chat": "聊天与回复",
+        "decision": "回复意愿",
+        "plugins": "插件",
+        "webui": "WebUI",
+        "persona": "人格",
+        "adapters": "适配器",
+        "log_level": "日志级别",
+        "background_check_minutes": "后台检查",
+        "database_path": "数据库路径",
+    }
+    parts = []
+    if applied:
+        parts.append("已立即生效：" + "、".join(groups.get(g, g) for g in applied))
+    if requires_restart:
+        parts.append(
+            "需重启后生效：" + describe_restart_fields(requires_restart)
+        )
+    return "。".join(parts) or "配置已保存（与当前一致，无需变更）"
 
 
 def _config_to_dict(config) -> dict[str, Any]:

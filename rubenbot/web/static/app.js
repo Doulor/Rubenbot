@@ -237,7 +237,10 @@ async function request(method, path, body) {
     throw new Unauthorized((data && data.error) || "需要登录");
   }
   if (!response.ok) {
-    throw new Error((data && data.error) || `请求失败（${response.status}）`);
+    const error = new Error((data && data.error) || `请求失败（${response.status}）`);
+    error.status = response.status;
+    error.fields = (data && data.fields) || [];
+    throw error;
   }
   return data;
 }
@@ -345,7 +348,7 @@ const PAGES = {
   groups: { title: "群组与意愿", sub: "每群活跃度、静默时段与决策记录", render: renderGroups },
   plugins: { title: "插件", sub: "已发现的插件与启停状态", render: renderPlugins },
   logs: { title: "日志", sub: "最近的运行日志", render: renderLogs },
-  settings: { title: "设置", sub: "配置文件与界面偏好", render: renderSettings },
+  settings: { title: "设置", sub: "模型、记忆、意愿与运行参数，保存即生效", render: renderSettings },
 };
 
 const state = {
@@ -1635,96 +1638,883 @@ async function renderLogs(view) {
 /* 设置                                                               */
 /* ------------------------------------------------------------------ */
 
+const LOG_LEVELS = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"];
+
+/** 需要重启才能生效的字段 → 展示名。 */
+const RESTART_LABELS = {
+  database_path: "数据库路径",
+  "persona.path": "人格文件路径",
+  "plugins.dir": "插件目录",
+  "webui.enabled": "WebUI 启用状态",
+  "webui.host": "WebUI 监听地址",
+  "webui.port": "WebUI 端口",
+};
+
+function restartLabel(field) {
+  if (field.startsWith("adapters.")) return `适配器 ${field.slice("adapters.".length)}`;
+  return RESTART_LABELS[field] || field;
+}
+
+function getPath(obj, path) {
+  return path.split(".").reduce((node, key) => (node == null ? undefined : node[key]), obj);
+}
+
+function setPath(obj, path, value) {
+  const keys = path.split(".");
+  let node = obj;
+  for (const key of keys.slice(0, -1)) {
+    if (node[key] === null || typeof node[key] !== "object") node[key] = {};
+    node = node[key];
+  }
+  node[keys[keys.length - 1]] = value;
+}
+
+/** 数字输入保留原始字符串，交给后端统一校验并给出字段错误。 */
+function numberField(value, onInput, { step = "any", min, max } = {}) {
+  return h("input", {
+    class: "input",
+    type: "number",
+    step,
+    min: min === undefined ? null : String(min),
+    max: max === undefined ? null : String(max),
+    value: value === null || value === undefined ? "" : String(value),
+    oninput: (event) => onInput(event.target.value),
+  });
+}
+
+function textField(value, onInput, { placeholder = "", mono = false } = {}) {
+  return h("input", {
+    class: `input ${mono ? "mono" : ""}`,
+    type: "text",
+    value: value === null || value === undefined ? "" : String(value),
+    placeholder,
+    oninput: (event) => onInput(event.target.value),
+  });
+}
+
+function switchField(value, onToggle, { label } = {}) {
+  const toggle = h("button", {
+    class: "switch",
+    type: "button",
+    role: "switch",
+    "aria-checked": value ? "true" : "false",
+    "aria-label": label || "开关",
+  });
+  toggle.addEventListener("click", () => {
+    const next = toggle.getAttribute("aria-checked") !== "true";
+    toggle.setAttribute("aria-checked", next ? "true" : "false");
+    onToggle(next);
+  });
+  return toggle;
+}
+
+function selectField(value, options, onSelect) {
+  return h(
+    "select",
+    { class: "select", onchange: (event) => onSelect(event.target.value) },
+    ...options.map((option) =>
+      h("option", { value: option.value, selected: String(value) === String(option.value) }, option.label)
+    )
+  );
+}
+
+/** 可增删的字符串列表（别名、静默时段、启用插件）。 */
+function listEditor(values, onChange, { placeholder = "输入后回车或点添加", normalize = null } = {}) {
+  let items = Array.isArray(values) ? values.slice() : [];
+  const chips = h("div", { class: "quiet-chips" });
+  const input = h("input", {
+    class: "input",
+    placeholder,
+    style: { width: "180px", height: "28px", fontSize: "12.5px" },
+    "aria-label": placeholder,
+  });
+
+  function commit(next) {
+    items = next;
+    onChange(items.slice());
+    render();
+  }
+
+  function add() {
+    let value = input.value.trim();
+    if (!value) return;
+    if (normalize) value = normalize(value);
+    if (!value) {
+      toast("格式不对", "error");
+      return;
+    }
+    if (items.includes(value)) {
+      input.value = "";
+      return;
+    }
+    input.value = "";
+    commit(items.concat(value));
+  }
+
+  function render() {
+    chips.replaceChildren(
+      ...items.map((item) =>
+        h(
+          "span",
+          { class: "chip" },
+          item,
+          h(
+            "button",
+            {
+              type: "button",
+              "aria-label": `移除 ${item}`,
+              onclick: () => commit(items.filter((value) => value !== item)),
+            },
+            icon("close")
+          )
+        )
+      ),
+      input,
+      h(
+        "button",
+        { class: "btn btn-sm btn-ghost", type: "button", onclick: add },
+        icon("plus"),
+        "添加"
+      )
+    );
+  }
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      add();
+    }
+  });
+  render();
+  return chips;
+}
+
+/** 一个表单项：标签 + 控件 + 说明。 */
+function settingsField(def, draft) {
+  const value = getPath(draft, def.path);
+  const set = (next) => setPath(draft, def.path, next);
+  let control;
+  if (def.kind === "switch") {
+    const stateText = h("span", { class: "field-hint" }, value ? "已启用" : "已停用");
+    control = h(
+      "div",
+      { style: { display: "flex", alignItems: "center", gap: "10px" } },
+      switchField(
+        Boolean(value),
+        (next) => {
+          set(next);
+          stateText.textContent = next ? "已启用" : "已停用";
+        },
+        { label: def.label }
+      ),
+      stateText
+    );
+  } else if (def.kind === "select") {
+    control = selectField(value, def.options, set);
+  } else if (def.kind === "number") {
+    control = numberField(value, set, { step: def.step, min: def.min, max: def.max });
+  } else if (def.kind === "password") {
+    control = h("input", {
+      class: "input",
+      type: "password",
+      autocomplete: "new-password",
+      placeholder: def.secretSet ? "已设置，留空不改" : "尚未设置",
+      oninput: (event) => set(event.target.value),
+    });
+  } else if (def.kind === "list") {
+    control = listEditor(value || [], set, { placeholder: def.placeholder, normalize: def.normalize });
+  } else {
+    control = textField(value, set, { placeholder: def.placeholder, mono: def.mono });
+  }
+  return h(
+    "div",
+    { class: `settings-field ${def.wide ? "wide" : ""}` },
+    h("span", { class: "field-label" }, def.label),
+    control,
+    def.hint ? h("span", { class: "field-hint" }, def.hint) : null,
+    def.restart ? h("span", { class: "restart-note" }, icon("warning"), "重启后生效") : null
+  );
+}
+
+function fieldGrid(defs, draft) {
+  return h(
+    "div",
+    { class: "settings-fields" },
+    ...defs.map((def) => settingsField(def, draft))
+  );
+}
+
+function quietHoursNormalize(value) {
+  return /^\d{1,2}:\d{2}-\d{1,2}:\d{2}$/.test(value) ? value : "";
+}
+
+/** 每群覆盖：增删群条目，每条可设倍率、基础意愿与静默时段。 */
+function groupsEditor(draft, secrets) {
+  const body = h("div", { style: { display: "grid", gap: "12px" } });
+  const groupsNode = h("div", { class: "group-list" });
+  const newId = h("input", {
+    class: "input",
+    placeholder: "要单独配置的群号",
+    style: { maxWidth: "200px" },
+    "aria-label": "要单独配置的群号",
+  });
+
+  function groups() {
+    if (!draft.decision.groups || typeof draft.decision.groups !== "object") {
+      draft.decision.groups = {};
+    }
+    return draft.decision.groups;
+  }
+
+  function render() {
+    const entries = Object.keys(groups());
+    groupsNode.replaceChildren(
+      ...(entries.length
+        ? entries.map((chatId) => groupRow(chatId))
+        : [h("div", { class: "field-hint" }, "还没有单独配置的群。默认所有群使用上面的全局参数。")])
+    );
+  }
+
+  function groupRow(chatId) {
+    const settings = groups()[chatId];
+    if (!settings) return h("div");
+    return h(
+      "div",
+      { class: "group-item" },
+      h(
+        "div",
+        { class: "group-item-head" },
+        h("span", { class: "row-title" }, `群 ${chatId}`),
+        h(
+          "button",
+          {
+            class: "icon-btn-sm danger",
+            type: "button",
+            title: "删除这个群的覆盖",
+            "aria-label": `删除群 ${chatId} 的覆盖`,
+            onclick: () => {
+              delete groups()[chatId];
+              render();
+            },
+          },
+          icon("trash")
+        )
+      ),
+      h(
+        "div",
+        { class: "settings-fields" },
+        h(
+          "div",
+          { class: "settings-field" },
+          h("span", { class: "field-label" }, "活跃度倍率"),
+          numberField(settings.activity_multiplier ?? 1, (value) => {
+            settings.activity_multiplier = value;
+          }, { step: "0.05", min: 0, max: 10 }),
+          h("span", { class: "field-hint" }, "放大或压低这个群的意愿分数（0–10）")
+        ),
+        h(
+          "div",
+          { class: "settings-field" },
+          h("span", { class: "field-label" }, "基础意愿（留空用全局）"),
+          numberField(settings.base, (value) => {
+            settings.base = value === "" ? null : value;
+          }, { step: "0.01", min: 0, max: 1 }),
+          h("span", { class: "field-hint" }, "覆盖全局 base，留空表示跟随")
+        ),
+        h(
+          "div",
+          { class: "settings-field wide" },
+          h("span", { class: "field-label" }, "静默时段"),
+          listEditor(settings.quiet_hours || [], (values) => {
+            settings.quiet_hours = values;
+          }, { placeholder: "23:00-07:30", normalize: quietHoursNormalize }),
+          h("span", { class: "field-hint" }, "这个时段内普通消息不开口；@、回复和叫名字不受影响")
+        )
+      )
+    );
+  }
+
+  const addButton = h(
+    "button",
+    {
+      class: "btn btn-sm",
+      type: "button",
+      onclick: () => {
+        const chatId = newId.value.trim();
+        if (!chatId) return;
+        if (groups()[chatId]) {
+          toast("这个群已经有单独配置", "error");
+          return;
+        }
+        groups()[chatId] = { activity_multiplier: 1, base: null, quiet_hours: [] };
+        newId.value = "";
+        render();
+      },
+    },
+    icon("plus"),
+    "添加群"
+  );
+  newId.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      addButton.click();
+    }
+  });
+
+  render();
+  body.append(
+    groupsNode,
+    h("div", { style: { display: "flex", gap: "8px", alignItems: "center" } }, newId, addButton)
+  );
+  return body;
+}
+
+function adaptersEditor(draft, secrets) {
+  const adapters = draft.adapters || (draft.adapters = {});
+  const consoleCfg = adapters.console || (adapters.console = { enabled: false });
+  const snow = adapters.snowluma || (adapters.snowluma = {});
+
+  const snowFields = h(
+    "div",
+    { class: "settings-fields", style: { marginTop: "6px" } },
+    settingsField(
+      { path: "adapters.snowluma.ws_url", label: "WebSocket 地址", hint: "OneBot v11 正向 WS，例如 ws://127.0.0.1:3001" },
+      draft
+    ),
+    settingsField(
+      { path: "adapters.snowluma.http_url", label: "HTTP 地址", hint: "发送消息用的 HTTP API，例如 http://127.0.0.1:3000" },
+      draft
+    ),
+    settingsField(
+      {
+        path: "adapters.snowluma.access_token",
+        label: "Access Token",
+        kind: "password",
+        hint: "OneBot 的鉴权 token，留空表示不鉴权",
+        secretSet: Boolean(secrets["adapters.snowluma.access_token"]),
+      },
+      draft
+    ),
+    settingsField(
+      { path: "adapters.snowluma.self_id", label: "Bot 的 QQ 号", hint: "可选，留空则从事件里自动获取" },
+      draft
+    )
+  );
+  snowFields.hidden = !snow.enabled;
+
+  return h(
+    "div",
+    { style: { display: "grid", gap: "12px" } },
+    h(
+      "div",
+      { class: "plugin-row", style: { padding: "0", borderTop: "0" } },
+      h("div", { class: "plugin-icon" }, icon("plugins")),
+      h(
+        "div",
+        { class: "row-main" },
+        h("div", { class: "row-title" }, "Console（终端调试）"),
+        h("div", { class: "row-sub" }, "从 stdin 读消息、往 stdout 回复；改配置后需重启")
+      ),
+      switchField(Boolean(consoleCfg.enabled), (value) => {
+        consoleCfg.enabled = value;
+      }, { label: "启用 Console 适配器" })
+    ),
+    h(
+      "div",
+      { class: "plugin-row", style: { padding: "0", borderTop: "1px solid var(--border)" } },
+      h("div", { class: "plugin-icon" }, icon("pulse")),
+      h(
+        "div",
+        { class: "row-main" },
+        h("div", { class: "row-title" }, "SnowLuma（OneBot v11）"),
+        h("div", { class: "row-sub" }, "正向 WS 收事件、HTTP API 发消息；连接参数改动需重启")
+      ),
+      switchField(Boolean(snow.enabled), (value) => {
+        snow.enabled = value;
+        snowFields.hidden = !value;
+      }, { label: "启用 SnowLuma 适配器" })
+    ),
+    snowFields
+  );
+}
+
+function pluginEditor(draft) {
+  const plugins = draft.plugins || (draft.plugins = {});
+  const allowAll = plugins.enabled === null || plugins.enabled === undefined;
+
+  const listWrap = h(
+    "div",
+    { class: "settings-field" },
+    h("span", { class: "field-label" }, "启用的插件"),
+    listEditor(plugins.enabled || [], (values) => {
+      plugins.enabled = values.length ? values : null;
+    }, { placeholder: "插件名", normalize: (v) => v.trim() }),
+    h("span", { class: "field-hint" }, "留空 = 启用全部；改动对运行中的 bot 立即生效")
+  );
+  listWrap.hidden = allowAll;
+
+  const hint = h("span", { class: "field-hint" }, allowAll ? "全部启用" : "只启用列表中的插件");
+  const switchRow = h(
+    "div",
+    { style: { display: "flex", alignItems: "center", gap: "10px" } },
+    switchField(allowAll, (value) => {
+      plugins.enabled = value ? null : [];
+      listWrap.hidden = value;
+      hint.textContent = value ? "全部启用" : "只启用列表中的插件";
+    }, { label: "全部启用插件" }),
+    hint
+  );
+
+  return h(
+    "div",
+    { style: { display: "grid", gap: "12px" } },
+    h(
+      "div",
+      { class: "settings-fields" },
+      settingsField(
+        { path: "plugins.dir", label: "插件目录", hint: "扫描 <目录>/<插件名>/plugin.py；改动需重启", restart: true },
+        draft
+      ),
+      settingsField(
+        { path: "plugins.command_prefix", label: "命令前缀", hint: "例如 /，留空表示不处理命令" },
+        draft
+      )
+    ),
+    switchRow,
+    listWrap
+  );
+}
+
+function resultNotice(result, onRestart) {
+  const applied = result.applied || [];
+  const restart = result.requires_restart || [];
+  return h(
+    "div",
+    { class: "notice good settings-result" },
+    icon("check"),
+    h(
+      "div",
+      { style: { display: "grid", gap: "6px", flex: "1" } },
+      h("strong", {}, "配置已保存"),
+      applied.length
+        ? h("div", { class: "result-line" },
+            h("span", { class: "tag good" }, "已立即生效"),
+            h("span", {}, applied.map(groupName).join("、")))
+        : null,
+      restart.length
+        ? h("div", { class: "result-line" },
+            h("span", { class: "tag warn" }, "需重启"),
+            h("span", {}, restart.map(restartLabel).join("、")))
+        : !applied.length
+        ? h("div", { class: "result-line" }, h("span", {}, "与当前配置一致，无需变更"))
+        : null
+    ),
+    restart.length
+      ? h("button", { class: "btn btn-sm", type: "button", onclick: onRestart }, icon("refresh"), "立即重启")
+      : null
+  );
+}
+
+function groupName(key) {
+  return {
+    llm: "模型与接口",
+    memory: "记忆",
+    chat: "聊天与回复",
+    decision: "回复意愿",
+    plugins: "插件",
+    webui: "WebUI",
+    persona: "人格",
+    adapters: "适配器",
+    log_level: "日志级别",
+    background_check_minutes: "后台检查",
+    database_path: "数据库路径",
+  }[key] || key;
+}
+
+function restartOverlay() {
+  let overlay = $(".restart-overlay");
+  if (overlay) return overlay;
+  overlay = h(
+    "div",
+    { class: "restart-overlay" },
+    h(
+      "div",
+      { class: "restart-card" },
+      h("div", { class: "brand-mark" }, "R"),
+      h("strong", {}, "正在重启 RubenBot…"),
+      h("p", { class: "field-hint", style: { margin: 0 } }, "进程恢复后页面会自动刷新，需要重新登录。"),
+      h("div", { class: "restart-spinner" })
+    )
+  );
+  document.body.append(overlay);
+  return overlay;
+}
+
+async function restartAndWait() {
+  restartOverlay();
+  try {
+    await api.post("/api/restart");
+  } catch (err) {
+    if (err instanceof Unauthorized) return;
+    toast(err.message || "重启请求失败", "error");
+    const overlay = $(".restart-overlay");
+    if (overlay) overlay.remove();
+    return;
+  }
+  // 轮询直到服务恢复（/api/me 不需要登录，重启后一定可达）
+  const deadline = Date.now() + 45000;
+  const probe = async () => {
+    try {
+      const response = await fetch("/api/me", { credentials: "same-origin", headers: { Accept: "application/json" } });
+      if (response.ok) {
+        location.reload();
+        return true;
+      }
+    } catch (err) {
+      // 服务还没起来，继续等
+    }
+    if (Date.now() > deadline) {
+      const card = $(".restart-card");
+      if (card) {
+        card.querySelector("p").textContent = "重启好像没有完成，请手动检查进程或刷新页面。";
+      }
+      return true;
+    }
+    return false;
+  };
+  const tick = async () => {
+    if (await probe()) return;
+    setTimeout(tick, 900);
+  };
+  setTimeout(tick, 1200);
+}
+
 async function renderSettings(view) {
   const data = await api.get("/api/config");
-  const effective = data.effective || {};
+  const structured = data.structured || {};
+  const secrets = structured.secrets || {};
+  const draft = JSON.parse(JSON.stringify(structured));
+  delete draft.secrets;
 
-  const textarea = h("textarea", {
-    class: "textarea code",
-    rows: "24",
-    spellcheck: "false",
-    "aria-label": "config.yaml 内容",
-    value: data.text,
-    placeholder: "config.yaml 不存在，保存后会创建",
-  });
-  const notice = h("div", { class: "notice", hidden: true });
-  const saveButton = h("button", { class: "btn btn-primary", type: "button" }, icon("check"), "保存配置");
+  const noticeBox = h("div", { hidden: true });
+  const errorBox = h("div", { hidden: true });
+
+  const showResult = (result) => {
+    noticeBox.hidden = false;
+    noticeBox.replaceChildren(resultNotice(result, () => confirmRestart()));
+  };
+
+  function confirmRestart() {
+    confirmDialog({
+      title: "立即重启 RubenBot？",
+      message: "进程会原地重启，正在处理的对话会中断，WebUI 需要重新登录。确定现在重启吗？",
+      confirmText: "立即重启",
+      danger: true,
+      onConfirm: () => restartAndWait(),
+    });
+  }
+
+  const saveButton = h(
+    "button",
+    { class: "btn btn-primary", type: "button" },
+    icon("check"),
+    "保存全部设置"
+  );
+  const saveBar = h(
+    "div",
+    { class: "settings-savebar" },
+    h(
+      "div",
+      { class: "row-main" },
+      h("div", { class: "row-title" }, "设置"),
+      h("div", { class: "row-sub" }, `配置文件：${data.path}`)
+    ),
+    h("div", { class: "spacer" }),
+    h("button", { class: "btn", type: "button", onclick: () => renderRoute() }, icon("refresh"), "放弃修改"),
+    saveButton
+  );
+
   saveButton.addEventListener("click", async () => {
     saveButton.disabled = true;
+    errorBox.hidden = true;
+    noticeBox.hidden = true;
     try {
-      const result = await api.put("/api/config", { text: textarea.value });
-      notice.hidden = false;
-      notice.className = "notice";
-      notice.replaceChildren(icon("warning"), h("span", {}, result.message || "已保存，需要重启后生效。"));
+      const result = await api.put("/api/config", { config: draft });
       toast("配置已保存");
+      if (result.relogin) {
+        // 口令变了，当前会话立即作废；重新登录后再看结果
+        showLogin();
+        toast("访问口令已更新，请重新登录", "error");
+        return;
+      }
+      state.settingsNotice = result;
+      await renderRoute();
     } catch (err) {
       if (err instanceof Unauthorized) return;
-      notice.hidden = false;
-      notice.className = "notice";
-      notice.replaceChildren(icon("warning"), h("span", {}, err.message || "保存失败"));
+      errorBox.hidden = false;
+      const fields = (err.fields || []).map((item) =>
+        h("div", { class: "result-line" },
+          h("span", { class: "tag bad" }, item.field),
+          h("span", {}, item.message))
+      );
+      errorBox.replaceChildren(
+        h("div", { class: "notice" },
+          icon("warning"),
+          h("div", { style: { display: "grid", gap: "6px", flex: "1" } },
+            h("strong", {}, "保存失败，配置没有写入"),
+            fields.length ? null : h("div", {}, err.message || "请检查填写内容"),
+            ...fields))
+      );
+      errorBox.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      toast("配置校验未通过", "error");
     } finally {
       saveButton.disabled = false;
     }
   });
 
-  const configCard = card("配置文件", {
-    hint: data.path,
-    actions: [h("button", { class: "btn btn-sm", type: "button", onclick: () => renderRoute() }, icon("refresh"), "重新读取")],
-    body: h(
-      "div",
-      { style: { display: "grid", gap: "12px" } },
-      h("div", { class: "notice" }, icon("warning"),
-        "这里直接编辑 YAML。保存前会做语法校验并留一份 .bak 备份；生效需要重启 bot。"),
-      textarea,
-      h("div", { style: { display: "flex", alignItems: "center", gap: "10px" } },
-        saveButton,
-        h("span", { class: "muted", style: { fontSize: "12px" } }, `${data.text.split("\n").length} 行`))
-    ),
-  });
-  notice.hidden = true;
+  const cards = [
+    card("模型与接口", {
+      hint: "OpenAI 兼容接口",
+      body: fieldGrid(
+        [
+          { path: "llm.base_url", label: "接口地址", hint: "例如 https://api.deepseek.com/v1", wide: true, mono: true },
+          {
+            path: "llm.api_key",
+            label: "API Key",
+            kind: "password",
+            hint: "留空表示保留原值；也可以写成 ${ENV_VAR} 从环境变量读取",
+            secretSet: Boolean(secrets["llm.api_key"]),
+          },
+          { path: "llm.chat_model", label: "对话模型", hint: "回复消息用的模型", mono: true },
+          { path: "llm.extract_model", label: "抽取模型", hint: "记忆抽取用；留空跟随对话模型", mono: true },
+          { path: "llm.consolidate_model", label: "归纳模型", hint: "记忆归纳用；留空跟随对话模型", mono: true },
+          { path: "llm.temperature", label: "温度", kind: "number", step: "0.05", min: 0, max: 2, hint: "0–2，越大越发散" },
+          { path: "llm.timeout", label: "超时（秒）", kind: "number", step: "1", min: 0.1, hint: "单次请求超时" },
+          { path: "llm.max_retries", label: "重试次数", kind: "number", step: "1", min: 0, max: 10, hint: "失败后的重试次数" },
+        ],
+        draft
+      ),
+    }),
+    card("人格与数据", {
+      hint: "路径改动需重启",
+      body: fieldGrid(
+        [
+          { path: "persona.path", label: "人格文件", hint: "SOUL.md 风格；路径不变时保存会顺带重读内容", wide: true, mono: true, restart: true },
+          { path: "database_path", label: "数据库文件", hint: "SQLite 路径；改动需重启", wide: true, mono: true, restart: true },
+        ],
+        draft
+      ),
+    }),
+    card("记忆", {
+      hint: "抽取与归纳参数",
+      body: fieldGrid(
+        [
+          { path: "memory.extract_every_n", label: "触发抽取的消息数", kind: "number", step: "1", min: 1, hint: "同一会话攒够多少条未抽取消息就触发" },
+          { path: "memory.extract_silence_seconds", label: "静默触发（秒）", kind: "number", step: "1", min: 0, hint: "会话静默这么久后触发抽取" },
+          { path: "memory.extract_min_pending", label: "单人最少条数", kind: "number", step: "1", min: 1, hint: "一个人至少积累几条才抽取" },
+          { path: "memory.extract_window", label: "单次抽取窗口", kind: "number", step: "1", min: 1, hint: "一次最多喂给模型的该人消息数" },
+          { path: "memory.inject_limit", label: "回复注入上限", kind: "number", step: "1", min: 0, hint: "回复时最多注入多少条记忆" },
+          { path: "memory.dedupe_threshold", label: "去重阈值", kind: "number", step: "0.01", min: 0, max: 1, hint: "与已有记忆的相似度达到多少算重复（0–1）" },
+          { path: "memory.consolidate_new_threshold", label: "归纳触发条数", kind: "number", step: "1", min: 1, hint: "新增记忆达到多少条触发归纳" },
+          { path: "memory.consolidate_interval_hours", label: "归纳间隔（小时）", kind: "number", step: "0.5", min: 0.1, hint: "距上次归纳超过这么久也会触发" },
+          { path: "memory.consolidate_max_memories", label: "归纳输入上限", kind: "number", step: "1", min: 1, hint: "单次最多送多少条记忆给模型" },
+          { path: "memory.consolidate_remove_ratio", label: "本轮移除比例", kind: "number", step: "0.01", min: 0, max: 1, hint: "一轮最多移除的比例" },
+          { path: "memory.consolidate_remove_min", label: "最少允许移除", kind: "number", step: "1", min: 1, hint: "一轮至少允许移除的条数" },
+          { path: "memory.raw_keep_per_chat", label: "原始消息保留", kind: "number", step: "1", min: 1, hint: "每个会话保留多少条原始消息" },
+        ],
+        draft
+      ),
+    }),
+    card("聊天与回复", {
+      hint: "回复长度与上下文",
+      body: fieldGrid(
+        [
+          { path: "chat.bot_name", label: "Bot 名称", hint: "会写进消息流水，也用作默认的叫名硬触发" },
+          { path: "chat.history_size", label: "上下文条数", kind: "number", step: "1", min: 1, hint: "拼进提示词的最近消息条数" },
+          { path: "chat.split_max_parts", label: "最多拆成几条", kind: "number", step: "1", min: 1, hint: "长回复按句拆条，避免刷屏" },
+          { path: "chat.split_part_chars", label: "每段字数上限", kind: "number", step: "1", min: 8, hint: "超过就拆成下一条" },
+          { path: "chat.split_delay_seconds", label: "拆条间隔（秒）", kind: "number", step: "0.1", min: 0, hint: "多条消息之间的停顿" },
+          { path: "chat.history_ttl_hours", label: "上下文有效期（小时）", kind: "number", step: "0.5", min: 0, hint: "超过这个时间的旧消息不再拼进上下文" },
+        ],
+        draft
+      ),
+    }),
+    card("回复意愿", {
+      hint: "群聊里什么时候开口",
+      body: fieldGrid(
+        [
+          { path: "decision.merge_window_seconds", label: "合并窗口（秒）", kind: "number", step: "0.5", min: 0, hint: "同一人连发的多条先攒着合并成一轮" },
+          { path: "decision.hard_merge_window_seconds", label: "硬触发窗口（秒）", kind: "number", step: "0.5", min: 0, hint: "私聊/@/回复/叫名字的短窗口，0 表示立即处理" },
+          { path: "decision.aliases", label: "叫名别名", kind: "list", wide: true, placeholder: "例如 小R", hint: "叫到这些名字算硬触发；留空则用 Bot 名称" },
+          { path: "decision.base", label: "基础意愿", kind: "number", step: "0.01", min: 0, max: 1, hint: "每个群的基础分，默认低，靠动量和相关性加分" },
+          { path: "decision.threshold", label: "开口阈值", kind: "number", step: "0.01", min: 0, max: 1, hint: "分数达到多少才开口" },
+          { path: "decision.threshold_noise", label: "阈值随机扰动", kind: "number", step: "0.01", min: 0, max: 1, hint: "阈值附近的随机波动幅度" },
+          { path: "decision.threshold_noise_band", label: "扰动生效范围", kind: "number", step: "0.01", min: 0, max: 1, hint: "离阈值多近才摇骰子" },
+          { path: "decision.momentum_bonus", label: "动量加成", kind: "number", step: "0.05", min: 0, max: 10, hint: "刚参与过这个会话时的加分" },
+          { path: "decision.momentum_half_life_seconds", label: "动量半衰期（秒）", kind: "number", step: "10", min: 1, hint: "动量随时间衰减的速度" },
+          { path: "decision.relevance_bonus", label: "相关性加成", kind: "number", step: "0.05", min: 0, max: 10, hint: "记忆检索命中时的最大加分" },
+          { path: "decision.relevance_scale", label: "相关性归一尺度", kind: "number", step: "0.5", min: 0.1, hint: "检索分数除以它后封顶" },
+          { path: "decision.ratio_window", label: "占比统计窗口", kind: "number", step: "1", min: 1, hint: "统计发言占比时看最近多少条消息" },
+          { path: "decision.ratio_threshold", label: "占比阈值", kind: "number", step: "0.01", min: 0, max: 1, hint: "bot 占比超过这个值开始减分" },
+          { path: "decision.ratio_silence", label: "占比静默线", kind: "number", step: "0.01", min: 0, max: 1, hint: "占比到这个值直接静默" },
+          { path: "decision.ratio_penalty", label: "占比最大减分", kind: "number", step: "0.1", min: 0, max: 10, hint: "占比超阈值时的最大减分" },
+          { path: "decision.cooldown_seconds", label: "发言后冷却（秒）", kind: "number", step: "1", min: 0, hint: "发言后这段时间内降低意愿" },
+          { path: "decision.cooldown_penalty", label: "冷却最大减分", kind: "number", step: "0.1", min: 0, max: 10, hint: "冷却期内最多减多少分" },
+          { path: "decision.veto_marker", label: "不回复标记", hint: "模型输出这个标记就静默丢弃" },
+        ],
+        draft
+      ),
+    }),
+    card("每群覆盖", {
+      hint: "单独调节某个群",
+      body: groupsEditor(draft, secrets),
+    }),
+    card("插件", {
+      hint: "目录与启停",
+      body: pluginEditor(draft),
+    }),
+    card("适配器", {
+      hint: "连接参数改动需重启",
+      body: adaptersEditor(draft, secrets),
+    }),
+    card("WebUI 与高级", {
+      hint: "监听地址与运行参数",
+      body: h(
+        "div",
+        { style: { display: "grid", gap: "16px" } },
+        fieldGrid(
+          [
+            { path: "webui.enabled", label: "启用 WebUI", kind: "switch", hint: "关闭后本次运行仍然可用，重启后不再启动", restart: true },
+            { path: "webui.host", label: "监听地址", hint: "默认 127.0.0.1；绑非本地地址必须设置口令", restart: true, mono: true },
+            { path: "webui.port", label: "端口", kind: "number", step: "1", min: 1, max: 65535, hint: "改动需重启", restart: true },
+            {
+              path: "webui.password",
+              label: "访问口令",
+              kind: "password",
+              hint: "留空表示保留原值；绑非本地地址时必须设置",
+              secretSet: Boolean(secrets["webui.password"]),
+            },
+            { path: "webui.session_hours", label: "登录有效期（小时）", kind: "number", step: "1", min: 0.1, hint: "会话 Cookie 的有效时长" },
+            { path: "background_check_minutes", label: "后台检查间隔（分钟）", kind: "number", step: "1", min: 0.1, hint: "记忆抽取/归纳的定期检查频率" },
+            {
+              path: "log_level",
+              label: "日志级别",
+              kind: "select",
+              hint: "立即生效",
+              options: LOG_LEVELS.map((value) => ({ value, label: value })),
+            },
+          ],
+          draft
+        )
+      ),
+    }),
+  ];
 
   const themeButton = (value, label) =>
-    h("button", {
-      type: "button",
-      "data-theme-choice": value,
-      onclick: () => applyTheme(value),
-    }, label);
-
+    h("button", { type: "button", "data-theme-choice": value, onclick: () => applyTheme(value) }, label);
   const appearance = card("外观", {
     body: h(
       "div",
-      { style: { display: "grid", gap: "10px" } },
-      h("div", { class: "field" },
-        h("span", { class: "field-label" }, "主题"),
-        h("div", { class: "segmented", style: { alignSelf: "flex-start" } },
-          themeButton("auto", "跟随系统"),
-          themeButton("light", "亮色"),
-          themeButton("dark", "暗色")))
+      { class: "field" },
+      h("span", { class: "field-label" }, "主题"),
+      h("div", { class: "segmented", style: { alignSelf: "flex-start" } },
+        themeButton("auto", "跟随系统"),
+        themeButton("light", "亮色"),
+        themeButton("dark", "暗色"))
     ),
   });
   applyTheme(localStorage.getItem("rubenbot.theme") || "auto");
 
-  const webui = effective.webui || {};
-  const bot = effective.chat || {};
-  const info = card("当前生效配置", {
-    body: h(
-      "div",
-      {},
-      kvRow("Bot 名称", bot.bot_name || "—"),
-      kvRow("数据库", effective.database_path || "—"),
-      kvRow("WebUI 监听", `${webui.host || "—"}:${webui.port || "—"}`),
-      kvRow("WebUI 口令", webui.password ? "已设置" : "未设置"),
-      kvRow("对话模型", (effective.llm && effective.llm.chat_model) || "—"),
-      kvRow("抽取模型", (effective.llm && (effective.llm.extract_model || effective.llm.chat_model)) || "—"),
-      kvRow("后台检查", `${effective.background_check_minutes ?? "—"} 分钟`),
-      h("p", { class: "field-hint", style: { margin: "10px 0 0" } },
-        "绑定非本地地址时必须在配置里设置 webui.password，否则 WebUI 拒绝启动。")
-    ),
+  // 原始 YAML：折叠放在底部，保留旧编辑方式
+  const textarea = h("textarea", {
+    class: "textarea code",
+    rows: "18",
+    spellcheck: "false",
+    "aria-label": "config.yaml 内容",
+    placeholder: "config.yaml 不存在，保存后会创建",
   });
+  textarea.value = data.text;
+  const yamlNotice = h("div", { hidden: true });
+  const yamlSave = h("button", { class: "btn", type: "button" }, icon("check"), "保存原始 YAML");
+  yamlSave.addEventListener("click", async () => {
+    yamlSave.disabled = true;
+    try {
+      const result = await api.put("/api/config", { text: textarea.value });
+      yamlNotice.hidden = false;
+      yamlNotice.replaceChildren(
+        h("div", { class: "notice" }, icon("warning"),
+          h("span", {}, result.message || "已保存，需要重启后生效。"))
+      );
+      toast("原始配置已保存");
+    } catch (err) {
+      if (err instanceof Unauthorized) return;
+      yamlNotice.hidden = false;
+      yamlNotice.replaceChildren(
+        h("div", { class: "notice" }, icon("warning"), h("span", {}, err.message || "保存失败"))
+      );
+    } finally {
+      yamlSave.disabled = false;
+    }
+  });
+  const advanced = h(
+    "details",
+    { class: "card advanced-yaml" },
+    h(
+      "summary",
+      { class: "card-head" },
+      h("h2", {}, "高级：原始 YAML"),
+      h("span", { class: "hint" }, "直接编辑 config.yaml；保存后需要重启才生效")
+    ),
+    h(
+      "div",
+      { class: "card-body", style: { display: "grid", gap: "12px" } },
+      h("div", { class: "notice" }, icon("warning"),
+        "这里的修改不做逐字段校验，保存前只检查 YAML 语法并留一份 .bak 备份。"),
+      textarea,
+      h("div", { style: { display: "flex", alignItems: "center", gap: "10px" } },
+        yamlSave,
+        h("span", { class: "muted", style: { fontSize: "12px" } }, `${data.text.split("\n").length} 行`)),
+      yamlNotice
+    )
+  );
+
+  // 重启提示：磁盘上已有改动但还没重启的字段
+  const pending = data.restart_fields || [];
+  const pendingCard = pending.length
+    ? h(
+        "div",
+        { class: "notice settings-result" },
+        icon("warning"),
+        h(
+          "div",
+          { style: { display: "grid", gap: "6px", flex: "1" } },
+          h("strong", {}, "有改动等待重启后生效"),
+          h("div", {}, pending.map(restartLabel).join("、"))
+        ),
+        h("button", { class: "btn btn-sm", type: "button", onclick: () => confirmRestart() },
+          icon("refresh"), "立即重启")
+      )
+    : null;
+
+  if (state.settingsNotice) {
+    showResult(state.settingsNotice);
+    state.settingsNotice = null;
+  }
 
   view.replaceChildren(
-    h("div", { class: "settings-grid" }, configCard, h("div", { class: "grid", style: { gap: "16px" } }, appearance, info))
+    ...[
+      saveBar,
+      noticeBox,
+      errorBox,
+      pendingCard,
+      h(
+        "div",
+        { class: "settings-stack" },
+        ...cards,
+        h("div", { class: "settings-stack-foot" }, appearance, advanced)
+      ),
+    ].filter(Boolean)
   );
+  applyTheme(localStorage.getItem("rubenbot.theme") || "auto");
 }
 
 /* ------------------------------------------------------------------ */

@@ -79,7 +79,7 @@ async def _run(config: Config, config_path: str = "config.yaml", *, no_webui: bo
     bot, llm, store = build_bot(config)
     webui = None
     if config.webui.enabled and not no_webui:
-        webui = await _start_webui(bot, config_path)
+        webui = await _start_webui(bot, config_path, webui_only=False)
     if not bot.adapters:
         logging.error("没有启用任何适配器，请在配置里设置 adapters.console: {} 或 adapters.snowluma")
         if webui is not None:
@@ -101,14 +101,14 @@ async def _run(config: Config, config_path: str = "config.yaml", *, no_webui: bo
         store.close()
 
 
-async def _start_webui(bot: RubenBot, config_path: str):
+async def _start_webui(bot: RubenBot, config_path: str, *, webui_only: bool = False):
     """按配置拉起 WebUI；失败只警告，不阻塞 bot 本身。"""
     from .web.auth import BindSecurityError
     from .web.server import start_webui
     from .web.state import WebState
 
     try:
-        state = WebState.from_bot(bot, config_path)
+        state = WebState.from_bot(bot, config_path, webui_only=webui_only)
         return await start_webui(state)
     except BindSecurityError as exc:
         # 安全底线：拒绝启动而不是悄悄改绑
@@ -163,6 +163,7 @@ def main(argv: list[str] | None = None) -> int:
             config_path=Path(args.config),
             plugins=None,
             signer=None,
+            webui_only=True,
         )
         from .web.auth import SessionSigner
 

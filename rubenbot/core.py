@@ -28,7 +28,7 @@ from .decision import (
     ReplyDecision,
     parse_generation_output,
 )
-from .llm import LLMProtocol
+from .llm import LLMClient, LLMProtocol
 from .memory.consolidate import Consolidator
 from .memory.extract import MemoryExtractor
 from .memory.retrieve import Retriever
@@ -122,6 +122,52 @@ class RubenBot:
     def register_adapter(self, adapter: BaseAdapter) -> None:
         self.adapters[adapter.name] = adapter
 
+    def apply_config(self, config: Config, *, rebuild_llm: bool = True) -> None:
+        """热应用新配置：后续消息立即使用新的 LLM、意愿、记忆与聊天参数。
+
+        WebUI 保存设置后调用。只换引用与参数，不动意愿评分/记忆算法本身；
+        已经建立的连接（适配器、数据库、WebUI 端口）不在这里处理，那些
+        字段只能重启生效。``rebuild_llm=False`` 时保留现有客户端（只改了
+        意愿/记忆等参数时不必重建连接）。
+        """
+        old_llm = self.llm
+        self.config = config
+        if rebuild_llm:
+            # 重建 LLM 客户端（改了 base_url / api_key / 超时等都需要新客户端）
+            self.llm = LLMClient(config.llm)
+        # 各模块持有的是配置对象引用，换成新对象即可让参数立即生效
+        self.extractor.config = config.memory
+        self.extractor.llm = self.llm
+        self.consolidator.config = config.memory
+        self.consolidator.llm = self.llm
+        self.context.config = config
+        if self.plugins is not None:
+            self.plugins.config = config
+        # 意愿引擎：配置与别名一起换，内部状态（冷却/动量）保留
+        self.decision_engine.config = config.decision
+        aliases = config.decision.aliases or [config.chat.bot_name]
+        self.decision_engine.set_aliases(aliases)
+        # 合并窗口：新值对之后到达的消息生效
+        self.merger.window = max(0.0, float(config.decision.merge_window_seconds))
+        self.merger.hard_window = max(0.0, float(config.decision.hard_merge_window_seconds))
+        # 旧客户端在后台关掉，不阻塞保存请求
+        if rebuild_llm and isinstance(old_llm, LLMClient):
+            try:
+                asyncio.get_running_loop().create_task(old_llm.close())
+            except RuntimeError:  # 没有事件循环（测试/同步调用）
+                pass
+        logger.info(
+            "配置已热应用：模型=%s 阈值=%.2f 注入上限=%s",
+            config.llm.chat_model,
+            config.decision.threshold,
+            config.memory.inject_limit,
+        )
+
+    def reload_persona(self, persona: Persona) -> None:
+        """人格文件重读后替换（路径不变时 WebUI 保存设置会顺带调用）。"""
+        self.persona = persona
+        self.context.persona = persona
+
     async def run(self) -> None:
         """启动全部适配器与后台任务，直到 stop。"""
         self._stop.clear()
@@ -184,13 +230,13 @@ class RubenBot:
                 logger.warning("关闭适配器 %s 失败：%s", adapter.name, exc)
 
     async def _background_loop(self) -> None:
-        """定期检查抽取与归纳。"""
-        interval = max(5.0, self.config.background_check_minutes * 60)
+        """定期检查抽取与归纳；间隔每轮从配置现读，改设置后无需重启。"""
         while not self._stop.is_set():
             try:
                 await self.run_maintenance()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("后台维护任务异常：%s", exc)
+            interval = max(5.0, self.config.background_check_minutes * 60)
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=interval)
             except asyncio.TimeoutError:
