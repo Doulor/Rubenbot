@@ -565,3 +565,11 @@ def test_unauthorized_api_call_does_not_leak_html(locked_client):
     response = locked_client.get("/api/overview")
     assert response.status_code == 401
     assert response.headers["content-type"].startswith("application/json")
+
+
+def test_stylesheet_honors_hidden_attribute():
+    """回归：.app/.login 的 display 不能盖过 hidden 属性，否则登录页和内容页会同页叠着。"""
+    from pathlib import Path
+
+    css = (Path(__file__).parent.parent / "rubenbot" / "web" / "static" / "styles.css").read_text(encoding="utf-8")
+    assert "[hidden]" in css and "display: none !important" in css

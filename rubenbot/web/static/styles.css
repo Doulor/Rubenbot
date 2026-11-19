@@ -5,6 +5,11 @@
  * 只有一个强调色；圆角只有两档（卡片 14px / 控件 10px），药丸用于状态标签。
  */
 
+/* hidden 属性必须真的隐藏：.app/.login 等类上的 display 会盖过 UA 的 [hidden] 规则 */
+[hidden] {
+  display: none !important;
+}
+
 :root {
   --font-sans: "IBM Plex Sans", "PingFang SC", "Hiragino Sans GB", "Noto Sans CJK SC",
     "Source Han Sans SC", "Microsoft YaHei", system-ui, sans-serif;
