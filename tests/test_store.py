@@ -1,10 +1,10 @@
-"""记忆存储：CRUD、变更日志与撤销。"""
+"""记忆存储：CRUD、变更日志与撤销；记忆 v2 新表的存取 API。"""
 
 import time
 
 import pytest
 
-from rubenbot.memory.store import MemoryStore
+from rubenbot.memory.store import Event, MemoryStore, ProfileLine
 
 
 @pytest.fixture()
@@ -270,3 +270,125 @@ def test_people_with_counts_and_chats(store):
 
     counts = store.chat_counts()
     assert counts == {"messages": 3, "replies": 1, "chats": 2}
+
+
+# ----------------------------------------------------------------------
+# 记忆 v2：events / profiles / 隐私 / 裁定 / 待询问
+# ----------------------------------------------------------------------
+
+
+def test_event_crud_and_filters(store):
+    store.add_event("console:u1", "去爬山了", ts=100.0, source_chat="console:g1", audience="group:g1")
+    store.add_event("console:u1", "看了电影", ts=200.0, salience=0.9, sensitivity="high")
+    store.add_event("console:u2", "上班", ts=150.0)
+    store.add_self_event("晚上好", source_chat="console:g1", audience="group:g1", ts=120.0)
+
+    mine = store.list_events(person_id="console:u1", newest_first=False)
+    assert [event.summary for event in mine] == ["去爬山了", "看了电影"]
+    assert mine[1].salience == 0.9 and mine[1].sensitivity == "high"
+    assert [event.summary for event in store.list_events(person_id="console:u1", since=150)] == ["看了电影"]
+    assert store.list_events(person_id="self")[0].audience == "group:g1"
+    assert store.count_events(person_id="console:u1") == 2
+
+    # 压缩标记不删数据
+    store.mark_events_compressed([mine[0].id])
+    assert store.get_event(mine[0].id).compressed is True
+    assert store.list_events(person_id="console:u1", include_compressed=False)[0].summary == "看了电影"
+
+    # 非法敏感度回落到 normal，salience 夹到 0-1
+    odd = store.add_event("console:u2", "怪事", sensitivity="super-secret", salience=5)
+    assert odd.sensitivity == "normal" and odd.salience == 1.0
+
+
+def test_prune_events_marks_old_low_salience(store):
+    low = store.add_event("console:u1", "小事", ts=100.0, salience=0.2)
+    high = store.add_event("console:u1", "大事", ts=100.0, salience=0.8)
+    assert store.prune_events(cutoff=200.0, keep_salience=0.7) == 1
+    assert store.get_event(low.id).compressed is True
+    assert store.get_event(high.id).compressed is False
+
+
+def test_profile_save_replaces_lines_and_evidence(store):
+    store.save_profile(
+        "console:u1",
+        stable_lines=[ProfileLine("住在杭州", ["event:1"]), ProfileLine("是后端工程师", ["memory:2"])],
+        status_lines=[ProfileLine("在准备考试", ["event:3"])],
+        status_expires_at=1000.0,
+        hooks=["杭州", "考试"],
+        now=10.0,
+    )
+    profile = store.get_profile("console:u1")
+    assert profile.stable_lines == ["住在杭州", "是后端工程师"]
+    assert profile.status_lines == ["在准备考试"]
+    assert profile.status_expires_at == 1000.0
+    assert profile.hooks == ["杭州", "考试"]
+    evidence = store.get_profile_evidence("console:u1")
+    assert evidence[("stable", 0)] == ["event:1"]
+    assert evidence[("stable", 1)] == ["memory:2"]
+    assert evidence[("status", 0)] == ["event:3"]
+
+    # 整体替换：旧行与证据一起清掉
+    store.save_profile("console:u1", stable_lines=[ProfileLine("搬去北京", ["event:9"])], status_lines=[])
+    profile = store.get_profile("console:u1")
+    assert profile.stable_lines == ["搬去北京"]
+    assert profile.status_lines == []
+    assert store.get_profile_evidence("console:u1") == {("stable", 0): ["event:9"]}
+
+
+def test_profile_update_writes_audit_log(store):
+    store.save_profile(
+        "console:u1", stable_lines=[ProfileLine("住在杭州", ["event:1"])], status_lines=[],
+        log_reason="首次提炼画像",
+    )
+    store.save_profile(
+        "console:u1", stable_lines=[ProfileLine("住在北京", ["event:2"])], status_lines=[],
+        log_reason="画像更新：矛盾替换",
+    )
+    logs = store.list_logs(person_id="console:u1")
+    assert logs[0].action == "profile_update"
+    assert logs[0].reason == "画像更新：矛盾替换"
+    assert any(item.get("section") == "stable" for item in logs[0].before)
+    # 画像日志只作审计，不能撤销
+    assert store.restore(logs[0].id) is False
+
+
+def test_privacy_settings(store):
+    assert store.get_privacy_mode("console:u1") == "normal"
+    assert store.is_norecord("console:u1") is False
+    store.set_privacy_mode("console:u1", "norecord", now=5.0)
+    assert store.is_norecord("console:u1") is True
+    store.set_privacy_mode("console:u1", "private", now=6.0)
+    assert store.get_privacy_mode("console:u1") == "private"
+    with pytest.raises(ValueError):
+        store.set_privacy_mode("console:u1", "paranoid")
+
+
+def test_rulings_upsert_and_list(store):
+    ruling = store.set_ruling("console:u1", "health", "deny", now=10.0)
+    assert ruling.verdict == "deny"
+    # 同一人同一 key 覆盖
+    store.set_ruling("console:u1", "health", "allow", now=20.0)
+    assert store.get_ruling("console:u1", "health").verdict == "allow"
+    store.set_ruling("console:u1", "event:7", "allow", now=30.0)
+    assert {r.key for r in store.list_rulings("console:u1")} == {"health", "event:7"}
+    # 不同的人互不影响
+    assert store.get_ruling("console:u2", "health") is None
+    with pytest.raises(ValueError):
+        store.set_ruling("console:u1", "health", "maybe")
+
+
+def test_pending_asks_lifecycle(store):
+    ask = store.add_pending_ask("console:u1", "event:7", "你这件事能跟别人说吗？", now=10.0)
+    assert ask.status == "pending" and ask.verdict == ""
+    assert [a.id for a in store.list_pending_asks("console:u1")] == [ask.id]
+
+    answered = store.answer_pending_ask(ask.id, "deny", now=20.0)
+    assert answered.status == "answered" and answered.verdict == "deny"
+    # 回答顺手落成裁定，同类不再问
+    assert store.get_ruling("console:u1", "event:7").verdict == "deny"
+    assert store.list_pending_asks("console:u1") == []
+
+    other = store.add_pending_ask("console:u1", "event:8", "这个呢？", now=100.0)
+    assert store.expire_pending_asks(older_than=150.0) == 1
+    assert store.list_pending_asks("console:u1", status=None)[-1].status == "expired"
+    assert store.list_pending_asks("console:u1", status="expired")[0].id == other.id

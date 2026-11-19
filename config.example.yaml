@@ -30,6 +30,17 @@ memory:
   consolidate_remove_ratio: 0.2
   consolidate_remove_min: 4
   raw_keep_per_chat: 500
+  # 记忆 v2：画像提炼与时间线
+  distill_new_threshold: 20      # 新增事件+事实达到多少条触发画像提炼
+  distill_interval_hours: 24     # 或距上次提炼超过这么久
+  distill_max_events: 120        # 一次提炼最多喂多少条新事件
+  distill_max_facts: 80          # 一次提炼最多喂多少条新事实
+  status_expiry_min_days: 1      # 近况过期天数夹取下限
+  status_expiry_max_days: 90     # 近况过期天数夹取上限
+  timeline_compress_after_days: 7   # 7 天前的事件按周压成 digest
+  timeline_prune_after_days: 90     # 90 天前只留高显著度事件
+  timeline_prune_keep_salience: 0.7
+  self_event_max_chars: 120      # 自我时间线里每条消息的截断长度
 
 chat:
   bot_name: "Ruben"

@@ -68,6 +68,22 @@ class MemoryConfig:
     consolidate_remove_min: int = 4
     raw_keep_per_chat: int = 500
 
+    # ---- 记忆 v2（画像 / 时间线 / 自我）----
+    # 画像提炼：新增事件+事实达到阈值、或距上次提炼超过间隔时触发
+    distill_new_threshold: int = 20
+    distill_interval_hours: float = 24.0
+    distill_max_events: int = 120
+    distill_max_facts: int = 80
+    # 近况（status）过期时间由模型估计天数，代码夹到这个区间
+    status_expiry_min_days: int = 1
+    status_expiry_max_days: int = 90
+    # 时间线压缩：7 天前按人按周压成 digest；90 天前只留高显著度
+    timeline_compress_after_days: float = 7.0
+    timeline_prune_after_days: float = 90.0
+    timeline_prune_keep_salience: float = 0.7
+    # bot 自己发的每条消息记进自我时间线的截断长度
+    self_event_max_chars: int = 120
+
 
 @dataclass
 class ChatConfig:

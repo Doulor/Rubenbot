@@ -37,7 +37,7 @@ from .decision import (
 )
 from .llm import LLMClient, LLMProtocol
 from .memory.consolidate import Consolidator
-from .memory.extract import MemoryExtractor
+from .memory.extract import MemoryExtractor, audience_for_chat
 from .memory.retrieve import Retriever
 from .memory.store import MemoryStore, make_person_id
 from .persona import Persona
@@ -731,6 +731,15 @@ class RubenBot:
                 processed=True,
                 platform_msg_id="" if message_id is None else str(message_id),
             )
+            # 自我时间线：发送成功即记一条 self 事件（记忆 v2 写入侧唯一接线点）
+            try:
+                self.store.add_self_event(
+                    text[: max(1, int(self.config.memory.self_event_max_chars))],
+                    source_chat=f"{event.platform}:{event.chat_id}",
+                    audience=audience_for_chat(event.chat_type, event.chat_id),
+                )
+            except Exception as exc:  # noqa: BLE001 - 自我事件失败不能影响发送
+                logger.warning("记录自我事件失败：%s", exc)
             if index < len(parts) - 1 and self.config.chat.split_delay_seconds > 0:
                 await asyncio.sleep(self.config.chat.split_delay_seconds)
         # 发言时间交给决策引擎：动量加成与发言后冷却都依赖它

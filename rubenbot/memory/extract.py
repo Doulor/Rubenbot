@@ -1,46 +1,74 @@
-"""从消息流批量抽取耐久事实。
+"""从消息流批量抽取：稳定事实（memories）+ 具体事件（events）。
 
 流程：消息先落 raw_messages；后台任务按阈值（条数或会话静默）触发；
-对每个有未处理消息的发送者，让模型从其消息里提炼「关于这个人的耐久事实」，
-解析 JSON、与已有记忆做精确/近似去重，然后入库并标记消息已处理。
+对每个有未处理消息的发送者，让模型把其消息分成两类——
+
+- **事件**：发生过的具体事，带时间线索，近原文、不抽象加工（时间线层严格侧）
+- **事实**：耐久的稳定事实（画像的原料），保持原有去重
+
+入库前的元数据（来源会话、受众、敏感度、稳定性）由代码按来源会话与模型
+标注共同决定；「不记模式」的人在入口处直接跳过。事件/事实的进一步提炼
+由 ``distill`` 作业负责（画像），这里只保证原料干净。
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 
 from ..llm import LLMProtocol, parse_json_payload
 from ..memory.retrieve import jaccard, normalize
-from ..memory.store import MemoryStore, PendingSender, RawMessage, make_person_id
+from ..memory.store import (
+    VALID_SENSITIVITY,
+    VALID_STABILITY,
+    MemoryStore,
+    PendingSender,
+    RawMessage,
+    make_person_id,
+)
 
 logger = logging.getLogger(__name__)
 
-EXTRACT_SYSTEM_PROMPT = """你是一个记忆整理员。你会看到某个群聊里某个人最近说的话（带上下文），
-请从中提炼关于「这个人」的**耐久事实**，写成简短的中文陈述句。
+EXTRACT_SYSTEM_PROMPT = """你是一个记忆整理员。你会看到某个会话里某个人最近说的话（带上下文），
+请把它分成两类信息，只提炼关于「这个人」的内容：
 
-只保留：
+一、facts（耐久事实）：长期有效的稳定信息
 - 身份（职业、所在地、年龄段等）
 - 稳定的偏好（喜欢/讨厌什么）
-- 习惯（作息、爱好、常用口头禅之外的稳定行为）
+- 习惯（作息、爱好）
 - 人际关系（家人、朋友、同事等）
-- 重要经历（发生过的事、计划中的事）
 - 明确做出的承诺
 
-不要保留：
-- 一次性的请求或问题（“帮我查一下”“今天吃什么”）
-- 当天的天气、临时情绪、纯语气词
+二、events（具体事件）：发生过的具体事
+- 每条一句话，尽量贴近原话，不许抽象加工、不许补充原话没有的细节
+- 带时间线索：原话里说了什么时候就填 time_hint（如“昨天下午”“2026-11-18”），
+  说不清就留空
+- salience 是这件事对这个人的重要程度（0-1）：日常闲聊 0.2~0.4，
+  重要的生活事件 0.7~1.0
+
+标注规则（facts 与 events 都要）：
+- sensitivity：normal 普通；high 涉及健康/财务/感情/身份等敏感类目；
+  sealed 当事人明确要求保密（如“别跟别人说”）
+- facts 的 stability：stable 长期有效；temporal 临时状态（如“明天出差”），
+  同时给 expires_in_days（估计几天后失效，1~90 的整数）；uncertain 拿不准真假
+
+不要记录：
+- 一次性的请求或问题、当天的天气、临时情绪、纯语气词
 - 对 bot 或他人的评价
 - 消息里没有依据的推测
 
-每条事实以「TA」作主语，避免使用「我」。事实应当长期有效。
+facts 以「TA」作主语，避免「我」。facts 的 category 取
+identity / preference / habit / relationship / experience / promise 之一；
+scope 为 global（长期有效）或 group（只在当前会话有意义）。
 
-严格输出 JSON 数组，每个元素形如：
-{"content": "TA 是杭州的一名后端工程师", "category": "identity", "scope": "global"}
-category 取 identity / preference / habit / relationship / experience / promise 之一。
-scope 为 global（长期有效）或 group（只在当前群有意义）。
-没有值得记录的事实就输出 []。
+严格输出 JSON 对象：
+{"facts": [{"content": "...", "category": "identity", "scope": "global",
+            "stability": "stable", "expires_in_days": 0, "sensitivity": "normal"}],
+ "events": [{"summary": "...", "time_hint": "", "salience": 0.4, "sensitivity": "normal"}]}
+没有内容就输出 {"facts": [], "events": []}。
 """
 
 
@@ -49,18 +77,39 @@ class ExtractedFact:
     content: str
     category: str = "fact"
     scope_type: str = "global"
+    stability: str = "stable"
+    expires_in_days: int | None = None
+    sensitivity: str = "normal"
+
+
+@dataclass
+class ExtractedEvent:
+    summary: str
+    time_hint: str = ""
+    ts: float | None = None  # 代码解析后的绝对时间；None 表示用消息时间
+    salience: float = 0.5
+    sensitivity: str = "normal"
+
+
+@dataclass
+class Extraction:
+    facts: list[ExtractedFact] = field(default_factory=list)
+    events: list[ExtractedEvent] = field(default_factory=list)
 
 
 @dataclass
 class ExtractResult:
     person_id: str
-    added: list[str]
+    added: list[str] = field(default_factory=list)
     skipped: int = 0
+    added_events: list[str] = field(default_factory=list)
+    skipped_events: int = 0
+    skipped_norecord: bool = False
     error: str | None = None
 
 
 class MemoryExtractor:
-    """按人批量抽取记忆。"""
+    """按人批量抽取记忆与事件。"""
 
     def __init__(self, llm: LLMProtocol, store: MemoryStore, config):
         self.llm = llm
@@ -91,10 +140,15 @@ class MemoryExtractor:
         return chosen
 
     async def maybe_extract(self, *, now: float | None = None, force: bool = False) -> list[ExtractResult]:
-        """满足触发条件时执行抽取；异常只记录，不抛出（由调用方兜底）。"""
+        """满足触发条件时执行抽取；异常只记录，不抛出（由调用方兜底）。
+
+        抽取结束后顺带跑写入侧下游（时间线压缩 + 画像提炼），它们各自带触发
+        条件与兜底，所以即使没有待抽取消息也会被调用（压缩仍需定期检查）。
+        """
         now = time.time() if now is None else now
         pending = self.store.pending_senders()
         if not pending:
+            await self.run_followups(now=now)
             return []
         if force:
             chats = sorted({p.chat_id for p in pending})
@@ -108,7 +162,29 @@ class MemoryExtractor:
                 result = await self.extract_sender(sender, now=now)
                 results.append(result)
         self.store.trim_raw(self.config.raw_keep_per_chat)
+        await self.run_followups(now=now)
         return results
+
+    async def run_followups(self, *, now: float | None = None) -> None:
+        """抽取之后的下游维护：画像提炼（异步）+ 时间线压缩（同步、无 LLM）。
+
+        挂在抽取流程末尾（不新增 core 调用点）；两者各自检查触发条件（阈值/
+        间隔），不满足时几乎零成本，任何一侧失败都不影响抽取结果。
+        先提炼后压缩：提炼吃的是原始事件，压缩生成的 digest 留给下一轮。
+        """
+        now = time.time() if now is None else now
+        # 局部导入避免与 distill 模块的循环依赖
+        from ..memory.distill import ProfileDistiller
+        from ..memory.timeline import TimelineCompressor
+
+        try:
+            await ProfileDistiller(self.llm, self.store, self.config).maybe_distill(now=now)
+        except Exception as exc:  # noqa: BLE001 - 提炼失败不能拖垮抽取
+            logger.warning("画像提炼异常：%s", exc)
+        try:
+            TimelineCompressor(self.store, self.config).run(now=now)
+        except Exception as exc:  # noqa: BLE001 - 压缩失败不能拖垮抽取
+            logger.warning("时间线压缩异常：%s", exc)
 
     # ------------------------------------------------------------------
     # 单人抽取
@@ -121,17 +197,27 @@ class MemoryExtractor:
             sender.platform, sender.chat_id, sender.sender_id, limit=self.config.extract_window
         )
         if not messages:
-            return ExtractResult(person_id=person_id, added=[])
+            return ExtractResult(person_id=person_id)
+        # 不记模式：不建画像、不进时间线；消息仍标记已处理，避免反复查库
+        if self._is_norecord(person_id):
+            self.store.mark_processed([m.id for m in messages])
+            logger.info("跳过不记模式的用户：%s", person_id)
+            return ExtractResult(person_id=person_id, skipped_norecord=True)
         try:
-            facts = await self._ask_model(sender, messages)
+            extraction = await self._ask_model(sender, messages)
         except Exception as exc:  # noqa: BLE001 - 单次抽取失败不应影响其他
             logger.warning("抽取失败（%s）：%s", person_id, exc)
-            return ExtractResult(person_id=person_id, added=[], error=str(exc))
+            return ExtractResult(person_id=person_id, error=str(exc))
+
+        audience = audience_for_chat(sender.chat_type, sender.chat_id)
+        origin_chat = f"{sender.platform}:{sender.chat_id}"
+        source_ref = f"{sender.platform}:{sender.chat_id}:{messages[0].id}-{messages[-1].id}"
+        base_ts = messages[-1].ts
 
         existing = self.store.list_memories(person_id=person_id)
         added: list[str] = []
         skipped = 0
-        for fact in facts:
+        for fact in extraction.facts:
             duplicate = self._is_duplicate(fact.content, existing)
             if duplicate:
                 skipped += 1
@@ -143,23 +229,87 @@ class MemoryExtractor:
                 scope_id=sender.chat_id if fact.scope_type == "group" else "",
                 category=fact.category,
                 source="extracted",
-                source_ref=f"{sender.platform}:{sender.chat_id}:{messages[0].id}-{messages[-1].id}",
+                source_ref=source_ref,
+                origin_chat=origin_chat,
+                audience=audience,
+                sensitivity=fact.sensitivity,
+                stability=fact.stability,
+                expires_at=self._expiry_ts(fact, base_ts),
                 now=now,
             )
             existing.append(mem)
             added.append(mem.content)
-        # 无论有没有新事实，这批消息都算处理过，避免反复请求模型
-        self.store.mark_processed([m.id for m in messages])
-        return ExtractResult(person_id=person_id, added=added, skipped=skipped)
 
-    async def _ask_model(self, sender: PendingSender, messages: list[RawMessage]) -> list[ExtractedFact]:
-        transcript = "\n".join(f"[{m.sender_name or m.sender_id}] {m.text}" for m in messages)
+        added_events: list[str] = []
+        skipped_events = 0
+        for event in extraction.events:
+            ts = resolve_event_ts(event.time_hint, base_ts) if event.ts is None else event.ts
+            if self._event_exists(person_id, event.summary, ts):
+                skipped_events += 1
+                continue
+            self.store.add_event(
+                person_id,
+                event.summary,
+                ts=ts,
+                source_chat=origin_chat,
+                audience=audience,
+                sensitivity=event.sensitivity,
+                salience=event.salience,
+                now=now,
+            )
+            added_events.append(event.summary)
+
+        # 无论有没有新内容，这批消息都算处理过，避免反复请求模型
+        self.store.mark_processed([m.id for m in messages])
+        return ExtractResult(
+            person_id=person_id,
+            added=added,
+            skipped=skipped,
+            added_events=added_events,
+            skipped_events=skipped_events,
+        )
+
+    def _is_norecord(self, person_id: str) -> bool:
+        try:
+            return self.store.is_norecord(person_id)
+        except Exception as exc:  # noqa: BLE001 - 隐私检查失败不能拖垮抽取
+            logger.warning("查询隐私设置失败（%s）：%s", person_id, exc)
+            return False
+
+    def _expiry_ts(self, fact: ExtractedFact, base_ts: float) -> float | None:
+        """临时事实的过期时间：天数夹到配置区间；非 temporal 一律无过期。"""
+        if fact.stability != "temporal":
+            return None
+        days = fact.expires_in_days
+        low = max(1, int(getattr(self.config, "status_expiry_min_days", 1)))
+        high = max(low, int(getattr(self.config, "status_expiry_max_days", 90)))
+        if days is None:
+            days = 3
+        days = min(high, max(low, int(days)))
+        return base_ts + days * 86400.0
+
+    def _event_exists(self, person_id: str, summary: str, ts: float) -> bool:
+        """同一人一天内同一句话（归一化后相同）的事件视为重复。"""
+        normalized = normalize(summary)
+        if not normalized:
+            return True
+        for event in self.store.list_events(person_id=person_id, since=ts - 86400, until=ts + 86400):
+            if event.kind != "event":
+                continue
+            if normalize(event.summary) == normalized:
+                return True
+        return False
+
+    async def _ask_model(self, sender: PendingSender, messages: list[RawMessage]) -> Extraction:
+        transcript = "\n".join(
+            f"[{format_ts(m.ts)}] [{m.sender_name or m.sender_id}] {m.text}" for m in messages
+        )
         user_prompt = (
             f"平台：{sender.platform}\n"
             f"会话：{sender.chat_id}（{'私聊' if sender.chat_type == 'private' else '群聊'}）\n"
             f"要了解的人：{sender.sender_name or sender.sender_id}（id={sender.sender_id}）\n\n"
             f"TA 最近说的话：\n{transcript}\n\n"
-            "请只提炼关于这个人的耐久事实，输出 JSON 数组。"
+            "请只针对这个人，分别输出 facts 与 events，JSON 对象格式。"
         )
         raw = await self.llm.complete(
             [
@@ -170,7 +320,7 @@ class MemoryExtractor:
             temperature=0.2,
             json_mode=True,
         )
-        return parse_extracted_facts(raw)
+        return parse_extraction(raw)
 
     def _is_duplicate(self, content: str, existing) -> bool:
         """精确重复直接跳过；token 重合度 ≥ 阈值也跳过。"""
@@ -188,13 +338,32 @@ class MemoryExtractor:
 VALID_CATEGORIES = {"identity", "preference", "habit", "relationship", "experience", "promise", "fact"}
 
 
-def parse_extracted_facts(raw: str) -> list[ExtractedFact]:
-    """解析模型输出；兼容数组或 {"facts": [...]}，并过滤空项/非法项。"""
+# ----------------------------------------------------------------------
+# 解析与时间推断
+# ----------------------------------------------------------------------
+
+
+def parse_extraction(raw: str) -> Extraction:
+    """解析模型输出：支持 {"facts": [...], "events": [...]} 与旧的纯数组。"""
     data = parse_json_payload(raw)
-    if isinstance(data, dict):
-        data = data.get("facts") or data.get("memories") or []
-    if not isinstance(data, list):
-        return []
+    if isinstance(data, list):
+        return Extraction(facts=_parse_facts(data), events=[])
+    if not isinstance(data, dict):
+        return Extraction()
+    facts_data = data.get("facts") or data.get("memories") or []
+    events_data = data.get("events") or []
+    return Extraction(
+        facts=_parse_facts(facts_data if isinstance(facts_data, list) else []),
+        events=_parse_events(events_data if isinstance(events_data, list) else []),
+    )
+
+
+def parse_extracted_facts(raw: str) -> list[ExtractedFact]:
+    """兼容旧接口：只取事实。"""
+    return parse_extraction(raw).facts
+
+
+def _parse_facts(data: list) -> list[ExtractedFact]:
     facts: list[ExtractedFact] = []
     for item in data:
         if isinstance(item, str):
@@ -208,11 +377,161 @@ def parse_extracted_facts(raw: str) -> list[ExtractedFact]:
         if category not in VALID_CATEGORIES:
             category = "fact"
         scope = str(item.get("scope") or "global").strip().lower()
+        stability = str(item.get("stability") or "stable").strip().lower()
+        if stability not in VALID_STABILITY:
+            stability = "stable"
+        sensitivity = str(item.get("sensitivity") or "normal").strip().lower()
+        if sensitivity not in VALID_SENSITIVITY:
+            sensitivity = "normal"
         facts.append(
             ExtractedFact(
                 content=content,
                 category=category,
                 scope_type="group" if scope == "group" else "global",
+                stability=stability,
+                expires_in_days=_parse_days(item.get("expires_in_days")),
+                sensitivity=sensitivity,
             )
         )
     return facts
+
+
+def _parse_events(data: list) -> list[ExtractedEvent]:
+    events: list[ExtractedEvent] = []
+    for item in data:
+        if isinstance(item, str):
+            item = {"summary": item}
+        if not isinstance(item, dict):
+            continue
+        summary = str(item.get("summary") or item.get("content") or "").strip()
+        if len(summary) < 2 or len(summary) > 300:
+            continue
+        sensitivity = str(item.get("sensitivity") or "normal").strip().lower()
+        if sensitivity not in VALID_SENSITIVITY:
+            sensitivity = "normal"
+        try:
+            salience = float(item.get("salience", 0.5))
+        except (TypeError, ValueError):
+            salience = 0.5
+        events.append(
+            ExtractedEvent(
+                summary=summary,
+                time_hint=str(item.get("time_hint") or item.get("time") or "").strip(),
+                salience=min(1.0, max(0.0, salience)),
+                sensitivity=sensitivity,
+            )
+        )
+    return events
+
+
+def _parse_days(value) -> int | None:
+    """解析模型给的天数；缺省返回 None（由夹取逻辑给默认值）。"""
+    if value is None or value == "":
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def format_ts(ts: float) -> str:
+    try:
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+    except (OverflowError, OSError, ValueError):
+        return "?"
+
+
+_WEEKDAY_WORDS = {"周一": 0, "周二": 1, "周三": 2, "周四": 3, "周五": 4, "周六": 5, "周日": 6, "周天": 6}
+_PERIOD_HOURS = {"凌晨": 3, "早上": 8, "上午": 10, "中午": 12, "下午": 15, "傍晚": 18, "晚上": 20, "夜里": 22}
+_TIME_RE = re.compile(r"(\d{1,2})[:：点时](\d{1,2})?分?")
+_DATE_RE = re.compile(r"(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})日?")
+_RECENT_DAYS = {
+    "今天": 0,
+    "今日": 0,
+    "昨天": 1,
+    "昨日": 1,
+    "前天": 2,
+}
+_DAYS_AGO_RE = re.compile(r"(\d{1,3})\s*天[前以]前?")
+
+
+def resolve_event_ts(time_hint: str, message_ts: float) -> float:
+    """把模型给的时间线索解析成绝对时间；推不出就用消息时间。
+
+    支持：``2026-11-18`` / ``2026/11/18 20:30``、今天/昨天/前天（可带时段与
+    钟点）、``N天前``；解析结果离消息时间太远（未来 7 天以外或一年前）时
+    回退到消息时间，防止模型瞎编年份。
+    """
+    hint = (time_hint or "").strip()
+    if not hint:
+        return message_ts
+    base = _local(message_ts)
+    ts: float | None = None
+
+    date_match = _DATE_RE.search(hint)
+    if date_match:
+        year, month, day = (int(part) for part in date_match.groups())
+        hour, minute = _clock(hint)
+        try:
+            ts = datetime(year, month, day, hour, minute).timestamp()
+        except ValueError:
+            ts = None
+
+    if ts is None:
+        days_back: int | None = None
+        for word, offset in _RECENT_DAYS.items():
+            if word in hint:
+                days_back = offset
+                break
+        if days_back is None:
+            ago = _DAYS_AGO_RE.search(hint)
+            if ago:
+                days_back = int(ago.group(1))
+        if days_back is None:
+            for word, weekday in _WEEKDAY_WORDS.items():
+                if word in hint:
+                    # 本周内最近的那个周几（含今天）
+                    days_back = (base.weekday() - weekday) % 7
+                    break
+        if days_back is not None:
+            hour, minute = _clock(hint)
+            target = (base - timedelta(days=days_back)).replace(
+                hour=hour, minute=minute, second=0, microsecond=0
+            )
+            ts = target.timestamp()
+
+    if ts is None:
+        return message_ts
+    if ts > message_ts + 7 * 86400 or ts < message_ts - 366 * 86400:
+        return message_ts
+    return float(ts)
+
+
+def _local(ts: float) -> datetime:
+    try:
+        return datetime.fromtimestamp(ts)
+    except (OverflowError, OSError, ValueError):
+        return datetime.now()
+
+
+def _clock(hint: str) -> tuple[int, int]:
+    """从时间线索里取钟点；只说「晚上」就按该时段代表时间。"""
+    match = _TIME_RE.search(hint)
+    if match:
+        hour = int(match.group(1))
+        minute = int(match.group(2) or 0)
+        if ("下午" in hint or "晚上" in hint) and hour < 12:
+            hour += 12
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return hour, minute
+    for word, hour in _PERIOD_HOURS.items():
+        if word in hint:
+            return hour, 0
+    return 12, 0
+
+
+def audience_for_chat(chat_type: str, chat_id: str) -> str:
+    """按来源会话类型判定原始受众。"""
+    if str(chat_type).lower() == "private":
+        return "private"
+    return f"group:{chat_id}"

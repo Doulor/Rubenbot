@@ -1,4 +1,6 @@
-"""SQLite 存储层：memories / memory_log / people / raw_messages。
+"""SQLite 存储层：memories / memory_log / people / raw_messages，
+以及记忆 v2 的 profiles / profile_evidence / events / rulings /
+privacy_settings / pending_asks。
 
 设计原则：单文件、无 ORM、同步调用（本地 SQLite 足够快），对外暴露小接口。
 所有时间戳统一用 Unix 秒（float）。
@@ -38,11 +40,84 @@ CREATE TABLE IF NOT EXISTS memories (
     category    TEXT NOT NULL DEFAULT 'fact',
     source      TEXT NOT NULL DEFAULT 'extracted', -- extracted / user / system
     source_ref  TEXT NOT NULL DEFAULT '',
+    -- 记忆 v2：来源会话、原始受众、敏感度、事实稳定性与过期时间
+    origin_chat TEXT NOT NULL DEFAULT '',          -- platform:chat_id
+    audience    TEXT NOT NULL DEFAULT '',          -- private / group:<id> / public
+    sensitivity TEXT NOT NULL DEFAULT 'normal',    -- normal / high / sealed
+    stability   TEXT NOT NULL DEFAULT 'stable',    -- stable / temporal / uncertain
+    expires_at  REAL,
     created_at  REAL NOT NULL,
     updated_at  REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_memories_person ON memories(person_id);
 CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);
+
+-- 画像层（语义记忆）：每个 person 一行，内容按行存储，每行挂证据链
+CREATE TABLE IF NOT EXISTS profiles (
+    person_id         TEXT PRIMARY KEY,
+    stable_text       TEXT NOT NULL DEFAULT '',   -- 稳定特性，一行一条
+    status_text       TEXT NOT NULL DEFAULT '',   -- 当前近况，一行一条
+    status_expires_at REAL,                       -- 近况整体过期时间
+    hooks             TEXT NOT NULL DEFAULT '',   -- 逗号分隔的话题关键词
+    updated_at        REAL NOT NULL
+);
+
+-- 画像每行 → 证据（event:<id> / memory:<id>）的映射
+CREATE TABLE IF NOT EXISTS profile_evidence (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    person_id     TEXT NOT NULL,
+    section       TEXT NOT NULL,                  -- stable / status
+    line_no       INTEGER NOT NULL,               -- 该节第几行（0 起）
+    evidence_refs TEXT NOT NULL DEFAULT '[]',     -- JSON 数组
+    UNIQUE(person_id, section, line_no)
+);
+CREATE INDEX IF NOT EXISTS idx_profile_evidence_person ON profile_evidence(person_id);
+
+-- 时间线层（情景记忆）：发生过的具体事；bot 自己用保留 person_id 'self'
+CREATE TABLE IF NOT EXISTS events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    person_id   TEXT NOT NULL,
+    ts          REAL NOT NULL,                    -- 事件发生时间
+    summary     TEXT NOT NULL,
+    source_chat TEXT NOT NULL DEFAULT '',         -- platform:chat_id
+    audience    TEXT NOT NULL DEFAULT '',         -- private / group:<id> / public
+    sensitivity TEXT NOT NULL DEFAULT 'normal',   -- normal / high / sealed
+    salience    REAL NOT NULL DEFAULT 0.5,        -- 显著度 0-1
+    compressed  INTEGER NOT NULL DEFAULT 0,       -- 1 = 已压进 digest
+    kind        TEXT NOT NULL DEFAULT 'event',    -- event / digest
+    created_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_events_person_ts ON events(person_id, ts);
+CREATE INDEX IF NOT EXISTS idx_events_compressed ON events(compressed, ts);
+
+-- 分寸裁定：本人对「某类目/某件事」的可说与否；判断逻辑在读取侧，这张表只存结论
+CREATE TABLE IF NOT EXISTS rulings (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    person_id  TEXT NOT NULL,
+    key        TEXT NOT NULL,                     -- 类目（health/finance/...）或具体事件 id
+    verdict    TEXT NOT NULL DEFAULT 'deny',      -- allow / deny
+    created_at REAL NOT NULL,
+    UNIQUE(person_id, key)
+);
+
+-- 按人三档隐私：normal / private / norecord
+CREATE TABLE IF NOT EXISTS privacy_settings (
+    person_id  TEXT PRIMARY KEY,
+    mode       TEXT NOT NULL DEFAULT 'normal',
+    updated_at REAL NOT NULL
+);
+
+-- 灰区异步询问：判断没把握的敏感事项，攒到私聊里自然时机问本人
+CREATE TABLE IF NOT EXISTS pending_asks (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    person_id  TEXT NOT NULL,
+    item_ref   TEXT NOT NULL,                     -- 相关记忆/事件引用
+    question   TEXT NOT NULL,
+    status     TEXT NOT NULL DEFAULT 'pending',   -- pending / answered / expired
+    verdict    TEXT NOT NULL DEFAULT '',          -- allow / deny
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pending_asks_person ON pending_asks(person_id, status);
 
 CREATE TABLE IF NOT EXISTS raw_messages (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -112,6 +187,12 @@ class Memory:
     category: str = "fact"
     source: str = "extracted"
     source_ref: str = ""
+    # 记忆 v2 元数据
+    origin_chat: str = ""
+    audience: str = ""
+    sensitivity: str = "normal"
+    stability: str = "stable"
+    expires_at: float | None = None
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -131,6 +212,90 @@ class Person:
     display_name: str
     first_seen: float
     last_seen: float
+
+
+# bot 自己在时间线里的保留 person_id（见 SPEC「内容结构：两层 + 自我」）
+SELF_PERSON_ID = "self"
+
+VALID_SENSITIVITY = {"normal", "high", "sealed"}
+VALID_STABILITY = {"stable", "temporal", "uncertain"}
+VALID_PRIVACY_MODES = {"normal", "private", "norecord"}
+
+
+@dataclass
+class Event:
+    """时间线层的一个事件：谁、何时、在哪个会话、发生了什么事。"""
+
+    id: int | None = None
+    person_id: str = ""
+    ts: float = field(default_factory=time.time)
+    summary: str = ""
+    source_chat: str = ""
+    audience: str = ""
+    sensitivity: str = "normal"
+    salience: float = 0.5
+    compressed: bool = False
+    kind: str = "event"  # event / digest
+    created_at: float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "Event":
+        data = dict(row)
+        data["compressed"] = bool(data.get("compressed", 0))
+        data["salience"] = float(data.get("salience") or 0.0)
+        return cls(**data)
+
+
+@dataclass
+class ProfileLine:
+    """画像里的一行结论，附带证据链（event/memory 引用）。"""
+
+    text: str
+    evidence_refs: list[str] = field(default_factory=list)
+    line_no: int = 0
+    # 近况类的估计有效天数（只用于计算 status_expires_at，不落库到证据表）
+    expires_in_days: int | None = None
+
+
+@dataclass
+class Profile:
+    person_id: str
+    stable_text: str = ""
+    status_text: str = ""
+    status_expires_at: float | None = None
+    hooks: list[str] = field(default_factory=list)
+    updated_at: float = field(default_factory=time.time)
+
+    @property
+    def stable_lines(self) -> list[str]:
+        return [line for line in self.stable_text.splitlines() if line.strip()]
+
+    @property
+    def status_lines(self) -> list[str]:
+        return [line for line in self.status_text.splitlines() if line.strip()]
+
+
+@dataclass
+class Ruling:
+    id: int
+    person_id: str
+    key: str
+    verdict: str  # allow / deny
+    created_at: float
+
+
+@dataclass
+class PendingAsk:
+    id: int
+    person_id: str
+    item_ref: str
+    question: str
+    status: str  # pending / answered / expired
+    verdict: str
+    created_at: float
 
 
 @dataclass
@@ -186,6 +351,7 @@ class MemoryStore:
         with self._lock:
             # 先给旧库补列，再执行建表/建索引脚本（索引引用了新列）
             _migrate_raw_messages(self._conn)
+            _migrate_memories(self._conn)
             self._conn.executescript(SCHEMA)
             self._conn.commit()
 
@@ -308,17 +474,42 @@ class MemoryStore:
         category: str = "fact",
         source: str = "extracted",
         source_ref: str = "",
+        origin_chat: str = "",
+        audience: str = "",
+        sensitivity: str = "normal",
+        stability: str = "stable",
+        expires_at: float | None = None,
         now: float | None = None,
     ) -> Memory:
         """直接写入一条记忆（不做去重；去重在 extract 层）。"""
         now = time.time() if now is None else now
+        if sensitivity not in VALID_SENSITIVITY:
+            sensitivity = "normal"
+        if stability not in VALID_STABILITY:
+            stability = "stable"
         with self._lock:
             cur = self._conn.execute(
                 """
-                INSERT INTO memories(person_id, scope_type, scope_id, content, category, source, source_ref, created_at, updated_at)
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO memories(person_id, scope_type, scope_id, content, category, source, source_ref,
+                                     origin_chat, audience, sensitivity, stability, expires_at, created_at, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (person_id, scope_type, scope_id or "", content.strip(), category, source, source_ref, now, now),
+                (
+                    person_id,
+                    scope_type,
+                    scope_id or "",
+                    content.strip(),
+                    category,
+                    source,
+                    source_ref,
+                    origin_chat,
+                    audience,
+                    sensitivity,
+                    stability,
+                    expires_at,
+                    now,
+                    now,
+                ),
             )
             self._conn.commit()
             mem_id = int(cur.lastrowid)
@@ -466,8 +657,9 @@ class MemoryStore:
                 for spec in add_specs:
                     cur = self._conn.execute(
                         """
-                        INSERT INTO memories(person_id, scope_type, scope_id, content, category, source, source_ref, created_at, updated_at)
-                        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        INSERT INTO memories(person_id, scope_type, scope_id, content, category, source, source_ref,
+                                             origin_chat, audience, sensitivity, stability, expires_at, created_at, updated_at)
+                        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             spec["person_id"],
@@ -477,6 +669,11 @@ class MemoryStore:
                             spec.get("category", "fact"),
                             spec.get("source", "extracted"),
                             spec.get("source_ref", ""),
+                            spec.get("origin_chat", ""),
+                            spec.get("audience", ""),
+                            spec.get("sensitivity", "normal"),
+                            spec.get("stability", "stable"),
+                            spec.get("expires_at"),
                             spec.get("created_at", now),
                             spec.get("updated_at", now),
                         ),
@@ -497,13 +694,17 @@ class MemoryStore:
         self,
         action: str,
         person_id: str | None,
-        before: Sequence[Memory],
-        after: Sequence[Memory],
+        before,
+        after,
         reason: str,
         now: float,
     ) -> LogEntry:
-        before_json = json.dumps([m.to_dict() for m in before], ensure_ascii=False)
-        after_json = json.dumps([m.to_dict() for m in after], ensure_ascii=False)
+        before_json = json.dumps(
+            [m.to_dict() if hasattr(m, "to_dict") else m for m in before], ensure_ascii=False
+        )
+        after_json = json.dumps(
+            [m.to_dict() if hasattr(m, "to_dict") else m for m in after], ensure_ascii=False
+        )
         cur = self._conn.execute(
             "INSERT INTO memory_log(action, person_id, before_json, after_json, reason, created_at, reverted) VALUES(?, ?, ?, ?, ?, ?, 0)",
             (action, person_id, before_json, after_json, reason, now),
@@ -536,6 +737,18 @@ class MemoryStore:
             row = self._conn.execute("SELECT * FROM memory_log WHERE id = ?", (log_id,)).fetchone()
         return self._row_to_log(row) if row else None
 
+    def latest_log_id(self, person_id: str, *, action: str | None = None) -> int | None:
+        """某人的最新一条日志 id（画像提炼写日志后取回用）。"""
+        sql = "SELECT id FROM memory_log WHERE person_id = ?"
+        params: list = [person_id]
+        if action is not None:
+            sql += " AND action = ?"
+            params.append(action)
+        sql += " ORDER BY id DESC LIMIT 1"
+        with self._lock:
+            row = self._conn.execute(sql, params).fetchone()
+        return int(row["id"]) if row else None
+
     @staticmethod
     def _row_to_log(row: sqlite3.Row) -> LogEntry:
         return LogEntry(
@@ -550,9 +763,12 @@ class MemoryStore:
         )
 
     def restore(self, log_id: int) -> bool:
-        """撤销一条日志：把 before 快照写回，并生成一条可反撤销的 restore 日志。"""
+        """撤销一条日志：把 before 快照写回，并生成一条可反撤销的 restore 日志。
+
+        只有记忆变更日志能撤销；画像变更（``profile_update``）只作审计留痕。
+        """
         log = self.get_log(log_id)
-        if log is None or log.reverted:
+        if log is None or log.reverted or log.action == "profile_update":
             return False
         before_ids = {int(m["id"]) for m in log.before}
         after_ids = {int(m["id"]) for m in log.after}
@@ -566,8 +782,9 @@ class MemoryStore:
                     row = dict(snapshot)
                     self._conn.execute(
                         """
-                        INSERT OR REPLACE INTO memories(id, person_id, scope_type, scope_id, content, category, source, source_ref, created_at, updated_at)
-                        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        INSERT OR REPLACE INTO memories(id, person_id, scope_type, scope_id, content, category, source, source_ref,
+                                                        origin_chat, audience, sensitivity, stability, expires_at, created_at, updated_at)
+                        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             row["id"],
@@ -578,6 +795,11 @@ class MemoryStore:
                             row.get("category", "fact"),
                             row.get("source", "extracted"),
                             row.get("source_ref", ""),
+                            row.get("origin_chat", ""),
+                            row.get("audience", ""),
+                            row.get("sensitivity", "normal"),
+                            row.get("stability", "stable"),
+                            row.get("expires_at"),
                             row.get("created_at", now),
                             row.get("updated_at", now),
                         ),
@@ -591,6 +813,461 @@ class MemoryStore:
                 self._conn.rollback()
                 raise
         return True
+
+    # ------------------------------------------------------------------
+    # events（时间线层）与自我时间线
+    # ------------------------------------------------------------------
+
+    def add_event(
+        self,
+        person_id: str,
+        summary: str,
+        *,
+        ts: float | None = None,
+        source_chat: str = "",
+        audience: str = "",
+        sensitivity: str = "normal",
+        salience: float = 0.5,
+        kind: str = "event",
+        compressed: bool = False,
+        now: float | None = None,
+    ) -> Event:
+        """记一条时间线事件。``person_id='self'`` 表示 bot 自己的行为。"""
+        now = time.time() if now is None else now
+        ts = now if ts is None else float(ts)
+        if sensitivity not in VALID_SENSITIVITY:
+            sensitivity = "normal"
+        salience = min(1.0, max(0.0, float(salience)))
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                INSERT INTO events(person_id, ts, summary, source_chat, audience, sensitivity,
+                                   salience, compressed, kind, created_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    person_id,
+                    ts,
+                    summary.strip(),
+                    source_chat,
+                    audience,
+                    sensitivity,
+                    salience,
+                    1 if compressed else 0,
+                    kind,
+                    now,
+                ),
+            )
+            self._conn.commit()
+            event_id = int(cur.lastrowid)
+        return self.get_event(event_id)  # type: ignore[return-value]
+
+    def add_self_event(
+        self,
+        summary: str,
+        *,
+        source_chat: str = "",
+        audience: str = "",
+        ts: float | None = None,
+        now: float | None = None,
+    ) -> Event:
+        """bot 自己发出的消息/行为进自我时间线（保留 person_id ``self``）。"""
+        return self.add_event(
+            SELF_PERSON_ID,
+            summary,
+            ts=ts,
+            source_chat=source_chat,
+            audience=audience,
+            sensitivity="normal",
+            salience=0.4,
+            now=now,
+        )
+
+    def get_event(self, event_id: int) -> Event | None:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
+        return Event.from_row(row) if row else None
+
+    def list_events(
+        self,
+        *,
+        person_id: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        created_since: float | None = None,
+        include_compressed: bool = True,
+        kinds: Sequence[str] | None = None,
+        limit: int | None = None,
+        newest_first: bool = True,
+    ) -> list[Event]:
+        """``since``/``until`` 按事件时间（ts）过滤；``created_since`` 按入库时间过滤。
+
+        画像提炼要的是「上次提炼之后新入库的」事件，用 ``created_since``。
+        """
+        sql = "SELECT * FROM events WHERE 1=1"
+        params: list = []
+        if person_id is not None:
+            sql += " AND person_id = ?"
+            params.append(person_id)
+        if since is not None:
+            sql += " AND ts >= ?"
+            params.append(float(since))
+        if until is not None:
+            sql += " AND ts < ?"
+            params.append(float(until))
+        if created_since is not None:
+            sql += " AND created_at > ?"
+            params.append(float(created_since))
+        if not include_compressed:
+            sql += " AND compressed = 0"
+        if kinds:
+            placeholders = ",".join("?" for _ in kinds)
+            sql += f" AND kind IN ({placeholders})"
+            params.extend(kinds)
+        sql += " ORDER BY ts DESC, id DESC" if newest_first else " ORDER BY ts ASC, id ASC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(max(1, int(limit)))
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [Event.from_row(row) for row in rows]
+
+    def count_events(self, person_id: str | None = None, since: float | None = None) -> int:
+        sql = "SELECT COUNT(*) AS c FROM events WHERE 1=1"
+        params: list = []
+        if person_id is not None:
+            sql += " AND person_id = ?"
+            params.append(person_id)
+        if since is not None:
+            sql += " AND created_at > ?"
+            params.append(float(since))
+        with self._lock:
+            row = self._conn.execute(sql, params).fetchone()
+        return int(row["c"])
+
+    def get_events_by_ids(self, ids: Sequence[int]) -> list[Event]:
+        ids = [int(i) for i in ids]
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM events WHERE id IN ({placeholders})", ids
+            ).fetchall()
+        return [Event.from_row(row) for row in rows]
+
+    def mark_events_compressed(self, ids: Sequence[int]) -> int:
+        """把若干子事件标记为已压缩（只改 compressed 标志，不删数据）。"""
+        ids = [int(i) for i in ids]
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        with self._lock:
+            cur = self._conn.execute(
+                f"UPDATE events SET compressed = 1 WHERE id IN ({placeholders})", ids
+            )
+            self._conn.commit()
+        return cur.rowcount
+
+    def prune_events(self, cutoff: float, keep_salience: float = 0.7) -> int:
+        """90 天前只保留高显著度事件与 digest；其余标记 compressed（不删数据）。"""
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                UPDATE events SET compressed = 1
+                WHERE compressed = 0 AND ts < ? AND kind = 'event' AND salience < ?
+                """,
+                (float(cutoff), float(keep_salience)),
+            )
+            self._conn.commit()
+        return cur.rowcount
+
+    # ------------------------------------------------------------------
+    # profiles / profile_evidence（画像层）
+    # ------------------------------------------------------------------
+
+    def get_profile(self, person_id: str) -> Profile | None:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM profiles WHERE person_id = ?", (person_id,)).fetchone()
+        if row is None:
+            return None
+        hooks = [item.strip() for item in (row["hooks"] or "").split(",") if item.strip()]
+        return Profile(
+            person_id=row["person_id"],
+            stable_text=row["stable_text"],
+            status_text=row["status_text"],
+            status_expires_at=row["status_expires_at"],
+            hooks=hooks,
+            updated_at=row["updated_at"],
+        )
+
+    def list_profiles(self, limit: int = 500) -> list[Profile]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM profiles ORDER BY updated_at DESC LIMIT ?", (max(1, int(limit)),)
+            ).fetchall()
+        profiles: list[Profile] = []
+        for row in rows:
+            hooks = [item.strip() for item in (row["hooks"] or "").split(",") if item.strip()]
+            profiles.append(
+                Profile(
+                    person_id=row["person_id"],
+                    stable_text=row["stable_text"],
+                    status_text=row["status_text"],
+                    status_expires_at=row["status_expires_at"],
+                    hooks=hooks,
+                    updated_at=row["updated_at"],
+                )
+            )
+        return profiles
+
+    def save_profile(
+        self,
+        person_id: str,
+        *,
+        stable_lines: Sequence[ProfileLine],
+        status_lines: Sequence[ProfileLine],
+        status_expires_at: float | None = None,
+        hooks: Sequence[str] = (),
+        now: float | None = None,
+        log_reason: str = "",
+    ) -> Profile:
+        """整体替换一个人的画像（含证据链），并可选写一条 ``profile_update`` 日志。
+
+        每行结论的证据链存进 ``profile_evidence``，行号与文本行一一对应。
+        """
+        now = time.time() if now is None else now
+        stable_text = "\n".join(line.text.strip() for line in stable_lines if line.text.strip())
+        status_text = "\n".join(line.text.strip() for line in status_lines if line.text.strip())
+        hooks_text = ",".join(dict.fromkeys(h.strip() for h in hooks if h and h.strip()))
+        with self._lock:
+            try:
+                old = self.get_profile(person_id)
+                self._conn.execute(
+                    """
+                    INSERT INTO profiles(person_id, stable_text, status_text, status_expires_at, hooks, updated_at)
+                    VALUES(?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(person_id) DO UPDATE SET
+                        stable_text = excluded.stable_text,
+                        status_text = excluded.status_text,
+                        status_expires_at = excluded.status_expires_at,
+                        hooks = excluded.hooks,
+                        updated_at = excluded.updated_at
+                    """,
+                    (person_id, stable_text, status_text, status_expires_at, hooks_text, now),
+                )
+                self._conn.execute("DELETE FROM profile_evidence WHERE person_id = ?", (person_id,))
+                for section, lines in (("stable", stable_lines), ("status", status_lines)):
+                    line_no = 0
+                    for line in lines:
+                        if not line.text.strip():
+                            continue
+                        self._conn.execute(
+                            """
+                            INSERT INTO profile_evidence(person_id, section, line_no, evidence_refs)
+                            VALUES(?, ?, ?, ?)
+                            """,
+                            (
+                                person_id,
+                                section,
+                                line_no,
+                                json.dumps(list(line.evidence_refs), ensure_ascii=False),
+                            ),
+                        )
+                        line_no += 1
+                if log_reason:
+                    log = self._insert_profile_log(person_id, old, stable_text, status_text, log_reason, now)
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return self.get_profile(person_id)  # type: ignore[return-value]
+
+    def _insert_profile_log(
+        self,
+        person_id: str,
+        old: Profile | None,
+        stable_text: str,
+        status_text: str,
+        reason: str,
+        now: float,
+    ) -> LogEntry:
+        """画像变更也写进 memory_log 留痕（仅审计，不能用 restore 回滚）。"""
+
+        def snapshot(profile: Profile | None) -> list[dict]:
+            if profile is None:
+                return []
+            items: list[dict] = []
+            for line in profile.stable_lines:
+                items.append({"content": line, "section": "stable"})
+            for line in profile.status_lines:
+                items.append({"content": line, "section": "status"})
+            return items
+
+        new_items = [{"content": line, "section": "stable"} for line in stable_text.splitlines() if line.strip()]
+        new_items += [{"content": line, "section": "status"} for line in status_text.splitlines() if line.strip()]
+        return self._insert_log("profile_update", person_id, snapshot(old), new_items, reason, now)
+
+    def get_profile_evidence(self, person_id: str) -> dict[tuple[str, int], list[str]]:
+        """返回 {(section, line_no): [evidence_ref, ...]}。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT section, line_no, evidence_refs FROM profile_evidence WHERE person_id = ? ORDER BY section, line_no",
+                (person_id,),
+            ).fetchall()
+        result: dict[tuple[str, int], list[str]] = {}
+        for row in rows:
+            try:
+                refs = json.loads(row["evidence_refs"] or "[]")
+            except (TypeError, ValueError):
+                refs = []
+            result[(row["section"], int(row["line_no"]))] = [str(r) for r in refs]
+        return result
+
+    # ------------------------------------------------------------------
+    # privacy_settings（按人三档隐私）
+    # ------------------------------------------------------------------
+
+    def get_privacy_mode(self, person_id: str) -> str:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT mode FROM privacy_settings WHERE person_id = ?", (person_id,)
+            ).fetchone()
+        mode = row["mode"] if row else "normal"
+        return mode if mode in VALID_PRIVACY_MODES else "normal"
+
+    def set_privacy_mode(self, person_id: str, mode: str, *, now: float | None = None) -> str:
+        if mode not in VALID_PRIVACY_MODES:
+            raise ValueError(f"未知隐私档位：{mode}")
+        now = time.time() if now is None else now
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO privacy_settings(person_id, mode, updated_at) VALUES(?, ?, ?)
+                ON CONFLICT(person_id) DO UPDATE SET mode = excluded.mode, updated_at = excluded.updated_at
+                """,
+                (person_id, mode, now),
+            )
+            self._conn.commit()
+        return mode
+
+    def is_norecord(self, person_id: str) -> bool:
+        return self.get_privacy_mode(person_id) == "norecord"
+
+    # ------------------------------------------------------------------
+    # rulings（分寸裁定存储；判断逻辑在读取侧）
+    # ------------------------------------------------------------------
+
+    def set_ruling(
+        self, person_id: str, key: str, verdict: str, *, now: float | None = None
+    ) -> Ruling:
+        if verdict not in ("allow", "deny"):
+            raise ValueError(f"未知裁定：{verdict}")
+        now = time.time() if now is None else now
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO rulings(person_id, key, verdict, created_at) VALUES(?, ?, ?, ?)
+                ON CONFLICT(person_id, key) DO UPDATE SET verdict = excluded.verdict, created_at = excluded.created_at
+                """,
+                (person_id, key, verdict, now),
+            )
+            self._conn.commit()
+            row = self._conn.execute(
+                "SELECT * FROM rulings WHERE person_id = ? AND key = ?", (person_id, key)
+            ).fetchone()
+        return Ruling(**dict(row))  # type: ignore[arg-type]
+
+    def get_ruling(self, person_id: str, key: str) -> Ruling | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM rulings WHERE person_id = ? AND key = ?", (person_id, key)
+            ).fetchone()
+        return Ruling(**dict(row)) if row else None
+
+    def list_rulings(self, person_id: str) -> list[Ruling]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM rulings WHERE person_id = ? ORDER BY created_at DESC, id DESC",
+                (person_id,),
+            ).fetchall()
+        return [Ruling(**dict(row)) for row in rows]
+
+    # ------------------------------------------------------------------
+    # pending_asks（灰区异步询问）
+    # ------------------------------------------------------------------
+
+    def add_pending_ask(
+        self,
+        person_id: str,
+        item_ref: str,
+        question: str,
+        *,
+        now: float | None = None,
+    ) -> PendingAsk:
+        now = time.time() if now is None else now
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                INSERT INTO pending_asks(person_id, item_ref, question, status, verdict, created_at)
+                VALUES(?, ?, ?, 'pending', '', ?)
+                """,
+                (person_id, item_ref, question.strip(), now),
+            )
+            self._conn.commit()
+            row = self._conn.execute(
+                "SELECT * FROM pending_asks WHERE id = ?", (int(cur.lastrowid),)
+            ).fetchone()
+        return PendingAsk(**dict(row))  # type: ignore[arg-type]
+
+    def list_pending_asks(
+        self, person_id: str | None = None, status: str | None = "pending", limit: int = 100
+    ) -> list[PendingAsk]:
+        sql = "SELECT * FROM pending_asks WHERE 1=1"
+        params: list = []
+        if person_id is not None:
+            sql += " AND person_id = ?"
+            params.append(person_id)
+        if status is not None:
+            sql += " AND status = ?"
+            params.append(status)
+        sql += " ORDER BY created_at ASC, id ASC LIMIT ?"
+        params.append(max(1, int(limit)))
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [PendingAsk(**dict(row)) for row in rows]
+
+    def answer_pending_ask(
+        self, ask_id: int, verdict: str, *, now: float | None = None
+    ) -> PendingAsk | None:
+        """本人回答了询问：写状态，并顺手落一条裁定。"""
+        if verdict not in ("allow", "deny"):
+            raise ValueError(f"未知裁定：{verdict}")
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM pending_asks WHERE id = ?", (ask_id,)).fetchone()
+            if row is None:
+                return None
+            ask = PendingAsk(**dict(row))
+            if ask.status != "pending":
+                return ask
+            self._conn.execute(
+                "UPDATE pending_asks SET status = 'answered', verdict = ? WHERE id = ?", (verdict, ask_id)
+            )
+            updated = self._conn.execute("SELECT * FROM pending_asks WHERE id = ?", (ask_id,)).fetchone()
+            self._conn.commit()
+        if ask.item_ref:
+            self.set_ruling(ask.person_id, ask.item_ref, verdict, now=now)
+        return PendingAsk(**dict(updated))
+
+    def expire_pending_asks(self, older_than: float) -> int:
+        """把 created_at 早于 ``older_than`` 的待询问标记为已过期。"""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE pending_asks SET status = 'expired' WHERE status = 'pending' AND created_at < ?",
+                (float(older_than),),
+            )
+            self._conn.commit()
+        return cur.rowcount
 
     # ------------------------------------------------------------------
     # raw_messages
@@ -953,6 +1630,33 @@ _RAW_MESSAGE_MIGRATIONS: dict[str, str] = {
     "platform_msg_id": "TEXT NOT NULL DEFAULT ''",
     "reply_to_id": "TEXT NOT NULL DEFAULT ''",
 }
+
+
+# 旧库升级：memories 后加的列（列名 -> 列定义）
+_MEMORIES_MIGRATIONS: dict[str, str] = {
+    "origin_chat": "TEXT NOT NULL DEFAULT ''",
+    "audience": "TEXT NOT NULL DEFAULT ''",
+    "sensitivity": "TEXT NOT NULL DEFAULT 'normal'",
+    "stability": "TEXT NOT NULL DEFAULT 'stable'",
+    "expires_at": "REAL",
+}
+
+
+def _migrate_memories(conn: sqlite3.Connection) -> None:
+    """给旧库的 memories 补上记忆 v2 的列；旧行按列定义里的默认值填充。"""
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memories'"
+    ).fetchone()
+    if exists is None:
+        return
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(memories)").fetchall()}
+    changed = False
+    for name, definition in _MEMORIES_MIGRATIONS.items():
+        if name not in columns:
+            conn.execute(f"ALTER TABLE memories ADD COLUMN {name} {definition}")
+            changed = True
+    if changed:
+        conn.commit()
 
 
 def _migrate_raw_messages(conn: sqlite3.Connection) -> None:
