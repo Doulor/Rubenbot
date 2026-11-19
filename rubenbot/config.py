@@ -151,6 +151,44 @@ class WebUIConfig:
     session_hours: float = 72.0
 
 
+@dataclass
+class TelegramConfig:
+    """``adapters.telegram`` 配置段（Telegram Bot API 长轮询）。
+
+    ``bot_token`` 与 llm 的 api_key 一样支持 ``${ENV_VAR}``（加载时已统一展开）。
+    ``allowed_chat_ids`` 为空表示不限制会话；填了则只处理这些 chat_id 的消息。
+    ``offset_file`` 落盘保存 getUpdates 的 offset，重启后不重复消费；留空表示不落盘。
+    """
+
+    bot_token: str = ""
+    poll_timeout: float = 30.0
+    allowed_chat_ids: list[str] = field(default_factory=list)
+    offset_file: str = "data/telegram_offset.json"
+
+    @classmethod
+    def from_options(cls, options: Any) -> "TelegramConfig":
+        if not isinstance(options, dict):
+            return cls()
+        token = options.get("bot_token")
+        poll_timeout = _as_float(options.get("poll_timeout"), 30.0)
+        allowed = options.get("allowed_chat_ids")
+        if allowed is None or allowed == "":
+            allowed_ids: list[str] = []
+        elif isinstance(allowed, (str, int)):
+            allowed_ids = [str(allowed)]
+        elif isinstance(allowed, (list, tuple, set)):
+            allowed_ids = [str(item) for item in allowed if str(item) != ""]
+        else:
+            allowed_ids = []
+        offset_file = options.get("offset_file", "data/telegram_offset.json")
+        return cls(
+            bot_token=str(token or "").strip(),
+            poll_timeout=max(0.0, poll_timeout),
+            allowed_chat_ids=allowed_ids,
+            offset_file="" if offset_file is None else str(offset_file),
+        )
+
+
 def is_loopback_host(host: str) -> bool:
     """判断绑定地址是否只对本机可见。
 
@@ -209,6 +247,10 @@ class Config:
         if not isinstance(caps, dict):
             return {}
         return {str(key): value is True for key, value in caps.items()}
+
+    def telegram_config(self) -> TelegramConfig:
+        """解析 ``adapters.telegram`` 段；未配置时返回默认值。"""
+        return TelegramConfig.from_options(self.adapter_options("telegram"))
 
     @classmethod
     def load(cls, path: str | Path = "config.yaml") -> "Config":
@@ -284,3 +326,13 @@ def _load_decision(data: dict[str, Any]) -> DecisionConfig:
 
 def _has(dataclass_type: type, key: str) -> bool:
     return key in getattr(dataclass_type, "__dataclass_fields__", {})
+
+
+def _as_float(value: Any, default: float) -> float:
+    """宽松转 float：空值/非法值回落到默认，避免配置写错就启动失败。"""
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
