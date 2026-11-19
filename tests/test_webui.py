@@ -47,6 +47,8 @@ def config(tmp_path: Path) -> Config:
     cfg.webui.host = "127.0.0.1"
     cfg.webui.port = 8765
     cfg.webui.password = ""
+    # 人格文件落到临时目录，别碰仓库里的 data/SOUL.md
+    cfg.persona_path = str(tmp_path / "SOUL.md")
     return cfg
 
 
@@ -541,6 +543,132 @@ def test_mask_secret():
     assert mask_secret("") == ""
     assert mask_secret("ab") == "**"
     assert mask_secret("abcdefgh") == "ab****gh"
+
+
+# ----------------------------------------------------------------------
+# 人设
+# ----------------------------------------------------------------------
+
+
+def test_persona_get_defaults_without_creating_file(client, config):
+    data = client.get("/api/persona").json()
+    assert data["path"] == config.persona_path
+    assert data["exists"] is False
+    assert data["in_sync"] is True
+    assert data["hot_reload"] is False
+    # GET 只读，不应顺手把默认人格写到磁盘
+    assert not Path(config.persona_path).exists()
+    assert "Ruben" in data["effective"]
+
+
+def test_put_persona_roundtrip_and_backup(client, config):
+    new_text = "# SOUL\n\n你是一只猫，说话带喵。\n"
+    saved = client.put("/api/persona", json={"text": new_text})
+    assert saved.status_code == 200
+    body = saved.json()
+    assert body["applied"] is False
+    assert body["restart_required"] is True
+    assert "下次启动生效" in body["message"]
+    assert Path(config.persona_path).read_text(encoding="utf-8") == new_text
+
+    # 再次保存会留下上一版的 .bak 备份
+    second = client.put("/api/persona", json={"text": "# SOUL\n\n第二版\n"})
+    assert second.status_code == 200
+    backup = Path(config.persona_path).with_name("SOUL.md.bak")
+    assert backup.read_text(encoding="utf-8") == new_text
+
+    data = client.get("/api/persona").json()
+    assert data["text"] == "# SOUL\n\n第二版\n"
+    assert data["effective"] == "# SOUL\n\n第二版\n"
+    assert data["in_sync"] is True
+    assert data["chars"] == len(data["text"])
+
+
+def test_put_empty_persona_rejected(client, config):
+    path = Path(config.persona_path)
+    path.write_text("# SOUL\n\n原人格\n", encoding="utf-8")
+
+    for payload in ({"text": ""}, {"text": "   \n\t "}, {}):
+        response = client.put("/api/persona", json=payload)
+        assert response.status_code == 422, payload
+    assert path.read_text(encoding="utf-8") == "# SOUL\n\n原人格\n"
+
+
+def test_reset_persona_restores_default(client, config):
+    from rubenbot.persona import DEFAULT_PERSONA
+
+    client.put("/api/persona", json={"text": "# SOUL\n\n临时人格\n"})
+    reset = client.post("/api/persona/reset")
+    assert reset.status_code == 200
+    assert Path(config.persona_path).read_text(encoding="utf-8") == DEFAULT_PERSONA
+    assert client.get("/api/persona").json()["effective"] == DEFAULT_PERSONA
+
+
+def test_persona_preview_includes_scene(config, store):
+    state = WebState(config=config, store=store, config_path=Path("config.yaml"))
+    with TestClient(create_app(state)) as c:
+        preview = c.get("/api/persona/preview").json()
+    assert "当前是群聊" in preview["prompt"]
+    assert "这里会放检索到的记忆" in preview["prompt"]
+    assert preview["source"] == "file"
+
+
+def test_persona_hot_reload_into_running_bot(config, store):
+    """运行中的 bot PUT 新人设后，build_context 拼出的系统提示词立即包含新文本。"""
+    import asyncio
+
+    from conftest import ScriptedLLM
+
+    from rubenbot.adapters.base import MessageEvent
+    from rubenbot.core import RubenBot
+    from rubenbot.persona import Persona
+
+    old_text = "# SOUL\n\n你是旧人格。\n"
+    Path(config.persona_path).write_text(old_text, encoding="utf-8")
+    bot = RubenBot(config, store, ScriptedLLM(), Persona(name="Ruben", text=old_text))
+
+    state = WebState.from_bot(bot, Path("config.yaml"))
+    app = create_app(state)
+    from fastapi.testclient import TestClient
+
+    with TestClient(app) as c:
+        new_text = "# SOUL\n\n你是新人格，说话很冲。\n"
+        saved = c.put("/api/persona", json={"text": new_text}).json()
+        assert saved["applied"] is True
+        assert saved["restart_required"] is False
+        assert "已生效" in saved["message"]
+        assert saved["persona"]["effective"] == new_text
+        assert saved["persona"]["effective_source"] == "bot"
+
+        event = MessageEvent(
+            platform="recording",
+            chat_type="group",
+            chat_id="g1",
+            sender_id="u1",
+            sender_name="阿花",
+            text="在吗",
+        )
+        messages = asyncio.run(bot.build_context(event))
+        assert new_text.strip() in messages[0]["content"]
+        assert "旧人格" not in messages[0]["content"]
+        # 插件上下文拿到的也是同一份新人格
+        assert bot.context.persona.text == new_text
+
+        preview = c.get("/api/persona/preview").json()
+        assert new_text.strip() in preview["prompt"]
+
+        # 恢复默认同样热加载
+        reset = c.post("/api/persona/reset").json()
+        assert reset["applied"] is True
+        assert bot.persona.text == reset["persona"]["effective"]
+        assert "旧人格" not in bot.persona.text
+
+
+def test_persona_requires_login(locked_client):
+    assert locked_client.get("/api/persona").status_code == 401
+    assert locked_client.put("/api/persona", json={"text": "x"}).status_code == 401
+    assert locked_client.post("/api/persona/reset").status_code == 401
+    assert locked_client.get("/api/persona/preview").status_code == 401
 
 
 # ----------------------------------------------------------------------

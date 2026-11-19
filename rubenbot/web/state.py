@@ -16,6 +16,7 @@ from typing import Any
 
 from ..config import Config
 from ..memory.store import MemoryStore
+from ..persona import Persona
 from ..plugins.loader import PluginManager
 from .auth import SessionSigner
 from .logbuffer import install
@@ -106,6 +107,30 @@ class WebState:
             return self.plugins.list_plugins()
         return []
 
+    # ------------------------------------------------------------------
+    # 人设
+    # ------------------------------------------------------------------
+
+    def bot_persona(self) -> Persona | None:
+        """运行中 bot 持有的人格对象；独立 WebUI 模式返回 None。"""
+        persona = getattr(self.bot, "persona", None) if self.bot is not None else None
+        return persona if isinstance(persona, Persona) else None
+
+    def apply_persona(self, persona: Persona) -> bool:
+        """把新人格换进运行中的 bot，后续消息立即使用。
+
+        返回是否真的热加载了。``context.persona`` 是插件钩子拿到的那份，
+        与 ``bot.persona`` 是同一对象引用，需要一起替换，避免插件看到旧人格。
+        """
+        bot = self.bot
+        if bot is None or not hasattr(bot, "persona"):
+            return False
+        bot.persona = persona
+        context = getattr(bot, "context", None)
+        if context is not None and hasattr(context, "persona"):
+            context.persona = persona
+        return True
+
     def restart_bot(self) -> bool:
         """请求 bot 停机；同一进程里的主流程会在 run() 返回后走 shutdown。
 
@@ -136,6 +161,24 @@ def save_config_text(path: str | Path, text: str, *, backup: bool = True) -> Pat
         raise ValueError(f"YAML 语法错误：{exc}") from exc
     if data is not None and not isinstance(data, dict):
         raise ValueError("配置的顶层必须是键值对（YAML mapping）")
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    backup_path: Path | None = None
+    if backup and target.exists():
+        backup_path = target.with_name(target.name + ".bak")
+        backup_path.write_text(target.read_text(encoding="utf-8"), encoding="utf-8")
+    tmp = target.with_name(target.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(target)
+    return backup_path
+
+
+def save_persona_text(path: str | Path, text: str, *, backup: bool = True) -> Path | None:
+    """保存人格文件；写之前留一份 ``SOUL.md.bak``。
+
+    与 :func:`save_config_text` 一样先写临时文件再原子替换，避免写一半
+    被 bot 读到半截内容。返回备份文件路径（首次保存没有旧文件时为 None）。
+    """
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     backup_path: Path | None = None

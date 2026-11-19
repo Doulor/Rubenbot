@@ -1470,6 +1470,98 @@ button {
   color: var(--good);
 }
 
+/* ---------------- 人设 ---------------- */
+
+.persona-edit {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.persona-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  min-width: 0;
+}
+
+.persona-path {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.persona-meta-spacer {
+  flex: 1;
+}
+
+.persona-editor {
+  min-height: 440px;
+  height: 58vh;
+  max-height: 900px;
+  padding: 18px 20px;
+  font-size: 13.5px;
+  line-height: 1.85;
+  border-radius: var(--r-card);
+  background: var(--surface-sunk);
+  resize: vertical;
+}
+
+.persona-editor:focus {
+  background: var(--surface);
+}
+
+.persona-foot {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+/* 有未保存修改时给保存按钮一圈柔和的强调，不做弹窗拦截 */
+.btn.is-dirty {
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.dirty-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--warn);
+  flex: none;
+}
+
+.persona-effective {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.persona-effective-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.persona-readonly,
+.persona-preview pre {
+  margin: 0;
+  padding: 16px 18px;
+  max-height: 46vh;
+  overflow: auto;
+  border-radius: var(--r-card);
+  background: var(--surface-sunk);
+  border: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.8;
+  color: var(--text-soft);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 /* ---------------- 登录 ---------------- */
 
 .login {

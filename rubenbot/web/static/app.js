@@ -340,6 +340,7 @@ async function pollHealth() {
 
 const PAGES = {
   overview: { title: "概览", sub: "运行状态与最近动静", render: renderOverview },
+  persona: { title: "人设", sub: "编辑人格文件，保存即热生效", render: renderPersona },
   memory: { title: "记忆", sub: "按人浏览、搜索与维护记忆库", render: renderMemory },
   people: { title: "人物", sub: "见过的每个人和他们的档案", render: renderPeople },
   groups: { title: "群组与意愿", sub: "每群活跃度、静默时段与决策记录", render: renderGroups },
@@ -385,6 +386,8 @@ async function renderRoute() {
   }
   const meta = PAGES[route.page];
   setHeader(meta.title, meta.sub, []);
+  // 换页即丢弃上一页的未保存编辑，顺带收掉 beforeunload 提醒
+  setPersonaDirty(false);
   const view = $("#view");
   view.replaceChildren(skeleton(3));
   try {
@@ -665,6 +668,221 @@ async function renderOverview(view) {
 
 function kvRow(key, value) {
   return h("div", { class: "kv" }, h("span", { class: "k" }, key), h("span", { class: "v" }, String(value)));
+}
+
+/* ------------------------------------------------------------------ */
+/* 人设                                                               */
+/* ------------------------------------------------------------------ */
+
+/** 离开人设页时若有未保存修改，给一次浏览器级提醒。 */
+const personaDirty = { active: false, beforeUnload: null };
+
+function setPersonaDirty(dirty, { dot, saveButton, note } = {}) {
+  personaDirty.active = dirty;
+  if (dot) dot.hidden = !dirty;
+  if (saveButton) saveButton.classList.toggle("is-dirty", dirty);
+  if (note) note.hidden = !dirty;
+  if (dirty && !personaDirty.beforeUnload) {
+    personaDirty.beforeUnload = (event) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", personaDirty.beforeUnload);
+  } else if (!dirty && personaDirty.beforeUnload) {
+    window.removeEventListener("beforeunload", personaDirty.beforeUnload);
+    personaDirty.beforeUnload = null;
+  }
+}
+
+async function renderPersona(view) {
+  const data = await api.get("/api/persona");
+
+  const editor = h("textarea", {
+    class: "textarea code persona-editor",
+    spellcheck: "false",
+    "aria-label": "人格文件内容",
+    value: data.text,
+    placeholder: "写一段自然的人格描述，比如「你是 Ruben，就是个来聊天的人…」",
+  });
+
+  const pathLine = h("span", { class: "hint persona-path", title: data.path }, data.path);
+  const dot = h("span", { class: "dirty-dot", title: "有未保存的修改", hidden: true });
+  const dirtyNote = h("span", { class: "muted", style: { fontSize: "12px" }, hidden: true }, "有未保存的修改");
+  const saveButton = h("button", { class: "btn btn-primary", type: "button" }, icon("check"), "保存并生效");
+  const reloadButton = h("button", { class: "btn btn-sm", type: "button" }, icon("refresh"), "重新读取");
+  const resetButton = h("button", { class: "btn btn-danger", type: "button" }, icon("restore"), "恢复默认");
+  const notice = h("div", { class: "notice", hidden: true });
+  const stats = h("span", { class: "muted mono", style: { fontSize: "12px" } });
+
+  const updateStats = () => {
+    const text = editor.value;
+    stats.textContent = `${text.length} 字 · ${text.split("\n").length} 行`;
+  };
+  const markDirty = () => setPersonaDirty(editor.value !== data.text, { dot, saveButton, note: dirtyNote });
+
+  editor.addEventListener("input", () => {
+    updateStats();
+    markDirty();
+  });
+  editor.addEventListener("keydown", (event) => {
+    // Ctrl/Cmd+S 直接保存，编辑长文本时顺手
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
+      event.preventDefault();
+      if (!saveButton.disabled) saveButton.click();
+    }
+  });
+  // Tab 在等宽编辑区里插入两个空格，而不是跳走焦点
+  editor.addEventListener("keydown", (event) => {
+    if (event.key !== "Tab" || event.shiftKey) return;
+    event.preventDefault();
+    const start = editor.selectionStart;
+    editor.setRangeText("  ", start, editor.selectionEnd, "end");
+    updateStats();
+    markDirty();
+  });
+  updateStats();
+  markDirty();
+
+  const showNotice = (kind, message) => {
+    notice.hidden = false;
+    notice.className = `notice ${kind === "good" ? "good" : ""}`;
+    notice.replaceChildren(icon(kind === "good" ? "check" : "warning"), h("span", {}, message));
+  };
+
+  saveButton.addEventListener("click", async () => {
+    if (!editor.value.trim()) {
+      toast("人格内容不能为空", "error");
+      editor.focus();
+      return;
+    }
+    saveButton.disabled = true;
+    saveButton.classList.add("busy");
+    try {
+      const result = await api.put("/api/persona", { text: editor.value });
+      data.text = editor.value;
+      data.exists = true;
+      setPersonaDirty(false, { dot, saveButton, note: dirtyNote });
+      showNotice("good", result.message || "已生效，无需重启。");
+      toast(result.applied ? "人设已保存并生效" : "人设已保存，下次启动生效");
+      await loadEffective();
+    } catch (err) {
+      if (err instanceof Unauthorized) return;
+      showNotice("bad", err.message || "保存失败");
+      toast("保存失败", "error");
+    } finally {
+      saveButton.disabled = false;
+      saveButton.classList.remove("busy");
+    }
+  });
+
+  reloadButton.addEventListener("click", async () => {
+    if (personaDirty.active) {
+      confirmDialog({
+        title: "放弃未保存的修改？",
+        message: "重新读取会丢弃编辑区里还没保存的内容。",
+        confirmText: "重新读取",
+        danger: true,
+        onConfirm: async () => {
+          setPersonaDirty(false);
+          await renderRoute();
+        },
+      });
+      return;
+    }
+    await renderRoute();
+  });
+
+  resetButton.addEventListener("click", () => {
+    confirmDialog({
+      title: "恢复默认人格？",
+      message: "当前人格文件会先备份为 .bak，然后换成内置的默认 Ruben 人格；运行中的 bot 会立即改用默认人格。",
+      confirmText: "恢复默认",
+      danger: true,
+      onConfirm: async () => {
+        const result = await api.post("/api/persona/reset");
+        setPersonaDirty(false);
+        toast(result.applied ? "已恢复默认人格并生效" : "已恢复默认人格，下次启动生效");
+        await renderRoute();
+      },
+    });
+  });
+
+  const editCard = card("人格文件", {
+    actions: [dot, reloadButton],
+    body: h(
+      "div",
+      { class: "persona-edit" },
+      h(
+        "div",
+        { class: "persona-meta" },
+        pathLine,
+        data.exists ? null : h("span", { class: "tag outline" }, "文件尚未创建，保存后生成"),
+        h("span", { class: "persona-meta-spacer" }),
+        h("span", { class: "hint" }, data.mtime ? `修改于 ${fmtDateTime(data.mtime)}` : "—"),
+        stats
+      ),
+      editor,
+      h(
+        "div",
+        { class: "persona-foot" },
+        saveButton,
+        resetButton,
+        dirtyNote,
+        h("span", { class: "persona-meta-spacer" }),
+        h("span", { class: "hint" }, data.hot_reload ? "保存后立即生效" : "当前无运行中的 bot，保存后下次启动生效")
+      ),
+      notice
+    ),
+  });
+
+  /* 只读：当前实际生效的人格 + 拼装预览 */
+  const effectiveBody = h("div", { class: "persona-effective" });
+  const previewBody = h("div", { class: "persona-preview" });
+  const effectiveCard = card("当前生效的人格", {
+    hint: data.effective_source === "bot" ? "来自运行中的 bot" : data.effective_source === "default" ? "内置默认" : "来自人格文件",
+    body: effectiveBody,
+  });
+  const previewCard = card("拼装预览", {
+    hint: "系统提示词的示例拼装",
+    body: previewBody,
+  });
+
+  const loadEffective = async () => {
+    const [current, preview] = await Promise.all([
+      api.get("/api/persona"),
+      api.get("/api/persona/preview").catch(() => null),
+    ]);
+    const drift =
+      current.effective_source !== "default" && current.effective !== data.text;
+    const tag =
+      current.effective_source === "bot"
+        ? h("span", { class: "tag good" }, icon("check"), "已生效")
+        : current.effective_source === "default"
+        ? h("span", { class: "tag outline" }, "默认人格")
+        : h("span", { class: "tag outline" }, "按文件加载");
+    effectiveBody.replaceChildren(
+      h(
+        "div",
+        { class: "persona-effective-head" },
+        tag,
+        h("span", { class: "hint" }, `生效名：${current.effective_name || "Ruben"} · ${current.effective_chars} 字`)
+      ),
+      drift
+        ? h("div", { class: "notice" }, icon("warning"),
+            h("span", {}, "编辑区的内容和当前生效的人格不一致：可能刚保存还没有生效，或文件被外部改过。"))
+        : null,
+      h("pre", { class: "persona-readonly" }, current.effective || "（空）")
+    );
+    if (preview) {
+      previewBody.replaceChildren(h("pre", { class: "persona-readonly" }, preview.prompt));
+    } else {
+      previewBody.replaceChildren(h("p", { class: "muted", style: { margin: 0, fontSize: "12.5px" } }, "预览不可用。"));
+    }
+  };
+  await loadEffective();
+
+  view.replaceChildren(editCard, h("div", { class: "grid grid-2" }, effectiveCard, previewCard));
+  // 切到别的页时由 renderRoute 统一清掉脏标记与 beforeunload 提醒
 }
 
 /* ------------------------------------------------------------------ */

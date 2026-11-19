@@ -27,6 +27,10 @@
 - ``GET  /api/logs``            运行日志尾部
 - ``GET  /api/config``          查看 config.yaml
 - ``PUT  /api/config``          编辑并校验后保存，返回需重启提示
+- ``GET  /api/persona``         查看人格文件内容与当前实际生效的人格
+- ``PUT  /api/persona``         保存人格并热加载到运行中的 bot
+- ``POST /api/persona/reset``   恢复默认人格（同样热加载）
+- ``GET  /api/persona/preview`` 拼装后的系统提示词示例
 """
 
 from __future__ import annotations
@@ -42,12 +46,15 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from ..adapters.base import MessageEvent
 from ..config import GroupDecisionConfig, is_loopback_host
+from ..core import format_scene
 from ..decision import parse_quiet_hours
 from ..memory.store import make_person_id
+from ..persona import DEFAULT_PERSONA, Persona, load_persona
 from .auth import COOKIE_NAME, BindSecurityError, check_bind_security, mask_secret
 from .logbuffer import records as log_records
-from .state import WebState, save_config_text
+from .state import WebState, save_config_text, save_persona_text
 
 logger = logging.getLogger(__name__)
 
@@ -239,6 +246,90 @@ def _mask_config(data: Any) -> Any:
     if isinstance(data, list):
         return [_mask_config(item) for item in data]
     return data
+
+
+def _persona_file_info(state: WebState) -> tuple[Path, bool, str, float | None]:
+    """返回（路径、是否存在、文件内容、修改时间）。"""
+    path = Path(state.config.persona_path)
+    exists = path.exists()
+    text = path.read_text(encoding="utf-8") if exists else ""
+    mtime = path.stat().st_mtime if exists else None
+    return path, exists, text, mtime
+
+
+def _effective_persona(state: WebState, file_text: str, exists: bool):
+    """当前实际生效的人格：运行中的 bot 持有对象优先，否则按文件内容构造。
+
+    GET 是只读操作：文件不存在时直接按默认人格展示，不顺手创建文件。
+    """
+    persona = state.bot_persona()
+    if persona is not None:
+        return persona, "bot"
+    if not exists:
+        return Persona(name=_extract_name_safe(DEFAULT_PERSONA), text=DEFAULT_PERSONA), "default"
+    return Persona(name=_extract_name_safe(file_text), text=file_text), "file"
+
+
+def _persona_payload(state: WebState) -> dict[str, Any]:
+    path, exists, file_text, mtime = _persona_file_info(state)
+    persona, source = _effective_persona(state, file_text, exists)
+    effective_text = persona.text
+    # 文件还不存在时，编辑区预填默认人格（与启动时 load_persona 会写入的一致），
+    # 免得用户面对一片空白不知道从哪改；exists 字段告诉前端这一点。
+    editor_text = file_text if exists else effective_text
+    return {
+        "ok": True,
+        "path": str(path),
+        "exists": exists,
+        "text": editor_text,
+        "chars": len(editor_text),
+        "mtime": mtime,
+        "name": persona.name,
+        "effective": effective_text,
+        "effective_chars": len(effective_text),
+        "effective_name": persona.name,
+        "effective_source": source,
+        "hot_reload": state.bot_persona() is not None,
+        "in_sync": editor_text == effective_text,
+    }
+
+
+def _extract_name_safe(text: str) -> str:
+    """预览用：不落地文件，直接猜名字。"""
+    from ..persona import _extract_name
+
+    return _extract_name(text) if text.strip() else "Ruben"
+
+
+def _preview_prompt(persona) -> str:
+    """拼一次系统提示词示例：人格 + 场景行 + 空记忆（与 core.build_context 同构）。"""
+    event = MessageEvent(
+        platform="webui",
+        chat_type="group",
+        chat_id="preview",
+        sender_id="preview",
+        sender_name="阿花",
+        text="",
+    )
+    sections = [persona.system_prompt(), "（这里会放检索到的记忆；示例里为空）", format_scene(event, "阿花")]
+    return "\n\n".join(sections)
+
+
+def _apply_persona(state: WebState, text: str) -> dict[str, Any]:
+    """写人格文件并热加载；返回给前端的落盘/生效信息。"""
+    backup = save_persona_text(state.config.persona_path, text)
+    persona = load_persona(state.config.persona_path)
+    applied = state.apply_persona(persona)
+    return {
+        "backup": str(backup) if backup else None,
+        "applied": applied,
+        "restart_required": not applied,
+        "message": (
+            "已生效，无需重启。后续消息会直接使用新人设。"
+            if applied
+            else "人格文件已保存。当前没有运行中的 bot，下次启动生效。"
+        ),
+    }
 
 
 def create_app(state: WebState):
@@ -640,6 +731,46 @@ def create_app(state: WebState):
             "restart_required": True,
             "message": "配置已保存。v1 需要重启 bot 才能生效。",
             "backup": str(backup) if backup else None,
+        }
+
+    # ------------------------------------------------------------------
+    # 人设
+    # ------------------------------------------------------------------
+
+    @app.get("/api/persona")
+    async def get_persona(request: Request):
+        require_session(request)
+        return _persona_payload(state)
+
+    @app.put("/api/persona")
+    async def put_persona(request: Request):
+        require_session(request)
+        body = await _json_body(request)
+        text = str(body.get("text") or "")
+        if not text.strip():
+            raise ApiError(422, "人格内容不能为空")
+        result = _apply_persona(state, text)
+        logger.info("WebUI 保存人格到 %s（%s）", state.config.persona_path, result["message"])
+        return {"ok": True, **result, "persona": _persona_payload(state)}
+
+    @app.post("/api/persona/reset")
+    async def reset_persona(request: Request):
+        require_session(request)
+        result = _apply_persona(state, DEFAULT_PERSONA)
+        logger.info("WebUI 恢复默认人格（%s）", result["message"])
+        return {"ok": True, **result, "persona": _persona_payload(state)}
+
+    @app.get("/api/persona/preview")
+    async def preview_persona(request: Request):
+        require_session(request)
+        persona = state.bot_persona()
+        if persona is None:
+            path, exists, file_text, _ = _persona_file_info(state)
+            persona, _source = _effective_persona(state, file_text, exists)
+        return {
+            "ok": True,
+            "prompt": _preview_prompt(persona),
+            "source": "bot" if state.bot_persona() is not None else "file",
         }
 
     # ------------------------------------------------------------------
