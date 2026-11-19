@@ -23,21 +23,38 @@ try:  # websockets 13+ 的新版客户端 API
 except ImportError:  # pragma: no cover - 兼容旧版
     from websockets.client import connect as ws_connect  # type: ignore
 
-from .base import BaseAdapter, EventCallback, MessageEvent, Segment
+from .base import (
+    BaseAdapter,
+    CapabilityError,
+    CapabilityNotSupported,
+    EventCallback,
+    MessageEvent,
+    Segment,
+    as_segment,
+    render_segments,
+)
 
 logger = logging.getLogger(__name__)
 
 _RECONNECT_MIN = 1.0
 _RECONNECT_MAX = 60.0
-# 字符串形式消息里的 CQ 码
+# 字符串形式消息里的 CQ @ 码（用于 mentions_bot 判断）
 _CQ_AT_RE = re.compile(r"\[CQ:at,qq=([^,\]]+)[^\]]*\]")
-_CQ_ANY_RE = re.compile(r"\[CQ:[^\]]+\]")
 
 
 class SnowLumaAdapter(BaseAdapter):
     """OneBot v11 正向 WS + HTTP API。"""
 
     name = "snowluma"
+
+    # SnowLuma 在 OneBot v11 之外的扩展动作
+    capabilities = frozenset({"message.emoji_like", "qzone.publish"})
+    capability_config_keys = {
+        "message.emoji_like": "emoji_like",
+        "qzone.publish": "qzone",
+    }
+    # 配置未写开关时的默认值：贴表情默认开，发说说默认关
+    capability_defaults = {"qzone.publish": False}
 
     def __init__(
         self,
@@ -198,6 +215,37 @@ class SnowLumaAdapter(BaseAdapter):
         except Exception:  # noqa: BLE001
             return False
 
+    # ------------------------------------------------------------------
+    # 平台能力
+    # ------------------------------------------------------------------
+
+    async def call_capability(self, name: str, **kwargs: Any) -> Any:
+        """调用 SnowLuma 扩展动作；失败统一抛 :class:`CapabilityError`。"""
+        if name == "message.emoji_like":
+            message_id = kwargs.get("message_id")
+            emoji_id = kwargs.get("emoji_id", kwargs.get("emoji"))
+            if message_id in (None, "") or emoji_id in (None, ""):
+                raise CapabilityError("message.emoji_like 需要 message_id 和 emoji_id")
+            return await self._extension_api(
+                name,
+                "set_msg_emoji_like",
+                {"message_id": _to_id(message_id), "emoji_id": str(emoji_id)},
+            )
+        if name == "qzone.publish":
+            content = kwargs.get("content")
+            if content is None or not str(content).strip():
+                raise CapabilityError("qzone.publish 需要非空 content")
+            return await self._extension_api(name, "send_qzone_msg", {"content": str(content)})
+        raise CapabilityNotSupported(self.name, name)
+
+    async def _extension_api(self, capability: str, action: str, params: dict[str, Any]) -> Any:
+        """扩展动作调用：把网络/平台错误收敛为能力失败原因。"""
+        try:
+            payload = await self.call_api(action, params)
+        except Exception as exc:  # noqa: BLE001 - 能力失败不能打断调用方
+            raise CapabilityError(f"{capability} 失败（{action}）：{exc}") from exc
+        return payload.get("data", payload)
+
 
 def _to_id(value: str | int) -> int | str:
     try:
@@ -213,44 +261,122 @@ def to_int(value: Any) -> int | None:
         return None
 
 
-def segment_to_onebot(segment: Segment) -> dict[str, Any]:
-    """Segment -> OneBot v11 消息段。"""
+def segment_to_onebot(segment: Segment | dict[str, Any]) -> dict[str, Any]:
+    """Segment -> OneBot v11 消息段。
+
+    图片支持 ``file`` / ``url`` / ``base64`` 任一输入：OneBot 的 ``file``
+    字段本身接受本地路径、URL 或 ``base64://`` 数据。
+    """
+    segment = as_segment(segment)
+    data = segment.data
     if segment.type == "text":
-        return {"type": "text", "data": {"text": str(segment.data.get("text", ""))}}
+        return {"type": "text", "data": {"text": str(data.get("text", ""))}}
     if segment.type == "image":
-        url = segment.data.get("url") or segment.data.get("file") or ""
-        return {"type": "image", "data": {"file": url}}
+        return {"type": "image", "data": {"file": _image_source(data)}}
+    if segment.type == "at":
+        return {"type": "at", "data": {"qq": str(data.get("qq", ""))}}
+    if segment.type == "reply":
+        return {"type": "reply", "data": {"id": str(data.get("id", ""))}}
     if segment.type == "face":
-        return {"type": "face", "data": {"id": str(segment.data.get("id", ""))}}
+        return {"type": "face", "data": {"id": str(data.get("id", ""))}}
+    if segment.type in ("record", "video", "file"):
+        source = data.get("file") or data.get("url") or ""
+        return {"type": segment.type, "data": {"file": source}}
+    # 未知类型退化为文本，保证消息不会凭空丢失
     return {"type": "text", "data": {"text": segment.render()}}
 
 
-def onebot_to_segments(message: Any) -> str:
-    """把 OneBot 的 message 字段（字符串或消息段数组）渲染为纯文本。"""
+def _image_source(data: dict[str, Any]) -> str:
+    """图片段的输入归一：file 优先，其次 url，最后 base64。"""
+    file = data.get("file")
+    if file:
+        return str(file)
+    url = data.get("url")
+    if url:
+        return str(url)
+    raw = data.get("base64")
+    if raw:
+        value = str(raw)
+        if value.startswith(("base64://", "data:")):
+            return value
+        return "base64://" + value
+    return ""
+
+
+# OneBot 段类型 -> 保留的 data 字段
+_SEGMENT_FIELDS: dict[str, tuple[str, ...]] = {
+    "text": ("text",),
+    "image": ("file", "url", "summary"),
+    "at": ("qq", "name"),
+    "reply": ("id",),
+    "face": ("id",),
+    "record": ("file", "url"),
+    "video": ("file", "url"),
+    "file": ("file", "url", "name"),
+}
+
+# 字符串形式消息里的 CQ 码：拆出 type 与 key=value 参数
+_CQ_CODE_RE = re.compile(r"\[CQ:(?P<type>[A-Za-z0-9_.-]+)(?P<params>(?:,[^,\]]*=[^,\]]*)*)\]")
+_CQ_PARAM_RE = re.compile(r",([^,=\]]+)=([^,\]]*)")
+
+
+def onebot_message_segments(message: Any) -> list[Segment]:
+    """OneBot ``message`` 字段（字符串或消息段数组）-> 统一消息段列表。"""
     if isinstance(message, str):
-        # 字符串形式可能带 CQ 码：at 渲染成 @qq，其余去掉
-        text = _CQ_AT_RE.sub(lambda m: "@" + m.group(1) + " ", message)
-        return re.sub(r"\s+", " ", _CQ_ANY_RE.sub("", text)).strip()
+        return _cq_string_to_segments(message)
     if not isinstance(message, list):
-        return ""
-    parts: list[str] = []
+        return []
+    segments: list[Segment] = []
     for item in message:
         if not isinstance(item, dict):
             continue
-        seg_type = item.get("type")
-        data = item.get("data") or {}
-        if seg_type == "text":
-            parts.append(str(data.get("text", "")))
-        elif seg_type == "at":
-            qq = str(data.get("qq", ""))
-            parts.append(f"@{qq} " if qq else " ")
-        elif seg_type == "face":
-            parts.append("[表情]")
-        elif seg_type == "image":
-            parts.append("[图片]")
-        elif seg_type == "reply":
-            continue  # reply 段单独处理
-    return "".join(parts).strip()
+        seg_type = str(item.get("type") or "")
+        if not seg_type:
+            continue
+        raw_data = item.get("data") or {}
+        if not isinstance(raw_data, dict):
+            raw_data = {}
+        fields = _SEGMENT_FIELDS.get(seg_type)
+        if fields is None:
+            # 未知类型原样保留，便于插件/后续扩展按名处理
+            segments.append(Segment(seg_type, raw_data))
+            continue
+        data = {key: raw_data[key] for key in fields if raw_data.get(key) is not None}
+        if seg_type in ("at", "reply", "face"):
+            for key in data:
+                data[key] = str(data[key])
+        segments.append(Segment(seg_type, data))
+    return segments
+
+
+def _cq_string_to_segments(message: str) -> list[Segment]:
+    """字符串形式（CQ 码）消息 -> 消息段列表。
+
+    字符串形式只在没有消息段数组时出现（部分实现）；这里仅识别 ``at``，
+    其余 CQ 码（图片、表情、红包等）按历史行为剔除，避免 ``[CQ:...]``
+    原文进入模型上下文。
+    """
+    segments: list[Segment] = []
+    pos = 0
+    for match in _CQ_CODE_RE.finditer(message):
+        if match.start() > pos:
+            segments.append(Segment.text(message[pos : match.start()]))
+        params = {key: value for key, value in _CQ_PARAM_RE.findall(match.group("params") or "")}
+        if match.group("type").lower() == "at" and params.get("qq"):
+            segments.append(Segment.at(params["qq"]))
+        pos = match.end()
+    if pos < len(message):
+        segments.append(Segment.text(message[pos:]))
+    return segments
+
+
+def onebot_to_segments(message: Any) -> str:
+    """把 OneBot 的 message 字段渲染为纯文本（``MessageEvent.text`` 的投影）。"""
+    text = render_segments(onebot_message_segments(message))
+    if isinstance(message, str):
+        # 字符串形式按旧行为归一空白
+        text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
 
 def _extract_reply_id(message: Any) -> str | None:
@@ -293,7 +419,8 @@ def parse_onebot_event(data: dict[str, Any], *, self_id: str | None = None) -> M
         return None  # 自己的消息不回显
 
     message = data.get("message", data.get("raw_message", ""))
-    text = onebot_to_segments(message).strip()
+    segments = onebot_message_segments(message)
+    text = onebot_to_segments(message)
     sender_name = str(sender.get("card") or sender.get("nickname") or user_id)
 
     if message_type == "private":
@@ -319,4 +446,5 @@ def parse_onebot_event(data: dict[str, Any], *, self_id: str | None = None) -> M
         reply_to_id=reply_to,
         mentions_bot=mentions_bot,
         raw={**data, "_reply_message_id": reply_id},
+        segments=segments,
     )

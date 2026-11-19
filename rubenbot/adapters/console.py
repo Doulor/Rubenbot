@@ -15,7 +15,15 @@ import re
 import sys
 from typing import Any, TextIO
 
-from .base import BaseAdapter, EventCallback, MessageEvent, Segment
+from .base import (
+    BaseAdapter,
+    CapabilityNotSupported,
+    EventCallback,
+    MessageEvent,
+    Segment,
+    render_segments,
+    text_segments,
+)
 
 _LINE_RE = re.compile(r"^\[(?P<chat>[^\]]+)\]\s*(?P<text>.*)$")
 _GROUP_USER_RE = re.compile(r"^(?P<chat>[^|\]]+)\|(?P<name>[^|\]]+)$")
@@ -117,10 +125,12 @@ class ConsoleAdapter(BaseAdapter):
             text=text,
             mentions_bot=True if chat_type == "private" else False,
             raw={"console": True},
+            segments=text_segments(text),
         )
 
     async def send(self, chat_id: str, segments: list[Segment], *, chat_type: str = "group") -> None:
-        text = "".join(segment.render() for segment in segments)
+        # 非文本段渲染成占位符（[图片]、[语音] 等），Console 没有富媒体
+        text = render_segments(segments)
         self.sent.append((chat_id, chat_type, segments))
         self.write(f"{self.bot_name}: {text}")
 
@@ -136,3 +146,7 @@ class ConsoleAdapter(BaseAdapter):
         if self._task is not None:
             self._task.cancel()
             self._task = None
+
+    async def call_capability(self, name: str, **kwargs: Any) -> Any:
+        """Console 不提供任何平台能力；调用即优雅失败。"""
+        raise CapabilityNotSupported(self.name, name)

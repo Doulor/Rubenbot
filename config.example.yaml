@@ -89,6 +89,12 @@ adapters:
     http_url: "http://127.0.0.1:3000"
     access_token: ""
     self_id: ""               # 可选：bot 的 QQ 号，留空则从事件里自动取
+    # 平台特有能力开关（SnowLuma 扩展动作）。插件/核心按名调用，关掉即跳过。
+    capabilities:
+      # 给消息贴表情（set_msg_emoji_like），默认开
+      emoji_like: true
+      # 发 QQ 空间说说（send_qzone_msg），默认关：对外发布内容，需显式打开
+      qzone: false
 
 background_check_minutes: 5
 log_level: "INFO"
