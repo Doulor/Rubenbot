@@ -18,6 +18,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+webui = ["fastapi>=0.110", "uvicorn>=0.29"]
 
 [project.scripts]
 rubenbot = "rubenbot.__main__:main"
