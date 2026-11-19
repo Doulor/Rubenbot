@@ -33,6 +33,7 @@ from .base import (
     as_segment,
     render_segments,
 )
+from .qzone import QzoneClient
 
 logger = logging.getLogger(__name__)
 
@@ -47,14 +48,35 @@ class SnowLumaAdapter(BaseAdapter):
 
     name = "snowluma"
 
-    # SnowLuma 在 OneBot v11 之外的扩展动作
-    capabilities = frozenset({"message.emoji_like", "qzone.publish"})
+    # SnowLuma 在 OneBot v11 之外的扩展动作，以及经 get_cookies 直调的空间接口
+    capabilities = frozenset(
+        {
+            "message.emoji_like",
+            "qzone.publish",
+            "qzone.feeds",
+            "qzone.like",
+            "qzone.comment",
+            "qzone.my_comments",
+            "qzone.reply",
+        }
+    )
     capability_config_keys = {
         "message.emoji_like": "emoji_like",
         "qzone.publish": "qzone",
+        # 空间只读能力共用一个开关；写操作各自独立，默认全关
+        "qzone.feeds": "feeds",
+        "qzone.my_comments": "feeds",
+        "qzone.like": "like",
+        "qzone.comment": "comment",
+        "qzone.reply": "reply",
     }
-    # 配置未写开关时的默认值：贴表情默认开，发说说默认关
-    capability_defaults = {"qzone.publish": False}
+    # 配置未写开关时的默认值：贴表情与空间只读默认开，其余（对外写操作）默认关
+    capability_defaults = {
+        "qzone.publish": False,
+        "qzone.like": False,
+        "qzone.comment": False,
+        "qzone.reply": False,
+    }
 
     def __init__(
         self,
@@ -64,6 +86,7 @@ class SnowLumaAdapter(BaseAdapter):
         self_id: str | int | None = None,
         reconnect: bool = True,
         http_client: httpx.AsyncClient | None = None,
+        qzone_client: QzoneClient | None = None,
     ):
         self.ws_url = ws_url
         self.http_url = http_url.rstrip("/")
@@ -72,6 +95,9 @@ class SnowLumaAdapter(BaseAdapter):
         self.reconnect = reconnect
         self._client = http_client
         self._owns_client = http_client is None
+        # 空间接口客户端：缺省惰性创建，登录态 Cookie 由 get_cookies 取
+        self._qzone = qzone_client
+        self._owns_qzone = qzone_client is None
         self._stop = asyncio.Event()
         self._task: asyncio.Task | None = None
         self._on_event: EventCallback | None = None
@@ -143,6 +169,9 @@ class SnowLumaAdapter(BaseAdapter):
         if self._owns_client and self._client is not None:
             await self._client.aclose()
             self._client = None
+        if self._owns_qzone and self._qzone is not None:
+            await self._qzone.aclose()
+            self._qzone = None
 
     # ------------------------------------------------------------------
     # 事件解析
@@ -236,7 +265,82 @@ class SnowLumaAdapter(BaseAdapter):
             if content is None or not str(content).strip():
                 raise CapabilityError("qzone.publish 需要非空 content")
             return await self._extension_api(name, "send_qzone_msg", {"content": str(content)})
+        if name.startswith("qzone."):
+            return await self._qzone_capability(name, **kwargs)
         raise CapabilityNotSupported(self.name, name)
+
+    async def _qzone_capability(self, capability: str, **kwargs: Any) -> Any:
+        """空间互动能力：经 get_cookies 取登录态后直调空间 Web 接口。"""
+        client = self._get_qzone_client()
+        try:
+            if capability == "qzone.feeds":
+                return await client.feeds(
+                    kwargs.get("uin"),
+                    num=kwargs.get("num", 10),
+                    pos=kwargs.get("pos", 0),
+                )
+            if capability == "qzone.my_comments":
+                return await client.my_comments(
+                    num=kwargs.get("num", 10),
+                    pos=kwargs.get("pos", 0),
+                )
+            if capability == "qzone.like":
+                return await client.like(_required(kwargs, "uin"), _required(kwargs, "tid"))
+            if capability == "qzone.comment":
+                return await client.comment(
+                    _required(kwargs, "uin"),
+                    _required(kwargs, "tid"),
+                    _required_str(kwargs, "content"),
+                )
+            if capability == "qzone.reply":
+                comment_id = kwargs.get("comment_id", kwargs.get("commentid"))
+                if comment_id in (None, ""):
+                    raise CapabilityError("qzone.reply 需要 comment_id")
+                return await client.reply(
+                    _required(kwargs, "uin"),
+                    _required(kwargs, "tid"),
+                    comment_id,
+                    _required_str(kwargs, "content"),
+                    comment_uin=kwargs.get("comment_uin"),
+                    reply_uin=kwargs.get("reply_uin"),
+                    comment_nickname=kwargs.get("comment_nickname"),
+                )
+        except CapabilityError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 能力失败不能打断调用方
+            raise CapabilityError(f"{capability} 失败：{exc}") from exc
+        raise CapabilityNotSupported(self.name, capability)
+
+    def _get_qzone_client(self) -> QzoneClient:
+        if self._qzone is None:
+            self._qzone = QzoneClient(self._fetch_qzone_cookie)
+            self._owns_qzone = True
+        return self._qzone
+
+    async def _fetch_qzone_cookie(self, domain: str) -> str:
+        """经 OneBot ``get_cookies`` 取协议端登录态 Cookie。"""
+        try:
+            payload = await self.call_api("get_cookies", {"domain": domain})
+        except Exception as exc:  # noqa: BLE001 - 由 QzoneClient 汇总成失败原因
+            raise RuntimeError(f"{domain}: {exc}") from exc
+        data = payload.get("data")
+        if isinstance(data, str):
+            return data
+        if isinstance(data, list):
+            # 部分实现（get_cookies 的 format=array）返回 [{name, value}, ...]
+            pairs = [
+                f"{item['name']}={item.get('value', '')}"
+                for item in data
+                if isinstance(item, dict) and item.get("name")
+            ]
+            return "; ".join(pairs)
+        if not isinstance(data, dict):
+            data = payload
+        for key in ("cookies", "cookie"):
+            value = data.get(key)
+            if value:
+                return str(value)
+        return ""
 
     async def _extension_api(self, capability: str, action: str, params: dict[str, Any]) -> Any:
         """扩展动作调用：把网络/平台错误收敛为能力失败原因。"""
@@ -252,6 +356,20 @@ def _to_id(value: str | int) -> int | str:
         return int(value)
     except (TypeError, ValueError):
         return value
+
+
+def _required(kwargs: dict[str, Any], key: str) -> Any:
+    value = kwargs.get(key)
+    if value in (None, ""):
+        raise CapabilityError(f"缺少参数 {key}")
+    return value
+
+
+def _required_str(kwargs: dict[str, Any], key: str) -> str:
+    value = str(_required(kwargs, key)).strip()
+    if not value:
+        raise CapabilityError(f"缺少参数 {key}")
+    return value
 
 
 def to_int(value: Any) -> int | None:
