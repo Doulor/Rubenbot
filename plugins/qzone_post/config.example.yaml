@@ -67,6 +67,44 @@ owner_ids: []
 # 例如：
 # owner_ids: ["10001"]
 
+# ---- 空间互动（后台巡检；写操作默认全关）----
+# 只巡检 interact_uins 里的 QQ，按 tid / 评论 id 去重，每轮与每日都有上限；
+# 安静时段沿用上面的 quiet_hours，期间不做任何互动动作。所有动作只走核心能力
+# 入口：qzone.feeds / qzone.like / qzone.comment / qzone.my_comments / qzone.reply。
+# 对应适配器开关（默认 feeds 开、like/comment/reply 关）：
+#   adapters.snowluma.capabilities.{feeds,like,comment,reply}
+#
+# 注意：QQ 空间接口未公开，自动点赞/评论属于对外写操作，频率过高有风控风险；
+# 建议只开给小范围、低频的白名单。
+interact_interval_minutes: 60
+# 白名单 QQ；留空表示不做互动巡检（只读巡检也不跑）
+interact_uins: []
+# 只看最近几天的说说/评论，窗口外的老说说整体跳过
+interact_days: 3
+# 每个 QQ 一次拉多少条说说；自己说说下的评论一次拉多少条
+interact_feed_num: 10
+interact_comment_num: 10
+# 能力失败后的退避时长（分钟）；期间整个巡检跳过
+interact_backoff_minutes: 30
+
+# 自动点赞（默认关）
+like_enabled: false
+like_chance: 0.8
+like_cap_per_round: 2
+like_daily_cap: 20
+# AI 评论（默认关）：按人格生成一句口语短评，不提「我是机器人」
+comment_enabled: false
+comment_chance: 0.3
+comment_cap_per_round: 1
+comment_daily_cap: 5
+comment_max_chars: 30
+# 回复自己说说下的评论（默认关）：只回别人的评论，每条说说最多回 reply_cap_per_post 条
+reply_enabled: false
+reply_cap_per_post: 3
+reply_cap_per_round: 3
+reply_daily_cap: 10
+reply_max_chars: 30
+
 # ---- 内容 ----
 # 生成的说说最长字数（越短越像真人随手写的）
 max_chars: 60

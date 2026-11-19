@@ -25,6 +25,16 @@
 配置里关了（``adapters.<name>.capabilities.qzone``）或调用出错时，都会把
 原因原样告诉用户并记日志。
 
+**空间互动**（后台巡检，写操作默认全关）：配置 ``interact_uins`` 白名单后，
+按 ``interact_interval_minutes`` 巡检这些 QQ 最近 ``interact_days`` 天的说说，
+可以按概率给他们点赞（``like_enabled`` / ``like_chance``）、让 LLM 写一句短
+评论（``comment_enabled`` / ``comment_chance``）；``reply_enabled`` 打开后还会
+巡检 ``qzone.my_comments``，用 LLM 回复别人在自己说说下的新评论。所有动作都走
+核心能力入口（``qzone.feeds`` / ``qzone.like`` / ``qzone.comment`` /
+``qzone.my_comments`` / ``qzone.reply``），按 tid / 评论 id 去重、每轮和每帖
+都有上限，安静时段（沿用 ``quiet_hours``）不做任何动作；能力失败只记日志
+并退避，不会循环猛打。去重状态落在插件目录下的 ``interact_state.json``。
+
 配置放在插件目录下的 ``config.yaml``（可选，未写用默认值）；嵌入式场景也
 可以直接把同结构的 dict 放进 ``ctx.extras["qzone_post_config"]`` 覆盖。
 字段见 README.md 与 :class:`QzonePostConfig`。
@@ -36,6 +46,7 @@ import asyncio
 import datetime as _dt
 import json
 import logging
+import os
 import random
 import re
 import time
@@ -51,6 +62,12 @@ logger = logging.getLogger(__name__)
 
 # 适配器里实际注册的能力名（SnowLuma 的 send_qzone_msg）
 CAPABILITY = "qzone.publish"
+# 空间互动能力（SnowLuma 的 qzone 客户端）
+CAP_FEEDS = "qzone.feeds"
+CAP_LIKE = "qzone.like"
+CAP_COMMENT = "qzone.comment"
+CAP_MY_COMMENTS = "qzone.my_comments"
+CAP_REPLY = "qzone.reply"
 # 核心流水里 bot 自己的发送者 id
 _BOT_SENDER_ID = "__bot__"
 _QUOTES = "「」『』“”\"'‘’"
@@ -62,6 +79,14 @@ _RANGE_RE = re.compile(r"^\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*$")
 _SCHEDULE_MODES = ("interval", "times", "both")
 # 草稿批准口令（去掉首尾标点后精确匹配）
 _APPROVE_WORDS = frozenset({"发"})
+# 互动去重状态的默认文件名（放在插件目录下，和 config.yaml 并列）
+_INTERACT_STATE_FILE = "interact_state.json"
+# 去重状态里最多留多少条记录；超出时按时间淘汰最旧的
+_STATE_KEEP = 2000
+# 状态里按 tid 记住已点赞/已评论的说说；按评论 id 记住已回复的评论
+_STATE_LIKES = "liked_tids"
+_STATE_COMMENTS = "commented_tids"
+_STATE_REPLIES = "replied_comments"
 
 
 @dataclass
@@ -115,9 +140,46 @@ class QzonePostConfig:
     draft_confirm: bool = True
     draft_timeout_minutes: float = 30.0
 
+    # ---- 空间互动（后台巡检；写操作默认全关）----
+    # 巡检间隔（分钟）
+    interact_interval_minutes: float = 60.0
+    # 白名单 QQ；空列表表示不做互动巡检
+    interact_uins: list[str] = field(default_factory=list)
+    # 只看最近几天的说说/评论，窗口外的整体跳过
+    interact_days: float = 3.0
+    # 每个 QQ 一次拉多少条说说；自己说说下的评论一次拉多少条
+    interact_feed_num: int = 10
+    interact_comment_num: int = 10
+    # 能力失败后的退避时长（分钟）；期间整个巡检跳过
+    interact_backoff_minutes: float = 30.0
+    # 自动点赞
+    like_enabled: bool = False
+    like_chance: float = 0.8
+    # 每轮最多赞几条；0 表示不限
+    like_cap_per_round: int = 2
+    # 每天最多赞几条（跨轮累计，落状态文件）；0 表示不限
+    like_daily_cap: int = 20
+    # LLM 评论
+    comment_enabled: bool = False
+    comment_chance: float = 0.3
+    comment_cap_per_round: int = 1
+    # 每天最多评几条；0 表示不限
+    comment_daily_cap: int = 5
+    comment_max_chars: int = 30
+    # 回复自己说说下的评论
+    reply_enabled: bool = False
+    reply_cap_per_post: int = 3
+    reply_cap_per_round: int = 3
+    # 每天最多回几条；0 表示不限
+    reply_daily_cap: int = 10
+    reply_max_chars: int = 30
+
     def __post_init__(self) -> None:
         # 配置里手写错的值（越界、非法时段）在这里归一；非法项退回默认值
         self.post_chance = normalize_chance(self.post_chance)
+        self.like_chance = normalize_chance(self.like_chance, default=0.8)
+        self.comment_chance = normalize_chance(self.comment_chance)
+        self.interact_uins = normalize_uins(self.interact_uins)
         self.quiet_hours = str(self.quiet_hours or "").strip()
         if self.quiet_hours and parse_hour_range(self.quiet_hours) is None:
             logger.warning(
@@ -173,6 +235,25 @@ def normalize_chance(value: Any, default: float = 0.3) -> float:
     except (TypeError, ValueError):
         return default
     return min(1.0, max(0.0, chance))
+
+
+def normalize_uins(value: Any) -> list[str]:
+    """把白名单 QQ 规范化成去重后的字符串列表。
+
+    QQ 号可能被写成数字、字符串或 ``"o12345"``；统一去掉前缀 ``o`` 并去掉空项。
+    """
+    if isinstance(value, (str, int)):
+        items: list[Any] = str(value).replace("，", ",").split(",")
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        return []
+    result: list[str] = []
+    for item in items:
+        text = str(item).strip().lstrip("oO")
+        if text and text not in result:
+            result.append(text)
+    return result
 
 
 def normalize_times(value: Any) -> list[str]:
@@ -242,6 +323,55 @@ def config_from_dict(data: dict[str, Any]) -> QzonePostConfig:
         draft_confirm=_as_bool(data.get("draft_confirm"), defaults.draft_confirm),
         draft_timeout_minutes=_as_float(
             data.get("draft_timeout_minutes"), defaults.draft_timeout_minutes, minimum=0.1
+        ),
+        # ---- 空间互动 ----
+        interact_interval_minutes=_as_float(
+            data.get("interact_interval_minutes"),
+            defaults.interact_interval_minutes,
+            minimum=0.1,
+        ),
+        interact_uins=normalize_uins(data.get("interact_uins", defaults.interact_uins)),
+        interact_days=_as_float(
+            data.get("interact_days"), defaults.interact_days, minimum=0.1
+        ),
+        interact_feed_num=_as_int(
+            data.get("interact_feed_num"), defaults.interact_feed_num, minimum=1
+        ),
+        interact_comment_num=_as_int(
+            data.get("interact_comment_num"), defaults.interact_comment_num, minimum=1
+        ),
+        interact_backoff_minutes=_as_float(
+            data.get("interact_backoff_minutes"), defaults.interact_backoff_minutes
+        ),
+        like_enabled=_as_bool(data.get("like_enabled"), defaults.like_enabled),
+        like_chance=normalize_chance(data.get("like_chance"), defaults.like_chance),
+        like_cap_per_round=_as_int(
+            data.get("like_cap_per_round"), defaults.like_cap_per_round
+        ),
+        like_daily_cap=_as_int(data.get("like_daily_cap"), defaults.like_daily_cap),
+        comment_enabled=_as_bool(data.get("comment_enabled"), defaults.comment_enabled),
+        comment_chance=normalize_chance(
+            data.get("comment_chance"), defaults.comment_chance
+        ),
+        comment_cap_per_round=_as_int(
+            data.get("comment_cap_per_round"), defaults.comment_cap_per_round
+        ),
+        comment_daily_cap=_as_int(
+            data.get("comment_daily_cap"), defaults.comment_daily_cap
+        ),
+        comment_max_chars=_as_int(
+            data.get("comment_max_chars"), defaults.comment_max_chars, minimum=1
+        ),
+        reply_enabled=_as_bool(data.get("reply_enabled"), defaults.reply_enabled),
+        reply_cap_per_post=_as_int(
+            data.get("reply_cap_per_post"), defaults.reply_cap_per_post
+        ),
+        reply_cap_per_round=_as_int(
+            data.get("reply_cap_per_round"), defaults.reply_cap_per_round
+        ),
+        reply_daily_cap=_as_int(data.get("reply_daily_cap"), defaults.reply_daily_cap),
+        reply_max_chars=_as_int(
+            data.get("reply_max_chars"), defaults.reply_max_chars, minimum=1
         ),
     )
 
@@ -341,6 +471,123 @@ class Draft:
     expires_at: float
 
 
+@dataclass
+class InteractReport:
+    """一轮互动巡检的结果；只用于日志与测试排查。"""
+
+    liked: int = 0
+    commented: int = 0
+    replied: int = 0
+    # 整轮被跳过的原因（安静时段、退避中、没有白名单……）
+    skipped: str = ""
+    # 能力失败导致本轮提前结束
+    stopped: bool = False
+
+    @property
+    def acted(self) -> bool:
+        return bool(self.liked or self.commented or self.replied)
+
+
+class InteractState:
+    """互动的去重状态与每日计数，落插件目录下的 JSON 文件。
+
+    - 点赞/评论按 ``tid`` 去重，回复按 ``tid:comment_id`` 去重；
+    - 每日计数按本地日期滚动，重启后沿用当天已用掉的额度；
+    - 文件损坏或不可写只记日志，退化成内存状态，绝不打断巡检。
+    """
+
+    def __init__(self, path: Path | None):
+        self.path = path
+        self.tids: dict[str, dict[str, float]] = {
+            _STATE_LIKES: {},
+            _STATE_COMMENTS: {},
+            _STATE_REPLIES: {},
+        }
+        self.daily_date = ""
+        self.daily: dict[str, int] = {"like": 0, "comment": 0, "reply": 0}
+
+    @classmethod
+    def load(cls, path: Path | None) -> "InteractState":
+        state = cls(path)
+        if path is None or not path.exists():
+            return state
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            logger.warning("[qzone_post] 读取互动状态 %s 失败，从头开始：%s", path, exc)
+            return state
+        if not isinstance(data, dict):
+            return state
+        for kind in state.tids:
+            raw = data.get(kind)
+            if not isinstance(raw, dict):
+                continue
+            for key, value in raw.items():
+                try:
+                    state.tids[kind][str(key)] = float(value)
+                except (TypeError, ValueError):
+                    continue
+        state.daily_date = str(data.get("daily_date") or "")
+        daily = data.get("daily")
+        if isinstance(daily, dict):
+            for kind in state.daily:
+                try:
+                    state.daily[kind] = max(0, int(daily.get(kind) or 0))
+                except (TypeError, ValueError):
+                    state.daily[kind] = 0
+        return state
+
+    def has(self, kind: str, key: str) -> bool:
+        return key in self.tids.get(kind, {})
+
+    def mark(self, kind: str, key: str, now: float) -> None:
+        items = self.tids.setdefault(kind, {})
+        items[key] = now
+        if len(items) > _STATE_KEEP:
+            # 只留最近的记录，别让状态文件无限长
+            stale = sorted(items, key=items.get)[: len(items) - _STATE_KEEP]
+            for item in stale:
+                items.pop(item, None)
+
+    def count_replies(self, tid: str) -> int:
+        """这条说说累计回过多少条评论（跨轮）。"""
+        prefix = f"{tid}:"
+        return sum(1 for key in self.tids.get(_STATE_REPLIES, {}) if key.startswith(prefix))
+
+    def roll_day(self, now: float) -> None:
+        today = local_date(now)
+        if today != self.daily_date:
+            self.daily_date = today
+            self.daily = {"like": 0, "comment": 0, "reply": 0}
+
+    def daily_count(self, kind: str, now: float) -> int:
+        self.roll_day(now)
+        return int(self.daily.get(kind, 0))
+
+    def note_action(self, kind: str, now: float) -> None:
+        self.roll_day(now)
+        self.daily[kind] = self.daily.get(kind, 0) + 1
+
+    def save(self) -> None:
+        if self.path is None:
+            return
+        payload: dict[str, Any] = {
+            "version": 1,
+            "daily_date": self.daily_date,
+            "daily": self.daily,
+        }
+        payload.update(self.tids)
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        try:
+            tmp.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            os.replace(tmp, self.path)
+        except OSError as exc:
+            logger.warning("[qzone_post] 保存互动状态 %s 失败：%s", self.path, exc)
+
+
 class QzonePostPlugin:
     """说说插件实例；loader 只调 :func:`register`，其余由实例自己管。"""
 
@@ -363,6 +610,12 @@ class QzonePostPlugin:
         self._fired_slots: dict[str, float] = {}
         # 每个时间点当天掷出的抖动偏移（秒）：同一槽位重算时沿用，别每次都变
         self._slot_offsets: dict[str, float] = {}
+        # 互动去重状态：插件目录下的 interact_state.json（没有目录时纯内存）
+        self._interact_state: InteractState | None = None
+        # 能力失败后的退避截止时间；之前的一轮直接跳过
+        self._interact_backoff_until: float = 0.0
+        # 自己空间的 QQ 号（首次读「自己说说下的评论」时从 feed_uin 记住）
+        self._self_uin: str = ""
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -435,10 +688,19 @@ class QzonePostPlugin:
     def _want_tick(self) -> bool:
         return self.config.prob or self.config.llm_decide
 
+    def _want_interact(self) -> bool:
+        """互动巡检：必须配了白名单；只读巡检默认开，写动作各自开关。"""
+        return bool(self.config.interact_uins)
+
     def _ensure_task(self) -> None:
         if not getattr(self.ctx.plugin, "enabled", True):
             return
-        if not (self._want_interval() or self._want_times() or self._want_tick()):
+        if not (
+            self._want_interval()
+            or self._want_times()
+            or self._want_tick()
+            or self._want_interact()
+        ):
             return
         try:
             loop = asyncio.get_running_loop()
@@ -451,6 +713,7 @@ class QzonePostPlugin:
             "interval": (self._want_interval(), self._interval_loop, "qzone_post_interval"),
             "times": (self._want_times(), self._times_loop, "qzone_post_times"),
             "tick": (self._want_tick(), self._tick_loop, "qzone_post_tick"),
+            "interact": (self._want_interact(), self._interact_loop, "qzone_post_interact"),
         }
         for key, (enabled, factory, name) in wanted.items():
             if not enabled:
@@ -978,6 +1241,380 @@ class QzonePostPlugin:
         return self._draft
 
     # ------------------------------------------------------------------
+    # 空间互动：后台巡检
+    # ------------------------------------------------------------------
+
+    @property
+    def interact_state(self) -> InteractState:
+        """互动去重状态；首次访问时从插件目录的 JSON 读入。"""
+        if self._interact_state is None:
+            path = getattr(getattr(self.ctx, "plugin", None), "path", None)
+            state_path = Path(path) / _INTERACT_STATE_FILE if path is not None else None
+            self._interact_state = InteractState.load(state_path)
+        return self._interact_state
+
+    def _interact_block_reason(self, now: float) -> str | None:
+        """这一轮不做任何互动的原因；可以做时返回 None。"""
+        if not self.config.interact_uins:
+            return "没有配置互动白名单（interact_uins）"
+        if in_quiet_hours(now, self.config.quiet_hours):
+            return f"安静时段（{self.config.quiet_hours} 不互动）"
+        if now < self._interact_backoff_until:
+            remain = (self._interact_backoff_until - now) / 60
+            return f"能力失败后还在退避（还要 {remain:.0f} 分钟）"
+        return None
+
+    def _back_off(self, now: float) -> None:
+        """能力失败：记日志并推迟下一轮，绝不重试猛打。"""
+        minutes = max(0.0, float(self.config.interact_backoff_minutes))
+        self._interact_backoff_until = now + minutes * 60
+        if minutes > 0:
+            logger.warning("[qzone_post] 互动能力失败，暂停巡检 %g 分钟", minutes)
+
+    async def run_interact(self, *, now: float | None = None) -> InteractReport:
+        """巡检一轮：白名单动态（点赞/评论）+ 回复自己说说下的评论。
+
+        只读巡检默认开（没有任何写开关时只拉说说、不做任何写操作）；安静时段、
+        退避中或没配白名单时整轮跳过；能力失败只记日志并退避，不会循环猛打。
+        """
+        now = time.time() if now is None else now
+        report = InteractReport()
+        blocked = self._interact_block_reason(now)
+        if blocked:
+            report.skipped = blocked
+            logger.debug("[qzone_post] 互动巡检跳过：%s", blocked)
+            return report
+        write = (
+            self.config.like_enabled
+            or self.config.comment_enabled
+            or self.config.reply_enabled
+        )
+        try:
+            if not await self._scan_feeds(now, report, write=write):
+                return report
+            if write and self.config.reply_enabled and not report.stopped:
+                await self._reply_comments(now, report)
+        finally:
+            self.interact_state.save()
+        if report.acted:
+            logger.info(
+                "[qzone_post] 互动巡检完成：赞 %s、评 %s、回 %s",
+                report.liked,
+                report.commented,
+                report.replied,
+            )
+        return report
+
+    async def _scan_feeds(self, now: float, report: InteractReport, *, write: bool) -> bool:
+        """拉白名单 QQ 最近几天的新说说；``write`` 为真时按开关点赞/评论。
+
+        返回 False 表示能力失败（调用方据此结束本轮）。
+        """
+        since = now - max(0.1, float(self.config.interact_days)) * 86400
+        like_cap = self._cap(self.config.like_cap_per_round)
+        comment_cap = self._cap(self.config.comment_cap_per_round)
+        for uin in self.config.interact_uins:
+            ok, result = await self._call_capability(
+                CAP_FEEDS, uin=uin, num=self.config.interact_feed_num
+            )
+            if not ok:
+                self._fail(f"读取 {uin} 的说说", result, now, report)
+                return False
+            for feed in _as_items(result):
+                tid = str(feed.get("tid") or "").strip()
+                created = _to_timestamp(feed.get("created_time"))
+                if not tid or created is None or created < since:
+                    continue  # 窗口外的老说说整体跳过
+                if not write:
+                    logger.debug("[qzone_post] 只读巡检：看到 %s 的新说说 %s", uin, tid)
+                    continue
+                if (
+                    self.config.like_enabled
+                    and feed.get("is_liked") is not True
+                    and (like_cap == 0 or report.liked < like_cap)
+                    and self._daily_ok("like", self.config.like_daily_cap, now)
+                    and not self.interact_state.has(_STATE_LIKES, tid)
+                ):
+                    if not await self._try_like(uin, tid, now, report):
+                        return False
+                if (
+                    self.config.comment_enabled
+                    and (comment_cap == 0 or report.commented < comment_cap)
+                    and self._daily_ok("comment", self.config.comment_daily_cap, now)
+                    and not self.interact_state.has(_STATE_COMMENTS, tid)
+                ):
+                    if not await self._try_comment(uin, tid, feed, now, report):
+                        return False
+        return True
+
+    async def _try_like(
+        self, uin: str, tid: str, now: float, report: InteractReport
+    ) -> bool:
+        """按概率给一条新说说点赞；返回 False 表示能力失败。"""
+        if not self._roll(self.config.like_chance):
+            return True
+        ok, detail = await self._call_capability(CAP_LIKE, uin=uin, tid=tid)
+        if not ok:
+            self._fail(f"给 {tid} 点赞", detail, now, report)
+            return False
+        state = self.interact_state
+        state.mark(_STATE_LIKES, tid, now)
+        state.note_action("like", now)
+        report.liked += 1
+        logger.info("[qzone_post] 给 %s 的说说 %s 点了赞", uin, tid)
+        return True
+
+    async def _try_comment(
+        self, uin: str, tid: str, feed: dict[str, Any], now: float, report: InteractReport
+    ) -> bool:
+        """按概率让 LLM 写一句短评论；返回 False 表示能力失败。"""
+        if not self._roll(self.config.comment_chance):
+            return True
+        text = await self._generate_interact_text(
+            kind="comment",
+            content=str(feed.get("content") or ""),
+            max_chars=self.config.comment_max_chars,
+        )
+        if not text:
+            return True
+        ok, detail = await self._call_capability(
+            CAP_COMMENT, uin=uin, tid=tid, content=text
+        )
+        if not ok:
+            self._fail(f"评论 {tid}", detail, now, report)
+            return False
+        state = self.interact_state
+        state.mark(_STATE_COMMENTS, tid, now)
+        state.note_action("comment", now)
+        report.commented += 1
+        logger.info("[qzone_post] 在 %s 的说说 %s 下评论：%s", uin, tid, text)
+        return True
+
+    async def _reply_comments(self, now: float, report: InteractReport) -> None:
+        """回复自己说说下别人发的新评论；同一评论只回一次。"""
+        ok, result = await self._call_capability(
+            CAP_MY_COMMENTS, num=self.config.interact_comment_num
+        )
+        if not ok:
+            self._fail("读取自己说说下的评论", result, now, report)
+            return
+        state = self.interact_state
+        since = now - max(0.1, float(self.config.interact_days)) * 86400
+        round_cap = self._cap(self.config.reply_cap_per_round)
+        post_cap = self._cap(self.config.reply_cap_per_post)
+        for comment in _as_items(result):
+            if round_cap and report.replied >= round_cap:
+                break
+            tid = str(comment.get("tid") or "").strip()
+            cid = str(comment.get("comment_id") or "").strip()
+            if not tid or not cid or not self._is_other_comment(comment):
+                continue  # 只回别人的评论
+            created = _to_timestamp(comment.get("created_time"))
+            if created is not None and created < since:
+                continue  # 窗口外的老评论同样跳过
+            key = f"{tid}:{cid}"
+            if state.has(_STATE_REPLIES, key):
+                continue
+            if post_cap and state.count_replies(tid) >= post_cap:
+                logger.debug("[qzone_post] 说说 %s 下已经回过 %s 条，跳过", tid, post_cap)
+                continue
+            if not self._daily_ok("reply", self.config.reply_daily_cap, now):
+                logger.debug("[qzone_post] 今天回复的额度用完了")
+                break
+            text = await self._generate_interact_text(
+                kind="reply",
+                content=str(comment.get("content") or ""),
+                nickname=str(comment.get("nickname") or ""),
+                max_chars=self.config.reply_max_chars,
+            )
+            if not text:
+                continue
+            kwargs: dict[str, Any] = {
+                "uin": _clean_uin(comment.get("feed_uin")),
+                "tid": tid,
+                "comment_id": cid,
+                "content": text,
+            }
+            if comment.get("comment_uin"):
+                # 显式带上被回复者，省掉适配器回读说说的那次请求
+                kwargs["comment_uin"] = str(comment["comment_uin"])
+            if comment.get("nickname"):
+                kwargs["comment_nickname"] = str(comment["nickname"])
+            ok, detail = await self._call_capability(CAP_REPLY, **kwargs)
+            if not ok:
+                self._fail(f"回复评论 {cid}", detail, now, report)
+                return
+            state.mark(_STATE_REPLIES, key, now)
+            state.note_action("reply", now)
+            report.replied += 1
+            logger.info("[qzone_post] 回复了说说 %s 下的评论 %s：%s", tid, cid, text)
+
+    def _fail(self, action: str, detail: Any, now: float, report: InteractReport) -> None:
+        logger.warning("[qzone_post] %s失败：%s", action, detail)
+        self._back_off(now)
+        report.stopped = True
+
+    def _is_other_comment(self, comment: dict[str, Any]) -> bool:
+        """只回别人发的评论：跳过自己的、以及本说说作者发的。"""
+        author = _clean_uin(comment.get("comment_uin"))
+        if not author:
+            return False
+        feed_uin = _clean_uin(comment.get("feed_uin"))
+        if feed_uin and not self._self_uin:
+            # my_comments 读的是自己的说说，说说主人就是自己
+            self._self_uin = feed_uin
+        if author == (self._self_uin or feed_uin):
+            return False
+        return True
+
+    @staticmethod
+    def _cap(value: int) -> int:
+        """每轮上限；0 表示不限。"""
+        return max(0, int(value))
+
+    def _daily_ok(self, kind: str, cap: int, now: float) -> bool:
+        """每日额度是否还有；``cap`` 为 0 表示不限。"""
+        cap = max(0, int(cap))
+        return cap == 0 or self.interact_state.daily_count(kind, now) < cap
+
+    async def _call_capability(self, name: str, **kwargs: Any) -> tuple[bool, Any]:
+        """经能力入口调用平台能力；读能力尽量拿回结构化结果。
+
+        插件不碰任何平台协议，只按名字调能力：
+
+        - 写能力（点赞/评论/回复）统一走宿主给的 ``ctx.call_capability``，
+          能力开关、失败原因都由核心入口裁决；
+        - 读能力（``qzone.feeds`` / ``qzone.my_comments``）需要列表数据，而核心
+          入口只回 ``(是否成功, 说明)``，所以先找声明了该能力且配置开关打开的
+          适配器，调用它的 ``call_capability`` 拿原始返回值（开关判断与核心
+          入口一致，不会绕过 ``adapters.<name>.capabilities``）；
+        - 找不到这样的适配器时退回 ``ctx.call_capability``（例如测试里的假通道、
+          或宿主自定义的能力通道直接返回数据）。
+
+        两条路都失败时只返回 ``(False, 原因)``，绝不抛异常。
+        """
+        if name in (CAP_FEEDS, CAP_MY_COMMENTS):
+            adapter = self._find_adapter(name)
+            if adapter is not None:
+                try:
+                    return True, await adapter.call_capability(name, **kwargs)
+                except Exception as exc:  # noqa: BLE001 - 能力失败不能拖垮插件
+                    logger.warning("[qzone_post] 调用能力 %s 失败：%s", name, exc)
+                    return False, str(exc) or exc.__class__.__name__
+        call = getattr(self.ctx, "call_capability", None)
+        if not callable(call):
+            return False, "宿主未就绪，无法调用平台能力"
+        try:
+            result = await call(name, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - 能力失败不能拖垮插件
+            logger.warning("[qzone_post] 调用能力 %s 异常：%s", name, exc)
+            return False, str(exc) or exc.__class__.__name__
+        if isinstance(result, tuple) and len(result) == 2:
+            ok, detail = result
+            if not ok:
+                return False, detail
+            if name in (CAP_FEEDS, CAP_MY_COMMENTS) and not isinstance(
+                detail, (list, dict)
+            ):
+                # 读能力没拿到结构化结果：按空列表处理，不误判成写操作
+                logger.debug("[qzone_post] 能力 %s 没有结构化结果", name)
+                return True, []
+            return True, detail
+        return True, result
+
+    def _find_adapter(self, name: str) -> Any | None:
+        """声明了该能力、且配置开关打开的适配器；没有则 None。"""
+        sources = (
+            getattr(getattr(self.ctx, "runtime", None), "adapters", None),
+            getattr(getattr(self.ctx, "bot", None), "adapters", None),
+        )
+        config = getattr(self.ctx, "config", None)
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            for adapter in source.values():
+                if name not in set(getattr(adapter, "capabilities", frozenset()) or ()):
+                    continue
+                key = (getattr(adapter, "capability_config_keys", None) or {}).get(name)
+                if key and hasattr(config, "adapter_capability_enabled"):
+                    default = (getattr(adapter, "capability_defaults", None) or {}).get(
+                        name, True
+                    )
+                    if not config.adapter_capability_enabled(
+                        adapter.name, key, default=default
+                    ):
+                        continue
+                return adapter
+        return None
+
+    async def _generate_interact_text(
+        self,
+        *,
+        kind: str,
+        content: str,
+        nickname: str = "",
+        max_chars: int = 30,
+    ) -> str:
+        """让 LLM 按人格写一句短评/短回复；失败返回空串。"""
+        llm = self.ctx.llm
+        if llm is None:
+            logger.warning("[qzone_post] 宿主还没就绪，拿不到 LLM")
+            return ""
+        persona = self._persona_text()
+        if kind == "comment":
+            task = (
+                "刷空间看到朋友发的一条说说，想留一句评论。\n"
+                f"说说内容：{content or '（只有图片，没写文字）'}\n"
+            )
+        else:
+            who = nickname or "一个朋友"
+            task = (
+                f"你在自己空间发的说说下面，{who} 给你留了条评论：{content}\n"
+                "想回一句。\n"
+            )
+        instruction = (
+            f"{persona}\n\n{task}"
+            "要求：\n"
+            "- 用上面这个人的口吻，像真人随手回一句，口语、别端着\n"
+            f"- 不超过 {max_chars} 字，一句话就够\n"
+            "- 不提「我是机器人」「AI」，不解释、不加引号、不加话题标签\n"
+            "- 只输出这一句话"
+        )
+        try:
+            raw = await llm.complete(
+                [{"role": "user", "content": instruction}], role="chat"
+            )
+        except Exception as exc:  # noqa: BLE001 - LLM 失败不拖垮插件
+            logger.warning("[qzone_post] 生成互动文案失败：%s", exc)
+            return ""
+        text = clean_generated(raw, max_chars)
+        if not text:
+            logger.warning("[qzone_post] LLM 返回了空的互动文案")
+        return text
+
+    async def _interact_loop(self, stop_event: asyncio.Event) -> None:
+        """后台互动巡检；停用后干净退出，单轮异常不影响下一轮。"""
+        period = max(0.1, float(self.config.interact_interval_minutes) * 60)
+        while not stop_event.is_set():
+            try:
+                if await self._wait_tick(stop_event, period):
+                    return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[qzone_post] 互动巡检等待异常：%s", exc)
+                await asyncio.sleep(min(period, 60.0))
+                continue
+            if self._should_exit(stop_event):
+                return
+            try:
+                await self.run_interact()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - 单轮失败不影响下一轮
+                logger.warning("[qzone_post] 互动巡检失败：%s", exc)
+
+    # ------------------------------------------------------------------
     # 内容生成
     # ------------------------------------------------------------------
 
@@ -1115,6 +1752,40 @@ class QzonePostPlugin:
         if memories:
             return "\n".join(f"- {memory.content}" for memory in memories)
         return ""
+
+
+# ----------------------------------------------------------------------
+# 互动用的小工具
+# ----------------------------------------------------------------------
+
+
+def _as_items(result: Any) -> list[dict[str, Any]]:
+    """把能力返回值规整成 ``list[dict]``；其它类型一律当空列表。"""
+    if isinstance(result, dict):
+        for key in ("items", "feeds", "comments", "msglist", "list"):
+            value = result.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+        return []
+    if isinstance(result, (list, tuple)):
+        return [item for item in result if isinstance(item, dict)]
+    return []
+
+
+def _to_timestamp(value: Any) -> float | None:
+    """说说/评论时间：接受秒级时间戳或数字字符串。"""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number <= 0:
+        return None
+    return number
+
+
+def _clean_uin(value: Any) -> str:
+    """QQ 号归一：去掉 ``o`` 前缀与空白。"""
+    return str(value if value is not None else "").strip().lstrip("oO")
 
 
 def load_config(ctx: Any) -> QzonePostConfig:

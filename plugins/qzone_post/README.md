@@ -37,6 +37,32 @@
 作废。主人用 `owner_ids` 识别；不配置时退化为发给第一个活跃私聊会话，并在日志里注明。
 草稿只存在内存里，插件重启即丢弃；一条草稿待确认期间不会再生成新的自动说说。
 
+## 空间互动（点赞 / 评论 / 回复评论，默认关）
+
+配了 `interact_uins` 白名单后，后台每 `interact_interval_minutes`（默认 60）分钟巡检
+一次这些 QQ 最近 `interact_days`（默认 3）天内的说说；只读巡检默认开，写操作各自
+有开关且默认全关：
+
+| 动作 | 开关 | 行为 |
+| --- | --- | --- |
+| 点赞 | `like_enabled` | 对窗口内的新说说按 `like_chance`（默认 0.8）点赞；同一 `tid` 只赞一次 |
+| AI 评论 | `comment_enabled` | 点赞之外按 `comment_chance`（默认 0.3）让 LLM 按人格写一句口语短评（≤`comment_max_chars` 字，不提「我是机器人」）；每轮最多 `comment_cap_per_round`（默认 1）条 |
+| 回复评论 | `reply_enabled` | 巡检 `qzone.my_comments`，对别人在自己说说下的新评论用 LLM 生成一句回复；同一评论只回一次，每条说说最多 `reply_cap_per_post`（默认 3）条、每轮最多 `reply_cap_per_round`（默认 3）条；只回别人的评论 |
+
+节制：
+
+- 安静时段（沿用 `quiet_hours`，默认 23:00–07:00）整轮不做任何互动动作；
+- 每轮上限之外还有每日额度：`like_daily_cap`（20）、`comment_daily_cap`（5）、
+  `reply_daily_cap`（10），按本地日期滚动，`0` 表示不限；
+- 任何能力调用失败只记日志，并按 `interact_backoff_minutes`（默认 30）退避，
+  期间整轮跳过，不会循环猛打；
+- 去重状态（已赞的 tid、已评论的 tid、已回复的评论）落在插件目录下的
+  `interact_state.json`，重启后继续生效；文件损坏只会从头开始并记日志。
+
+所有动作只走核心能力入口：`qzone.feeds` / `qzone.like` / `qzone.comment` /
+`qzone.my_comments` / `qzone.reply`。对应的适配器开关默认是 `feeds` 开、
+`like` / `comment` / `reply` 关；适配器那边没打开时，插件只会在日志里看到失败原因。
+
 ## 配置
 
 复制 `config.example.yaml` 为 `qzone_post/config.yaml`，或把同结构的 dict 放进
@@ -64,6 +90,26 @@
 | `max_chars` | `60` | 生成内容的最大字数（超出按句末标点截断） |
 | `topic_window_hours` | `6` | 取题材时回看群聊的小时数 |
 | `topic_limit` | `20` | 一次取多少条群聊消息当题材 |
+| `interact_uins` | `[]` | 互动白名单 QQ；留空不做互动巡检 |
+| `interact_interval_minutes` | `60` | 互动巡检间隔（分钟） |
+| `interact_days` | `3` | 只看最近几天的说说/评论 |
+| `interact_feed_num` | `10` | 每个 QQ 一次拉多少条说说 |
+| `interact_comment_num` | `10` | 自己说说下的评论一次拉多少条 |
+| `interact_backoff_minutes` | `30` | 能力失败后的退避时长 |
+| `like_enabled` | `false` | 自动点赞 |
+| `like_chance` | `0.8` | 点赞概率 |
+| `like_cap_per_round` | `2` | 每轮最多赞几条；`0` 不限 |
+| `like_daily_cap` | `20` | 每天最多赞几条；`0` 不限 |
+| `comment_enabled` | `false` | AI 评论 |
+| `comment_chance` | `0.3` | 评论概率 |
+| `comment_cap_per_round` | `1` | 每轮最多评几条；`0` 不限 |
+| `comment_daily_cap` | `5` | 每天最多评几条；`0` 不限 |
+| `comment_max_chars` | `30` | 评论文案最大字数 |
+| `reply_enabled` | `false` | 回复自己说说下的评论 |
+| `reply_cap_per_post` | `3` | 每条说说下累计最多回几条 |
+| `reply_cap_per_round` | `3` | 每轮最多回几条 |
+| `reply_daily_cap` | `10` | 每天最多回几条；`0` 不限 |
+| `reply_max_chars` | `30` | 回复文案最大字数 |
 
 ## 还需要打开平台能力
 
@@ -79,6 +125,21 @@ adapters:
 没打开、适配器不支持、或调用失败时，命令会直接回复原因；自动路径只记日志并等下一轮，
 不会把主循环或后台任务带死。
 
+空间互动同理，适配器侧还需要（按需打开，写操作默认关）：
+
+```yaml
+adapters:
+  snowluma:
+    capabilities:
+      feeds: true      # 只读巡检（qzone.feeds / qzone.my_comments）
+      like: true       # 点赞
+      comment: true    # 评论
+      reply: true      # 回复评论
+```
+
+QQ 空间接口未公开，自动点赞/评论属于对外写操作，高频调用有风控风险；建议只开给
+小范围、低频的白名单，并保持每日额度。
+
 ## 生命周期
 
 - 后台任务在插件启用后、宿主处理第一条消息时懒启动（宿主同步加载插件时还没有事件循环）。
@@ -90,4 +151,6 @@ adapters:
 
 `tests/test_qzone_post.py` 用假 capability 入口与假 LLM 覆盖命令路径、间隔/时间点定时、
 概率门拦截、LLM 判断返回 `post: false` 不发、冷却 / 每日上限 / 安静时段拦截、
-草稿确认的批准与作废（含超时、非主人、群消息）、能力不可用、停用后任务退出。
+草稿确认的批准与作废（含超时、非主人、群消息）、能力不可用、停用后任务退出；
+空间互动覆盖白名单外不巡检、窗口外跳过、去重不重复赞/评/回、概率为 0 不动作、
+每轮/每日上限拦截、安静时段拦截、回复只针对他人评论、能力失败退避与后台任务退出。

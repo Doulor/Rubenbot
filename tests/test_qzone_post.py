@@ -859,3 +859,526 @@ def _load_module():
     sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
+
+
+# ----------------------------------------------------------------------
+# 空间互动：巡检 / 点赞 / 评论 / 回复
+# ----------------------------------------------------------------------
+
+
+class InteractCapability:
+    """互动用的假能力入口：假说说流、假评论列表，写操作只记录调用。
+
+    ``bot.call_capability`` 被换成它；``feeds`` 按 uin 返回预设列表，
+    ``my_comments`` 返回预设评论；其余能力一律成功（除非在 ``fail_for`` 里）。
+    """
+
+    def __init__(self):
+        self.calls: list[tuple[str | None, str, dict]] = []
+        self.feeds: dict[str, list[dict]] = {}
+        self.comments: list[dict] = []
+        self.fail_for: dict[str, str] = {}
+
+    def add_feed(self, uin: str, tid: str, created: float, content: str = "今天的云很好看"):
+        self.feeds.setdefault(uin, []).append(
+            {"tid": tid, "uin": uin, "created_time": int(created), "content": content}
+        )
+
+    async def __call__(self, adapter_name, name, **kwargs):
+        self.calls.append((adapter_name, name, kwargs))
+        if name in self.fail_for:
+            return False, self.fail_for[name]
+        if name == "qzone.feeds":
+            uin = str(kwargs.get("uin") or "")
+            return True, list(self.feeds.get(uin, []))
+        if name == "qzone.my_comments":
+            return True, list(self.comments)
+        return True, "ok: 1"
+
+    def names(self) -> list[str]:
+        return [name for _, name, _ in self.calls]
+
+    def calls_of(self, name: str) -> list[dict]:
+        return [kwargs for _, cap, kwargs in self.calls if cap == name]
+
+
+INTERACT_BASE = (
+    'quiet_hours: ""\n'
+    'interact_uins: ["20001"]\n'
+    'interact_days: 3\n'
+    'interact_backoff_minutes: 0\n'
+)
+
+
+def make_interact_bot(tmp_path, extra_yaml="", *, replies=None):
+    cap = InteractCapability()
+    bot, adapter, manager, llm, _, _ = make_bot(
+        tmp_path, INTERACT_BASE + extra_yaml, llm_replies=replies or [], capability=cap
+    )
+    plugin = manager.extras["qzone_post"]
+    plugin.rng = FixedRng(0.0)  # 概率门默认全过（0.0 < 任何 >0 的概率）
+    return bot, manager, plugin, llm, cap
+
+
+LIKE_ONLY = 'like_enabled: true\nlike_chance: 1.0\nlike_cap_per_round: 5\n'
+COMMENT_ONLY = (
+    'comment_enabled: true\ncomment_chance: 1.0\n'
+    'comment_cap_per_round: 5\ncomment_max_chars: 30\n'
+)
+REPLY_ONLY = 'reply_enabled: true\nreply_cap_per_round: 3\nreply_cap_per_post: 3\n'
+
+
+def test_interact_only_polls_whitelisted_uins(tmp_path):
+    bot, manager, plugin, _, cap = make_interact_bot(tmp_path, LIKE_ONLY)
+    now = time.time()
+    cap.add_feed("20001", "t-1", now - 600)
+    cap.add_feed("29999", "t-other", now - 600)  # 非白名单
+
+    report = asyncio.run(plugin.run_interact(now=now))
+
+    assert [call["uin"] for call in cap.calls_of("qzone.feeds")] == ["20001"]
+    assert [call["tid"] for call in cap.calls_of("qzone.like")] == ["t-1"]
+    assert report.liked == 1
+    assert "29999" not in str(cap.calls)
+
+
+def test_interact_without_whitelist_does_nothing(tmp_path):
+    bot, manager, plugin, _, cap = make_interact_bot(
+        tmp_path, LIKE_ONLY + 'interact_uins: []\n'
+    )
+    report = asyncio.run(plugin.run_interact(now=time.time()))
+    assert cap.calls == []
+    assert "白名单" in report.skipped
+
+
+def test_interact_skips_feeds_outside_window(tmp_path):
+    bot, manager, plugin, _, cap = make_interact_bot(tmp_path, LIKE_ONLY)
+    now = time.time()
+    cap.add_feed("20001", "old", now - 4 * 86400)  # 4 天前，窗口外
+    cap.add_feed("20001", "fresh", now - 3600)
+
+    report = asyncio.run(plugin.run_interact(now=now))
+
+    assert [call["tid"] for call in cap.calls_of("qzone.like")] == ["fresh"]
+    assert report.liked == 1
+
+
+def test_interact_like_not_repeated_across_rounds(tmp_path):
+    bot, manager, plugin, _, cap = make_interact_bot(tmp_path, LIKE_ONLY)
+    now = time.time()
+    cap.add_feed("20001", "t-1", now - 60)
+
+    asyncio.run(plugin.run_interact(now=now))
+    asyncio.run(plugin.run_interact(now=now + 3600))
+
+    assert len(cap.calls_of("qzone.like")) == 1
+    # 去重状态落了插件数据文件
+    state_path = Path(manager.plugins["qzone_post"].path) / "interact_state.json"
+    assert state_path.exists()
+    assert "t-1" in state_path.read_text(encoding="utf-8")
+    assert "t-1" in plugin.interact_state.tids["liked_tids"]
+
+
+def test_interact_skips_feeds_already_liked_by_us(tmp_path):
+    bot, manager, plugin, _, cap = make_interact_bot(tmp_path, LIKE_ONLY)
+    now = time.time()
+    cap.feeds["20001"] = [
+        {"tid": "t-liked", "uin": "20001", "created_time": int(now - 60), "is_liked": True},
+        {"tid": "t-new", "uin": "20001", "created_time": int(now - 50), "is_liked": False},
+    ]
+
+    asyncio.run(plugin.run_interact(now=now))
+
+    assert [c["tid"] for c in cap.calls_of("qzone.like")] == ["t-new"]
+
+
+def test_interact_like_chance_zero_never_likes(tmp_path):
+    bot, manager, plugin, _, cap = make_interact_bot(
+        tmp_path, 'like_enabled: true\nlike_chance: 0\n'
+    )
+    plug_rng = FixedRng(0.0)
+    plugin.rng = plug_rng
+    now = time.time()
+    cap.add_feed("20001", "t-1", now - 60)
+
+    asyncio.run(plugin.run_interact(now=now))
+
+    assert cap.calls_of("qzone.like") == []
+    assert cap.names() == ["qzone.feeds"]
+
+
+def test_interact_like_per_round_cap(tmp_path):
+    bot, manager, plugin, _, cap = make_interact_bot(
+        tmp_path, 'like_enabled: true\nlike_chance: 1.0\nlike_cap_per_round: 1\n'
+    )
+    now = time.time()
+    for index in range(3):
+        cap.add_feed("20001", f"t-{index}", now - 60)
+
+    report = asyncio.run(plugin.run_interact(now=now))
+
+    assert len(cap.calls_of("qzone.like")) == 1
+    assert report.liked == 1
+
+
+def test_interact_comment_generated_and_deduped(tmp_path):
+    bot, manager, plugin, llm, cap = make_interact_bot(
+        tmp_path, COMMENT_ONLY, replies=["这云看着真舒服"]
+    )
+    now = time.time()
+    cap.add_feed("20001", "t-1", now - 60, content="今天的云很好看")
+
+    asyncio.run(plugin.run_interact(now=now))
+    asyncio.run(plugin.run_interact(now=now + 3600))
+
+    comments = cap.calls_of("qzone.comment")
+    assert comments == [
+        {"uin": "20001", "tid": "t-1", "content": "这云看着真舒服"}
+    ]
+    assert len(llm.calls) == 1
+    prompt = llm.calls[0]["messages"][-1]["content"]
+    assert "今天的云很好看" in prompt
+    assert "机器人" in prompt  # 提示词里明确不许自称机器人
+
+
+def test_interact_comment_chance_zero_never_comments(tmp_path):
+    bot, manager, plugin, llm, cap = make_interact_bot(
+        tmp_path, 'comment_enabled: true\ncomment_chance: 0\n'
+    )
+    plugin.rng = FixedRng(0.0)
+    now = time.time()
+    cap.add_feed("20001", "t-1", now - 60)
+
+    asyncio.run(plugin.run_interact(now=now))
+
+    assert cap.calls_of("qzone.comment") == []
+    assert llm.calls == []
+
+
+def test_interact_comment_per_round_cap(tmp_path):
+    bot, manager, plugin, llm, cap = make_interact_bot(
+        tmp_path,
+        'comment_enabled: true\ncomment_chance: 1.0\ncomment_cap_per_round: 1\n',
+        replies=["好看", "不错"],
+    )
+    now = time.time()
+    cap.add_feed("20001", "t-1", now - 60)
+    cap.add_feed("20001", "t-2", now - 50)
+
+    report = asyncio.run(plugin.run_interact(now=now))
+
+    assert len(cap.calls_of("qzone.comment")) == 1
+    assert report.commented == 1
+    assert len(llm.calls) == 1
+
+
+def test_interact_quiet_hours_block_everything(tmp_path):
+    bot, manager, plugin, llm, cap = make_interact_bot(
+        tmp_path,
+        LIKE_ONLY + COMMENT_ONLY + REPLY_ONLY + 'quiet_hours: "00:00-23:59"\n',
+        replies=["hi"],
+    )
+    now = time.time()
+    cap.add_feed("20001", "t-1", now - 60)
+    cap.comments = [
+        {
+            "tid": "own-1",
+            "feed_uin": "10000",
+            "comment_id": "c-1",
+            "comment_uin": "30003",
+            "nickname": "小明",
+            "content": "羡慕",
+            "created_time": int(now - 60),
+        }
+    ]
+
+    report = asyncio.run(plugin.run_interact(now=now))
+
+    assert cap.calls == []
+    assert llm.calls == []
+    assert "安静时段" in report.skipped
+
+
+def test_interact_replies_only_to_others_comments(tmp_path):
+    bot, manager, plugin, llm, cap = make_interact_bot(
+        tmp_path, REPLY_ONLY, replies=["谢谢呀"]
+    )
+    now = time.time()
+    cap.comments = [
+        {  # 自己发在自己说说下的评论：不回
+            "tid": "own-1",
+            "feed_uin": "10000",
+            "comment_id": "c-self",
+            "comment_uin": "10000",
+            "nickname": "我",
+            "content": "自己顶一下",
+            "created_time": int(now - 30),
+        },
+        {  # 别人发的：回
+            "tid": "own-1",
+            "feed_uin": "10000",
+            "comment_id": "c-1",
+            "comment_uin": "30003",
+            "nickname": "小明",
+            "content": "照片呢",
+            "created_time": int(now - 60),
+        },
+    ]
+
+    report = asyncio.run(plugin.run_interact(now=now))
+    asyncio.run(plugin.run_interact(now=now + 3600))  # 同一评论不重复回
+
+    replies = cap.calls_of("qzone.reply")
+    assert len(replies) == 1
+    assert replies[0] == {
+        "uin": "10000",
+        "tid": "own-1",
+        "comment_id": "c-1",
+        "content": "谢谢呀",
+        "comment_uin": "30003",
+        "comment_nickname": "小明",
+    }
+    assert report.replied == 1
+
+
+def test_interact_reply_caps_per_post_and_round(tmp_path):
+    bot, manager, plugin, llm, cap = make_interact_bot(
+        tmp_path,
+        'reply_enabled: true\nreply_cap_per_post: 2\nreply_cap_per_round: 1\n',
+        replies=["嗯嗯", "哈哈", "好的"],
+    )
+    now = time.time()
+    cap.comments = [
+        {
+            "tid": "own-1",
+            "feed_uin": "10000",
+            "comment_id": f"c-{index}",
+            "comment_uin": f"3000{index}",
+            "nickname": f"朋友{index}",
+            "content": "哈哈",
+            "created_time": int(now - 60),
+        }
+        for index in range(4)
+    ]
+
+    # 每轮最多回 1 条
+    asyncio.run(plugin.run_interact(now=now))
+    assert len(cap.calls_of("qzone.reply")) == 1
+
+    # 每条说说累计最多回 2 条：第 2 轮回掉第 2 条后，第 3 轮不再回
+    asyncio.run(plugin.run_interact(now=now + 60))
+    asyncio.run(plugin.run_interact(now=now + 120))
+    assert [c["comment_id"] for c in cap.calls_of("qzone.reply")] == ["c-0", "c-1"]
+
+
+def test_interact_daily_cap_blocks_likes(tmp_path):
+    bot, manager, plugin, _, cap = make_interact_bot(
+        tmp_path,
+        'like_enabled: true\nlike_chance: 1.0\nlike_cap_per_round: 0\n'
+        'like_daily_cap: 1\n',
+    )
+    now = time.time()
+    cap.add_feed("20001", "t-1", now - 60)
+    cap.add_feed("20001", "t-2", now - 50)
+
+    asyncio.run(plugin.run_interact(now=now))
+    assert len(cap.calls_of("qzone.like")) == 1
+
+    # 第二天额度重置
+    cap.feeds["20001"].append(
+        {"tid": "t-3", "uin": "20001", "created_time": int(now + 86400), "content": "新的一天"}
+    )
+    asyncio.run(plugin.run_interact(now=now + 86400))
+    # 第二天先补上昨天没赞成的 t-2，额度用完后 t-3 留到下一天
+    assert [c["tid"] for c in cap.calls_of("qzone.like")] == ["t-1", "t-2"]
+
+
+def test_interact_failure_backs_off_and_stops_round(tmp_path):
+    bot, manager, plugin, _, cap = make_interact_bot(
+        tmp_path, LIKE_ONLY + REPLY_ONLY + 'interact_backoff_minutes: 30\n'
+    )
+    now = time.time()
+    cap.fail_for["qzone.feeds"] = "登录态失效"
+    cap.comments = []
+
+    report = asyncio.run(plugin.run_interact(now=now))
+    assert report.stopped is True
+    assert cap.names() == ["qzone.feeds"]  # 失败后不再继续，也不调回复
+
+    # 退避期内整轮跳过，不再打接口
+    report = asyncio.run(plugin.run_interact(now=now + 60))
+    assert cap.names() == ["qzone.feeds"]
+    assert "退避" in report.skipped
+
+    # 退避结束后恢复
+    cap.fail_for.clear()
+    cap.add_feed("20001", "t-1", now - 60)
+    report = asyncio.run(plugin.run_interact(now=now + 31 * 60))
+    assert report.liked == 1
+
+
+def test_interact_read_only_when_all_switches_off(tmp_path):
+    bot, manager, plugin, llm, cap = make_interact_bot(tmp_path)
+    now = time.time()
+    cap.add_feed("20001", "t-1", now - 60)
+
+    report = asyncio.run(plugin.run_interact(now=now))
+
+    assert cap.names() == ["qzone.feeds"]
+    assert llm.calls == []
+    assert report.acted is False
+
+
+def test_interact_task_starts_when_whitelist_configured(tmp_path):
+    bot, manager, plugin, _, cap = make_interact_bot(tmp_path, LIKE_ONLY)
+
+    async def scenario():
+        await bot.handle_event(private("在吗"))
+        task = plugin._tasks.get("interact")
+        assert task is not None and not task.done()
+        assert task.get_name() == "qzone_post_interact"
+        manager.set_enabled("qzone_post", False)
+        for _ in range(100):
+            if task.done():
+                break
+            await asyncio.sleep(0.01)
+        assert task.done()
+
+    asyncio.run(scenario())
+
+
+def test_interact_loop_survives_exceptions(tmp_path):
+    bot, manager, plugin, _, cap = make_interact_bot(tmp_path, LIKE_ONLY)
+    plugin.config.interact_interval_minutes = 0.0001
+    now = time.time()
+    cap.add_feed("20001", "t-1", now - 60)
+    calls = {"n": 0}
+    original = plugin.run_interact
+
+    async def flaky(*, now=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("第一轮炸了")
+        return await original(now=now)
+
+    plugin.run_interact = flaky
+
+    async def scenario():
+        stop_event = asyncio.Event()
+        task = asyncio.create_task(plugin._interact_loop(stop_event))
+        for _ in range(200):
+            if cap.calls_of("qzone.like"):
+                break
+            await asyncio.sleep(0.01)
+        assert calls["n"] >= 2
+        assert cap.calls_of("qzone.like"), "第一轮异常后应当继续巡检"
+        stop_event.set()
+        await asyncio.wait_for(task, timeout=2)
+
+    asyncio.run(scenario())
+
+
+def test_interact_reply_skipped_when_llm_returns_empty(tmp_path):
+    bot, manager, plugin, llm, cap = make_interact_bot(
+        tmp_path, REPLY_ONLY, replies=[""]
+    )
+    now = time.time()
+    cap.comments = [
+        {
+            "tid": "own-1",
+            "feed_uin": "10000",
+            "comment_id": "c-1",
+            "comment_uin": "30003",
+            "nickname": "小明",
+            "content": "照片呢",
+            "created_time": int(now - 60),
+        }
+    ]
+
+    report = asyncio.run(plugin.run_interact(now=now))
+
+    assert len(llm.calls) == 1
+    assert cap.calls_of("qzone.reply") == []
+
+
+def test_interact_reply_skips_old_comments(tmp_path):
+    bot, manager, plugin, llm, cap = make_interact_bot(
+        tmp_path, REPLY_ONLY + 'interact_days: 1\n', replies=["谢谢"]
+    )
+    now = time.time()
+    cap.comments = [
+        {
+            "tid": "own-1",
+            "feed_uin": "10000",
+            "comment_id": "old",
+            "comment_uin": "30003",
+            "nickname": "小明",
+            "content": "太久了",
+            "created_time": int(now - 5 * 86400),
+        },
+        {
+            "tid": "own-1",
+            "feed_uin": "10000",
+            "comment_id": "new",
+            "comment_uin": "30004",
+            "nickname": "小红",
+            "content": "刚发的",
+            "created_time": int(now - 600),
+        },
+    ]
+
+    asyncio.run(plugin.run_interact(now=now))
+
+    assert [c["comment_id"] for c in cap.calls_of("qzone.reply")] == ["new"]
+
+
+def test_interact_loop_runs_and_exits_cleanly(tmp_path):
+    bot, manager, plugin, _, cap = make_interact_bot(tmp_path, LIKE_ONLY)
+    plugin.config.interact_interval_minutes = 0.0001  # 一轮间隔压到 0.1 秒
+    now = time.time()
+    cap.add_feed("20001", "t-1", now - 60)
+
+    async def scenario():
+        stop_event = asyncio.Event()
+        task = asyncio.create_task(plugin._interact_loop(stop_event))
+        for _ in range(100):
+            if cap.calls_of("qzone.like"):
+                break
+            await asyncio.sleep(0.01)
+        assert cap.calls_of("qzone.like")
+        stop_event.set()
+        await asyncio.wait_for(task, timeout=2)
+
+    asyncio.run(scenario())
+
+
+def test_interact_config_defaults_and_override():
+    module = _load_module()
+    defaults = module.QzonePostConfig()
+    assert defaults.interact_interval_minutes == 60
+    assert defaults.interact_days == 3
+    assert defaults.interact_uins == []
+    # 写操作默认全关，只读巡检默认开
+    assert defaults.like_enabled is False
+    assert defaults.comment_enabled is False
+    assert defaults.reply_enabled is False
+    assert defaults.like_chance == 0.8
+    assert defaults.comment_chance == 0.3
+
+    cfg = module.config_from_dict(
+        {
+            "interact_uins": [20001, "o20002", "20001"],
+            "interact_days": "5",
+            "like_enabled": True,
+            "like_chance": 2,
+            "comment_chance": -1,
+            "reply_cap_per_post": "2",
+        }
+    )
+    assert cfg.interact_uins == ["20001", "20002"]
+    assert cfg.interact_days == 5
+    assert cfg.like_enabled is True
+    assert cfg.like_chance == 1.0
+    assert cfg.comment_chance == 0.0
+    assert cfg.reply_cap_per_post == 2
+    assert cfg.comment_enabled is False
