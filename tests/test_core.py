@@ -3,6 +3,7 @@
 import asyncio
 import json
 import random
+import re
 import time
 
 import pytest
@@ -155,7 +156,8 @@ def test_group_scene_prompt_mentions_group(config, store):
     assert "当前是私聊" not in system
 
 
-
+def test_history_and_memory_in_context(config, store):
+    """历史以「[时间] [昵称] 正文」渲染，记忆与说话人信息都在系统提示里。"""
     store.upsert_person("recording", "u1", "阿花")
     store.add_memory("recording:u1", "TA 最喜欢的歌手是坂本龙一")
     config.memory.inject_limit = 5
@@ -171,9 +173,9 @@ def test_group_scene_prompt_mentions_group(config, store):
     assert "你是 Ruben" in system["content"]
     assert "坂本龙一" in system["content"]  # 注入的记忆
     assert "阿花" in system["content"]  # 说话人信息
-    # 历史消息以 说话人：内容 的形式出现
-    assert any(m["content"].startswith("阿草：今天听歌吗") for m in messages)
-    assert messages[-1]["content"].startswith("阿花：最近在听坂本龙一")
+    # 历史消息按「[HH:MM] [昵称] 正文」渲染
+    assert any(re.match(r"\[\d{2}:\d{2}\] \[阿草\] 今天听歌吗$", m["content"]) for m in messages)
+    assert re.match(r"\[\d{2}:\d{2}\] \[阿花\] 最近在听坂本龙一$", messages[-1]["content"])
 
 
 def test_llm_failure_does_not_crash(config, store):
@@ -404,8 +406,20 @@ def test_console_adapter_parse_and_send():
     assert group.text == "大家好"
     named = adapter.parse_line("[摸鱼群|阿花] 我来啦")
     assert named.sender_name == "阿花"
+    # Console 给入站事件与出站回执都发本地递增 id
+    assert named.platform_msg_id
+    assert named.platform_msg_id != private.platform_msg_id
     asyncio.run(adapter.send("摸鱼群", [Segment.text("收到")]))
     assert "Ruben: 收到" in out.getvalue()
+
+
+def test_console_adapter_send_returns_id():
+    import io
+
+    adapter = ConsoleAdapter(stdout=io.StringIO())
+    first = asyncio.run(adapter.send("摸鱼群", [Segment.text("收到")]))
+    second = asyncio.run(adapter.send("摸鱼群", [Segment.text("再来")]))
+    assert first and second and first != second
 
 
 def test_decision_written_to_store_log(config, store):

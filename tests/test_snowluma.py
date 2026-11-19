@@ -73,6 +73,9 @@ def test_parse_mentions_and_reply():
     ]
     event = parse_onebot_event(group_payload(message=reply_message))
     assert event.reply_to_id == "777"
+    # 事件自身的消息 id 与被引用的目标 id 分开带出去
+    assert event.platform_msg_id == "9001"
+    assert event.raw["_reply_message_id"] == "9001"
 
 
 def test_parse_string_message_with_cq_codes():
@@ -84,6 +87,16 @@ def test_parse_string_message_with_cq_codes():
     )
     assert event.mentions_bot is True
     assert event.text == "@10000 你好"
+
+
+def test_parse_string_message_with_cq_reply():
+    """字符串形式（CQ 码）里的 reply 段也要解析出被引用 id。"""
+    event = parse_onebot_event(
+        group_payload(message="[CQ:reply,id=777]回你", raw_message="[CQ:reply,id=777]回你")
+    )
+    assert event.reply_to_id == "777"
+    assert event.platform_msg_id == "9001"
+    assert "777" not in event.text  # reply 码不进入正文
 
 
 def test_onebot_to_segments_variants():
@@ -116,11 +129,14 @@ def test_send_group_and_private():
     adapter = make_adapter(handler)
 
     async def scenario():
-        await adapter.send("55555", [Segment.text("你好")], chat_type="group")
-        await adapter.send("12345", [Segment.text("私聊")], chat_type="private")
+        group_id = await adapter.send("55555", [Segment.text("你好")], chat_type="group")
+        private_id = await adapter.send("12345", [Segment.text("私聊")], chat_type="private")
         await adapter._client.aclose()
+        return group_id, private_id
 
-    asyncio.run(scenario())
+    group_id, private_id = asyncio.run(scenario())
+    assert group_id == "42"  # 出站回执：OneBot 响应里的 message_id
+    assert private_id == "42"
     assert calls[0][0] == "/send_group_msg"
     assert calls[0][1]["group_id"] == 55555  # 数字 id 转 int
     assert calls[0][1]["message"] == [{"type": "text", "data": {"text": "你好"}}]
@@ -128,6 +144,20 @@ def test_send_group_and_private():
     assert calls[1][1]["user_id"] == 12345
     # 记录自己发的消息 id，用于识别“回复 bot”
     assert "42" in adapter._bot_message_ids
+
+
+def test_send_without_message_id_returns_none():
+    def handler(request):
+        return httpx.Response(200, json={"status": "ok", "data": {}})
+
+    adapter = make_adapter(handler)
+
+    async def scenario():
+        result = await adapter.send("1", [Segment.text("x")])
+        await adapter._client.aclose()
+        return result
+
+    assert asyncio.run(scenario()) is None
 
 
 def test_send_failure_raises():

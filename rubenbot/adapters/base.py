@@ -130,6 +130,9 @@ class MessageEvent:
 
     ``text`` 是 ``segments`` 的纯文本投影（图片→[图片]、表情→[表情] 等）；
     记忆、上下文与意愿判断仍只依赖 ``text``，行为不变。
+
+    ``platform_msg_id`` 是平台侧的消息 id（拿不到时为 None），用于入站去重
+    与引用解析；``reply_to_id`` 是这条消息引用的那条消息的平台 id。
     """
 
     platform: str
@@ -142,6 +145,7 @@ class MessageEvent:
     mentions_bot: bool = False
     raw: dict[str, Any] = field(default_factory=dict)
     segments: list[Segment] = field(default_factory=list)
+    platform_msg_id: str | None = None
 
     @property
     def is_private(self) -> bool:
@@ -172,8 +176,14 @@ class BaseAdapter(abc.ABC):
         """启动并持续把统一事件交给 ``on_event``；应阻塞直到 stop。"""
 
     @abc.abstractmethod
-    async def send(self, chat_id: str, segments: list[Segment], *, chat_type: str = "group") -> None:
-        """发送消息。"""
+    async def send(
+        self, chat_id: str, segments: list[Segment], *, chat_type: str = "group"
+    ) -> str | None:
+        """发送消息，返回平台侧的消息 id；平台不提供或不在响应里时返回 None。
+
+        返回值可以忽略——core 用它把 bot 自己发出的消息连同 id 落进流水，
+        以便后续解析「这条消息引用了谁」和拼 bot 自己的时间线。
+        """
 
     @abc.abstractmethod
     async def stop(self) -> None:

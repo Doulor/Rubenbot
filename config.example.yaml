@@ -38,6 +38,8 @@ chat:
   split_part_chars: 60
   split_delay_seconds: 0.6
   history_ttl_hours: 12
+  # 入站去重：同一平台消息 id 在该时间窗内重复到达则丢弃（秒；0 关闭）
+  dedupe_ttl_seconds: 300
 
 # 回复决策（意愿系统）：群里什么时候开口
 decision:

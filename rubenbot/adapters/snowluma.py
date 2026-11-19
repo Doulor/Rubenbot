@@ -221,7 +221,7 @@ class SnowLumaAdapter(BaseAdapter):
             raise RuntimeError(f"OneBot API {action} 失败：{payload}")
         return payload if isinstance(payload, dict) else {"data": payload}
 
-    async def send(self, chat_id: str, segments: list[Segment], *, chat_type: str = "group") -> None:
+    async def send(self, chat_id: str, segments: list[Segment], *, chat_type: str = "group") -> str | None:
         action = "send_private_msg" if chat_type == "private" else "send_group_msg"
         key = "user_id" if chat_type == "private" else "group_id"
         payload = await self.call_api(
@@ -230,11 +230,14 @@ class SnowLumaAdapter(BaseAdapter):
         )
         data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
         message_id = data.get("message_id")
-        if message_id is not None:
-            self._bot_message_ids.add(str(message_id))
-            # 简单裁剪，避免无限增长
-            if len(self._bot_message_ids) > 500:
-                self._bot_message_ids = set(list(self._bot_message_ids)[-250:])
+        if message_id is None:
+            return None
+        message_id = str(message_id)
+        self._bot_message_ids.add(message_id)
+        # 简单裁剪，避免无限增长
+        if len(self._bot_message_ids) > 500:
+            self._bot_message_ids = set(list(self._bot_message_ids)[-250:])
+        return message_id
 
     async def heartbeat(self) -> bool:
         """可选 HTTP 心跳探测：get_status 是否可用。"""
@@ -498,12 +501,21 @@ def onebot_to_segments(message: Any) -> str:
 
 
 def _extract_reply_id(message: Any) -> str | None:
+    """被引用消息的 id：消息段数组里的 reply 段，或字符串形式里的 CQ:reply。"""
     if isinstance(message, list):
         for item in message:
             if isinstance(item, dict) and item.get("type") == "reply":
                 rid = (item.get("data") or {}).get("id")
                 if rid is not None:
                     return str(rid)
+    elif isinstance(message, str):
+        match = _CQ_CODE_RE.search(message)
+        while match is not None:
+            if match.group("type").lower() == "reply":
+                params = {key: value for key, value in _CQ_PARAM_RE.findall(match.group("params") or "")}
+                if params.get("id"):
+                    return str(params["id"])
+            match = _CQ_CODE_RE.search(message, match.end())
     return None
 
 
@@ -548,6 +560,8 @@ def parse_onebot_event(data: dict[str, Any], *, self_id: str | None = None) -> M
         chat_id = str(data.get("group_id"))
         chat_type = "group"
 
+    # 注意：``reply_id`` 是这条消息自身的 id（变量名沿用旧实现）；被引用的
+    # 目标 id 在 ``reply_to`` 里，两个都要带出去。
     reply_id = str(data.get("message_id")) if data.get("message_id") is not None else None
     reply_to = _extract_reply_id(message)
     mentions_bot = _mentions_self(message, self_id) or (
@@ -565,4 +579,5 @@ def parse_onebot_event(data: dict[str, Any], *, self_id: str | None = None) -> M
         mentions_bot=mentions_bot,
         raw={**data, "_reply_message_id": reply_id},
         segments=segments,
+        platform_msg_id=reply_id,
     )

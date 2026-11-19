@@ -186,7 +186,9 @@ pytest
 | | `consolidate_new_threshold` | 新增记忆达到多少条触发归纳 |
 | | `consolidate_interval_hours` | 距上次归纳超过多久触发 |
 | | `raw_keep_per_chat` | 每会话保留的已处理流水条数 |
-| `chat` | `history_size` | 上下文带入的最近消息条数 |
+| `chat` | `history_size` | 上下文带入的最近消息条数（只计真实消息，系统/工具条目不占窗口） |
+| | `history_ttl_hours` | 超过这个时间的旧消息不再拼进上下文 |
+| | `dedupe_ttl_seconds` | 入站去重窗口：同一平台消息 id 在此窗口内重复到达即丢弃（默认 300 秒，0 关闭） |
 | | `split_max_parts` `split_part_chars` `split_delay_seconds` | 长回复拆条策略 |
 | `decision` | `merge_window_seconds` `hard_merge_window_seconds` | 消息合并窗口（普通 / 硬触发） |
 | | `aliases` | 视为「叫名字」的别名，空则用 `chat.bot_name` |
@@ -246,7 +248,10 @@ def register(ctx):
    模型明确说「没有值得记录的事实」时，再反复喂同一批消息只会浪费调用。只有 LLM 调用失败时才保留 pending，下一轮重试。
 
 5. **bot 自己的回复也写进 `raw_messages`，但用 `__bot__` 标记且 `processed=1`**
-   这样下一轮上下文能看到自己的话，对话连贯；同时它不会被当成「人物」，也不参与记忆抽取。
+   这样下一轮上下文能看到自己的话，对话连贯；同时它不会被当成「人物」，也不参与记忆抽取。出站回执里的平台消息 id 一并落库，后续消息引用它时能解析出「[我] 说过什么」。
+
+5.1 **历史按结构化格式渲染，消息 id 双向落库**（借鉴 MaiBot 研读 #1/#17 的最小版）
+   `raw_messages` 新增 `platform_msg_id` / `reply_to_id` 两列（旧库启动时自动补列）。拼历史时每条渲染成 `[HH:MM] [昵称] 正文`，bot 自己标 `[我]`；被引用的消息只在**本批历史**里按 `reply_to_id` 查，查到就在正文后附 `（引用 [昵称]：正文截断 50 字）`，查不到只标 `（引用了一条消息）`。本轮正在回的那条（回复目标）正文单独截断 300 字放进「上下文要求」区，不整段重复。`chat.history_size` 窗口只计真实消息：`sender_id` 以 `__` 开头的系统/工具条目不占名额。入站事件按 `(platform, platform_msg_id)` 在 `chat.dedupe_ttl_seconds`（默认 5 分钟）内去重，重复事件直接跳过。
 
 6. **群聊开口由「意愿系统」决定，不是平坦概率**（`rubenbot/decision.py`）
    私聊、被 @ / 被回复 / 叫到名字（`aliases`，默认 `chat.bot_name`）是硬触发，直接生成。普通群消息先过合并窗口（同一发送者 4 秒内连发合成一轮，别人插话则提前放行），再算意愿分：`基础值 + 动量（半衰期衰减） + 相关性（记忆检索最高分归一化）`，减去 `发言占比惩罚`（最近 N 条里 bot 占比超过 20% 开始减，60% 直接静默）和 `发言后冷却`（默认 30 秒）。分数过 `threshold` 才生成；离阈值很近时加一点随机扰动，避免机械感。生成阶段模型可以只输出 `[不回复]` 自行否决。每次决策用 INFO 日志记录回/不回、分数和主要因子，`bot.last_decision` 保留最近结果供 WebUI 读取。所有时间与随机源都可注入，单测用假时钟/固定随机。

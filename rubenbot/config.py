@@ -79,6 +79,8 @@ class ChatConfig:
     split_delay_seconds: float = 0.6
     bot_name: str = "Ruben"
     history_ttl_hours: float = 12.0
+    # 入站去重：同一平台消息 id 在这个时间窗内重复到达则丢弃；0 表示不去重
+    dedupe_ttl_seconds: float = 300.0
 
 
 @dataclass

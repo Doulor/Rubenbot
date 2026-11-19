@@ -318,7 +318,9 @@ class RubenBot:
 
     async def _handle_event(self, event: MessageEvent) -> None:
         now = time.time()
-        await self._record(event, now)
+        if not await self._record(event, now):
+            # 重复事件：直接跳过，不再进插件/合并窗口
+            return
 
         # 插件 on_message：可修改事件或直接拦截（返回 False）
         if self.plugins is not None:
@@ -435,10 +437,19 @@ class RubenBot:
         except Exception as exc:  # noqa: BLE001 - 观测数据写不进去也不能影响回复
             logger.warning("写入决策日志失败：%s", exc)
 
-    async def _record(self, event: MessageEvent, now: float) -> None:
-        """落流水 + 更新人物；bot 自己发的消息不进流水。"""
+    async def _record(self, event: MessageEvent, now: float) -> bool:
+        """落流水 + 更新人物；返回 False 表示这是重复事件（已被丢掉）。
+
+        去重：同一 (platform, platform_msg_id) 在 ``chat.dedupe_ttl_seconds``
+        时间窗内重复到达时只记 debug 日志并跳过；平台消息 id 为空的平台不去重。
+        """
         if not event.text.strip():
-            return
+            return True
+        if self._is_duplicate(event, now):
+            logger.debug(
+                "重复消息，已跳过：%s %s %s", event.platform, event.platform_msg_id, event.text[:40]
+            )
+            return False
         person_id = make_person_id(event.platform, event.sender_id)
         self.store.upsert_person(event.platform, event.sender_id, event.sender_name, now=now)
         self.store.add_raw_message(
@@ -449,10 +460,28 @@ class RubenBot:
             sender_name=event.sender_name,
             text=event.text,
             ts=now,
+            platform_msg_id=event.platform_msg_id or "",
+            reply_to_id=event.reply_to_id or "",
         )
         self._last_activity[f"{event.platform}:{event.chat_id}"] = now
         self.last_message_at = now
         logger.debug("记录消息 %s: %s", person_id, event.text[:60])
+        return True
+
+    def _is_duplicate(self, event: MessageEvent, now: float) -> bool:
+        """入站去重检查；去掉重或没有平台消息 id 时返回 False。"""
+        if not event.platform_msg_id:
+            return False
+        ttl = self.config.chat.dedupe_ttl_seconds
+        if ttl <= 0:
+            return False
+        try:
+            return self.store.platform_message_exists(
+                event.platform, event.platform_msg_id, since=now - ttl
+            )
+        except Exception as exc:  # noqa: BLE001 - 去重失败宁可放行，不能丢消息
+            logger.warning("入站去重检查失败：%s", exc)
+            return False
 
     # ------------------------------------------------------------------
     # 回复决策
@@ -507,8 +536,86 @@ class RubenBot:
         lines = [f"- {m.content}" for m in memories]
         return "你记得的事：\n" + "\n".join(lines)
 
+    # 引用消息正文的截断长度（渲染历史时）
+    QUOTE_SNIPPET_CHARS = 50
+    # 回复目标（本轮正在回的那条）正文的截断长度
+    REPLAY_TARGET_CHARS = 300
+
+    @staticmethod
+    def _format_clock(ts: float) -> str:
+        return time.strftime("%H:%M", time.localtime(ts))
+
+    @staticmethod
+    def _truncate(text: str, limit: int) -> str:
+        text = " ".join((text or "").split())
+        if len(text) <= limit:
+            return text
+        return text[:limit].rstrip() + "…"
+
+    def _quote_suffix(self, msg, index: dict[str, object]) -> str:
+        """被引用消息的附注：查得到就带昵称+截断正文，查不到只说明引用了消息。"""
+        if not msg.reply_to_id:
+            return ""
+        target = index.get(msg.reply_to_id)
+        if target is None:
+            return "（引用了一条消息）"
+        name = "我" if target.sender_id == BOT_SENDER_ID else (target.sender_name or target.sender_id)
+        snippet = self._truncate(target.text, self.QUOTE_SNIPPET_CHARS)
+        return f"（引用 [{name}]：{snippet}）"
+
+    def render_history(self, messages: list) -> list[dict[str, str]]:
+        """把流水渲染成对话消息：``[HH:MM] [昵称] 正文``，bot 自己标 ``[我]``。
+
+        被引用的消息只在**本批历史**里按 ``reply_to_id`` 查；查不到就只标
+        「（引用了一条消息）」。附注放在正文后的独立括号里，不属于正文。
+        """
+        index: dict[str, object] = {}
+        for msg in messages:
+            if msg.platform_msg_id:
+                index.setdefault(msg.platform_msg_id, msg)
+
+        rendered: list[dict[str, str]] = []
+        for msg in messages:
+            is_bot = msg.sender_id == BOT_SENDER_ID
+            name = "我" if is_bot else (msg.sender_name or msg.sender_id)
+            content = f"[{self._format_clock(msg.ts)}] [{name}] {msg.text}"
+            content += self._quote_suffix(msg, index)
+            rendered.append({"role": "assistant" if is_bot else "user", "content": content})
+        return rendered
+
+    def _reply_target_section(self, event: MessageEvent) -> str:
+        """本轮正在回的那条消息：单独截断放进上下文要求区，不整段重复。"""
+        if not event.reply_to_id:
+            return ""
+        try:
+            target = self.store.message_by_platform_id(
+                event.platform, event.reply_to_id, chat_id=event.chat_id
+            )
+        except Exception as exc:  # noqa: BLE001 - 查引用失败不影响回复
+            logger.warning("查询被引用消息失败：%s", exc)
+            target = None
+        if target is None:
+            # 历史里已经标了「（引用了一条消息）」，这里不重复占位
+            return ""
+        is_bot = target.sender_id == BOT_SENDER_ID
+        name = "我" if is_bot else (target.sender_name or target.sender_id)
+        body = self._truncate(target.text, self.REPLAY_TARGET_CHARS)
+        return f"对方引用的那条消息（{name}）：{body}"
+
+    @staticmethod
+    def _requirements_section(reply_target: str) -> str:
+        """上下文要求区：本轮回复目标（被引用那条）单独截断呈现，不整段重复。"""
+        if not reply_target:
+            return ""
+        return "上下文要求：\n" + "\n".join(
+            [
+                f"- {reply_target}",
+                "- 被引用的内容只作理解背景，不必复述；直接接当前这轮的话。",
+            ]
+        )
+
     async def build_context(self, event: MessageEvent, *, now: float | None = None) -> list[dict[str, str]]:
-        """人格 + 记忆 + 最近历史 + 群/说话人信息。"""
+        """人格 + 记忆 + 场景 + 上下文要求 + 最近历史（结构化渲染）。"""
         now = time.time() if now is None else now
         persona_prompt = self.persona.system_prompt()
         person_id = make_person_id(event.platform, event.sender_id)
@@ -527,6 +634,9 @@ class RubenBot:
             sections.append(memory_text)
         # 场景说明带行为约束，压住人格文件里可能残留的场景想象
         sections.append(format_scene(event, display))
+        requirements = self._requirements_section(self._reply_target_section(event))
+        if requirements:
+            sections.append(requirements)
         system_prompt = "\n\n".join(sections)
 
         messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
@@ -536,12 +646,9 @@ class RubenBot:
             limit=self.config.chat.history_size,
             since=since,
             platform=event.platform,
+            real_only=True,
         )
-        for msg in history:
-            is_bot = msg.sender_id == BOT_SENDER_ID
-            role = "assistant" if is_bot else "user"
-            content = msg.text if is_bot else f"{msg.sender_name or msg.sender_id}：{msg.text}"
-            messages.append({"role": role, "content": content})
+        messages.extend(self.render_history(history))
         return messages
 
     # ------------------------------------------------------------------
@@ -608,11 +715,12 @@ class RubenBot:
         for index, segments in enumerate(parts):
             text = render_segments(segments)
             try:
-                await adapter.send(event.chat_id, segments, chat_type=event.chat_type)
+                message_id = await adapter.send(event.chat_id, segments, chat_type=event.chat_type)
             except Exception as exc:  # noqa: BLE001 - 一条发失败不影响后续
                 logger.warning("发送失败（%s 第 %s 条）：%s", event.platform, index + 1, exc)
                 continue
-            # 记入流水，供后续上下文使用；标记已处理，不参与记忆抽取
+            # 记入流水，供后续上下文使用；标记已处理，不参与记忆抽取。
+            # 平台回执的消息 id 一并落库，后续引用解析与自我时间线依赖它。
             self.store.add_raw_message(
                 platform=event.platform,
                 chat_id=event.chat_id,
@@ -621,6 +729,7 @@ class RubenBot:
                 sender_name=self.config.chat.bot_name,
                 text=text,
                 processed=True,
+                platform_msg_id="" if message_id is None else str(message_id),
             )
             if index < len(parts) - 1 and self.config.chat.split_delay_seconds > 0:
                 await asyncio.sleep(self.config.chat.split_delay_seconds)

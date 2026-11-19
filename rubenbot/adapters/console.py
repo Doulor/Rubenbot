@@ -51,6 +51,8 @@ class ConsoleAdapter(BaseAdapter):
         self.user_name = user_name
         self.bot_name = bot_name
         self.sent: list[tuple[str, str, list[Segment]]] = []  # 测试/调试用
+        # 本地递增消息 id：入站事件与出站回执都用它，便于去重/引用解析
+        self._next_id = 1
         self._stop = asyncio.Event()
         self._task: asyncio.Task | None = None
         self._on_event: EventCallback | None = None
@@ -126,13 +128,23 @@ class ConsoleAdapter(BaseAdapter):
             mentions_bot=True if chat_type == "private" else False,
             raw={"console": True},
             segments=text_segments(text),
+            platform_msg_id=self._local_id(),
         )
 
-    async def send(self, chat_id: str, segments: list[Segment], *, chat_type: str = "group") -> None:
+    def _local_id(self) -> str:
+        """本地递增消息 id（单进程内唯一即可）。"""
+        value = self._next_id
+        self._next_id += 1
+        return f"console-{value}"
+
+    async def send(
+        self, chat_id: str, segments: list[Segment], *, chat_type: str = "group"
+    ) -> str | None:
         # 非文本段渲染成占位符（[图片]、[语音] 等），Console 没有富媒体
         text = render_segments(segments)
         self.sent.append((chat_id, chat_type, segments))
         self.write(f"{self.bot_name}: {text}")
+        return self._local_id()
 
     def write(self, text: str) -> None:
         try:

@@ -14,6 +14,11 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Iterable, Sequence
 
+# 系统/工具条目（不是用户真实发言）的 sender_id 前缀；bot 自己的消息
+# ``__bot__`` 算真实消息，不在此列。窗口按真实消息计时会用到。
+SYSTEM_SENDER_PREFIX = "__"
+BOT_SENDER_ID = "__bot__"  # 与 decision.BOT_SENDER_ID 保持一致
+
 SCHEMA = """CREATE TABLE IF NOT EXISTS people (
     person_id     TEXT PRIMARY KEY,
     platform      TEXT NOT NULL,
@@ -48,10 +53,14 @@ CREATE TABLE IF NOT EXISTS raw_messages (
     sender_name TEXT NOT NULL DEFAULT '',
     text        TEXT NOT NULL,
     ts          REAL NOT NULL,
-    processed   INTEGER NOT NULL DEFAULT 0
+    processed   INTEGER NOT NULL DEFAULT 0,
+    -- 平台消息 id 与它引用的消息 id（入站/出站都记，用于引用解析与自我时间线）
+    platform_msg_id TEXT NOT NULL DEFAULT '',
+    reply_to_id     TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_raw_chat ON raw_messages(chat_id, ts);
 CREATE INDEX IF NOT EXISTS idx_raw_pending ON raw_messages(processed, sender_id);
+CREATE INDEX IF NOT EXISTS idx_raw_platform_msg ON raw_messages(platform, platform_msg_id);
 
 CREATE TABLE IF NOT EXISTS memory_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -134,6 +143,8 @@ class RawMessage:
     sender_name: str
     text: str
     ts: float
+    platform_msg_id: str = ""
+    reply_to_id: str = ""
 
 
 @dataclass
@@ -173,6 +184,8 @@ class MemoryStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         with self._lock:
+            # 先给旧库补列，再执行建表/建索引脚本（索引引用了新列）
+            _migrate_raw_messages(self._conn)
             self._conn.executescript(SCHEMA)
             self._conn.commit()
 
@@ -594,18 +607,76 @@ class MemoryStore:
         sender_name: str = "",
         ts: float | None = None,
         processed: bool = False,
+        platform_msg_id: str = "",
+        reply_to_id: str = "",
     ) -> int:
         ts = time.time() if ts is None else ts
         with self._lock:
             cur = self._conn.execute(
                 """
-                INSERT INTO raw_messages(platform, chat_id, chat_type, sender_id, sender_name, text, ts, processed)
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO raw_messages(platform, chat_id, chat_type, sender_id, sender_name, text, ts, processed,
+                                         platform_msg_id, reply_to_id)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (platform, str(chat_id), chat_type, str(sender_id), sender_name, text, ts, 1 if processed else 0),
+                (
+                    platform,
+                    str(chat_id),
+                    chat_type,
+                    str(sender_id),
+                    sender_name,
+                    text,
+                    ts,
+                    1 if processed else 0,
+                    str(platform_msg_id or ""),
+                    str(reply_to_id or ""),
+                ),
             )
             self._conn.commit()
         return int(cur.lastrowid)
+
+    def platform_message_exists(
+        self,
+        platform: str,
+        platform_msg_id: str,
+        *,
+        since: float | None = None,
+        chat_id: str | None = None,
+    ) -> bool:
+        """平台消息 id 是否已在流水里（入站去重用）；``since`` 限定时间窗。"""
+        if not platform_msg_id:
+            return False
+        sql = "SELECT 1 FROM raw_messages WHERE platform = ? AND platform_msg_id = ? AND platform_msg_id <> ''"
+        params: list = [platform, str(platform_msg_id)]
+        if since is not None:
+            sql += " AND ts >= ?"
+            params.append(since)
+        if chat_id is not None:
+            sql += " AND chat_id = ?"
+            params.append(str(chat_id))
+        sql += " LIMIT 1"
+        with self._lock:
+            row = self._conn.execute(sql, params).fetchone()
+        return row is not None
+
+    def message_by_platform_id(
+        self,
+        platform: str,
+        platform_msg_id: str,
+        *,
+        chat_id: str | None = None,
+    ) -> RawMessage | None:
+        """按平台消息 id 反查流水里的一条消息（引用解析用）。"""
+        if not platform_msg_id:
+            return None
+        sql = "SELECT * FROM raw_messages WHERE platform = ? AND platform_msg_id = ?"
+        params: list = [platform, str(platform_msg_id)]
+        if chat_id is not None:
+            sql += " AND chat_id = ?"
+            params.append(str(chat_id))
+        sql += " ORDER BY id DESC LIMIT 1"
+        with self._lock:
+            row = self._conn.execute(sql, params).fetchone()
+        return self._row_to_raw(row) if row else None
 
     def recent_messages(
         self,
@@ -613,8 +684,14 @@ class MemoryStore:
         limit: int = 30,
         since: float | None = None,
         platform: str | None = None,
+        *,
+        real_only: bool = False,
     ) -> list[RawMessage]:
-        """按时间正序返回某会话最近的消息。"""
+        """按时间正序返回某会话最近的消息。
+
+        ``real_only=True`` 时排除系统/工具条目（sender_id 以 ``__`` 开头，
+        bot 自己的 ``__bot__`` 不算），窗口只按真实消息计。
+        """
         sql = "SELECT * FROM raw_messages WHERE chat_id = ?"
         params: list = [str(chat_id)]
         if platform is not None:
@@ -623,6 +700,10 @@ class MemoryStore:
         if since is not None:
             sql += " AND ts >= ?"
             params.append(since)
+        if real_only:
+            # 不用 LIKE：``_`` 是 LIKE 的通配符，这里按前缀切片精确比较
+            sql += " AND (substr(sender_id, 1, ?) <> ? OR sender_id = ?)"
+            params.extend([len(SYSTEM_SENDER_PREFIX), SYSTEM_SENDER_PREFIX, BOT_SENDER_ID])
         sql += " ORDER BY ts DESC, id DESC LIMIT ?"
         params.append(limit)
         with self._lock:
@@ -711,6 +792,8 @@ class MemoryStore:
             sender_name=row["sender_name"],
             text=row["text"],
             ts=row["ts"],
+            platform_msg_id=row["platform_msg_id"] or "",
+            reply_to_id=row["reply_to_id"] or "",
         )
 
     # ------------------------------------------------------------------
@@ -863,3 +946,23 @@ class MemoryStore:
 def make_person_id(platform: str, platform_uid: str) -> str:
     """person_id 形如 ``snowluma:12345``；同一人不同平台暂不合并。"""
     return f"{platform}:{platform_uid}"
+
+
+# 旧库升级：raw_messages 后加的列（列名 -> 列定义）
+_RAW_MESSAGE_MIGRATIONS: dict[str, str] = {
+    "platform_msg_id": "TEXT NOT NULL DEFAULT ''",
+    "reply_to_id": "TEXT NOT NULL DEFAULT ''",
+}
+
+
+def _migrate_raw_messages(conn: sqlite3.Connection) -> None:
+    """给旧库的 raw_messages 补上新列；新库（表不存在）直接跳过。"""
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'raw_messages'"
+    ).fetchone()
+    if exists is None:
+        return
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(raw_messages)").fetchall()}
+    for name, definition in _RAW_MESSAGE_MIGRATIONS.items():
+        if name not in columns:
+            conn.execute(f"ALTER TABLE raw_messages ADD COLUMN {name} {definition}")
