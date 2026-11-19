@@ -195,3 +195,109 @@ def test_set_enabled_broken_plugin_returns_false(plugin_dir):
     manager.plugins["broken"] = Plugin(name="broken", path=plugin_dir / "broken", enabled=False)
     assert manager.set_enabled("broken", True) is False
     assert manager.plugins["broken"].enabled is False
+
+
+# ----------------------------------------------------------------------
+# 能力通道与生命周期
+# ----------------------------------------------------------------------
+
+LIFECYCLE_SOURCE = '''
+def register(ctx):
+    runtime = ctx.extras.setdefault("life", {"events": [], "published": []})
+    runtime["events"].append("register")
+
+    @ctx.on_start
+    async def started():
+        runtime["events"].append("start")
+
+    @ctx.on_stop
+    async def stopped():
+        runtime["events"].append("stop")
+
+    @ctx.command("publish")
+    async def publish(runtime_ctx, event, args):
+        ok, detail = await ctx.call_capability("qzone.publish", content=args)
+        return f"{ok}:{detail}"
+'''
+
+
+@pytest.fixture()
+def lifecycle_dir(tmp_path: Path) -> Path:
+    root = tmp_path / "plugins"
+    demo = root / "life"
+    demo.mkdir(parents=True)
+    (demo / "plugin.py").write_text(LIFECYCLE_SOURCE, encoding="utf-8")
+    return root
+
+
+def test_plugin_can_call_capability(lifecycle_dir):
+    store = MemoryStore(":memory:")
+    config = Config()
+    config.plugins.dir = str(lifecycle_dir)
+    config.chat.split_delay_seconds = 0
+    manager = PluginManager(config, store)
+    manager.load_all()
+
+    calls = []
+
+    class FakeBot:
+        async def call_capability(self, adapter_name, name, **kwargs):
+            calls.append((adapter_name, name, kwargs))
+            return True, "ok: 1"
+
+    manager.extras["bot"] = FakeBot()
+    bot = RubenBot(config, store, ScriptedLLM(), Persona("Ruben", "你是 Ruben"), plugins=manager)
+    adapter = RecordingAdapter()
+    bot.register_adapter(adapter)
+    asyncio.run(bot.handle_event(private("/publish 今天不错")))
+    assert calls == [(None, "qzone.publish", {"content": "今天不错"})]
+    assert adapter.texts == ["True:ok: 1"]
+
+
+def test_plugin_capability_without_bot_fails_gracefully(lifecycle_dir):
+    manager = make_manager(lifecycle_dir)
+    manager.load_all()
+    ctx = manager.plugins["life"].commands["publish"]
+
+    async def scenario():
+        # 直接取插件注册时闭包里的 ctx 不便，改为从 manager 重建一个上下文
+        from rubenbot.plugins.loader import PluginContext
+
+        context = PluginContext(manager.plugins["life"], manager)
+        return await context.call_capability("qzone.publish", content="x")
+
+    ok, reason = asyncio.run(scenario())
+    assert ok is False and "未就绪" in reason
+
+
+def test_lifecycle_start_stop_on_toggle(lifecycle_dir):
+    manager = make_manager(lifecycle_dir, enabled=[])
+    manager.load_all()
+    plugin = manager.plugins["life"]
+    assert plugin.enabled is False
+    # 启用时 register + on_start 都会跑（此时没有事件循环，协程回调被丢弃）
+    assert manager.set_enabled("life", True) is True
+    assert plugin.enabled is True
+    assert manager.extras["life"]["events"] == ["register"]
+
+    async def scenario():
+        # 有事件循环时重新禁用/启用，生命周期回调会被调度执行
+        manager.set_enabled("life", False)
+        await asyncio.sleep(0)
+        manager.set_enabled("life", True)
+        await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+    events = manager.extras["life"]["events"]
+    assert "stop" in events and "start" in events
+
+
+def test_reregister_does_not_duplicate_hooks(lifecycle_dir):
+    manager = make_manager(lifecycle_dir, enabled=[])
+    manager.load_all()
+    plugin = manager.plugins["life"]
+    manager.set_enabled("life", True)
+    first = len(plugin.message_hooks), len(plugin.start_hooks)
+    manager.set_enabled("life", False)
+    manager.set_enabled("life", True)
+    assert (len(plugin.message_hooks), len(plugin.start_hooks)) == first

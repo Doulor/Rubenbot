@@ -8,12 +8,22 @@ ctx 提供：
 - ``on_before_reply(handler)``：``handler(ctx, event, messages)``，可返回新的 messages
 - ``on_after_reply(handler)``：``handler(ctx, event, reply)``
 - ``command(name, handler)``：注册命令，``handler(ctx, event, args)`` 返回字符串作为回复
+- ``on_start(handler)`` / ``on_stop(handler)``：插件启用 / 停用时的生命周期回调
+  （后台任务据此启动与干净退出；可同步/异步，异常只记录）
+
+除了 ``store`` / ``config``，插件还可以经 ``PluginContext`` 使用：
+
+- ``call_capability(name, **kwargs)``：走核心能力入口（如 ``qzone.publish``），
+  返回 ``(是否成功, 说明/原因)``；适配器不支持、配置关闭或执行失败都只返回原因
+- ``llm``：核心的 LLM 客户端（需要 bot 已就绪，否则为 None）
+- ``bot`` / ``runtime``：宿主 bot 与最近一次分发时的运行时上下文
 
 钩子与命令里的异常都会被捕获并记录，不会拖垮主循环。
 """
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import inspect
 import logging
@@ -49,6 +59,10 @@ class Plugin:
     before_reply_hooks: list[MessageHook] = field(default_factory=list)
     after_reply_hooks: list[MessageHook] = field(default_factory=list)
     commands: dict[str, Command] = field(default_factory=dict)
+    # 插件停用/卸载时的清理回调（关闭后台任务等）
+    stop_hooks: list[Callable[[], Any]] = field(default_factory=list)
+    # 插件启用时的启动回调（拉起后台任务等）
+    start_hooks: list[Callable[[], Any]] = field(default_factory=list)
     enabled: bool = True
     # 是否真的执行过 register；加载时被禁用的插件是 False
     loaded: bool = False
@@ -65,6 +79,56 @@ class PluginContext:
         # 插件开发者可以通过它拿到宿主的其他组件
         self.extras: dict[str, Any] = manager.extras
 
+    # ------------------------------------------------------------------
+    # 宿主组件与平台能力
+    # ------------------------------------------------------------------
+
+    @property
+    def runtime(self) -> Any | None:
+        """最近一次分发时的运行时上下文（``BotContext``），可能为 None。"""
+        return getattr(self.manager, "current_runtime", None)
+
+    @property
+    def bot(self) -> Any | None:
+        """宿主 bot。
+
+        优先取构造 ``PluginManager`` 时注入的 ``extras["bot"]``，否则取最近
+        一次分发的运行时上下文里的 bot（宿主每处理一条消息都会更新）。
+        """
+        bot = self.extras.get("bot")
+        if bot is not None:
+            return bot
+        runtime = self.runtime
+        extra = getattr(runtime, "extras", None)
+        return extra.get("bot") if isinstance(extra, dict) else None
+
+    @property
+    def llm(self) -> Any | None:
+        """核心的 LLM 客户端；bot 尚未就绪时为 None。"""
+        return getattr(self.bot, "llm", None)
+
+    async def call_capability(
+        self,
+        name: str,
+        *,
+        adapter: str | None = None,
+        **kwargs: Any,
+    ) -> tuple[bool, str]:
+        """经核心能力入口调用平台能力，返回 ``(是否成功, 说明/失败原因)``。
+
+        插件不直接碰任何平台协议：未声明能力、配置关闭、执行失败都只会拿到
+        一个失败原因，不会抛异常。
+        """
+        bot = self.bot
+        call = getattr(bot, "call_capability", None)
+        if not callable(call):
+            return False, "宿主未就绪，无法调用平台能力"
+        try:
+            return await call(adapter, name, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - 能力失败不能拖垮插件
+            logger.warning("插件调用能力 %s 异常：%s", name, exc)
+            return False, str(exc) or exc.__class__.__name__
+
     def on_message(self, handler: MessageHook) -> MessageHook:
         self.plugin.message_hooks.append(handler)
         return handler
@@ -75,6 +139,22 @@ class PluginContext:
 
     def on_after_reply(self, handler: MessageHook) -> MessageHook:
         self.plugin.after_reply_hooks.append(handler)
+        return handler
+
+    def on_start(self, handler: Callable[[], Any]) -> Callable[[], Any]:
+        """注册插件启动回调：插件加载后、及运行时被重新启用时调用。
+
+        回调可以同步也可以返回 awaitable；异常只记录不向外抛。
+        """
+        self.plugin.start_hooks.append(handler)
+        return handler
+
+    def on_stop(self, handler: Callable[[], Any]) -> Callable[[], Any]:
+        """注册插件清理回调：插件被禁用时调用（后台任务据此干净退出）。
+
+        回调可以同步也可以返回 awaitable；异常只记录不向外抛。
+        """
+        self.plugin.stop_hooks.append(handler)
         return handler
 
     def command(self, name: str, handler: CommandHandler | None = None):
@@ -106,6 +186,12 @@ class PluginManager:
         self.store = store
         self.extras: dict[str, Any] = extras or {}
         self.plugins: dict[str, Plugin] = {}
+        # 最近一次分发时的运行时上下文（BotContext）：插件可从它拿 bot、persona 等
+        self.current_runtime: Any = None
+
+    def _remember_runtime(self, ctx) -> None:
+        if ctx is not None:
+            self.current_runtime = ctx
 
     @property
     def enabled_plugins(self) -> list[Plugin]:
@@ -156,8 +242,17 @@ class PluginManager:
         register = getattr(module, "register", None)
         if not callable(register):
             raise AttributeError("plugin.py 缺少 register(ctx) 函数")
+        # 运行时重新启用会重新 register：先清掉上次注册的钩子，避免重复分发
+        plugin.message_hooks.clear()
+        plugin.before_reply_hooks.clear()
+        plugin.after_reply_hooks.clear()
+        plugin.commands.clear()
+        plugin.start_hooks.clear()
+        plugin.stop_hooks.clear()
         register(PluginContext(plugin, self))
         plugin.loaded = True
+        if plugin.enabled:
+            self._run_lifecycle(plugin, plugin.start_hooks, "on_start")
 
     # ------------------------------------------------------------------
     # 分发
@@ -165,6 +260,7 @@ class PluginManager:
 
     async def run_message_hooks(self, ctx, event: MessageEvent) -> bool:
         """返回 False 表示某插件拦截了这条消息。"""
+        self._remember_runtime(ctx)
         for plugin in self.enabled_plugins:
             for handler in plugin.message_hooks:
                 try:
@@ -198,6 +294,7 @@ class PluginManager:
 
     async def handle_commands(self, ctx, event: MessageEvent) -> bool:
         """识别 ``/命令 参数`` 并执行；返回是否命中。"""
+        self._remember_runtime(ctx)
         text = (event.text or "").strip()
         prefix = self.config.plugins.command_prefix
         if not prefix or not text.startswith(prefix):
@@ -248,17 +345,54 @@ class PluginManager:
 
         禁用只是让分发时跳过它（已注册的钩子留着，再次启用立即生效）；
         启用一个加载时被跳过的插件时，会现场执行它的 ``register``。
+        禁用/启用时会同步调用插件的 ``on_stop`` / ``on_start`` 回调，
+        后台任务据此启动和干净退出。
         这个开关只在内存里，重启后以配置文件为准。
         """
         plugin = self.plugins.get(name)
         if plugin is None:
             return False
+        was_enabled = plugin.enabled
         if enabled and not plugin.loaded:
+            plugin.enabled = True  # _load_plugin 按启用状态决定是否跑 on_start
             try:
                 self._load_plugin(plugin)
             except Exception as exc:  # noqa: BLE001 - 插件失败不能拖垮宿主
+                plugin.enabled = was_enabled
                 logger.warning("启用插件 %s 失败：%s", name, exc)
                 return False
-        plugin.enabled = enabled
+        else:
+            plugin.enabled = enabled
+            if enabled and not was_enabled:
+                self._run_lifecycle(plugin, plugin.start_hooks, "on_start")
+            elif not enabled and was_enabled:
+                self._run_lifecycle(plugin, plugin.stop_hooks, "on_stop")
         logger.info("插件 %s 已%s", name, "启用" if enabled else "禁用")
         return True
+
+    @staticmethod
+    def _run_lifecycle(plugin: Plugin, hooks: list[Callable[[], Any]], label: str) -> None:
+        """同步调用生命周期回调；协程回调有事件循环时调度，否则丢弃并记日志。"""
+        for handler in list(hooks):
+            try:
+                result = handler()
+            except Exception as exc:  # noqa: BLE001 - 回调失败不能拖垮宿主
+                logger.warning("插件 %s 的 %s 回调异常：%s", plugin.name, label, exc)
+                continue
+            if inspect.isawaitable(result):
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    close = getattr(result, "close", None)
+                    if callable(close):
+                        close()
+                    logger.debug("插件 %s 的 %s 是协程，当前没有事件循环，已跳过", plugin.name, label)
+                    continue
+                loop.create_task(_await_close(result, plugin.name, label))
+
+
+async def _await_close(result: Any, plugin_name: str, label: str) -> None:
+    try:
+        await result
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("插件 %s 的 %s 回调异常：%s", plugin_name, label, exc)
