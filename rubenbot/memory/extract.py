@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from ..llm import LLMProtocol, parse_json_payload
-from ..memory.retrieve import jaccard, normalize
+from ..memory.retrieve import audience_for_chat, jaccard, normalize
 from ..memory.store import (
     VALID_SENSITIVITY,
     VALID_STABILITY,
@@ -530,8 +530,5 @@ def _clock(hint: str) -> tuple[int, int]:
     return 12, 0
 
 
-def audience_for_chat(chat_type: str, chat_id: str) -> str:
-    """按来源会话类型判定原始受众。"""
-    if str(chat_type).lower() == "private":
-        return "private"
-    return f"group:{chat_id}"
+# ``audience_for_chat`` 定义在读取侧（retrieve），写入侧与读取侧共用同一份判定；
+# 这里继续导出同名符号（见文件顶部的 import），旧调用方无需改动。

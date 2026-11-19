@@ -73,6 +73,25 @@ RubenBot 是一个以**记忆**为核心的拟人社交聊天 bot 框架。它�
 4. 按人分组，天然不会跨人合并；
 5. 每次变更写 `memory_log`（before/after 全文 + 理由），可撤销。
 
+### 记忆 v2：读取侧（渐进披露与分寸）
+
+写入侧把消息沉淀成「时间线事件 + 事实 → 画像」，读取侧按「像人一样」的原则分层注入：
+
+- **T0 群成员索引（常驻）**：本群近 30 天活跃成员每人一行「昵称｜一句话身份｜话题钩子」，
+  兼任别名表；缓存 10 分钟或画像一更新就失效。
+- **T1 预拉取**：说话人核心画像常驻；被 @、被昵称/钩子命中的在场者拉核心画像与话题相关旧事
+  （时间模糊成「昨天/上周」，不报具体日期）。事实层只留真命中，已提炼进画像的不重复注入；
+  总预算超了先砍事实、再砍时间线，画像核心不动。
+- **T2 recall 工具**：模型支持 OpenAI 工具调用时，生成过程最多两轮 `recall(person_query, topic,
+  time_range)` 深查；中转/模型不支持、或用不上就自动退化为单次生成。
+- **跨会话接续**：私聊时把本人近 24h 在别处会话的要点压成背景摘要；群聊永不注入私聊来源。
+- **分寸审查口（`memory/gate.py`，唯一）**：跨场合候选按「同场合/公开放行 → 三档隐私 → 封存 →
+  已有裁定 → 高敏感扣下并待问 → 模型按准则权衡」判定；模型低置信或任何一步异常一律扣下
+  （fail closed）。裁定落到 `rulings` 复用，同一项对同一类受众不再重复问。
+- **自我**：bot 自己在本会话最近的行为（自我时间线）作为背景注入，只作近况参考，不改人设。
+- **隐私命令**：`/隐私` 查看档位与「记得我什么」（画像只在私聊摊开），`/隐私 模式 正常|隐私|不记`
+  切换，`/隐私 清空` 真删画像/事件/事实并留审计痕迹；灰区拿不准的事会在私聊里自然时机问本人一次。
+
 ### 模块一览
 
 | 路径 | 职责 |
@@ -83,7 +102,8 @@ RubenBot 是一个以**记忆**为核心的拟人社交聊天 bot 框架。它�
 | `rubenbot/core.py` | 消息主循环、合并窗口调度、决策、上下文拼装、拆条发送、后台维护 |
 | `rubenbot/decision.py` | 回复意愿系统：消息合并、硬触发、意愿评分、生成否决标记 |
 | `rubenbot/memory/store.py` | SQLite 读写唯一入口：人物、记忆、流水、变更日志、撤销 |
-| `rubenbot/memory/retrieve.py` | 分词、Jaccard、IDF 加权检索 |
+| `rubenbot/memory/retrieve.py` | 分词、Jaccard、IDF 加权检索；读取侧（群成员索引 / 预拉取 / 跨会话 / recall） |
+| `rubenbot/memory/gate.py` | 唯一的分寸审查口：跨场合记忆的放行/扣下/待询问判断（fail closed） |
 | `rubenbot/memory/extract.py` | 批量抽取 + 去重 + 标记已处理 |
 | `rubenbot/memory/consolidate.py` | 归纳提议的解析、校验与执行 |
 | `rubenbot/adapters/base.py` | `BaseAdapter`、`MessageEvent`、`Segment` |
@@ -92,6 +112,7 @@ RubenBot 是一个以**记忆**为核心的拟人社交聊天 bot 框架。它�
 | `rubenbot/plugins/loader.py` | 插件发现、钩子与命令分发 |
 | `rubenbot/__main__.py` | 命令行入口 `rubenbot` / `python -m rubenbot` |
 | `plugins/hello/` | 示例插件：`/hello` 命令 + `on_message` 钩子 |
+| `plugins/privacy/` | 内置插件：`/隐私` 命令（档位 / 自查 / 清空）与灰区询问投递 |
 | `data/SOUL.md` | 默认人格示例 |
 
 ---
@@ -166,7 +187,7 @@ ConsoleAdapter 的输入格式：
 pytest
 ```
 
-当前共 142 个测试，覆盖存储 CRUD / 变更日志与撤销、检索打分、抽取去重、归纳校验（不许新词、20% 上限、user 来源不可删）、回复决策（合并窗口、动量衰减、占比抑制、冷却、硬触发、生成否决）、主循环、插件、SnowLuma 事件解析，以及 Console + 假 LLM 的端到端流程。
+当前共 594 个测试，覆盖存储 CRUD / 变更日志与撤销、检索打分、抽取去重、归纳校验（不许新词、20% 上限、user 来源不可删）、画像提炼与时间线压缩、记忆读取侧（索引 / 预拉取 / 预算裁剪 / 跨会话 / 分寸审查 / 隐私命令）、回复决策（合并窗口、动量衰减、占比抑制、冷却、硬触发、生成否决）、主循环、插件、SnowLuma 事件解析，以及 Console + 假 LLM 的端到端流程。
 
 ---
 
@@ -186,6 +207,11 @@ pytest
 | | `consolidate_new_threshold` | 新增记忆达到多少条触发归纳 |
 | | `consolidate_interval_hours` | 距上次归纳超过多久触发 |
 | | `raw_keep_per_chat` | 每会话保留的已处理流水条数 |
+| | `index_max_members` `index_ttl_seconds` `index_active_days` | 群成员索引（T0）的人数、缓存与活跃窗口 |
+| | `inject_budget_tokens` `profile_inject_max_chars` | 记忆注入预算与画像篇幅；超预算先砍事实、再砍时间线 |
+| | `cross_session_hours` `self_inject_hours` `self_inject_limit` | 私聊跨会话摘要与自我注入的回看窗口 |
+| | `gate_confidence_threshold` `gate_ask_high_sensitivity` | 分寸审查的置信度下限与灰区询问开关 |
+| | `recall_tool_enabled` `recall_tool_max_rounds` | recall 工具循环开关与轮数（模型不支持时自动退化） |
 | `chat` | `history_size` | 上下文带入的最近消息条数（只计真实消息，系统/工具条目不占窗口） |
 | | `history_ttl_hours` | 超过这个时间的旧消息不再拼进上下文 |
 | | `dedupe_ttl_seconds` | 入站去重窗口：同一平台消息 id 在此窗口内重复到达即丢弃（默认 300 秒，0 关闭） |
@@ -227,7 +253,7 @@ def register(ctx):
 - `on_after_reply(handler)`：`handler(ctx, event, reply)`
 - `command(name, handler)`：`handler(ctx, event, args)`，返回字符串作为回复；可直接调用也可作装饰器
 
-钩子和命令都同时支持同步/异步函数，异常会被捕获并记录，不会拖垮主循环。`ctx` 上还能拿到 `store`、`config`，以及 `runtime` 中的 `persona`、`adapters`、`retriever`、`extractor`、`consolidator`。
+钩子和命令都同时支持同步/异步函数，异常会被捕获并记录，不会拖垮主循环。`ctx` 上还能拿到 `store`、`config`，以及 `runtime` 中的 `persona`、`adapters`、`retriever`、`extractor`、`consolidator`；记忆读取侧与分寸审查口经 `ctx.extras["memory_reader"]` / `ctx.extras["privacy_gate"]`（或 `runtime.memory` / `runtime.gate`）取用。
 
 ---
 
@@ -288,6 +314,29 @@ def register(ctx):
 
 17. **WebUI 放到第二阶段**
    第一阶段先把核心链路和可观测性（日志、变更日志、插件列表接口）打牢；`PluginManager.list_plugins()` 等已为后续 WebUI 预留查询入口。
+
+### 记忆 v2 读取侧的实现取舍
+
+18. **隐私判断只有 `gate.py` 一个口**
+    其他模块（读取侧、recall、privacy 插件）只负责「把候选凑齐、把问题问出去」，不做任何「这个人能不能看」的判断。审查顺序固定：同场合/公开放行（不调模型）→ 三档隐私 → 封存 → 已有裁定 → 高敏感扣下并排队 → 模型按准则权衡。**任何一步异常，剩余跨场合项全部扣下**（fail closed）；同场合项不受异常影响。
+
+19. **「群 → 私」不审查，「私 → 群」「群 A → 群 B」才审查**
+    不对称原则：跟本人私聊时回看他自己在群里说过的话是自然的；反过来把私聊内容带到群里才是风险。历史数据没有 `audience` 时按同场合处理，保证旧记忆仍可用。
+
+20. **自查不走审查口**
+    「你记得我什么」是本人查看本人画像，不属于跨场合披露；若也走 gate，隐私模式/高敏感默认扣下会让本人看不到自己的东西，和规格相反。群聊里不自查（避免档案被围观），`/隐私` 在群里也只报档位、画像只在私聊摊开。
+
+21. **recall 工具的退化是常态**
+    `chat_with_tools` 只做一次往返，循环在 core（最多 `recall_tool_max_rounds` 轮，默认 2）。中转返回「不支持 tools」时记 `ToolUnsupported` 并记住不再尝试；网络错误、模型不用工具、工具结果异常都只是退化为原来的单次生成，不影响回复。工具结果与普通召回走同一个 gate。
+
+22. **注入预算的裁剪顺序是硬约定**
+    `inject_budget_tokens` 超了只砍「事实 → 时间线 → 跨会话 → 自我 → 索引 → 被提及者画像」，说话人核心画像不参与裁剪。宁可少给背景，也不让主对话对象的关键信息被挤掉。
+
+23. **时间一律模糊化**
+    注入的时间线、跨会话摘要、自我时间线都用 `format_relative_time` 压成「今天/昨天/前天/上周/上个月」，不出现精确时间戳和会话 id——人记得的本来就是「大概什么时候」。
+
+24. **「清空」是真删，日志只留计数**
+    `/隐私 清空` 删除画像、事件、事实、裁定、待询问；`memory_log` 只记 `purge` 动作与各类条数（正文不留），并直接标记 `reverted=1`、禁止 `restore`，否则「清空」就不算真删。
 
 ---
 

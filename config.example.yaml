@@ -5,9 +5,10 @@ llm:
   base_url: "https://api.deepseek.com/v1"
   api_key: "${RUBENBOT_API_KEY}"
   chat_model: "deepseek-chat"
-  # 抽取/归纳缺省时跟随 chat_model
+  # 抽取/归纳/审查缺省时跟随 chat_model
   extract_model: ""
   consolidate_model: ""
+  gate_model: ""
   temperature: 0.8
   timeout: 60
   max_retries: 2
@@ -41,6 +42,22 @@ memory:
   timeline_prune_after_days: 90     # 90 天前只留高显著度事件
   timeline_prune_keep_salience: 0.7
   self_event_max_chars: 120      # 自我时间线里每条消息的截断长度
+  # 记忆 v2 读取侧：渐进披露、跨会话、分寸审查
+  index_active_days: 30          # 群成员索引只收近 N 天在本群活跃的人
+  index_max_members: 40          # 索引最多多少人
+  index_ttl_seconds: 600         # 索引缓存多久失效（画像更新时立即失效）
+  index_identity_chars: 40       # 索引「一句话身份」截断长度
+  mentioned_max_people: 3        # 一轮最多预拉几个被提及者的画像
+  profile_inject_max_chars: 600  # 说话人核心画像注入的最大字符数
+  inject_budget_tokens: 1200     # 本轮记忆注入预算；超了先砍事实、再砍时间线
+  timeline_hit_limit: 6          # 每人最多带几条相关旧事
+  cross_session_hours: 24        # 私聊跨会话摘要回看的小时数
+  self_inject_hours: 24          # 自我注入回看本会话的小时数
+  self_inject_limit: 3           # 自我注入最多几条
+  gate_confidence_threshold: 0.6 # 分寸审查模型判定的置信度下限
+  gate_ask_high_sensitivity: true # 高敏感跨场合项是否进待问队列
+  recall_tool_enabled: true      # 模型支持工具调用时开放 recall 工具
+  recall_tool_max_rounds: 2      # recall 工具循环最多几轮
 
 chat:
   bot_name: "Ruben"

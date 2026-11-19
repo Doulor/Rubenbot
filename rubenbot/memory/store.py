@@ -765,10 +765,11 @@ class MemoryStore:
     def restore(self, log_id: int) -> bool:
         """撤销一条日志：把 before 快照写回，并生成一条可反撤销的 restore 日志。
 
-        只有记忆变更日志能撤销；画像变更（``profile_update``）只作审计留痕。
+        只有记忆变更日志能撤销；画像变更（``profile_update``）只作审计留痕，
+        本人要求清空（``purge``）是真删，绝不能从日志里撤销回来。
         """
         log = self.get_log(log_id)
-        if log is None or log.reverted or log.action == "profile_update":
+        if log is None or log.reverted or log.action in ("profile_update", "purge"):
             return False
         before_ids = {int(m["id"]) for m in log.before}
         after_ids = {int(m["id"]) for m in log.after}
@@ -1472,6 +1473,110 @@ class MemoryStore:
             platform_msg_id=row["platform_msg_id"] or "",
             reply_to_id=row["reply_to_id"] or "",
         )
+
+    def active_senders(
+        self,
+        *,
+        platform: str | None = None,
+        chat_id: str | None = None,
+        since: float,
+        limit: int | None = None,
+    ) -> list[dict]:
+        """近期活跃的发送者：``[{sender_id, sender_name, last_ts, count}, ...]``。
+
+        ``chat_id`` 给定则只看该会话（群成员索引用）；不给则跨会话汇总，
+        每个 sender_id 一行（跨会话摘要用）。系统条目与 bot 自己都排除
+        （``__bot__`` 也以 ``__`` 开头，不能像 ``recent_messages`` 那样单独放行）。
+        """
+        sql = """
+            SELECT sender_id, MAX(sender_name) AS sender_name,
+                   MAX(ts) AS last_ts, COUNT(*) AS count
+            FROM raw_messages
+            WHERE ts >= ? AND sender_id <> ''
+              AND substr(sender_id, 1, ?) <> ?
+        """
+        params: list = [float(since), len(SYSTEM_SENDER_PREFIX), SYSTEM_SENDER_PREFIX]
+        if platform is not None:
+            sql += " AND platform = ?"
+            params.append(platform)
+        if chat_id is not None:
+            sql += " AND chat_id = ?"
+            params.append(str(chat_id))
+        sql += " GROUP BY sender_id ORDER BY last_ts DESC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(max(1, int(limit)))
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [
+            {
+                "sender_id": row["sender_id"],
+                "sender_name": row["sender_name"] or "",
+                "last_ts": float(row["last_ts"] or 0.0),
+                "count": int(row["count"] or 0),
+            }
+            for row in rows
+        ]
+
+    def profile_evidence_refs(self, person_id: str) -> set[str]:
+        """某人画像行挂着的全部证据引用（``event:12`` / ``memory:3``）。"""
+        return {ref for refs in self.get_profile_evidence(person_id).values() for ref in refs}
+
+    def purge_person(self, person_id: str, *, reason: str = "", now: float | None = None) -> dict:
+        """彻底删除某人的记忆、事件、画像、裁定与待询问，并在 memory_log 留痕。
+
+        返回各类被删条数。``memory_log`` 只记数量与原因，不把被删正文再留存
+        一份（否则「清空」就不算真删了）；这条日志标记为不可撤销。
+        """
+        now = time.time() if now is None else now
+        with self._lock:
+            try:
+                counts = {
+                    "memories": int(
+                        self._conn.execute(
+                            "SELECT COUNT(*) AS c FROM memories WHERE person_id = ?", (person_id,)
+                        ).fetchone()["c"]
+                    ),
+                    "events": int(
+                        self._conn.execute(
+                            "SELECT COUNT(*) AS c FROM events WHERE person_id = ?", (person_id,)
+                        ).fetchone()["c"]
+                    ),
+                    "profile": 1 if self.get_profile(person_id) is not None else 0,
+                    "rulings": int(
+                        self._conn.execute(
+                            "SELECT COUNT(*) AS c FROM rulings WHERE person_id = ?", (person_id,)
+                        ).fetchone()["c"]
+                    ),
+                    "pending_asks": int(
+                        self._conn.execute(
+                            "SELECT COUNT(*) AS c FROM pending_asks WHERE person_id = ?", (person_id,)
+                        ).fetchone()["c"]
+                    ),
+                }
+                self._conn.execute("DELETE FROM memories WHERE person_id = ?", (person_id,))
+                self._conn.execute("DELETE FROM events WHERE person_id = ?", (person_id,))
+                self._conn.execute("DELETE FROM profile_evidence WHERE person_id = ?", (person_id,))
+                self._conn.execute("DELETE FROM profiles WHERE person_id = ?", (person_id,))
+                self._conn.execute("DELETE FROM rulings WHERE person_id = ?", (person_id,))
+                self._conn.execute("DELETE FROM pending_asks WHERE person_id = ?", (person_id,))
+                self._conn.execute(
+                    "INSERT INTO memory_log(action, person_id, before_json, after_json, reason, created_at, reverted)"
+                    " VALUES('purge', ?, '[]', '[]', ?, ?, 1)",
+                    (
+                        person_id,
+                        (
+                            f"{reason or '本人要求清空记忆'}；删除计数={json.dumps(counts, ensure_ascii=False)}"
+                            "；正文不保留，不可撤销"
+                        ),
+                        now,
+                    ),
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return counts
 
     # ------------------------------------------------------------------
     # meta（后台任务的游标等）

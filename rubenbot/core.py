@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
 import re
@@ -35,10 +36,11 @@ from .decision import (
     ReplyDecision,
     parse_generation_output,
 )
-from .llm import LLMClient, LLMProtocol
+from .llm import LLMClient, LLMProtocol, ToolUnsupported
 from .memory.consolidate import Consolidator
 from .memory.extract import MemoryExtractor, audience_for_chat
-from .memory.retrieve import Retriever
+from .memory.gate import PrivacyGate
+from .memory.retrieve import MemoryReader, Retriever
 from .memory.store import MemoryStore, make_person_id
 from .persona import Persona
 from .plugins.loader import PluginContext, PluginManager
@@ -49,6 +51,36 @@ _SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？!?…~～])\s*|\n+")
 # 适配器异常后的重启退避（秒）
 ADAPTER_RESTART_MIN = 1.0
 ADAPTER_RESTART_MAX = 30.0
+
+# recall 工具的定义（T2）。只开放这一个工具，模型不用/失败就退化为单次生成。
+RECALL_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "recall",
+        "description": (
+            "回忆关于某人或某个话题的记忆（画像、旧事、事实）。"
+            "背景记忆不够用时才调用，不要为了闲聊反复调用。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "person_query": {
+                    "type": "string",
+                    "description": "要回忆的人：昵称或你在上下文里看到的名字",
+                },
+                "topic": {
+                    "type": "string",
+                    "description": "话题关键词；留空表示看这个人最近的事",
+                },
+                "time_range": {
+                    "type": "string",
+                    "description": "时间范围，如 7d / 24h / 3d；留空表示不限",
+                },
+            },
+            "required": ["person_query"],
+        },
+    },
+}
 
 
 def format_scene(event: MessageEvent, display: str) -> str:
@@ -85,6 +117,16 @@ class BotContext:
     def plugins(self) -> PluginManager | None:
         return self.extras.get("plugins")
 
+    @property
+    def memory(self) -> Any | None:
+        """读取侧（索引 / 预拉取 / recall）；privacy 插件等可从这拿。"""
+        return self.extras.get("memory_reader")
+
+    @property
+    def gate(self) -> PrivacyGate | None:
+        """唯一的分寸审查口；插件判断「能不能说」一律走它。"""
+        return self.extras.get("privacy_gate")
+
 
 class RubenBot:
     """把各模块串起来的主循环。"""
@@ -105,6 +147,10 @@ class RubenBot:
         self.persona = persona
         self.rng = rng or random.Random()
         self.retriever = Retriever(store)
+        self.gate = PrivacyGate(store, llm, config.memory)
+        self.memory_reader = MemoryReader(
+            store, llm, config.memory, gate=self.gate, retriever=self.retriever
+        )
         self.extractor = MemoryExtractor(llm, store, config.memory)
         self.consolidator = Consolidator(llm, store, config.memory)
         self.adapters: dict[str, BaseAdapter] = {}
@@ -117,7 +163,12 @@ class RubenBot:
             retriever=self.retriever,
             extractor=self.extractor,
             consolidator=self.consolidator,
-            extras={"plugins": plugins, "bot": self},
+            extras={
+                "plugins": plugins,
+                "bot": self,
+                "memory_reader": self.memory_reader,
+                "privacy_gate": self.gate,
+            },
         )
         # 每个会话最近一次收到消息的时间，用于日志/调试
         self._last_activity: dict[str, float] = {}
@@ -163,6 +214,11 @@ class RubenBot:
         self.extractor.llm = self.llm
         self.consolidator.config = config.memory
         self.consolidator.llm = self.llm
+        # 读取侧与审查口：配置/模型一起热换，索引缓存保留（配置里 TTL 会立即生效）
+        self.memory_reader.config = config.memory
+        self.memory_reader.llm = self.llm
+        self.memory_reader.gate.llm = self.llm
+        self.memory_reader.gate.config = config.memory
         self.context.config = config
         if self.plugins is not None:
             self.plugins.config = config
@@ -386,7 +442,7 @@ class RubenBot:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("插件 on_before_reply 异常：%s", exc)
 
-        raw_reply = await self.generate(messages)
+        raw_reply = await self.generate(messages, event=event)
         parsed = parse_generation_output(raw_reply, marker)
         if parsed.vetoed:
             logger.info(
@@ -529,13 +585,6 @@ class RubenBot:
     # 上下文拼装
     # ------------------------------------------------------------------
 
-    def format_memories(self, memories: list) -> str:
-        """把检索到的记忆渲染成一条中性标题；标题不绑定场景，私聊里不会冒出「群」。"""
-        if not memories:
-            return ""
-        lines = [f"- {m.content}" for m in memories]
-        return "你记得的事：\n" + "\n".join(lines)
-
     # 引用消息正文的截断长度（渲染历史时）
     QUOTE_SNIPPET_CHARS = 50
     # 回复目标（本轮正在回的那条）正文的截断长度
@@ -615,21 +664,15 @@ class RubenBot:
         )
 
     async def build_context(self, event: MessageEvent, *, now: float | None = None) -> list[dict[str, str]]:
-        """人格 + 记忆 + 场景 + 上下文要求 + 最近历史（结构化渲染）。"""
+        """人格 + 记忆（索引/画像/时间线/事实/跨会话）+ 场景 + 上下文要求 + 最近历史。"""
         now = time.time() if now is None else now
         persona_prompt = self.persona.system_prompt()
         person_id = make_person_id(event.platform, event.sender_id)
         person = self.store.get_person(person_id)
         display = (person.display_name if person else "") or event.sender_name
 
-        memories = self.retriever.retrieve(
-            event.text,
-            person_id=person_id,
-            group_id=event.chat_id if event.is_group else None,
-            limit=self.config.memory.inject_limit,
-        )
         sections: list[str] = [persona_prompt]
-        memory_text = self.format_memories(memories)
+        memory_text = await self.memory_text(event, now=now)
         if memory_text:
             sections.append(memory_text)
         # 场景说明带行为约束，压住人格文件里可能残留的场景想象
@@ -651,17 +694,167 @@ class RubenBot:
         messages.extend(self.render_history(history))
         return messages
 
+    def recent_window_texts(self, event: MessageEvent, *, now: float | None = None) -> list[str]:
+        """取本轮消息窗口的文本（被提及者识别用），失败返回空列表。"""
+        now = time.time() if now is None else now
+        try:
+            history = self.store.recent_messages(
+                event.chat_id,
+                limit=self.config.chat.history_size,
+                since=now - self.config.chat.history_ttl_hours * 3600,
+                platform=event.platform,
+                real_only=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - 窗口取不到只是少一点上下文
+            logger.warning("读取消息窗口失败：%s", exc)
+            return []
+        return [msg.text for msg in history if msg.sender_id != BOT_SENDER_ID]
+
+    async def memory_text(self, event: MessageEvent, *, now: float | None = None) -> str:
+        """读取侧组装好的记忆区块；任何失败都退化为空（不影响回复）。"""
+        now = time.time() if now is None else now
+        person_id = make_person_id(event.platform, event.sender_id)
+        try:
+            block = await self.memory_reader.assemble(
+                text=event.text,
+                person_id=person_id,
+                platform=event.platform,
+                chat_id=event.chat_id,
+                chat_type=event.chat_type,
+                window_texts=self.recent_window_texts(event, now=now),
+                now=now,
+            )
+        except Exception as exc:  # noqa: BLE001 - 记忆组装失败不能拖垮回复
+            logger.warning("组装记忆区块失败：%s", exc)
+            return ""
+        return block.render()
+
+    async def recall(
+        self,
+        person_query: str,
+        topic: str = "",
+        time_range: str = "",
+        *,
+        event: MessageEvent | None = None,
+        now: float | None = None,
+    ) -> str:
+        """T2：按人/话题/时段深查记忆（结果内部过分寸审查口）。
+
+        ``event`` 给了就按当前会话的受众审查；不给则按「未知受众」审查
+        （跨场合项会被扣下）。任何异常都返回一句「查不到」，不向外抛。
+        """
+        now = time.time() if now is None else now
+        if event is not None:
+            audience_now = audience_for_chat(event.chat_type, event.chat_id)
+            speaker = make_person_id(event.platform, event.sender_id)
+        else:
+            audience_now, speaker = "unknown", ""
+        try:
+            return await self.memory_reader.recall(
+                person_query,
+                topic,
+                time_range,
+                audience_now=audience_now,
+                speaker=speaker,
+                now=now,
+            )
+        except Exception as exc:  # noqa: BLE001 - 回忆失败只当没查到
+            logger.warning("recall 失败：%s", exc)
+            return "回忆失败，暂时想不起来。"
+
     # ------------------------------------------------------------------
     # 生成与发送
     # ------------------------------------------------------------------
 
-    async def generate(self, messages: list[dict[str, str]]) -> str:
+    async def generate(self, messages: list[dict[str, str]], *, event: MessageEvent | None = None) -> str:
+        """生成回复；模型支持工具调用时先给最多两轮 recall 工具循环。
+
+        工具不可用、模型不用工具、或任何一步出问题，都退化为普通单次生成。
+        """
+        if event is not None and self.config.memory.recall_tool_enabled:
+            try:
+                reply = await self._generate_with_tools(messages, event)
+            except ToolUnsupported as exc:
+                logger.debug("当前模型不支持工具调用，退化为单次生成：%s", exc)
+                reply = None
+            except Exception as exc:  # noqa: BLE001 - 工具循环失败不能拖死回复
+                logger.warning("recall 工具循环失败，退化为单次生成：%s", exc)
+                reply = None
+            if reply is not None:
+                return reply.strip()
         try:
             reply = await self.llm.complete(messages, role="chat")
         except Exception as exc:  # noqa: BLE001 - LLM 失败不能带死循环
             logger.warning("生成回复失败：%s", exc)
             return ""
         return (reply or "").strip()
+
+    async def _generate_with_tools(self, messages: list[dict[str, str]], event: MessageEvent) -> str | None:
+        """最多两轮 recall 工具循环；返回 None 表示应当退化为单次生成。"""
+        if not getattr(self.llm, "supports_tools", True):
+            raise ToolUnsupported("当前模型已确认不支持工具调用")
+        chat_with_tools = getattr(self.llm, "chat_with_tools", None)
+        if not callable(chat_with_tools):
+            raise ToolUnsupported("当前 LLM 客户端不支持工具调用")
+        max_rounds = max(0, int(self.config.memory.recall_tool_max_rounds))
+        if max_rounds == 0:
+            raise ToolUnsupported("recall 工具循环已关闭")
+        working: list[dict[str, Any]] = list(messages)
+        used_tool = False
+        for _ in range(max_rounds):
+            message = await chat_with_tools(working, [RECALL_TOOL], role="chat")
+            tool_calls = message.get("tool_calls") or []
+            if not tool_calls:
+                content = (message.get("content") or "").strip()
+                if content:
+                    # 模型没要工具、直接给了回复：这就是一次正常生成，不必再花一次请求
+                    return content
+                return None
+            used_tool = True
+            working.append(
+                {
+                    "role": "assistant",
+                    "content": message.get("content") or "",
+                    "tool_calls": tool_calls,
+                }
+            )
+            for call in tool_calls:
+                working.append(await self._tool_result_message(call, event))
+        # 两轮后模型还在要工具：不再给，直接让模型收尾一次
+        message = await chat_with_tools(
+            working, [RECALL_TOOL], role="chat", tool_choice="none"
+        )
+        return message.get("content") or ""
+    async def _tool_result_message(self, call: dict[str, Any], event: MessageEvent) -> dict[str, Any]:
+        """执行一次 recall 工具调用，把结果包装成 tool 消息。"""
+        call_id = str(call.get("id") or "")
+        function = call.get("function") or {}
+        name = str(function.get("name") or "")
+        if name != "recall":
+            return {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": f"没有名为 {name or '（空）'} 的工具。",
+            }
+        arguments = function.get("arguments") or "{}"
+        if isinstance(arguments, str):
+            try:
+                args = json.loads(arguments)
+            except json.JSONDecodeError:
+                args = {}
+        else:
+            args = arguments if isinstance(arguments, dict) else {}
+        try:
+            content = await self.recall(
+                str(args.get("person_query") or ""),
+                str(args.get("topic") or ""),
+                str(args.get("time_range") or ""),
+                event=event,
+            )
+        except Exception as exc:  # noqa: BLE001 - 工具失败只把原因告诉模型
+            logger.warning("recall 工具执行失败：%s", exc)
+            content = f"回忆失败：{exc}"
+        return {"role": "tool", "tool_call_id": call_id, "content": content}
 
     def split_reply(self, reply: str) -> list[str]:
         """按句/长度拆成 2~3 条短消息。"""

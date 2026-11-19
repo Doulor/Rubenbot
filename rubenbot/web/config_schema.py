@@ -72,6 +72,7 @@ def structured_config(config: Config) -> dict[str, Any]:
     # 在「打开设置 → 原样保存」时被误判成改动
     llm["extract_model"] = llm.get("extract_model") or ""
     llm["consolidate_model"] = llm.get("consolidate_model") or ""
+    llm["gate_model"] = llm.get("gate_model") or ""
     webui = asdict(config.webui)
     password = webui.pop("password", "")
     access_token = snow.get("access_token", "")
@@ -243,7 +244,7 @@ def _validate_llm(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
         value = v.text(section["chat_model"], "llm.chat_model")
         if value is not None:
             out["chat_model"] = value
-    for key in ("extract_model", "consolidate_model"):
+    for key in ("extract_model", "consolidate_model", "gate_model"):
         if key in section:
             value = section[key]
             if value is None:
@@ -279,6 +280,15 @@ def _validate_memory(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
         "consolidate_max_memories": 1,
         "consolidate_remove_min": 1,
         "raw_keep_per_chat": 1,
+        # 记忆 v2 读取侧
+        "index_max_members": 1,
+        "index_identity_chars": 8,
+        "mentioned_max_people": 0,
+        "profile_inject_max_chars": 120,
+        "inject_budget_tokens": 0,
+        "timeline_hit_limit": 1,
+        "self_inject_limit": 0,
+        "recall_tool_max_rounds": 0,
     }
     for key, minimum in int_fields.items():
         if key in section:
@@ -289,12 +299,23 @@ def _validate_memory(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
         "dedupe_threshold": (0, 1),
         "consolidate_interval_hours": (0.1, None),
         "consolidate_remove_ratio": (0, 1),
+        # 记忆 v2 读取侧
+        "index_active_days": (0.1, None),
+        "index_ttl_seconds": (0, None),
+        "cross_session_hours": (0.1, None),
+        "self_inject_hours": (0.1, None),
+        "gate_confidence_threshold": (0, 1),
     }
     for key, (minimum, maximum) in float_fields.items():
         if key in section:
             number = v.number(section[key], f"memory.{key}", minimum=minimum, maximum=maximum)
             if number is not None:
                 out[key] = float(number)
+    for key in ("gate_ask_high_sensitivity", "recall_tool_enabled"):
+        if key in section:
+            flag = v.boolean(section[key], f"memory.{key}")
+            if flag is not None:
+                out[key] = flag
     return out
 
 

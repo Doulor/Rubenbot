@@ -1,4 +1,4 @@
-"""记忆层：存储、检索、抽取、归纳，以及记忆 v2 的画像提炼与时间线压缩。"""
+"""记忆层：存储、检索、抽取、归纳，以及记忆 v2 的画像提炼、时间线压缩与读取侧。"""
 
 from .consolidate import Consolidator, ConsolidateResult
 from .distill import ProfileDistiller, ProfileUpdate
@@ -10,7 +10,20 @@ from .extract import (
     MemoryExtractor,
     parse_extraction,
 )
-from .retrieve import Retriever, jaccard, tokenize
+from .gate import PrivacyGate, ReviewItem
+from .retrieve import (
+    MemberIndex,
+    MemberRow,
+    MemoryBlock,
+    MemoryReader,
+    Retriever,
+    audience_for_chat,
+    estimate_tokens,
+    format_relative_time,
+    is_self_inquiry,
+    jaccard,
+    tokenize,
+)
 from .store import (
     Event,
     LogEntry,
@@ -36,19 +49,29 @@ __all__ = [
     "ExtractedFact",
     "Extraction",
     "LogEntry",
+    "MemberIndex",
+    "MemberRow",
     "Memory",
+    "MemoryBlock",
     "MemoryExtractor",
+    "MemoryReader",
     "MemoryStore",
     "PendingAsk",
     "Person",
     "Profile",
     "ProfileDistiller",
     "ProfileLine",
+    "PrivacyGate",
     "ProfileUpdate",
+    "ReviewItem",
     "RawMessage",
     "Retriever",
     "Ruling",
     "TimelineCompressor",
+    "audience_for_chat",
+    "estimate_tokens",
+    "format_relative_time",
+    "is_self_inquiry",
     "jaccard",
     "make_person_id",
     "parse_extraction",

@@ -127,14 +127,15 @@ def test_private_scene_prompt_has_no_group_framing(config, store):
     store.add_memory("recording:u1", "TA 最喜欢的歌手是坂本龙一")
     llm = ScriptedLLM({"chat": ["在的"]})
     bot, _ = make_bot(config, store, llm)
-    asyncio.run(bot.handle_event(private_event("在吗")))
+    asyncio.run(bot.handle_event(private_event("在吗，最近在听坂本龙一")))
 
     system = llm.chat_messages[0][0]["content"]
     assert "当前是私聊" in system
     assert "两个人单独说话" in system
     assert "阿花" in system
-    # 记忆标题与场景描述都不能把私聊说成群聊
+    # 记忆区块在私聊里也要正常出现，且不能把私聊说成群聊
     assert "你记得的事" in system
+    assert "坂本龙一" in system
     assert "这个群" not in system
     assert "当前是群聊" not in system
 

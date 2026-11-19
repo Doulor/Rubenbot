@@ -39,6 +39,10 @@ class LLMError(RuntimeError):
     """LLM 调用失败。"""
 
 
+class ToolUnsupported(LLMError):
+    """当前中转/模型不支持 OpenAI 工具调用（拿它当正常退化信号，不当异常上报）。"""
+
+
 class LLMClient:
     """OpenAI 兼容的异步客户端。"""
 
@@ -46,6 +50,14 @@ class LLMClient:
         self.config = config
         self._transport = transport
         self._client: httpx.AsyncClient | None = None
+        # 探测到不支持工具后置 True，后续不再白试（省一次失败请求）
+        self._tools_unsupported = False
+
+    @property
+    def supports_tools(self) -> bool:
+        """当前是否还能尝试工具调用；模型/中转不支持时由 ``chat_with_tools``
+        抛出 :class:`ToolUnsupported` 并置 False。"""
+        return not self._tools_unsupported
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -99,6 +111,47 @@ class LLMClient:
                     logger.warning("LLM 调用失败（第 %s 次），%.1fs 后重试：%s", attempt + 1, delay, exc)
                     await asyncio.sleep(delay)
         raise LLMError(f"LLM 调用最终失败: {last_error}") from last_error
+
+    async def chat_with_tools(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        role: str = "chat",
+        temperature: float | None = None,
+        tool_choice: str = "auto",
+    ) -> dict[str, Any]:
+        """单次工具调用请求，返回原始 ``choices[0].message``（可能带 tool_calls）。
+
+        只做一次往返，工具循环由调用方控制（core 里最多两轮）。中转或模型不
+        支持工具调用时抛 :class:`ToolUnsupported`，由调用方退化为普通生成。
+        """
+        if getattr(self, "_tools_unsupported", False):
+            raise ToolUnsupported("已探测到当前模型不支持工具调用")
+        payload: dict[str, Any] = {
+            "model": self.config.model_for(role),
+            "messages": messages,
+            "temperature": self.config.temperature if temperature is None else temperature,
+            "tools": tools,
+            "tool_choice": tool_choice,
+        }
+        client = await self._get_client()
+        resp = await client.post("/chat/completions", json=payload)
+        if resp.status_code >= 400:
+            text = resp.text[:300]
+            # 400/422 且错误里提到 tools/tool 时视为不支持，标记后走退化路径
+            lowered = text.lower()
+            if resp.status_code in (400, 404, 422, 501) and (
+                "tool" in lowered or "function" in lowered or "unsupported" in lowered
+            ):
+                self._tools_unsupported = True
+                raise ToolUnsupported(f"模型不支持工具调用：{text}")
+            raise LLMError(f"LLM 返回 {resp.status_code}: {text}")
+        data = resp.json()
+        choices = data.get("choices") or []
+        if not choices:
+            raise LLMError(f"LLM 响应缺少 choices: {str(data)[:300]}")
+        return choices[0].get("message") or {}
 
 
 def parse_json_payload(text: str) -> Any:

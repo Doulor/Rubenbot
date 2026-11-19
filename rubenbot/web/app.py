@@ -1002,7 +1002,7 @@ def _config_snapshot(config: Config) -> dict[str, Any]:
                 flat[path] = item
     # 「留空」在这几个字段上有两种等价写法（None 与空串），比较时统一，
     # 否则「打开设置直接保存」会被误判为改过
-    for path in ("llm.extract_model", "llm.consolidate_model"):
+    for path in ("llm.extract_model", "llm.consolidate_model", "llm.gate_model"):
         if flat.get(path) is None:
             flat[path] = ""
     return flat

@@ -37,15 +37,22 @@ class LLMConfig:
     chat_model: str = "gpt-4o-mini"
     extract_model: str | None = None
     consolidate_model: str | None = None
+    # 分寸审查（gate）用的模型；留空跟随 chat
+    gate_model: str | None = None
     temperature: float = 0.8
     timeout: float = 60.0
     max_retries: int = 2
 
     def model_for(self, role: str = "chat") -> str:
-        """按用途取模型，抽取/归纳未配置时跟随 chat。"""
+        """按用途取模型，抽取/归纳/审查未配置时跟随 chat。"""
         if role == "extract":
             return self.extract_model or self.chat_model
         if role == "consolidate":
+            return self.consolidate_model or self.chat_model
+        if role == "gate":
+            return self.gate_model or self.chat_model
+        if role == "distill":
+            # 提炼沿用归纳模型（没配就跟随 chat）
             return self.consolidate_model or self.chat_model
         return self.chat_model
 
@@ -83,6 +90,34 @@ class MemoryConfig:
     timeline_prune_keep_salience: float = 0.7
     # bot 自己发的每条消息记进自我时间线的截断长度
     self_event_max_chars: int = 120
+
+    # ---- 记忆 v2 读取侧（索引 / 预拉取 / 跨会话 / 分寸审查）----
+    # 群成员索引：只收近 N 天在本群活跃过的人，最多多少人，缓存多久失效
+    index_active_days: float = 30.0
+    index_max_members: int = 40
+    index_ttl_seconds: float = 600.0
+    # 索引里「一句话身份」的截断长度
+    index_identity_chars: int = 40
+    # 一轮里最多拉几个被提及者的核心画像
+    mentioned_max_people: int = 3
+    # 说话人核心画像的最大字符数（画像核心不参与预算裁剪）
+    profile_inject_max_chars: int = 600
+    # 本轮记忆注入的总 token 预算；超了先砍事实、再砍时间线，画像核心不动
+    inject_budget_tokens: int = 1200
+    # 每个被提及者最多带几条相关时间线片段
+    timeline_hit_limit: int = 6
+    # 私聊跨会话摘要回看的小时数
+    cross_session_hours: float = 24.0
+    # 自我注入：回看本会话里 bot 自己最近说过/做过的事
+    self_inject_hours: float = 24.0
+    self_inject_limit: int = 3
+    # 分寸审查：模型裁定的置信度阈值，低于它不放行
+    gate_confidence_threshold: float = 0.6
+    # 高敏感跨场合项是否顺带进待问队列
+    gate_ask_high_sensitivity: bool = True
+    # recall 工具循环（模型支持 OpenAI 工具调用时生效）
+    recall_tool_enabled: bool = True
+    recall_tool_max_rounds: int = 2
 
 
 @dataclass
