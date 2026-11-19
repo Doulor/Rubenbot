@@ -139,8 +139,6 @@ def main(argv: list[str] | None = None) -> int:
     setup_logging(args.log_level or config.log_level)
 
     if args.init_persona:
-        from pathlib import Path
-
         path = Path(config.persona_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists():
