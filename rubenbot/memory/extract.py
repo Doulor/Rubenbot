@@ -167,6 +167,7 @@ class MemoryExtractor:
                 {"role": "user", "content": user_prompt},
             ],
             role="extract",
+            task="extract",
             temperature=0.2,
             json_mode=True,
         )

@@ -148,7 +148,85 @@ def test_persona_name_fallback(tmp_path):
 
 def make_client(handler, **kwargs) -> LLMClient:
     transport = httpx.MockTransport(handler)
+    kwargs.setdefault("retry_delays", (0.0, 0.0))
     return LLMClient(LLMConfig(api_key="k", chat_model="m", extract_model="m-extract", max_retries=1), transport=transport, **kwargs)
+
+
+# ----------------------------------------------------------------------
+# 角色表与回退链
+# ----------------------------------------------------------------------
+
+
+def test_model_for_prebuilt_roles_fall_back_to_chat():
+    cfg = LLMConfig(chat_model="m-chat")
+    for role in ("chat", "extract", "consolidate", "fast", "summary", "vision", "自定义角色"):
+        assert cfg.model_for(role) == "m-chat"
+    assert cfg.model_for() == "m-chat"
+
+
+def test_model_for_exact_role_then_fallback_chain():
+    cfg = LLMConfig(
+        chat_model="m-chat",
+        models={"fast": "m-fast", "summary": "m-summary", "vision": "m-vision", "custom": "m-custom"},
+    )
+    assert cfg.model_for("fast") == "m-fast"
+    # 没配的预置角色回退 chat；自定义角色也回退 chat
+    assert cfg.model_for("extract") == "m-chat"
+    assert cfg.model_for("consolidate") == "m-chat"
+    assert cfg.model_for("custom") == "m-custom"
+    assert cfg.model_for("unknown") == "m-chat"
+
+
+def test_model_for_legacy_fields_still_compatible():
+    cfg = LLMConfig(chat_model="m-chat", extract_model="m-extract", consolidate_model="m-cons")
+    assert cfg.model_for("extract") == "m-extract"
+    assert cfg.model_for("consolidate") == "m-cons"
+    assert cfg.model_for("fast") == "m-chat"
+    # 两种写法并存时 models 优先
+    cfg.models = {"extract": "m-new"}
+    assert cfg.model_for("extract") == "m-new"
+
+
+def test_model_for_custom_roles_fall_back_to_chat():
+    cfg = LLMConfig(chat_model="m-chat", models={"fast": "m-fast", "summary": "m-fast"})
+    assert cfg.model_for("summary") == "m-fast"
+    # 未知角色不会沿别人的链走，直接回 chat
+    assert cfg.model_for("nonexistent") == "m-chat"
+
+
+def test_llm_config_normalizes_models():
+    cfg = LLMConfig(models={"fast": " m-f ", "empty": "", "none": None, " ": "x", "n": 3})
+    assert cfg.models == {"fast": "m-f", "n": "3"}
+    assert cfg.model_for("n") == "3"
+
+
+def test_config_from_dict_loads_models_map():
+    cfg = Config.from_dict({"llm": {"chat_model": "m-chat", "models": {"fast": "m-fast", "summary": "m-sum"}}})
+    assert cfg.llm.model_for("fast") == "m-fast"
+    assert cfg.llm.model_for("summary") == "m-sum"
+    assert cfg.llm.model_for("vision") == "m-chat"
+
+
+def test_llm_task_defaults_to_role_and_can_be_customized():
+    def handler(request):
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    rec = []
+    client = LLMClient(
+        LLMConfig(api_key="k", chat_model="m", models={"fast": "m-fast"}),
+        transport=httpx.MockTransport(handler),
+        usage_recorder=rec.append,
+        retry_delays=(0.0,),
+    )
+
+    async def scenario():
+        await client.complete([{"role": "user", "content": "hi"}], role="fast")
+        await client.complete([{"role": "user", "content": "hi"}], role="fast", task="title")
+        await client.close()
+
+    asyncio.run(scenario())
+    assert [u.task for u in rec] == ["fast", "title"]
+    assert {u.model for u in rec} == {"m-fast"}
 
 
 def test_llm_complete_payload_and_model():

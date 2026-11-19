@@ -35,7 +35,7 @@ from .decision import (
     ReplyDecision,
     parse_generation_output,
 )
-from .llm import LLMClient, LLMProtocol
+from .llm import LLMClient, LLMProtocol, make_usage_recorder
 from .memory.consolidate import Consolidator
 from .memory.extract import MemoryExtractor
 from .memory.retrieve import Retriever
@@ -157,7 +157,7 @@ class RubenBot:
         self.config = config
         if rebuild_llm:
             # 重建 LLM 客户端（改了 base_url / api_key / 超时等都需要新客户端）
-            self.llm = LLMClient(config.llm)
+            self.llm = LLMClient(config.llm, usage_recorder=make_usage_recorder(self.store))
         # 各模块持有的是配置对象引用，换成新对象即可让参数立即生效
         self.extractor.config = config.memory
         self.extractor.llm = self.llm
@@ -299,6 +299,18 @@ class RubenBot:
             await self.consolidator.maybe_consolidate(now=now)
         except Exception as exc:  # noqa: BLE001
             logger.warning("记忆归纳异常：%s", exc)
+        self._trim_usage(now)
+
+    def _trim_usage(self, now: float) -> None:
+        """用量表最多每天清理一次；失败只记 debug，不影响维护任务。"""
+        if now - self.store.get_meta_float("llm_usage:trimmed_at", 0.0) < 86400:
+            return
+        try:
+            self.store.trim_llm_usage(now=now)
+        except Exception as exc:  # noqa: BLE001 - 清理失败不值得打断维护
+            logger.debug("清理 LLM 用量记录失败：%s", exc)
+            return
+        self.store.set_meta("llm_usage:trimmed_at", str(now))
 
     # ------------------------------------------------------------------
     # 事件处理
@@ -550,7 +562,7 @@ class RubenBot:
 
     async def generate(self, messages: list[dict[str, str]]) -> str:
         try:
-            reply = await self.llm.complete(messages, role="chat")
+            reply = await self.llm.complete(messages, role="chat", task="chat")
         except Exception as exc:  # noqa: BLE001 - LLM 失败不能带死循环
             logger.warning("生成回复失败：%s", exc)
             return ""

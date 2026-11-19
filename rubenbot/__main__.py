@@ -16,7 +16,7 @@ from .adapters.console import ConsoleAdapter
 from .adapters.snowluma import SnowLumaAdapter
 from .config import Config
 from .core import RubenBot
-from .llm import LLMClient
+from .llm import LLMClient, make_usage_recorder
 from .memory.store import MemoryStore
 from .persona import DEFAULT_PERSONA, load_persona
 from .plugins.loader import PluginManager
@@ -62,7 +62,7 @@ def build_adapters(config: Config):
 
 def build_bot(config: Config) -> tuple[RubenBot, LLMClient, MemoryStore]:
     store = MemoryStore(config.database_path)
-    llm = LLMClient(config.llm)
+    llm = LLMClient(config.llm, usage_recorder=make_usage_recorder(store))
     persona = load_persona(config.persona_path)
     plugins = PluginManager(config, store)
     try:

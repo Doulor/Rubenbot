@@ -244,6 +244,53 @@ def test_overview_with_bot_instance(client, store, config):
 # ----------------------------------------------------------------------
 
 
+def test_usage_api_returns_7_day_aggregate(client, store):
+    now = time.time()
+    store.add_llm_usage(task="chat", model="m-big", prompt_tokens=100, completion_tokens=20, latency_ms=120, ts=now - 3600)
+    store.add_llm_usage(task="extract", model="m-small", prompt_tokens=5, completion_tokens=1, latency_ms=60, ts=now - 1800)
+    store.add_llm_usage(task="extract", model="m-small", ok=False, latency_ms=50, ts=now - 1700)
+    # 8 天前的数据不在默认 7 天窗口里
+    store.add_llm_usage(task="chat", model="m-big", prompt_tokens=9999, ts=now - 8 * 86400)
+
+    data = client.get("/api/usage").json()
+    assert data["ok"] is True
+    assert data["days"] == 7
+    total = data["total"]
+    assert total["calls"] == 3
+    assert total["ok_calls"] == 2
+    assert total["failed_calls"] == 1
+    assert total["total_tokens"] == 126
+    by_task = {item["task"]: item for item in data["by_task"]}
+    assert set(by_task) == {"chat", "extract"}
+    assert by_task["chat"]["total_tokens"] == 120
+    assert by_task["extract"]["calls"] == 2
+    assert by_task["extract"]["failed_calls"] == 1
+    assert data["by_model"]
+
+    # days 参数可控
+    wide = client.get("/api/usage", params={"days": 30}).json()
+    assert wide["total"]["total_tokens"] == 9999 + 126
+
+
+def test_usage_api_empty_and_validation(client):
+    data = client.get("/api/usage").json()
+    assert data["total"]["calls"] == 0
+    assert data["by_task"] == []
+    # 非法天数额被夹到合理范围而不是 500
+    assert client.get("/api/usage", params={"days": 0}).json()["days"] == 1
+    assert client.get("/api/usage", params={"days": 999}).json()["days"] == 90
+    assert client.get("/api/usage", params={"days": "abc"}).status_code == 422
+
+
+def test_usage_api_requires_session(locked_client):
+    assert locked_client.get("/api/usage").status_code == 401
+
+
+# ----------------------------------------------------------------------
+# 记忆
+# ----------------------------------------------------------------------
+
+
 def test_memory_list_search_and_filter(client, store):
     seed(store)
     data = client.get("/api/memories").json()

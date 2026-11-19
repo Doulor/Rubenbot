@@ -125,6 +125,18 @@ class WebState:
             return self.plugins.list_plugins()
         return []
 
+    def usage_summary(self, *, days: int = 7) -> dict[str, Any]:
+        """近 ``days`` 天的 LLM 用量聚合：总量 + 按 task / model 分组。"""
+        days = max(1, int(days))
+        since = time.time() - days * 86400
+        return {
+            "days": days,
+            "since": since,
+            "total": self.store.usage_totals(since=since),
+            "by_task": self.store.usage_by_task(since=since),
+            "by_model": self.store.usage_by_model(since=since),
+        }
+
     # ------------------------------------------------------------------
     # 人设
     # ------------------------------------------------------------------

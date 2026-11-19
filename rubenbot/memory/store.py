@@ -12,7 +12,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 SCHEMA = """CREATE TABLE IF NOT EXISTS people (
     person_id     TEXT PRIMARY KEY,
@@ -88,6 +88,20 @@ CREATE TABLE IF NOT EXISTS decision_log (
 );
 CREATE INDEX IF NOT EXISTS idx_decision_chat ON decision_log(chat_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_decision_created ON decision_log(created_at);
+
+-- LLM 用量：每次请求尝试一行（重试的失败尝试也记，ok 区分）
+CREATE TABLE IF NOT EXISTS llm_usage (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts                REAL NOT NULL,
+    task              TEXT NOT NULL DEFAULT 'chat',
+    model             TEXT NOT NULL DEFAULT '',
+    prompt_tokens     INTEGER,                  -- 上游没给 usage 时为 NULL
+    completion_tokens INTEGER,
+    latency_ms        INTEGER NOT NULL DEFAULT 0,
+    ok                INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_ts ON llm_usage(ts);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_task ON llm_usage(task);
 """
 
 
@@ -859,7 +873,176 @@ class MemoryStore:
             "created_at": row["created_at"],
         }
 
+    # ------------------------------------------------------------------
+    # llm_usage（每次上游请求尝试一条；token 拿不到就是 NULL）
+    # ------------------------------------------------------------------
+
+    def add_llm_usage(
+        self,
+        *,
+        task: str = "chat",
+        model: str = "",
+        prompt_tokens: int | None = None,
+        completion_tokens: int | None = None,
+        latency_ms: int = 0,
+        ok: bool = True,
+        ts: float | None = None,
+    ) -> int:
+        """记录一次 LLM 请求尝试；只存上游实际给的数据，不补齐 token。"""
+        ts = time.time() if ts is None else ts
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                INSERT INTO llm_usage(ts, task, model, prompt_tokens, completion_tokens, latency_ms, ok)
+                VALUES(?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ts,
+                    str(task or "chat"),
+                    str(model or ""),
+                    _none_or_int(prompt_tokens),
+                    _none_or_int(completion_tokens),
+                    int(latency_ms or 0),
+                    int(bool(ok)),
+                ),
+            )
+            self._conn.commit()
+        return int(cur.lastrowid)
+
+    def usage_totals(self, since: float | None = None) -> dict:
+        """用量总量：调用次数、成败、token 合计、平均延迟。"""
+        sql = """
+            SELECT COUNT(*) AS calls,
+                   SUM(ok) AS ok_calls,
+                   SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS failed_calls,
+                   SUM(COALESCE(prompt_tokens, 0)) AS prompt_tokens,
+                   SUM(COALESCE(completion_tokens, 0)) AS completion_tokens,
+                   SUM(CASE WHEN prompt_tokens IS NULL THEN 1 ELSE 0 END) AS usage_missing,
+                   AVG(latency_ms) AS avg_latency_ms
+            FROM llm_usage
+        """
+        params: list = []
+        if since is not None:
+            sql += " WHERE ts >= ?"
+            params.append(since)
+        with self._lock:
+            row = self._conn.execute(sql, params).fetchone()
+        calls = int(row["calls"] or 0)
+        prompt = int(row["prompt_tokens"] or 0)
+        completion = int(row["completion_tokens"] or 0)
+        return {
+            "calls": calls,
+            "ok_calls": int(row["ok_calls"] or 0),
+            "failed_calls": int(row["failed_calls"] or 0),
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": prompt + completion,
+            # 上游没给 usage 的调用数：这些行的 token 是 NULL，不是 0
+            "usage_missing": int(row["usage_missing"] or 0),
+            "avg_latency_ms": round(float(row["avg_latency_ms"] or 0.0), 1),
+        }
+
+    def usage_by_task(self, since: float | None = None, limit: int = 50) -> list[dict]:
+        """按 task 聚合，token 多的排前面。"""
+        sql = """
+            SELECT task, COUNT(*) AS calls,
+                   SUM(ok) AS ok_calls,
+                   SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS failed_calls,
+                   SUM(COALESCE(prompt_tokens, 0)) AS prompt_tokens,
+                   SUM(COALESCE(completion_tokens, 0)) AS completion_tokens,
+                   AVG(latency_ms) AS avg_latency_ms
+            FROM llm_usage
+        """
+        params: list = []
+        if since is not None:
+            sql += " WHERE ts >= ?"
+            params.append(since)
+        sql += " GROUP BY task ORDER BY prompt_tokens + completion_tokens DESC, calls DESC LIMIT ?"
+        params.append(max(1, limit))
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [_usage_group(row, "task") for row in rows]
+
+    def usage_by_model(self, since: float | None = None, limit: int = 50) -> list[dict]:
+        """按模型聚合，token 多的排前面。"""
+        sql = """
+            SELECT model, COUNT(*) AS calls,
+                   SUM(ok) AS ok_calls,
+                   SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS failed_calls,
+                   SUM(COALESCE(prompt_tokens, 0)) AS prompt_tokens,
+                   SUM(COALESCE(completion_tokens, 0)) AS completion_tokens,
+                   AVG(latency_ms) AS avg_latency_ms
+            FROM llm_usage
+        """
+        params: list = []
+        if since is not None:
+            sql += " WHERE ts >= ?"
+            params.append(since)
+        sql += " GROUP BY model ORDER BY prompt_tokens + completion_tokens DESC, calls DESC LIMIT ?"
+        params.append(max(1, limit))
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [_usage_group(row, "model") for row in rows]
+
+    def usage_by_day(self, since: float | None = None, limit: int = 31) -> list[dict]:
+        """按天聚合（本地时区），返回从早到晚的每日用量。"""
+        sql = """
+            SELECT date(ts, 'unixepoch', 'localtime') AS day,
+                   COUNT(*) AS calls,
+                   SUM(ok) AS ok_calls,
+                   SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS failed_calls,
+                   SUM(COALESCE(prompt_tokens, 0)) AS prompt_tokens,
+                   SUM(COALESCE(completion_tokens, 0)) AS completion_tokens,
+                   AVG(latency_ms) AS avg_latency_ms
+            FROM llm_usage
+        """
+        params: list = []
+        if since is not None:
+            sql += " WHERE ts >= ?"
+            params.append(since)
+        sql += " GROUP BY day ORDER BY day DESC LIMIT ?"
+        params.append(max(1, limit))
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [_usage_group(row, "day") for row in reversed(rows)]
+
+    def trim_llm_usage(self, keep_days: float = 180.0, *, now: float | None = None) -> int:
+        """只保留最近 keep_days 天的用量记录，避免库无限增长。"""
+        now = time.time() if now is None else now
+        cutoff = now - max(0.0, float(keep_days)) * 86400
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM llm_usage WHERE ts < ?", (cutoff,))
+            self._conn.commit()
+        return cur.rowcount
+
 
 def make_person_id(platform: str, platform_uid: str) -> str:
     """person_id 形如 ``snowluma:12345``；同一人不同平台暂不合并。"""
     return f"{platform}:{platform_uid}"
+
+
+def _none_or_int(value: Any) -> int | None:
+    """把 token 数转成 int；None/非法值保持 None（SQLite 里就是 NULL）。"""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
+
+
+def _usage_group(row: sqlite3.Row, key: str) -> dict:
+    """把一行分组聚合结果转成字典，token 合计仍是整数。"""
+    prompt = int(row["prompt_tokens"] or 0)
+    completion = int(row["completion_tokens"] or 0)
+    return {
+        key: row[key],
+        "calls": int(row["calls"] or 0),
+        "ok_calls": int(row["ok_calls"] or 0),
+        "failed_calls": int(row["failed_calls"] or 0),
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": prompt + completion,
+        "avg_latency_ms": round(float(row["avg_latency_ms"] or 0.0), 1),
+    }

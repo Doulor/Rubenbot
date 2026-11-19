@@ -1,17 +1,25 @@
 """OpenAI 兼容的 LLM 客户端。
 
 只实现 chat/completions 这一条路径，够用且不引入额外依赖。
-``complete(role=...)`` 里的 role 决定使用哪个模型：chat / extract / consolidate。
+``complete(role=...)`` 里的 role 决定使用哪个模型（chat / extract / consolidate，
+以及 fast / summary / vision 等预置角色），回退规则见 :class:`LLMConfig.model_for`。
+``task=`` 是给用量统计用的标签，默认取 role；插件可传自定义名字。
+
+可选的 ``usage_recorder`` 在每次调用尝试后回调一条用量记录；上游没给 usage
+时 token 记 ``None``（落库为 NULL），不猜不编。记录失败只记 debug，不影响主流程。
 测试里可以用任意实现了 ``complete`` 的假对象替换。
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import re
-from typing import Any, Protocol
+import time
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable, Protocol
 
 import httpx
 
@@ -20,6 +28,33 @@ from .config import LLMConfig
 logger = logging.getLogger(__name__)
 
 _JSON_BLOCK = re.compile(r"```(?:json)?\s*(.*?)```", re.S)
+
+# 值得重试的 HTTP 状态：超时/限流/服务端故障
+RETRYABLE_STATUS = frozenset({408, 429})
+# 指数退避间隔（秒）：最多重试 2 次 → 1s / 3s；次数更多时按 2 倍继续
+RETRY_DELAYS: tuple[float, ...] = (1.0, 3.0)
+
+
+@dataclass
+class LLMUsage:
+    """一次上游调用的用量快照。
+
+    ``prompt_tokens`` / ``completion_tokens`` / ``total_tokens`` 为 None 表示
+    上游响应里没有 usage 字段（或这次尝试根本没拿到响应）。
+    """
+
+    ts: float
+    task: str
+    model: str
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    latency_ms: int = 0
+    ok: bool = False
+
+
+# usage 回调签名：可能是同步的，也可能要写库（异步），两种都支持
+UsageRecorder = Callable[[LLMUsage], Any | Awaitable[Any]]
 
 
 class LLMProtocol(Protocol):
@@ -30,6 +65,7 @@ class LLMProtocol(Protocol):
         messages: list[dict[str, str]],
         *,
         role: str = "chat",
+        task: str | None = None,
         temperature: float | None = None,
         json_mode: bool = False,
     ) -> str: ...
@@ -39,12 +75,69 @@ class LLMError(RuntimeError):
     """LLM 调用失败。"""
 
 
+class LLMResponseError(LLMError):
+    """上游返回了非 2xx；``status`` 供重试策略判断。"""
+
+    def __init__(self, message: str, *, status: int):
+        super().__init__(message)
+        self.status = status
+
+
+def is_retryable_status(status: int) -> bool:
+    """408 / 429 / 5xx 值得退避重试；401、404 这类配置错误不重试。"""
+    return status in RETRYABLE_STATUS or 500 <= status < 600
+
+
+def retry_delay(attempt: int, delays: tuple[float, ...] = RETRY_DELAYS) -> float:
+    """第 ``attempt`` 次重试前等待的秒数（从 0 开始数）。"""
+    if not delays:
+        return 0.0
+    if attempt < len(delays):
+        return delays[attempt]
+    return delays[-1] * (2 ** (attempt - len(delays) + 1))
+
+
+def usage_from_response(data: Any) -> tuple[int | None, int | None, int | None]:
+    """从响应 JSON 里取 (prompt, completion, total) tokens；缺失的项为 None。
+
+    ``total`` 缺失时只在 prompt/completion 都有值时才相加，不伪造半份数据。
+    """
+    usage = data.get("usage") if isinstance(data, dict) else None
+    if not isinstance(usage, dict):
+        return None, None, None
+    prompt = _as_token_count(usage.get("prompt_tokens"))
+    completion = _as_token_count(usage.get("completion_tokens"))
+    total = _as_token_count(usage.get("total_tokens"))
+    if total is None and prompt is not None and completion is not None:
+        total = prompt + completion
+    return prompt, completion, total
+
+
+def _as_token_count(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
+
+
 class LLMClient:
     """OpenAI 兼容的异步客户端。"""
 
-    def __init__(self, config: LLMConfig, transport: httpx.AsyncBaseTransport | None = None):
+    def __init__(
+        self,
+        config: LLMConfig,
+        transport: httpx.AsyncBaseTransport | None = None,
+        usage_recorder: UsageRecorder | None = None,
+        retry_delays: tuple[float, ...] | None = None,
+    ):
         self.config = config
         self._transport = transport
+        self._usage_recorder = usage_recorder
+        # 测试可注入零延迟；生产用模块默认的 1s / 3s
+        self._retry_delays = RETRY_DELAYS if retry_delays is None else retry_delays
         self._client: httpx.AsyncClient | None = None
 
     async def _get_client(self) -> httpx.AsyncClient:
@@ -67,12 +160,19 @@ class LLMClient:
         messages: list[dict[str, str]],
         *,
         role: str = "chat",
+        task: str | None = None,
         temperature: float | None = None,
         json_mode: bool = False,
     ) -> str:
-        """调用 chat/completions，返回第一条回复的文本内容。"""
+        """调用 chat/completions，返回第一条回复的文本内容。
+
+        ``task`` 只用于用量打标；默认与 ``role`` 相同。每次尝试都会记一条
+        用量（失败记 ok=0，token 为 NULL）。
+        """
+        model = self.config.model_for(role)
+        task_name = (task or role or "chat").strip() or "chat"
         payload: dict[str, Any] = {
-            "model": self.config.model_for(role),
+            "model": model,
             "messages": messages,
             "temperature": self.config.temperature if temperature is None else temperature,
         }
@@ -82,23 +182,96 @@ class LLMClient:
         client = await self._get_client()
         last_error: Exception | None = None
         for attempt in range(self.config.max_retries + 1):
+            started = time.perf_counter()
             try:
                 resp = await client.post("/chat/completions", json=payload)
-                if resp.status_code >= 400:
-                    raise LLMError(f"LLM 返回 {resp.status_code}: {resp.text[:300]}")
-                data = resp.json()
-                choices = data.get("choices") or []
-                if not choices:
-                    raise LLMError(f"LLM 响应缺少 choices: {str(data)[:300]}")
-                content = choices[0].get("message", {}).get("content") or ""
-                return content
-            except (httpx.HTTPError, LLMError) as exc:
+            except httpx.HTTPError as exc:
+                # 网络/超时层失败：这次尝试没有响应，token 记 NULL
+                await self._record_usage(task_name, model, None, started, ok=False)
                 last_error = exc
-                if attempt < self.config.max_retries:
-                    delay = 0.5 * (2**attempt)
-                    logger.warning("LLM 调用失败（第 %s 次），%.1fs 后重试：%s", attempt + 1, delay, exc)
-                    await asyncio.sleep(delay)
+            else:
+                try:
+                    data: Any = resp.json()
+                except ValueError:
+                    data = None
+                if resp.status_code >= 400:
+                    # 429/5xx 也可能带 usage 计费信息，能读到就记上
+                    await self._record_usage(task_name, model, data, started, ok=False)
+                    error = LLMResponseError(
+                        f"LLM 返回 {resp.status_code}: {resp.text[:300]}", status=resp.status_code
+                    )
+                    if not is_retryable_status(resp.status_code):
+                        # 401/404 这类配置错误重试也没用，直接失败
+                        raise error
+                    last_error = error
+                else:
+                    choices = (data.get("choices") if isinstance(data, dict) else None) or []
+                    if not choices:
+                        await self._record_usage(task_name, model, data, started, ok=False)
+                        last_error = LLMError(f"LLM 响应缺少 choices: {str(data)[:300]}")
+                    else:
+                        content = choices[0].get("message", {}).get("content") or ""
+                        await self._record_usage(task_name, model, data, started, ok=True)
+                        return content
+            if attempt >= self.config.max_retries:
+                break
+            delay = retry_delay(attempt, self._retry_delays)
+            logger.warning(
+                "LLM 调用失败（第 %s 次），%.1fs 后重试：%s", attempt + 1, delay, last_error
+            )
+            await asyncio.sleep(delay)
         raise LLMError(f"LLM 调用最终失败: {last_error}") from last_error
+
+    async def _record_usage(
+        self,
+        task: str,
+        model: str,
+        data: Any,
+        started: float,
+        *,
+        ok: bool,
+    ) -> None:
+        """写一条用量；没配回调或写失败都只记 debug，绝不影响调用结果。"""
+        recorder = self._usage_recorder
+        if recorder is None:
+            return
+        prompt, completion, total = usage_from_response(data)
+        usage = LLMUsage(
+            ts=time.time(),
+            task=task,
+            model=model,
+            prompt_tokens=prompt,
+            completion_tokens=completion,
+            total_tokens=total,
+            latency_ms=max(0, int((time.perf_counter() - started) * 1000)),
+            ok=ok,
+        )
+        try:
+            result = recorder(usage)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:  # noqa: BLE001 - 统计失败不能影响主流程
+            logger.debug("LLM 用量记录失败：%s", exc)
+
+
+def make_usage_recorder(store: Any) -> UsageRecorder | None:
+    """把 store 包成用量回调；``store`` 没有用量表（或测试用的假 store）时返回 None。"""
+    add = getattr(store, "add_llm_usage", None)
+    if not callable(add):
+        return None
+
+    def record(usage: LLMUsage) -> None:
+        add(
+            task=usage.task,
+            model=usage.model,
+            prompt_tokens=usage.prompt_tokens,
+            completion_tokens=usage.completion_tokens,
+            latency_ms=usage.latency_ms,
+            ok=usage.ok,
+            ts=usage.ts,
+        )
+
+    return record
 
 
 def parse_json_payload(text: str) -> Any:

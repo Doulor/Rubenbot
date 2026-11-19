@@ -72,6 +72,9 @@ def structured_config(config: Config) -> dict[str, Any]:
     # 在「打开设置 → 原样保存」时被误判成改动
     llm["extract_model"] = llm.get("extract_model") or ""
     llm["consolidate_model"] = llm.get("consolidate_model") or ""
+    # 角色表统一成「角色 → 模型名」，没配的角色不出现
+    models = llm.get("models")
+    llm["models"] = dict(models) if isinstance(models, dict) else {}
     webui = asdict(config.webui)
     password = webui.pop("password", "")
     access_token = snow.get("access_token", "")
@@ -228,6 +231,29 @@ def _prune_secret(container: dict[str, Any], key: str) -> None:
         container.pop(key, None)
 
 
+def _validate_models(value: Any, v: _Validator) -> dict[str, str] | None:
+    """校验 ``llm.models`` 角色映射：角色名非空，模型名填了就保留、空串表示未配。"""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        v.fail("llm.models", "应为「角色 → 模型名」的对象")
+        return None
+    result: dict[str, str] = {}
+    for raw_role, raw_model in value.items():
+        role = str(raw_role).strip()
+        if not role:
+            continue  # 空角色名直接忽略，不算错误
+        if raw_model is None:
+            continue
+        if not isinstance(raw_model, str):
+            v.fail(f"llm.models.{role}", "必须填模型名或留空")
+            continue
+        model = raw_model.strip()
+        if model:
+            result[role] = model
+    return result
+
+
 def _validate_llm(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
     out: dict[str, Any] = {}
     if "base_url" in section:
@@ -252,6 +278,10 @@ def _validate_llm(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
                 out[key] = value.strip()
             else:
                 v.fail(f"llm.{key}", "必须填模型名或留空（留空跟随对话模型）")
+    if "models" in section:
+        models = _validate_models(section["models"], v)
+        if models is not None:
+            out["models"] = models
     if "temperature" in section:
         number = v.number(section["temperature"], "llm.temperature", minimum=0, maximum=2)
         if number is not None:

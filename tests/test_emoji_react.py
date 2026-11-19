@@ -448,7 +448,7 @@ def test_end_to_end_through_core_with_real_bot():
             return {"message_id": kwargs.get("message_id")}
 
     class SilentLLM:
-        async def complete(self, messages, *, role="chat", temperature=None, json_mode=False):
+        async def complete(self, messages, *, role="chat", task=None, temperature=None, json_mode=False):
             return "嗯嗯" if role == "chat" else "[]"
 
     store = MemoryStore(":memory:")
