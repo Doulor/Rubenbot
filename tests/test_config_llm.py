@@ -1,0 +1,198 @@
+"""配置、人格、LLM 客户端。"""
+
+import asyncio
+import json
+
+import httpx
+import pytest
+
+from rubenbot.config import Config, LLMConfig
+from rubenbot.llm import LLMClient, LLMError, parse_json_payload
+from rubenbot.persona import DEFAULT_PERSONA, load_persona
+
+
+# ----------------------------------------------------------------------
+# 配置
+# ----------------------------------------------------------------------
+
+
+def test_config_defaults():
+    cfg = Config()
+    assert cfg.llm.model_for("extract") == cfg.llm.chat_model
+    assert cfg.llm.model_for("consolidate") == cfg.llm.chat_model
+    assert cfg.memory.extract_every_n == 30
+    assert cfg.memory.inject_limit == 20
+    assert cfg.chat.group_talkativeness == 0.08
+    assert cfg.chat.split_max_parts == 3
+    assert cfg.enabled_adapters == []
+
+
+def test_config_from_dict_and_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("MY_KEY", "sk-test")
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+llm:
+  base_url: "http://localhost:8000/v1"
+  api_key: "${MY_KEY}"
+  chat_model: "m-chat"
+  extract_model: "m-extract"
+persona:
+  path: "data/P.md"
+memory:
+  extract_every_n: 7
+  inject_limit: 9
+chat:
+  bot_name: "小R"
+plugins:
+  dir: "myplugins"
+  enabled: ["hello"]
+adapters:
+  console: {}
+  snowluma:
+    ws_url: "ws://x"
+database_path: "data/x.db"
+""",
+        encoding="utf-8",
+    )
+    cfg = Config.load(path)
+    assert cfg.llm.api_key == "sk-test"
+    assert cfg.llm.model_for("extract") == "m-extract"
+    assert cfg.llm.model_for("consolidate") == "m-chat"
+    assert cfg.persona_path == "data/P.md"
+    assert cfg.memory.extract_every_n == 7
+    assert cfg.chat.bot_name == "小R"
+    assert cfg.plugins.enabled == ["hello"]
+    assert cfg.enabled_adapters == ["console", "snowluma"]
+    assert cfg.database_path == "data/x.db"
+
+
+def test_config_missing_file_returns_defaults(tmp_path):
+    cfg = Config.load(tmp_path / "nope.yaml")
+    assert cfg.llm.chat_model == Config().llm.chat_model
+
+
+def test_config_ignores_unknown_keys():
+    cfg = Config.from_dict({"llm": {"chat_model": "x", "unknown": 1}, "whatever": True})
+    assert cfg.llm.chat_model == "x"
+
+
+def test_config_empty_adapter_is_disabled():
+    cfg = Config.from_dict({"adapters": {"console": {}, "snowluma": None}})
+    assert cfg.enabled_adapters == ["console"]
+
+
+# ----------------------------------------------------------------------
+# 人格
+# ----------------------------------------------------------------------
+
+
+def test_load_persona_creates_default(tmp_path):
+    path = tmp_path / "data" / "SOUL.md"
+    persona = load_persona(path)
+    assert path.exists()
+    assert persona.text == DEFAULT_PERSONA
+    assert "Ruben" in persona.system_prompt()
+
+
+def test_load_persona_custom_name(tmp_path):
+    path = tmp_path / "p.md"
+    path.write_text("# 小满\n\n你是一只猫。\n", encoding="utf-8")
+    persona = load_persona(path)
+    assert persona.name == "小满"
+    assert "你是一只猫" in persona.system_prompt()
+
+
+def test_persona_name_fallback(tmp_path):
+    path = tmp_path / "p.md"
+    path.write_text("你是阿七，一个普通人。", encoding="utf-8")
+    assert load_persona(path).name == "阿七"
+
+
+# ----------------------------------------------------------------------
+# LLM
+# ----------------------------------------------------------------------
+
+
+def make_client(handler, **kwargs) -> LLMClient:
+    transport = httpx.MockTransport(handler)
+    return LLMClient(LLMConfig(api_key="k", chat_model="m", extract_model="m-extract", max_retries=1), transport=transport, **kwargs)
+
+
+def test_llm_complete_payload_and_model():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["auth"] = request.headers.get("authorization")
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "你好"}}]})
+
+    client = make_client(handler)
+
+    async def scenario():
+        reply = await client.complete([{"role": "user", "content": "hi"}], role="extract", json_mode=True)
+        await client.close()
+        return reply
+
+    assert asyncio.run(scenario()) == "你好"
+    assert captured["url"].endswith("/chat/completions")
+    assert captured["auth"] == "Bearer k"
+    assert captured["body"]["model"] == "m-extract"
+    assert captured["body"]["response_format"] == {"type": "json_object"}
+
+
+def test_llm_retries_then_succeeds():
+    attempts = []
+
+    def handler(request):
+        attempts.append(1)
+        if len(attempts) == 1:
+            return httpx.Response(500, text="boom")
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = make_client(handler)
+
+    async def scenario():
+        result = await client.complete([{"role": "user", "content": "hi"}])
+        await client.close()
+        return result
+
+    assert asyncio.run(scenario()) == "ok"
+    assert len(attempts) == 2
+
+
+def test_llm_final_failure_raises():
+    def handler(request):
+        return httpx.Response(401, text="unauthorized")
+
+    client = make_client(handler)
+
+    async def scenario():
+        with pytest.raises(LLMError):
+            await client.complete([{"role": "user", "content": "hi"}])
+        await client.close()
+
+    asyncio.run(scenario())
+
+
+def test_llm_missing_choices_raises():
+    def handler(request):
+        return httpx.Response(200, json={"choices": []})
+
+    client = make_client(handler)
+
+    async def scenario():
+        with pytest.raises(LLMError):
+            await client.complete([{"role": "user", "content": "hi"}])
+        await client.close()
+
+    asyncio.run(scenario())
+
+
+def test_parse_json_payload():
+    assert parse_json_payload('{"a": 1}') == {"a": 1}
+    assert parse_json_payload('```json\n[1, 2]\n```') == [1, 2]
+    assert parse_json_payload('结果如下：[{"x": 1}] 以上') == [{"x": 1}]
+    assert parse_json_payload("") is None
+    assert parse_json_payload("不是 JSON") is None

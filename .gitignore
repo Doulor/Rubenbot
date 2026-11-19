@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# 虚拟环境
+.venv/
+venv/
+
+# 测试与工具缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 运行时配置与数据（示例文件保留）
+config.yaml
+data/*.db
+data/*.db-*
+data/*.sqlite*
+*.log
+.claude-run*.log
+
+# 编辑器
+.idea/
+.vscode/
+.DS_Store

@@ -1,0 +1,60 @@
+# RubenBot 配置示例：复制为 config.yaml 后修改
+# 字符串里可以用 ${ENV_VAR} 引用环境变量，例如 api_key: "${RUBENBOT_API_KEY}"
+
+llm:
+  base_url: "https://api.deepseek.com/v1"
+  api_key: "${RUBENBOT_API_KEY}"
+  chat_model: "deepseek-chat"
+  # 抽取/归纳缺省时跟随 chat_model
+  extract_model: ""
+  consolidate_model: ""
+  temperature: 0.8
+  timeout: 60
+  max_retries: 2
+
+persona:
+  path: "data/SOUL.md"
+
+database_path: "data/rubenbot.db"
+
+memory:
+  extract_every_n: 30          # 同一会话攒够多少条未抽取消息就触发
+  extract_silence_seconds: 300 # 或者会话静默这么久后触发
+  extract_min_pending: 4       # 单人至少积累几条才抽取
+  extract_window: 80           # 一次最多喂给模型的该人消息数
+  inject_limit: 20             # 回复时最多注入多少条记忆
+  dedupe_threshold: 0.8        # 与已有记忆的 token Jaccard 相似度阈值
+  consolidate_new_threshold: 50
+  consolidate_interval_hours: 24
+  consolidate_max_memories: 150
+  consolidate_remove_ratio: 0.2
+  consolidate_remove_min: 4
+  raw_keep_per_chat: 500
+
+chat:
+  bot_name: "Ruben"
+  group_talkativeness: 0.08           # 群里普通消息的插话概率
+  group_talkativeness_boost: 0.25     # 刚聊过时的插话概率
+  boost_window_seconds: 90
+  history_size: 30
+  split_max_parts: 3
+  split_part_chars: 60
+  split_delay_seconds: 0.6
+  history_ttl_hours: 12
+
+plugins:
+  dir: "plugins"
+  # 不写 enabled 表示全部启用；写列表则只启用列表中的
+  # enabled: ["hello"]
+  command_prefix: "/"
+
+adapters:
+  console: {}                 # 本地调试：stdin/stdout
+  snowluma:                   # OneBot v11
+    ws_url: "ws://127.0.0.1:3001"
+    http_url: "http://127.0.0.1:3000"
+    access_token: ""
+    self_id: ""               # 可选：bot 的 QQ 号，留空则从事件里自动取
+
+background_check_minutes: 5
+log_level: "INFO"
