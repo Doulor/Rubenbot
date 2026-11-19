@@ -24,8 +24,8 @@ class ScriptedLLM:
         self.default = default
         self.calls: list[dict[str, Any]] = []
 
-    async def complete(self, messages, *, role="chat", temperature=None, json_mode=False):
-        self.calls.append({"role": role, "messages": messages, "json_mode": json_mode})
+    async def complete(self, messages, *, role="chat", task=None, temperature=None, json_mode=False):
+        self.calls.append({"role": role, "task": task, "messages": messages, "json_mode": json_mode})
         queue = self.responses.get(role)
         if queue:
             return queue.pop(0)

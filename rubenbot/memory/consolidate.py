@@ -215,6 +215,7 @@ class Consolidator:
                 {"role": "user", "content": self._render_memories(memories)},
             ],
             role="consolidate",
+            task="consolidate",
             temperature=0.2,
             json_mode=True,
         )

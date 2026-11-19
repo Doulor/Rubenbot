@@ -28,13 +28,42 @@ def _expand_env(value: Any) -> Any:
     return value
 
 
+DEFAULT_CHAT_MODEL = "gpt-4o-mini"
+
+# 预置角色及其回退链：自身没配模型时沿链找，最终都落到 chat。
+# 未知角色（插件/新代码自定义的 task）同样回退 chat，不报错。
+ROLE_FALLBACKS: dict[str, tuple[str, ...]] = {
+    "chat": (),
+    "extract": ("chat",),
+    "consolidate": ("chat",),
+    "fast": ("chat",),
+    "summary": ("chat",),
+    "vision": ("chat",),
+    # 记忆 v2：分寸审查没配就跟随 chat；画像提炼沿用归纳模型
+    "gate": ("chat",),
+    "distill": ("consolidate", "chat"),
+}
+
+# 预置角色表；`models` 里写别的角色名也允许，只是回退链只有 chat
+MODEL_ROLES: tuple[str, ...] = tuple(ROLE_FALLBACKS)
+
+
 @dataclass
 class LLMConfig:
-    """OpenAI 兼容接口配置。"""
+    """OpenAI 兼容接口配置。
+
+    角色表有两代写法，同时兼容：
+
+    - ``models``：可扩展映射 ``{角色: 模型名}``，例如 ``fast: 小模型``；
+    - ``chat_model`` / ``extract_model`` / ``consolidate_model``：旧字段。
+
+    解析顺序是「精确角色 → 回退链 → chat → 默认模型」；``models`` 优先于
+    旧字段。旧配置不写 ``models`` 时行为与以前完全一致。
+    """
 
     base_url: str = "https://api.openai.com/v1"
     api_key: str = ""
-    chat_model: str = "gpt-4o-mini"
+    chat_model: str = DEFAULT_CHAT_MODEL
     extract_model: str | None = None
     consolidate_model: str | None = None
     # 分寸审查（gate）用的模型；留空跟随 chat
@@ -42,19 +71,61 @@ class LLMConfig:
     temperature: float = 0.8
     timeout: float = 60.0
     max_retries: int = 2
+    # 角色 → 模型名。预置角色见 MODEL_ROLES，也可写自定义角色。
+    # 放在末尾是为了不改变旧字段的位置参数顺序。
+    models: dict[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """把 ``models`` 归一化成「非空字符串 → 字符串」的字典。"""
+        raw = self.models if isinstance(self.models, dict) else {}
+        cleaned: dict[str, str] = {}
+        for key, value in raw.items():
+            name = str(key).strip()
+            if not name or value is None:
+                continue
+            model = str(value).strip()
+            if model:
+                cleaned[name] = model
+        self.models = cleaned
+
+    def _explicit_model(self, role: str) -> str | None:
+        """只看这个角色自己配没配，不沿着回退链走。"""
+        mapped = self.models.get(role)
+        if mapped:
+            return mapped
+        # 旧字段：保持完全兼容
+        if role == "extract":
+            return self.extract_model or None
+        if role == "consolidate":
+            return self.consolidate_model or None
+        if role == "gate":
+            return self.gate_model or None
+        if role == "chat":
+            return self.chat_model or None
+        return None
+
+    def _resolve_model(self, role: str, seen: set[str]) -> str | None:
+        if role in seen:
+            return None
+        seen.add(role)
+        explicit = self._explicit_model(role)
+        if explicit:
+            return explicit
+        # 预置角色按表回退；未知角色一律回退 chat
+        for fallback in ROLE_FALLBACKS.get(role, ("chat",)):
+            resolved = self._resolve_model(fallback, seen)
+            if resolved:
+                return resolved
+        return None
 
     def model_for(self, role: str = "chat") -> str:
-        """按用途取模型，抽取/归纳/审查未配置时跟随 chat。"""
-        if role == "extract":
-            return self.extract_model or self.chat_model
-        if role == "consolidate":
-            return self.consolidate_model or self.chat_model
-        if role == "gate":
-            return self.gate_model or self.chat_model
-        if role == "distill":
-            # 提炼沿用归纳模型（没配就跟随 chat）
-            return self.consolidate_model or self.chat_model
-        return self.chat_model
+        """按用途取模型：精确角色 → 回退链 → chat → 默认模型。
+
+        记忆 v2 的 ``gate`` 走 ``gate_model``；``distill`` 未配置时沿用
+        ``consolidate`` 的回退链（归纳模型 → chat）。
+        """
+        name = str(role or "chat").strip() or "chat"
+        return self._resolve_model(name, set()) or self.chat_model or DEFAULT_CHAT_MODEL
 
 
 @dataclass

@@ -514,6 +514,12 @@ def create_app(state: WebState):
     # 记忆
     # ------------------------------------------------------------------
 
+    @app.get("/api/usage")
+    async def usage(request: Request, days: int = 7):
+        """近 N 天 LLM 用量聚合（默认 7 天）；前端页面本轮不做，只留接口。"""
+        require_session(request)
+        return {"ok": True, **state.usage_summary(days=max(1, min(days, 90)))}
+
     @app.get("/api/memories")
     async def list_memories(
         request: Request,
@@ -1001,8 +1007,8 @@ def _config_snapshot(config: Config) -> dict[str, Any]:
             else:
                 flat[path] = item
     # 「留空」在这几个字段上有两种等价写法（None 与空串），比较时统一，
-    # 否则「打开设置直接保存」会被误判为改过
-    for path in ("llm.extract_model", "llm.consolidate_model", "llm.gate_model"):
+    # 否则「打开设置直接保存」会被误判为改过；``llm.models`` 也是整段比较
+    for path in ("llm.extract_model", "llm.consolidate_model", "llm.gate_model", "llm.models"):
         if flat.get(path) is None:
             flat[path] = ""
     return flat

@@ -110,6 +110,7 @@ def test_structured_config_covers_every_field(config):
             "chat_model",
             "extract_model",
             "consolidate_model",
+            "models",
             "temperature",
             "timeout",
             "max_retries",
@@ -172,6 +173,33 @@ def test_structured_config_covers_every_field(config):
     assert view["webui"]["password"] == ""
     assert view["adapters"]["snowluma"]["access_token"] == ""
     assert view["secrets"]["llm.api_key"] is True
+
+
+def test_validate_structured_models_map():
+    update = validate_structured(
+        {"llm": {"models": {"fast": " m-fast ", "summary": "", "vision": None, "": "x"}}}
+    )
+    assert update["llm"]["models"] == {"fast": "m-fast"}
+    with pytest.raises(ConfigValidationError):
+        validate_structured({"llm": {"models": ["fast"]}})
+    with pytest.raises(ConfigValidationError):
+        validate_structured({"llm": {"models": {"fast": 3}}})
+
+
+def test_put_structured_models_map_written_and_resent_unchanged(client, config_path):
+    response = client.put(
+        "/api/config",
+        json={"config": {"llm": {"models": {"fast": "m-fast", "vision": "m-vision"}}}},
+    )
+    assert response.status_code == 200, response.text
+    assert read_yaml(config_path)["llm"]["models"] == {"fast": "m-fast", "vision": "m-vision"}
+
+    # 原样再存一次不应报变化
+    view = client.get("/api/config").json()["structured"]
+    view.pop("secrets")
+    again = client.put("/api/config", json={"config": view})
+    assert again.status_code == 200, again.text
+    assert again.json()["applied"] == []
 
 
 def test_validate_structured_accepts_string_numbers():

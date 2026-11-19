@@ -26,7 +26,7 @@ class ToolLLM:
         self.chat_calls = 0
         self.last_tool_messages = None
 
-    async def complete(self, messages, *, role="chat", temperature=None, json_mode=False):
+    async def complete(self, messages, *, role="chat", task=None, temperature=None, json_mode=False):
         self.chat_calls += 1
         return self.chat_reply
 

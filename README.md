@@ -98,7 +98,7 @@ RubenBot 是一个以**记忆**为核心的拟人社交聊天 bot 框架。它�
 | --- | --- |
 | `rubenbot/config.py` | 读取 YAML 配置，展开 `${ENV_VAR}`，未知键忽略，缺文件走默认值 |
 | `rubenbot/persona.py` | 加载 SOUL.md 风格的 Markdown 人格；不存在时生成默认人格 |
-| `rubenbot/llm.py` | OpenAI 兼容客户端；`chat` / `extract` / `consolidate` 可分模型；带退避重试 |
+| `rubenbot/llm.py` | OpenAI 兼容客户端；按角色（`chat` / `extract` / `consolidate` / `fast` / `summary` / `vision` 及自定义）选模型；408/429/5xx 指数退避重试；每次调用写用量表 |
 | `rubenbot/core.py` | 消息主循环、合并窗口调度、决策、上下文拼装、拆条发送、后台维护 |
 | `rubenbot/decision.py` | 回复意愿系统：消息合并、硬触发、意愿评分、生成否决标记 |
 | `rubenbot/memory/store.py` | SQLite 读写唯一入口：人物、记忆、流水、变更日志、撤销 |
@@ -197,6 +197,8 @@ pytest
 | --- | --- | --- |
 | `llm` | `base_url` `api_key` `chat_model` | 任意 OpenAI 兼容接口 |
 | | `extract_model` `consolidate_model` | 留空则跟随 `chat_model` |
+| `models` | 可扩展的角色 → 模型映射（如 `fast` / `summary` / `vision`，未配的角色回退 `chat_model`），优先于上面两个旧字段 |
+| `timeout` `max_retries` | 单次请求超时（秒）与失败重试次数（408/429/5xx，间隔 1s / 3s） |
 | `persona` | `path` | 人格文件，默认 `data/SOUL.md` |
 | `database_path` | — | SQLite 路径，默认 `data/rubenbot.db` |
 | `memory` | `extract_every_n` | 会话攒够多少条未抽取消息触发 |

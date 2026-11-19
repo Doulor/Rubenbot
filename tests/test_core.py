@@ -445,3 +445,48 @@ def test_group_decision_log_has_factors(config, store):
     assert entry["reason"] == "below_threshold"
     assert entry["factors"]["base"] == 0.05
     assert "momentum" in entry["factors"]
+
+
+# ----------------------------------------------------------------------
+# LLM 调用打标与用量落库（真实客户端 + MockTransport）
+# ----------------------------------------------------------------------
+
+
+def test_llm_client_records_usage_with_task_labels(config, store):
+    """主循环、抽取、归纳都走同一个客户端，各自的任务名都要落进用量表。"""
+    import httpx
+
+    from rubenbot.llm import LLMClient, make_usage_recorder
+
+    tasks = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        # 抽取/归纳请求 JSON 模式；按 user 内容区分任务
+        text = body["messages"][-1]["content"]
+        if "JSON" in text or body.get("response_format"):
+            tasks.append("json")
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "好的" if not body.get("response_format") else "[]"}}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+            },
+        )
+
+    client = LLMClient(config.llm, transport=httpx.MockTransport(handler), usage_recorder=make_usage_recorder(store), retry_delays=(0.0,))
+    bot, _ = make_bot(config, store, client)
+
+    # 私聊必回 → chat 任务
+    asyncio.run(bot.handle_event(private_event("在吗")))
+    # 抽取任务
+    store.add_raw_message(platform="recording", chat_id="u1", sender_id="u1", sender_name="阿花", text="我住在杭州")
+    asyncio.run(bot.extractor.maybe_extract(force=True))
+    asyncio.run(client.close())
+
+    by_task = {item["task"]: item for item in store.usage_by_task()}
+    assert "chat" in by_task
+    assert "extract" in by_task
+    assert by_task["chat"]["total_tokens"] == 7
+    assert by_task["extract"]["total_tokens"] == 7
+    assert store.usage_totals()["calls"] == 2

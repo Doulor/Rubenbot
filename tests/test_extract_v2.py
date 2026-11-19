@@ -22,7 +22,7 @@ class FakeLLM:
         self.responses = list(responses)
         self.calls = []
 
-    async def complete(self, messages, *, role="chat", temperature=None, json_mode=False):
+    async def complete(self, messages, *, role="chat", task=None, temperature=None, json_mode=False):
         self.calls.append({"role": role, "messages": messages, "json_mode": json_mode})
         return self.responses.pop(0) if self.responses else '{"facts": [], "events": []}'
 

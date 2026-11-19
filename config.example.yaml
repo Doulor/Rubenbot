@@ -9,9 +9,15 @@ llm:
   extract_model: ""
   consolidate_model: ""
   gate_model: ""
+  # 可扩展的角色 → 模型映射：预置 fast / summary / vision（未配回退 chat_model），
+  # 也可写自定义角色名（gate / distill 等）；同一角色写了这里就优先于上面的旧字段。
+  models: {}
+  #   fast: "deepseek-chat"        # 小任务（标题、轻判断等）
+  #   summary: "deepseek-chat"     # 滚动摘要
+  #   vision: "qwen-vl-plus"       # 看图
   temperature: 0.8
-  timeout: 60
-  max_retries: 2
+  timeout: 60          # 单次请求超时（秒）
+  max_retries: 2       # 失败重试次数：408/429/5xx 退避重试，间隔 1s / 3s
 
 persona:
   path: "data/SOUL.md"
