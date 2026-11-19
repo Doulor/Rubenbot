@@ -120,7 +120,42 @@ def test_group_silent_does_not_call_llm(config, store):
     assert store.recent_messages("g1")[0].text == "你好呀"
 
 
-def test_context_contains_persona_memories_and_history(config, store):
+def test_private_scene_prompt_has_no_group_framing(config, store):
+    """私聊上下文要明确说明只有两个人，且不能把这里描述成群聊。"""
+    store.upsert_person("recording", "u1", "阿花")
+    store.add_memory("recording:u1", "TA 最喜欢的歌手是坂本龙一")
+    llm = ScriptedLLM({"chat": ["在的"]})
+    bot, _ = make_bot(config, store, llm)
+    asyncio.run(bot.handle_event(private_event("在吗")))
+
+    system = llm.chat_messages[0][0]["content"]
+    assert "当前是私聊" in system
+    assert "两个人单独说话" in system
+    assert "阿花" in system
+    # 记忆标题与场景描述都不能把私聊说成群聊
+    assert "你记得的事" in system
+    assert "这个群" not in system
+    assert "当前是群聊" not in system
+
+
+def test_group_scene_prompt_mentions_group(config, store):
+    """群聊上下文要说明有很多人、回复所有人可见。"""
+    config.decision.base = 10.0
+    store.upsert_person("recording", "u1", "阿花")
+    llm = ScriptedLLM({"chat": ["嗯"]})
+    bot, _ = make_bot(config, store, llm)
+    asyncio.run(bot.handle_event(group_event("有人吗")))
+
+    system = llm.chat_messages[0][0]["content"]
+    assert "当前是群聊" in system
+    assert "很多人" in system
+    assert "所有人" in system
+    assert "阿花" in system
+    # chat_id 对模型没有意义，不进提示词
+    assert "当前是私聊" not in system
+
+
+
     store.upsert_person("recording", "u1", "阿花")
     store.add_memory("recording:u1", "TA 最喜欢的歌手是坂本龙一")
     config.memory.inject_limit = 5

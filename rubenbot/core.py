@@ -432,10 +432,11 @@ class RubenBot:
     # ------------------------------------------------------------------
 
     def format_memories(self, memories: list) -> str:
+        """把检索到的记忆渲染成一条中性标题；标题不绑定场景，私聊里不会冒出「群」。"""
         if not memories:
             return ""
         lines = [f"- {m.content}" for m in memories]
-        return "你记得关于对方和这个群的事：\n" + "\n".join(lines)
+        return "你记得的事：\n" + "\n".join(lines)
 
     async def build_context(self, event: MessageEvent, *, now: float | None = None) -> list[dict[str, str]]:
         """人格 + 记忆 + 最近历史 + 群/说话人信息。"""
@@ -455,8 +456,18 @@ class RubenBot:
         memory_text = self.format_memories(memories)
         if memory_text:
             sections.append(memory_text)
-        scene = "私聊" if event.is_private else f"群聊 {event.chat_id}"
-        sections.append(f"当前场景：{scene}；正在和你说话的人：{display}。")
+        # 场景说明带行为约束，压住人格文件里可能残留的场景想象
+        if event.is_private:
+            scene = (
+                f"当前是私聊：现在只有你和{display}两个人单独说话，没有别人在场。"
+                "不要把这里当成群聊，也不要提「群」「大家」这类词。"
+            )
+        else:
+            scene = (
+                f"当前是群聊：群里有很多人，这条消息是{display}说的。"
+                "你的回复群里所有人都看得见。"
+            )
+        sections.append(scene)
         system_prompt = "\n\n".join(sections)
 
         messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
