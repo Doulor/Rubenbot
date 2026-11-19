@@ -161,6 +161,14 @@ def test_next_deadline_and_flush_all():
     assert merger.next_deadline() is None
 
 
+def test_merger_batch_cap_defaults_do_not_break_normal_window():
+    """默认整批上限 10s 比普通窗口长：正常对话仍按窗口续命。"""
+    merger = MessageMerger(window=4.0, hard_window=1.0)
+    merger.add(group_event("一"), 100.0)
+    merger.add(group_event("二"), 103.0)
+    assert merger.next_deadline() == 107.0
+
+
 # ----------------------------------------------------------------------
 # 硬触发
 # ----------------------------------------------------------------------

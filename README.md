@@ -218,7 +218,13 @@ pytest
 | | `history_ttl_hours` | 超过这个时间的旧消息不再拼进上下文 |
 | | `dedupe_ttl_seconds` | 入站去重窗口：同一平台消息 id 在此窗口内重复到达即丢弃（默认 300 秒，0 关闭） |
 | | `split_max_parts` `split_part_chars` `split_delay_seconds` | 长回复拆条策略 |
+| `chat` | `history_size` | 上下文带入的最近消息条数 |
+| | `split_max_parts` `split_part_chars` | 长回复拆条策略（按句拆，避开括号/引号/颜文字/URL） |
+| | `type_speed` `type_delay_max_seconds` | 按字数估算打字停顿的全局倍率 / 单条上限 |
+| | `strip_action_parens` | 发送前移除「（笑）」这类括号动作描写（默认关） |
 | `decision` | `merge_window_seconds` `hard_merge_window_seconds` | 消息合并窗口（普通 / 硬触发） |
+| | `batch_max_seconds` | 一批消息从首条起最多等多久（防无限续命） |
+| | `urgent_seconds` | 批里出现 @/回复 bot 时，截止时间提前到「首条 + 该值」 |
 | | `aliases` | 视为「叫名字」的别名，空则用 `chat.bot_name` |
 | | `base` `threshold` | 每群基础意愿 / 开口阈值 |
 | | `momentum_bonus` `momentum_half_life_seconds` | 对话动量加分与衰减半衰期 |

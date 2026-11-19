@@ -49,7 +49,7 @@ def make_bot(tmp_path, plugin_yaml="", *, llm_replies=None, capability=None):
     store = MemoryStore(":memory:")
     config = Config()
     config.plugins.dir = str(root)
-    config.chat.split_delay_seconds = 0
+    config.chat.type_speed = 0
     config.decision.merge_window_seconds = 0
     config.decision.hard_merge_window_seconds = 0
     manager = PluginManager(config, store)
@@ -117,7 +117,7 @@ def test_command_disabled_capability_reason_from_real_gate(tmp_path):
     store = MemoryStore(":memory:")
     config = Config()
     config.plugins.dir = str(root)
-    config.chat.split_delay_seconds = 0
+    config.chat.type_speed = 0
     config.decision.merge_window_seconds = 0
     config.decision.hard_merge_window_seconds = 0
     manager = PluginManager(config, store)

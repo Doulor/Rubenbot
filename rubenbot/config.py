@@ -198,7 +198,12 @@ class ChatConfig:
     history_size: int = 30
     split_max_parts: int = 3
     split_part_chars: int = 60
-    split_delay_seconds: float = 0.6
+    # 打字节奏：中文字 0.3s/字、其他字符 0.15s/字，每条另加 0.3s 回车时间；
+    # type_speed 是全局倍率（0 表示两条之间不停顿），单条上限防止长文等太久
+    type_speed: float = 1.0
+    type_delay_max_seconds: float = 4.0
+    # 发送前是否移除括号里的动作描写（如「（笑）」）；默认关闭
+    strip_action_parens: bool = False
     bot_name: str = "Ruben"
     history_ttl_hours: float = 12.0
     # 入站去重：同一平台消息 id 在这个时间窗内重复到达则丢弃；0 表示不去重
@@ -221,6 +226,10 @@ class DecisionConfig:
     # 消息合并窗口：普通消息攒 4 秒；硬触发走短窗口，0 表示立即处理
     merge_window_seconds: float = 4.0
     hard_merge_window_seconds: float = 1.0
+    # 整批上限：从首条消息算起最多等这么久就放出；0 表示不设上限
+    batch_max_seconds: float = 10.0
+    # @/回复 bot 的批次截止时间不晚于「首条 + urgent_seconds」；0 表示不启用
+    urgent_seconds: float = 2.0
     # 叫到这些名字/别名视为硬触发；为空时使用 chat.bot_name
     aliases: list[str] = field(default_factory=list)
 
