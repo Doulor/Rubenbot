@@ -1,30 +1,75 @@
 # qzone_post 插件配置（可选；不写就用下面的默认值）
 #
-# 触发方式一：聊天里发 /说说 [内容]（命令名由 command 决定）
-#   - 带内容：直接发这条
-#   - 不带内容：按当前人格让 LLM 生成一条短说说再发
-# 触发方式二：定时，interval_hours > 0 时后台按间隔自动生成并发布
+# 触发方式（可组合）：
+#   一、聊天里发 /说说 [内容]（命令名由 command 决定）
+#       - 带内容：直接发这条
+#       - 不带内容：按当前人格让 LLM 生成一条短说说再发
+#   二、间隔定时：interval_hours > 0 时后台按间隔自动生成并发布
+#   三、时间点定时：schedule_mode: times 或 both，配合 times / jitter_minutes
+#   四、概率触发：prob: true，bot 回完一轮消息 / 后台 tick 时按 post_chance 掷骰
+#   五、LLM 判断：llm_decide: true，后台每 check_interval_minutes 问模型
+#       「现在有没有值得发的事」，返回 {"post": bool, "content": str}
+#
+# 自动模式（二/三/四/五）都受「节制三件套」约束：cooldown_minutes、
+# daily_cap、quiet_hours。命令是明确指令，不受限也不走草稿确认。
 #
 # 发布只走核心能力 qzone.publish（SnowLuma 的 send_qzone_msg）。要真正发出去，
 # 还得在 config.yaml 里打开 adapters.snowluma.capabilities.qzone: true；
 # 没开时插件会回复明确原因。
 
-# 定时发布间隔（小时）；0 = 关闭定时
+# ---- 间隔定时 ----
+# 定时发布间隔（小时）；0 = 关闭间隔定时
 interval_hours: 0
 
+# ---- 时间点定时 ----
+# interval | times | both
+#   interval：只用 interval_hours
+#   times   ：只用下面的 times 时间点
+#   both    ：两者并存
+schedule_mode: interval
+# 每天固定时间点，如 ["08:30", "21:00"]
+times: []
+# 每个时间点的随机抖动（±分钟）
+jitter_minutes: 10
+
+# ---- 概率 / LLM 触发 ----
+# 后台检查 tick 的间隔（分钟）
+check_interval_minutes: 60
+# 概率触发：bot 完成一轮回复后（以及后台 tick）按 post_chance 掷骰
+prob: false
+post_chance: 0.3
+# LLM 判断：让模型自己判断现在有没有值得发的事
+llm_decide: false
+# 模型说发之后，是否还要再过一次 post_chance 概率门
+llm_then_prob: true
+
+# ---- 节制三件套（所有自动模式强制生效）----
+# 两次自动发布的最小间隔（分钟）
+cooldown_minutes: 480
+# 每天自动发布上限；0 = 不限
+daily_cap: 2
+# 安静时段；形如 "23:00-07:00"，空串关闭
+quiet_hours: "23:00-07:00"
+
+# ---- 草稿确认 ----
+# 自动模式生成的内容先私聊发给主人，主人回「发」才发布；
+# 回其他内容或超时作废。命令触发不走草稿。
+draft_confirm: true
+draft_timeout_minutes: 30
+
+# ---- 命令与主人 ----
 # 命令名（不带前缀），默认「说说」
 command: "说说"
-
 # 只有 owner_ids 里的人能用命令；默认关
 owner_only: false
-# 主人 QQ（或平台的 sender_id）；owner_only 开启时必须填
+# 主人 QQ（或平台的 sender_id）；命令权限与草稿确认都用它
 owner_ids: []
 # 例如：
 # owner_ids: ["10001"]
 
+# ---- 内容 ----
 # 生成的说说最长字数（越短越像真人随手写的）
 max_chars: 60
-
 # 定时写什么：优先取最近 topic_window_hours 小时内的群聊，其次最近记忆，
 # 都没有就写日常向
 topic_window_hours: 6
