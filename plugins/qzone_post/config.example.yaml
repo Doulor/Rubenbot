@@ -1,0 +1,31 @@
+# qzone_post 插件配置（可选；不写就用下面的默认值）
+#
+# 触发方式一：聊天里发 /说说 [内容]（命令名由 command 决定）
+#   - 带内容：直接发这条
+#   - 不带内容：按当前人格让 LLM 生成一条短说说再发
+# 触发方式二：定时，interval_hours > 0 时后台按间隔自动生成并发布
+#
+# 发布只走核心能力 qzone.publish（SnowLuma 的 send_qzone_msg）。要真正发出去，
+# 还得在 config.yaml 里打开 adapters.snowluma.capabilities.qzone: true；
+# 没开时插件会回复明确原因。
+
+# 定时发布间隔（小时）；0 = 关闭定时
+interval_hours: 0
+
+# 命令名（不带前缀），默认「说说」
+command: "说说"
+
+# 只有 owner_ids 里的人能用命令；默认关
+owner_only: false
+# 主人 QQ（或平台的 sender_id）；owner_only 开启时必须填
+owner_ids: []
+# 例如：
+# owner_ids: ["10001"]
+
+# 生成的说说最长字数（越短越像真人随手写的）
+max_chars: 60
+
+# 定时写什么：优先取最近 topic_window_hours 小时内的群聊，其次最近记忆，
+# 都没有就写日常向
+topic_window_hours: 6
+topic_limit: 20
