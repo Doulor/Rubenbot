@@ -44,6 +44,22 @@ ADAPTER_RESTART_MIN = 1.0
 ADAPTER_RESTART_MAX = 30.0
 
 
+def format_scene(event: MessageEvent, display: str) -> str:
+    """拼装场景说明行。
+
+    独立成函数，WebUI 的人设预览要用同一段文案，避免两处漂移。
+    """
+    if event.is_private:
+        return (
+            f"当前是私聊：现在只有你和{display}两个人单独说话，没有别人在场。"
+            "不要把这里当成群聊，也不要提「群」「大家」这类词。"
+        )
+    return (
+        f"当前是群聊：群里有很多人，这条消息是{display}说的。"
+        "你的回复群里所有人都看得见。"
+    )
+
+
 @dataclass
 class BotContext:
     """插件钩子与命令处理拿到的运行时上下文。"""
@@ -503,17 +519,7 @@ class RubenBot:
         if memory_text:
             sections.append(memory_text)
         # 场景说明带行为约束，压住人格文件里可能残留的场景想象
-        if event.is_private:
-            scene = (
-                f"当前是私聊：现在只有你和{display}两个人单独说话，没有别人在场。"
-                "不要把这里当成群聊，也不要提「群」「大家」这类词。"
-            )
-        else:
-            scene = (
-                f"当前是群聊：群里有很多人，这条消息是{display}说的。"
-                "你的回复群里所有人都看得见。"
-            )
-        sections.append(scene)
+        sections.append(format_scene(event, display))
         system_prompt = "\n\n".join(sections)
 
         messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
