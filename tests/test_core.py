@@ -3,6 +3,7 @@
 import asyncio
 import json
 import random
+import time
 
 import pytest
 
@@ -54,7 +55,7 @@ class FixedRng(random.Random):
 
 
 # ----------------------------------------------------------------------
-# 触发判断
+# 触发判断（细节见 test_decision.py）
 # ----------------------------------------------------------------------
 
 
@@ -68,22 +69,23 @@ def test_mention_always_replies(config, store):
     assert bot.should_reply(group_event(mentions=True)).should_reply
 
 
-def test_group_probability(config, store):
-    config.chat.group_talkativeness = 0.08
-    low, _ = make_bot(config, store, ScriptedLLM(), rng=FixedRng(0.5))
-    assert not low.should_reply(group_event()).should_reply
-    high, _ = make_bot(config, store, ScriptedLLM(), rng=FixedRng(0.01))
-    assert high.should_reply(group_event()).should_reply
+def test_group_base_alone_not_enough(config, store):
+    """只有基础值（默认 0.10）不够过阈值，不会随机插话。"""
+    bot, _ = make_bot(config, store, ScriptedLLM(), rng=FixedRng(0.0))
+    decision = bot.should_reply(group_event(), now=1000.0)
+    assert not decision.should_reply
+    assert decision.reason == "below_threshold"
+    assert decision.factors.base == config.decision.base
 
 
-def test_conversation_boost(config, store):
-    config.chat.group_talkativeness = 0.05
-    config.chat.group_talkativeness_boost = 0.3
-    config.chat.boost_window_seconds = 60
-    bot, _ = make_bot(config, store, ScriptedLLM(), rng=FixedRng(0.2))
-    assert not bot.should_reply(group_event(), now=1000.0).should_reply
-    bot._last_reply_at["recording:g1"] = 990.0
-    assert bot.should_reply(group_event(), now=1000.0).should_reply
+def test_momentum_after_bot_replied(config, store):
+    """bot 刚发过言（动量加成）且过了冷却，普通消息就有机会过线。"""
+    config.decision.cooldown_seconds = 0
+    bot, _ = make_bot(config, store, ScriptedLLM(), rng=FixedRng(0.5))
+    bot.decision_engine.note_reply("recording:g1", 1000.0)
+    decision = bot.should_reply(group_event(), now=1005.0)
+    assert decision.should_reply
+    assert decision.factors.momentum > 0
 
 
 # ----------------------------------------------------------------------
@@ -108,7 +110,7 @@ def test_handle_event_records_and_replies(config, store):
 
 
 def test_group_silent_does_not_call_llm(config, store):
-    config.chat.group_talkativeness = 0.0
+    config.decision.base = 0.0
     llm = ScriptedLLM()
     bot, adapter = make_bot(config, store, llm)
     asyncio.run(bot.handle_event(group_event()))
@@ -228,6 +230,92 @@ def test_maintenance_error_contained(config, store):
     bot, _ = make_bot(config, store, BoomLLM())
     store.add_raw_message(platform="recording", chat_id="u1", sender_id="u1", text="x")
     asyncio.run(bot.run_maintenance(force_extract=True))  # 不抛异常
+
+
+# ----------------------------------------------------------------------
+# 合并窗口与生成否决（端到端）
+# ----------------------------------------------------------------------
+
+
+def test_merge_window_combines_burst(config, store):
+    """窗口内同一发送者连发多条，只决策/生成一次，上下文里看到合并文本。"""
+    config.decision.merge_window_seconds = 4.0
+    config.decision.base = 10.0  # 保证评分过线
+    llm = ScriptedLLM({"chat": ["慢慢说"]})
+    bot, adapter = make_bot(config, store, llm)
+    asyncio.run(bot.handle_event(group_event("我跟你讲")))
+    asyncio.run(bot.handle_event(group_event("今天遇到件事")))
+    assert adapter.sent == []
+    assert len(bot.merger) == 1
+    asyncio.run(bot.flush_merger(now=time.time() + 10))
+    assert adapter.texts == ["慢慢说"]
+    assert len(llm.chat_messages) == 1
+    # 两条碎片都在上下文里（流水逐条保存），模型看到的是完整的一段
+    contents = [m["content"] for m in llm.chat_messages[0]]
+    assert any("我跟你讲" in c for c in contents)
+    assert any("今天遇到件事" in c for c in contents)
+
+
+def test_merge_window_other_sender_releases_round(config, store):
+    """别人插话时，前一个人攒的那轮立即处理。"""
+    config.decision.merge_window_seconds = 4.0
+    config.decision.base = 10.0
+    llm = ScriptedLLM({"chat": ["收到"]})
+    bot, adapter = make_bot(config, store, llm)
+    asyncio.run(bot.handle_event(group_event("我先说", sender="u1")))
+    assert adapter.sent == []
+    event = group_event("我也来", sender="u2")
+    # 事件内部用真实时钟记录，这里直接驱动一次：u2 到达后 u1 的轮次应已放出
+    asyncio.run(bot._handle_event(event))
+    assert adapter.texts == ["收到"]
+    assert len(llm.chat_messages) == 1
+    assert any("我先说" in m["content"] for m in llm.chat_messages[0])
+
+
+def test_generation_veto_keeps_silent(config, store):
+    """评分过了、模型输出否决标记时静默丢弃，不写 bot 流水。"""
+    llm = ScriptedLLM({"chat": ["[不回复]"]})
+    bot, adapter = make_bot(config, store, llm)
+    asyncio.run(bot.handle_event(private_event("随便说说")))
+    assert adapter.sent == []
+    assert llm.chat_messages  # 确实调用了模型
+    assert not any(m.sender_id == BOT_SENDER_ID for m in store.recent_messages("u1"))
+
+
+def test_prompt_tells_model_veto_marker(config, store):
+    marker = config.decision.veto_marker
+    llm = ScriptedLLM({"chat": ["在的"]})
+    bot, _ = make_bot(config, store, llm)
+    asyncio.run(bot.handle_event(private_event("在吗")))
+    system = llm.chat_messages[0][0]["content"]
+    assert marker in system
+    assert "没必要接话" in system
+
+
+def test_topic_relevance_from_memories(config, store):
+    """存过相关记忆的话题，相关性分数应被带上。"""
+    config.decision.base = 0.0
+    config.decision.momentum_bonus = 0.0
+    store.add_memory("recording:u1", "TA 在学吉他，练的是《阿尔罕布拉宫》")
+    bot, _ = make_bot(config, store, ScriptedLLM())
+    decision = bot.should_reply(group_event("阿尔罕布拉宫好难弹"), now=1000.0)
+    assert decision.factors.relevance > 0
+    # 不相干的话题没有相关性加分
+    other = bot.should_reply(group_event("今天下雨了"), now=1000.0)
+    assert other.factors.relevance == 0
+
+
+def test_decision_logged(config, store, caplog):
+    import logging
+
+    llm = ScriptedLLM({"chat": ["嗯"]})
+    bot, _ = make_bot(config, store, llm)
+    with caplog.at_level(logging.INFO, logger="rubenbot.core"):
+        asyncio.run(bot.handle_event(group_event()))
+    assert "决策" in caplog.text
+    assert "不回" in caplog.text
+    assert "recording:g1" in bot.last_decision
+    assert bot.last_decision["recording:g1"].should_reply is False
 
 
 # ----------------------------------------------------------------------

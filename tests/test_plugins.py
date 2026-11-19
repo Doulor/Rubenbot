@@ -57,6 +57,8 @@ def make_manager(plugin_dir: Path, enabled=None) -> PluginManager:
     config = Config()
     config.plugins.dir = str(plugin_dir)
     config.plugins.enabled = enabled
+    config.decision.merge_window_seconds = 0
+    config.decision.hard_merge_window_seconds = 0
     return PluginManager(config, MemoryStore(":memory:"))
 
 
@@ -88,6 +90,8 @@ def make_bot(plugin_dir: Path, replies=None) -> tuple[RubenBot, RecordingAdapter
     config = Config()
     config.plugins.dir = str(plugin_dir)
     config.chat.split_delay_seconds = 0
+    config.decision.merge_window_seconds = 0
+    config.decision.hard_merge_window_seconds = 0
     manager = PluginManager(config, store)
     manager.load_all()
     llm = ScriptedLLM({"chat": replies or []})

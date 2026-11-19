@@ -72,15 +72,54 @@ class MemoryConfig:
 class ChatConfig:
     """对话与发送参数。"""
 
-    group_talkativeness: float = 0.08
-    group_talkativeness_boost: float = 0.25
-    boost_window_seconds: float = 90.0
     history_size: int = 30
     split_max_parts: int = 3
     split_part_chars: int = 60
     split_delay_seconds: float = 0.6
     bot_name: str = "Ruben"
     history_ttl_hours: float = 12.0
+
+
+@dataclass
+class GroupDecisionConfig:
+    """单个群的决策覆盖项；未写的字段沿用全局默认。"""
+
+    activity_multiplier: float = 1.0
+    base: float | None = None
+    quiet_hours: list[str] = field(default_factory=list)
+
+
+@dataclass
+class DecisionConfig:
+    """回复意愿系统参数（见 SPEC「回复决策」）。"""
+
+    # 消息合并窗口：普通消息攒 4 秒；硬触发走短窗口，0 表示立即处理
+    merge_window_seconds: float = 4.0
+    hard_merge_window_seconds: float = 1.0
+    # 叫到这些名字/别名视为硬触发；为空时使用 chat.bot_name
+    aliases: list[str] = field(default_factory=list)
+
+    # 意愿评分：基础值 + 动量 + 相关性 - 占比 - 冷却
+    base: float = 0.10
+    threshold: float = 0.85
+    threshold_noise: float = 0.10
+    threshold_noise_band: float = 0.20
+    momentum_bonus: float = 1.00
+    momentum_half_life_seconds: float = 120.0
+    relevance_bonus: float = 0.60
+    relevance_scale: float = 8.0
+    # 发言占比：看最近 ratio_window 条消息（含 bot 自己的）
+    ratio_window: int = 30
+    ratio_threshold: float = 0.20
+    ratio_silence: float = 0.60
+    ratio_penalty: float = 1.50
+    # 发言后冷却
+    cooldown_seconds: float = 30.0
+    cooldown_penalty: float = 0.60
+    # 模型输出该标记时静默丢弃
+    veto_marker: str = "[不回复]"
+    # 每群覆盖：群 id -> 配置
+    groups: dict[str, GroupDecisionConfig] = field(default_factory=dict)
 
 
 @dataclass
@@ -100,6 +139,7 @@ class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     chat: ChatConfig = field(default_factory=ChatConfig)
+    decision: DecisionConfig = field(default_factory=DecisionConfig)
     plugins: PluginsConfig = field(default_factory=PluginsConfig)
     persona_path: str = "data/SOUL.md"
     database_path: str = "data/rubenbot.db"
@@ -131,6 +171,7 @@ class Config:
         llm = LLMConfig(**{k: v for k, v in (data.get("llm") or {}).items() if _has(LLMConfig, k)})
         memory = MemoryConfig(**{k: v for k, v in (data.get("memory") or {}).items() if _has(MemoryConfig, k)})
         chat = ChatConfig(**{k: v for k, v in (data.get("chat") or {}).items() if _has(ChatConfig, k)})
+        decision = _load_decision(data.get("decision") or {})
         plugins = PluginsConfig(**{k: v for k, v in (data.get("plugins") or {}).items() if _has(PluginsConfig, k)})
         persona = data.get("persona") or {}
         if isinstance(persona, str):
@@ -142,7 +183,31 @@ class Config:
             "background_check_minutes": data.get("background_check_minutes", 5.0),
             "log_level": data.get("log_level", "INFO"),
         }
-        return cls(llm=llm, memory=memory, chat=chat, plugins=plugins, **basics)
+        return cls(
+            llm=llm, memory=memory, chat=chat, decision=decision, plugins=plugins, **basics
+        )
+
+
+def _load_decision(data: dict[str, Any]) -> DecisionConfig:
+    """解析 decision 段；``groups`` 单独转成 GroupDecisionConfig。"""
+    if not isinstance(data, dict):
+        return DecisionConfig()
+    plain = {k: v for k, v in data.items() if _has(DecisionConfig, k) and k != "groups"}
+    config = DecisionConfig(**plain)
+    groups = data.get("groups") or {}
+    if isinstance(groups, dict):
+        for chat_id, options in groups.items():
+            if not isinstance(options, dict):
+                continue
+            quiet = options.get("quiet_hours") or []
+            if isinstance(quiet, str):
+                quiet = [quiet]
+            config.groups[str(chat_id)] = GroupDecisionConfig(
+                activity_multiplier=float(options.get("activity_multiplier", 1.0)),
+                base=None if options.get("base") is None else float(options["base"]),
+                quiet_hours=[str(item) for item in quiet],
+            )
+    return config
 
 
 def _has(dataclass_type: type, key: str) -> bool:

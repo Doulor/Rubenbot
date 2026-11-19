@@ -33,14 +33,48 @@ memory:
 
 chat:
   bot_name: "Ruben"
-  group_talkativeness: 0.08           # 群里普通消息的插话概率
-  group_talkativeness_boost: 0.25     # 刚聊过时的插话概率
-  boost_window_seconds: 90
   history_size: 30
   split_max_parts: 3
   split_part_chars: 60
   split_delay_seconds: 0.6
   history_ttl_hours: 12
+
+# 回复决策（意愿系统）：群里什么时候开口
+decision:
+  # 消息合并窗口：同一人连发的多条先攒着合并成一轮（秒）
+  merge_window_seconds: 4
+  # 硬触发（私聊/@/回复/叫名字）走短窗口；0 表示立即处理
+  hard_merge_window_seconds: 1
+  # 叫到这些名字/别名就算硬触发；留空则用 chat.bot_name
+  aliases: []
+
+  base: 0.10                  # 每个群的基础意愿（默认低，靠动量和相关性加分）
+  threshold: 0.85             # 分数达到多少才开口
+  threshold_noise: 0.10       # 阈值附近的随机扰动幅度
+  threshold_noise_band: 0.20  # 离阈值多近才摇骰子
+
+  momentum_bonus: 1.00        # 对话动量：bot 刚参与过这个会话时的加分
+  momentum_half_life_seconds: 120  # 动量的半衰期
+  relevance_bonus: 0.60       # 话题相关性：记忆检索命中时的最大加分
+  relevance_scale: 8.0        # 检索分数归一化尺度
+
+  ratio_window: 30            # 统计发言占比时看最近多少条消息（含 bot）
+  ratio_threshold: 0.20       # bot 占比超过这个值开始减分
+  ratio_silence: 0.60         # 占比到这个值直接静默
+  ratio_penalty: 1.50         # 占比超阈值时的最大减分
+
+  cooldown_seconds: 30        # 发言后冷却时间（硬触发不受影响）
+  cooldown_penalty: 0.60      # 冷却期内最多减多少分
+
+  veto_marker: "[不回复]"     # 模型输出这个标记就静默丢弃
+
+  # 每群覆盖：键是群的 chat_id
+  groups: {}
+  # groups:
+  #   "123456":
+  #     activity_multiplier: 1.5   # 活跃度倍率
+  #     base: 0.15                 # 覆盖基础值（不写则用全局 base）
+  #     quiet_hours: ["23:00-07:30"]  # 静默时段，可写多个
 
 plugins:
   dir: "plugins"

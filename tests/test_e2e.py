@@ -16,7 +16,9 @@ from conftest import ScriptedLLM
 def build() -> tuple[RubenBot, ConsoleAdapter, ScriptedLLM]:
     config = Config()
     config.chat.split_delay_seconds = 0
-    config.chat.group_talkativeness = 0.0  # 群里不随机插话
+    config.decision.merge_window_seconds = 0  # 测试里不攒消息，逐条处理
+    config.decision.hard_merge_window_seconds = 0
+    config.decision.base = 0.0  # 群里默认不插话
     store = MemoryStore(":memory:")
     extract_payload = json.dumps(
         [
@@ -87,6 +89,33 @@ def test_end_to_end_group_mention():
         assert "Ruben:" in console.stdout.getvalue()
         output = console.stdout.getvalue()
         assert "后端" in output
+
+    asyncio.run(scenario())
+
+
+def test_end_to_end_merge_window_with_merge_loop():
+    """走真实的合并循环：碎片消息攒成一轮后只回复一次。"""
+
+    async def scenario():
+        bot, console, llm = build()
+        bot.config.decision.merge_window_seconds = 0.05
+        bot.merger.window = 0.05
+        bot.config.decision.base = 10.0  # 群里保证过线
+        bot._stop.clear()
+        task = asyncio.create_task(bot._merge_loop())
+        await console.feed_line("[摸鱼群|阿花] 我跟你讲")
+        await console.feed_line("[摸鱼群|阿花] 今天遇到件事")
+        await asyncio.sleep(0.01)
+        assert console.sent == []  # 还在窗口里，不应逐条回复
+        await asyncio.sleep(0.4)
+        assert len(console.sent) == 1
+        assert len(llm.chat_messages) == 1
+        bot.stop()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
     asyncio.run(scenario())
 

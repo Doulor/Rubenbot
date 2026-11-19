@@ -22,7 +22,12 @@ def test_config_defaults():
     assert cfg.llm.model_for("consolidate") == cfg.llm.chat_model
     assert cfg.memory.extract_every_n == 30
     assert cfg.memory.inject_limit == 20
-    assert cfg.chat.group_talkativeness == 0.08
+    assert cfg.decision.merge_window_seconds == 4.0
+    assert cfg.decision.hard_merge_window_seconds == 1.0
+    assert cfg.decision.cooldown_seconds == 30.0
+    assert cfg.decision.ratio_threshold == 0.2
+    assert cfg.decision.veto_marker == "[不回复]"
+    assert cfg.decision.groups == {}
     assert cfg.chat.split_max_parts == 3
     assert cfg.enabled_adapters == []
 
@@ -80,6 +85,33 @@ def test_config_ignores_unknown_keys():
 def test_config_empty_adapter_is_disabled():
     cfg = Config.from_dict({"adapters": {"console": {}, "snowluma": None}})
     assert cfg.enabled_adapters == ["console"]
+
+
+def test_config_decision_section():
+    cfg = Config.from_dict(
+        {
+            "decision": {
+                "base": 0.05,
+                "threshold": 0.9,
+                "merge_window_seconds": 2,
+                "aliases": ["小R", "Ruben"],
+                "groups": {
+                    "123": {"activity_multiplier": 1.5, "base": 0.2, "quiet_hours": ["23:00-07:30"]},
+                    "456": {"quiet_hours": "00:00-06:00"},
+                },
+            }
+        }
+    )
+    assert cfg.decision.base == 0.05
+    assert cfg.decision.threshold == 0.9
+    assert cfg.decision.merge_window_seconds == 2
+    assert cfg.decision.aliases == ["小R", "Ruben"]
+    group = cfg.decision.groups["123"]
+    assert group.activity_multiplier == 1.5
+    assert group.base == 0.2
+    assert group.quiet_hours == ["23:00-07:30"]
+    # 字符串形式也接受
+    assert cfg.decision.groups["456"].quiet_hours == ["00:00-06:00"]
 
 
 # ----------------------------------------------------------------------

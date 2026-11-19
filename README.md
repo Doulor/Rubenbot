@@ -26,9 +26,9 @@ RubenBot 是一个以**记忆**为核心的拟人社交聊天 bot 框架。它�
                             │  core.RubenBot                │
                             │  1. 落 raw_messages / people  │
                             │  2. 插件 on_message / 命令     │
-                            │  3. 触发判断（私聊/被 @/概率）  │
+                            │  3. 合并窗口 → 意愿决策        │
                             │  4. 拼上下文（人格+记忆+历史）  │
-                            │  5. LLM 生成 → 拆条发送        │
+                            │  5. LLM 生成 → 否决检查 → 拆条 │
                             └──────┬───────────────┬────────┘
                                    │               │
                     ┌──────────────▼──┐   ┌────────▼──────────────┐
@@ -80,7 +80,8 @@ RubenBot 是一个以**记忆**为核心的拟人社交聊天 bot 框架。它�
 | `rubenbot/config.py` | 读取 YAML 配置，展开 `${ENV_VAR}`，未知键忽略，缺文件走默认值 |
 | `rubenbot/persona.py` | 加载 SOUL.md 风格的 Markdown 人格；不存在时生成默认人格 |
 | `rubenbot/llm.py` | OpenAI 兼容客户端；`chat` / `extract` / `consolidate` 可分模型；带退避重试 |
-| `rubenbot/core.py` | 消息主循环、触发判断、上下文拼装、拆条发送、后台维护 |
+| `rubenbot/core.py` | 消息主循环、合并窗口调度、决策、上下文拼装、拆条发送、后台维护 |
+| `rubenbot/decision.py` | 回复意愿系统：消息合并、硬触发、意愿评分、生成否决标记 |
 | `rubenbot/memory/store.py` | SQLite 读写唯一入口：人物、记忆、流水、变更日志、撤销 |
 | `rubenbot/memory/retrieve.py` | 分词、Jaccard、IDF 加权检索 |
 | `rubenbot/memory/extract.py` | 批量抽取 + 去重 + 标记已处理 |
@@ -157,7 +158,7 @@ ConsoleAdapter 的输入格式：
 | `[摸鱼群\|阿花] 今天好累` | 指定群名与昵称 |
 | `/hello` | 触发示例插件命令 |
 
-群聊里普通消息默认只有 `group_talkativeness`（0.08）的概率被接话；想调试时可以在配置里临时调高，或直接发 `/hello`。
+群聊里普通消息默认只拿 `decision.base`（0.10）的基础意愿，单靠它过不了阈值；被 @ / 被回复 / 叫到名字（`Ruben`）时必回。想调试时可以在配置里临时调高 `decision.base` / `decision.threshold`，或直接发 `/hello`。
 
 ### 4. 测试
 
@@ -165,7 +166,7 @@ ConsoleAdapter 的输入格式：
 pytest
 ```
 
-当前共 96 个测试，覆盖存储 CRUD / 变更日志与撤销、检索打分、抽取去重、归纳校验（不许新词、20% 上限、user 来源不可删）、主循环、插件、SnowLuma 事件解析，以及 Console + 假 LLM 的端到端流程。
+当前共 142 个测试，覆盖存储 CRUD / 变更日志与撤销、检索打分、抽取去重、归纳校验（不许新词、20% 上限、user 来源不可删）、回复决策（合并窗口、动量衰减、占比抑制、冷却、硬触发、生成否决）、主循环、插件、SnowLuma 事件解析，以及 Console + 假 LLM 的端到端流程。
 
 ---
 
@@ -185,10 +186,17 @@ pytest
 | | `consolidate_new_threshold` | 新增记忆达到多少条触发归纳 |
 | | `consolidate_interval_hours` | 距上次归纳超过多久触发 |
 | | `raw_keep_per_chat` | 每会话保留的已处理流水条数 |
-| `chat` | `group_talkativeness` | 群聊普通消息插话概率 |
-| | `group_talkativeness_boost` | 刚聊过时的插话概率 |
-| | `history_size` | 上下文带入的最近消息条数 |
+| `chat` | `history_size` | 上下文带入的最近消息条数 |
 | | `split_max_parts` `split_part_chars` `split_delay_seconds` | 长回复拆条策略 |
+| `decision` | `merge_window_seconds` `hard_merge_window_seconds` | 消息合并窗口（普通 / 硬触发） |
+| | `aliases` | 视为「叫名字」的别名，空则用 `chat.bot_name` |
+| | `base` `threshold` | 每群基础意愿 / 开口阈值 |
+| | `momentum_bonus` `momentum_half_life_seconds` | 对话动量加分与衰减半衰期 |
+| | `relevance_bonus` `relevance_scale` | 话题相关性（记忆检索）加分 |
+| | `ratio_window` `ratio_threshold` `ratio_silence` `ratio_penalty` | 发言占比抑制 |
+| | `cooldown_seconds` `cooldown_penalty` | 发言后冷却 |
+| | `veto_marker` | 模型输出该标记即静默丢弃 |
+| | `groups` | 每群覆盖：`activity_multiplier` / `base` / `quiet_hours` |
 | `plugins` | `dir` `enabled` `command_prefix` | `enabled` 为空表示全部启用 |
 | `background_check_minutes` | — | 抽取/归纳检查间隔 |
 
@@ -240,8 +248,8 @@ def register(ctx):
 5. **bot 自己的回复也写进 `raw_messages`，但用 `__bot__` 标记且 `processed=1`**
    这样下一轮上下文能看到自己的话，对话连贯；同时它不会被当成「人物」，也不参与记忆抽取。
 
-6. **群聊插话是概率行为，并带「刚聊过」加成**
-   私聊必回、被 @ / 被回复必回；其余消息按 `group_talkativeness` 随机决定。最近刚回复过的会话在 `boost_window_seconds` 内提高概率，模拟「话题还没结束」。随机源可注入，测试里用固定种子。
+6. **群聊开口由「意愿系统」决定，不是平坦概率**（`rubenbot/decision.py`）
+   私聊、被 @ / 被回复 / 叫到名字（`aliases`，默认 `chat.bot_name`）是硬触发，直接生成。普通群消息先过合并窗口（同一发送者 4 秒内连发合成一轮，别人插话则提前放行），再算意愿分：`基础值 + 动量（半衰期衰减） + 相关性（记忆检索最高分归一化）`，减去 `发言占比惩罚`（最近 N 条里 bot 占比超过 20% 开始减，60% 直接静默）和 `发言后冷却`（默认 30 秒）。分数过 `threshold` 才生成；离阈值很近时加一点随机扰动，避免机械感。生成阶段模型可以只输出 `[不回复]` 自行否决。每次决策用 INFO 日志记录回/不回、分数和主要因子，`bot.last_decision` 保留最近结果供 WebUI 读取。所有时间与随机源都可注入，单测用假时钟/固定随机。
 
 7. **每个会话一把 `asyncio.Lock`**
    同一会话的消息串行处理，避免并发回复、上下文互相覆盖；不同会话之间仍然并行。
