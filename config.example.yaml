@@ -89,12 +89,25 @@ adapters:
     http_url: "http://127.0.0.1:3000"
     access_token: ""
     self_id: ""               # 可选：bot 的 QQ 号，留空则从事件里自动取
-    # 平台特有能力开关（SnowLuma 扩展动作）。插件/核心按名调用，关掉即跳过。
+    # 平台特有能力开关（SnowLuma 扩展动作 / QQ 空间 Web 接口）。
+    # 插件/核心按名调用，关掉即跳过；未写的项用代码里的默认值。
     capabilities:
       # 给消息贴表情（set_msg_emoji_like），默认开
       emoji_like: true
       # 发 QQ 空间说说（send_qzone_msg），默认关：对外发布内容，需显式打开
       qzone: false
+      # ---- QQ 空间互动（经 get_cookies 拿登录态后直调空间 Web 接口）----
+      # 读别人/自己的说说流（qzone.feeds）与自己说说下收到的评论
+      # （qzone.my_comments）：只读，默认开。注意 feeds: false 会同时关掉这两项。
+      feeds: true
+      # ⚠️ 以下三项是对外写操作，默认全关。开启风险提示：
+      #   - QQ 空间接口未公开，高频点赞/评论极易触发风控（返回 -10049 /
+      #     needVerify，严重时账号被限制空间功能）；
+      #   - 自动化互动属于非人工行为，请自行确认不违反腾讯的服务条款；
+      #   - 建议只在小范围、低频场景使用，并在插件层加冷却与频率上限。
+      like: false       # 给说说点赞（qzone.like）
+      comment: false    # 给说说发表评论（qzone.comment）
+      reply: false      # 回复自己说说下的评论（qzone.reply）
 
 background_check_minutes: 5
 log_level: "INFO"

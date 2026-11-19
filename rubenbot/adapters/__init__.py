@@ -13,6 +13,7 @@ from .base import (
     text_segments,
 )
 from .console import ConsoleAdapter
+from .qzone import QzoneClient
 from .snowluma import SnowLumaAdapter
 
 __all__ = [
@@ -21,6 +22,7 @@ __all__ = [
     "CapabilityNotSupported",
     "ConsoleAdapter",
     "MessageEvent",
+    "QzoneClient",
     "SEGMENT_PLACEHOLDERS",
     "Segment",
     "SnowLumaAdapter",
