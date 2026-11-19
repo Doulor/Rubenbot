@@ -187,6 +187,29 @@ class Config:
         """返回配置中启用（值不为 null/false）的适配器名；``{}`` 也算启用。"""
         return [name for name, opts in self.adapters.items() if opts is not None and opts is not False]
 
+    def adapter_options(self, name: str) -> dict[str, Any]:
+        """某个适配器的配置段；未配置或不是 dict 时返回空 dict。"""
+        options = self.adapters.get(name)
+        return options if isinstance(options, dict) else {}
+
+    def adapter_capability_enabled(self, adapter_name: str, config_key: str, default: bool = True) -> bool:
+        """读取 ``adapters.<adapter>.capabilities.<config_key>`` 开关。
+
+        未写时用 ``default``；只接受布尔值，写成字符串等一律视为关闭，避免
+        ``"false"`` 这种意外真值。
+        """
+        caps = self.adapter_options(adapter_name).get("capabilities")
+        if not isinstance(caps, dict) or config_key not in caps:
+            return default
+        return caps[config_key] is True
+
+    def adapter_capabilities(self, adapter_name: str) -> dict[str, bool]:
+        """某个适配器配置里的能力开关表（原样返回布尔化后的副本）。"""
+        caps = self.adapter_options(adapter_name).get("capabilities")
+        if not isinstance(caps, dict):
+            return {}
+        return {str(key): value is True for key, value in caps.items()}
+
     @classmethod
     def load(cls, path: str | Path = "config.yaml") -> "Config":
         """从 YAML 加载配置；文件不存在时返回全默认值。"""

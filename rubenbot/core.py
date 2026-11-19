@@ -18,7 +18,14 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from .adapters.base import BaseAdapter, MessageEvent, Segment
+from .adapters.base import (
+    BaseAdapter,
+    CapabilityError,
+    MessageEvent,
+    Segment,
+    as_segment,
+    render_segments,
+)
 from .config import Config
 from .decision import (
     BOT_SENDER_ID,
@@ -577,16 +584,31 @@ class RubenBot:
             parts = parts[: max_parts - 1] + ["".join(parts[max_parts - 1 :])]
         return parts
 
-    async def send_reply(self, event: MessageEvent, reply: str, *, now: float | None = None) -> None:
-        """拆条发送，并把 bot 自己的话写进流水（``processed=True``，不参与记忆抽取）。"""
+    async def send_reply(
+        self,
+        event: MessageEvent,
+        reply: str | list[Segment] | list[dict[str, Any]],
+        *,
+        now: float | None = None,
+    ) -> None:
+        """拆条发送，并把 bot 自己的话写进流水（``processed=True``，不参与记忆抽取）。
+
+        ``reply`` 可以是纯文本（按句拆条），也可以是一组消息段：段列表原样
+        交给适配器，整条消息只发一次，不做二次拆分。
+        """
         adapter = self.adapters.get(event.platform)
         if adapter is None:
             logger.warning("没有平台 %s 的适配器，无法回复", event.platform)
             return
-        parts = self.split_reply(reply)
-        for index, part in enumerate(parts):
+        if isinstance(reply, str):
+            parts: list[list[Segment]] = [[Segment.text(part)] for part in self.split_reply(reply)]
+        else:
+            segments = [as_segment(segment) for segment in reply]
+            parts = [segments] if segments else []
+        for index, segments in enumerate(parts):
+            text = render_segments(segments)
             try:
-                await adapter.send(event.chat_id, [Segment.text(part)], chat_type=event.chat_type)
+                await adapter.send(event.chat_id, segments, chat_type=event.chat_type)
             except Exception as exc:  # noqa: BLE001 - 一条发失败不影响后续
                 logger.warning("发送失败（%s 第 %s 条）：%s", event.platform, index + 1, exc)
                 continue
@@ -597,10 +619,86 @@ class RubenBot:
                 chat_type=event.chat_type,
                 sender_id=BOT_SENDER_ID,
                 sender_name=self.config.chat.bot_name,
-                text=part,
+                text=text,
                 processed=True,
             )
             if index < len(parts) - 1 and self.config.chat.split_delay_seconds > 0:
                 await asyncio.sleep(self.config.chat.split_delay_seconds)
         # 发言时间交给决策引擎：动量加成与发言后冷却都依赖它
         self.decision_engine.note_reply(self.decision_engine.chat_key(event), time.time() if now is None else now)
+
+    # ------------------------------------------------------------------
+    # 平台能力
+    # ------------------------------------------------------------------
+
+    async def call_capability(
+        self,
+        adapter_name: str | None,
+        name: str,
+        **kwargs: Any,
+    ) -> tuple[bool, str]:
+        """统一的平台能力入口：``(是否成功, 说明/失败原因)``。
+
+        - ``adapter_name`` 为空时按顺序试所有在线适配器，用第一个**已声明且
+          配置开关打开**的能力；都不可用则返回失败。
+        - 适配器未声明、配置关闭、执行出错一律返回 ``(False, 原因)`` 并记日志，
+          绝不抛异常打断主循环。
+        """
+        candidates: list[BaseAdapter] = []
+        if adapter_name is None:
+            candidates = list(self.adapters.values())
+            if not candidates:
+                logger.warning("调用能力 %s 失败：当前没有在线适配器", name)
+                return False, "当前没有在线适配器"
+        else:
+            adapter = self.adapters.get(adapter_name)
+            if adapter is None:
+                logger.warning("调用能力 %s 失败：适配器 %s 不在线", name, adapter_name)
+                return False, f"适配器 {adapter_name} 不在线"
+            candidates = [adapter]
+
+        reasons: list[str] = []
+        for adapter in candidates:
+            reason = self._capability_block_reason(adapter, name)
+            if reason is not None:
+                reasons.append(reason)
+                continue
+            try:
+                result = await adapter.call_capability(name, **kwargs)
+            except CapabilityError as exc:
+                logger.warning("适配器 %s 调用能力 %s 失败：%s", adapter.name, name, exc)
+                return False, str(exc)
+            except Exception as exc:  # noqa: BLE001 - 能力失败不能打断主循环
+                logger.warning("适配器 %s 调用能力 %s 异常：%s", adapter.name, name, exc)
+                return False, str(exc) or exc.__class__.__name__
+            logger.info("适配器 %s 调用能力 %s 成功", adapter.name, name)
+            return True, self._capability_success_text(result)
+
+        reason = "；".join(dict.fromkeys(reasons)) or f"没有适配器支持能力 {name}"
+        logger.warning("调用能力 %s 失败：%s", name, reason)
+        return False, reason
+
+    def _capability_block_reason(self, adapter: BaseAdapter, name: str) -> str | None:
+        """能力不可用的原因；可用时返回 None。"""
+        declared = set(getattr(adapter, "capabilities", frozenset()) or ())
+        if name not in declared:
+            return f"适配器 {adapter.name} 不支持能力 {name}"
+        config_key = (getattr(adapter, "capability_config_keys", None) or {}).get(name)
+        if config_key:
+            default = (getattr(adapter, "capability_defaults", None) or {}).get(name, True)
+            if not self.config.adapter_capability_enabled(adapter.name, config_key, default=default):
+                return f"适配器 {adapter.name} 的能力 {name} 已在配置中关闭（adapters.{adapter.name}.capabilities.{config_key}）"
+        return None
+
+    @staticmethod
+    def _capability_success_text(result: Any) -> str:
+        if result is None:
+            return "ok"
+        if isinstance(result, dict):
+            for key in ("message_id", "id"):
+                if result.get(key) is not None:
+                    return f"ok: {result[key]}"
+        if isinstance(result, (str, int, float)):
+            return f"ok: {result}"
+        return "ok"
+
