@@ -28,6 +28,9 @@ function h(tag, props = {}, ...children) {
       node.innerHTML = value;
     } else if (key === "text") {
       node.textContent = value;
+    } else if (key === "value" && tag === "textarea") {
+      // textarea 的 value 只能走属性，setAttribute("value") 不会回填内容
+      node.value = String(value);
     } else if (value === true) node.setAttribute(key, "");
     else node.setAttribute(key, String(value));
   }
@@ -448,9 +451,42 @@ function kpi(label, iconName, value, note, hint) {
   return h(
     "div",
     { class: "card kpi" },
-    h("div", { class: "kpi-top" }, h("span", {}, label), icon(iconName)),
+    h("div", { class: "kpi-top" }, h("span", {}, label), h("span", { class: "kpi-icon" }, icon(iconName))),
     h("div", { class: "kpi-value" }, value),
     h("div", { class: "kpi-note" }, note, hint ? [" ", h("em", {}, hint)] : null)
+  );
+}
+
+/** 概览英雄卡：运行状态 + 大号发光主按钮造型（跳设置）。 */
+function overviewHero(data) {
+  const running = Boolean(data.bot.running);
+  const runningAdapters = data.adapters.filter((item) => item.running).length;
+  return h(
+    "section",
+    { class: "hero" },
+    h(
+      "div",
+      { class: "hero-copy" },
+      h(
+        "span",
+        { class: `hero-status ${running ? "" : "is-off"}` },
+        h("span", { class: "live-dot", dataset: { state: running ? "ok" : "off" } }),
+        running ? "运行中" : "已停止"
+      ),
+      h("h2", { class: "hero-title" }, data.bot.name || "RubenBot"),
+      h("p", { class: "hero-sub" },
+        running ? `已运行 ${fmtDuration(data.bot.uptime_seconds)}，正在等待下一条消息` : "bot 当前没有运行"),
+      h(
+        "div",
+        { class: "hero-chips" },
+        h("span", { class: "hero-chip" }, `适配器 ${runningAdapters} / ${data.adapters.length}`),
+        h("span", { class: "hero-chip" }, `记忆 ${fmtNumber(data.counts.memories)} 条`),
+        h("span", { class: "hero-chip" }, `插件 ${data.plugins.enabled} / ${data.plugins.total}`),
+        h("span", { class: "hero-chip" }, `WebUI ${data.webui.host}:${data.webui.port}`)
+      )
+    ),
+    h("a", { class: "hero-action", href: "#/settings", "aria-label": "打开设置" },
+      icon("settings"), "设置")
   );
 }
 
@@ -659,6 +695,7 @@ async function renderOverview(view) {
     );
 
     view.replaceChildren(
+      overviewHero(data),
       tiles,
       h("div", { class: "grid grid-2" }, h("div", { class: "grid" }, runtime, adapters), h("div", { class: "grid" }, plugins, webui)),
       decisions
