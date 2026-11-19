@@ -164,3 +164,34 @@ def test_hook_exception_does_not_crash(plugin_dir):
     bot.register_adapter(adapter)
     asyncio.run(bot.handle_event(private("hi")))
     assert adapter.texts == ["还在"]
+
+
+def test_set_enabled_runtime_and_lazy_load(plugin_dir):
+    """运行时启停：禁用后钩子不再分发；被跳过的插件启用时现场 register。"""
+    manager = make_manager(plugin_dir, enabled=[])
+    manager.load_all()
+    demo = manager.plugins["demo"]
+    assert demo.enabled is False and demo.loaded is False
+
+    assert manager.set_enabled("demo", True) is True
+    assert demo.enabled is True and demo.loaded is True
+    assert "ping" in demo.commands
+
+    assert manager.set_enabled("demo", False) is True
+    assert demo.enabled is False
+    assert manager.enabled_plugins == []
+
+    assert manager.set_enabled("missing", True) is False
+    # 加载失败的插件也能在启用时报错而不是拖垮宿主
+    assert manager.set_enabled("broken", True) is False
+
+
+def test_set_enabled_broken_plugin_returns_false(plugin_dir):
+    manager = make_manager(plugin_dir, enabled=[])
+    manager.load_all()
+    # broken 插件 import 就炸，load_all 会把它移除；手工放回去模拟
+    from rubenbot.plugins.loader import Plugin
+
+    manager.plugins["broken"] = Plugin(name="broken", path=plugin_dir / "broken", enabled=False)
+    assert manager.set_enabled("broken", True) is False
+    assert manager.plugins["broken"].enabled is False

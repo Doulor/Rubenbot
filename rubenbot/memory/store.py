@@ -14,8 +14,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Iterable, Sequence
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS people (
+SCHEMA = """CREATE TABLE IF NOT EXISTS people (
     person_id     TEXT PRIMARY KEY,
     platform      TEXT NOT NULL,
     platform_uid  TEXT NOT NULL,
@@ -69,6 +68,26 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- 回复决策日志：每次「回 / 不回」的结论与因子，供 WebUI 展示和调参
+CREATE TABLE IF NOT EXISTS decision_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    platform    TEXT NOT NULL,
+    chat_id     TEXT NOT NULL,
+    chat_type   TEXT NOT NULL DEFAULT 'group',
+    sender_id   TEXT NOT NULL DEFAULT '',
+    sender_name TEXT NOT NULL DEFAULT '',
+    text        TEXT NOT NULL DEFAULT '',
+    should_reply INTEGER NOT NULL DEFAULT 0,
+    reason      TEXT NOT NULL DEFAULT '',
+    hard_trigger TEXT NOT NULL DEFAULT '',
+    score       REAL NOT NULL DEFAULT 0,
+    threshold   REAL NOT NULL DEFAULT 0,
+    factors     TEXT NOT NULL DEFAULT '{}',   -- DecisionFactors 的 JSON
+    created_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_decision_chat ON decision_log(chat_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_decision_created ON decision_log(created_at);
 """
 
 
@@ -201,6 +220,67 @@ class MemoryStore:
             ).fetchall()
         return [Person(**dict(row)) for row in rows]
 
+    def count_people(self) -> int:
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) AS c FROM people").fetchone()
+        return int(row["c"])
+
+    def memory_counts_by_person(self) -> dict[str, int]:
+        """一次查出每个人有多少条记忆，供人物列表展示。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT person_id, COUNT(*) AS c FROM memories GROUP BY person_id"
+            ).fetchall()
+        return {row["person_id"]: int(row["c"]) for row in rows}
+
+    def list_people_with_counts(self, limit: int = 200) -> list[tuple[Person, int]]:
+        counts = self.memory_counts_by_person()
+        return [(person, counts.get(person.person_id, 0)) for person in self.list_people(limit)]
+
+    def list_chats(self, limit: int = 200) -> list[dict]:
+        """会话列表：按最近消息时间排序，带消息数与最后活跃时间。"""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT platform, chat_id, chat_type,
+                       MAX(chat_id) AS _,
+                       MAX(ts) AS last_ts, COUNT(*) AS message_count,
+                       MAX(sender_name) AS _n
+                FROM raw_messages
+                GROUP BY platform, chat_id, chat_type
+                ORDER BY last_ts DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [
+            {
+                "platform": row["platform"],
+                "chat_id": row["chat_id"],
+                "chat_type": row["chat_type"],
+                "last_ts": row["last_ts"],
+                "message_count": int(row["message_count"]),
+            }
+            for row in rows
+        ]
+
+    def chat_counts(self) -> dict[str, int]:
+        """消息总数与机器人自己发出的消息数（按会话无关的全量统计）。"""
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT COUNT(*) AS total,
+                       SUM(CASE WHEN sender_id = '__bot__' THEN 1 ELSE 0 END) AS bot,
+                       COUNT(DISTINCT platform || ':' || chat_id) AS chats
+                FROM raw_messages
+                """
+            ).fetchone()
+        return {
+            "messages": int(row["total"] or 0),
+            "replies": int(row["bot"] or 0),
+            "chats": int(row["chats"] or 0),
+        }
+
     # ------------------------------------------------------------------
     # memories
     # ------------------------------------------------------------------
@@ -304,6 +384,38 @@ class MemoryStore:
         with self._lock:
             row = self._conn.execute(sql, params).fetchone()
         return int(row["c"])
+
+    def search_memories(
+        self,
+        query: str = "",
+        *,
+        person_id: str | None = None,
+        scope_type: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[Memory], int]:
+        """按内容做简单全文搜索（LIKE，``%``/``_`` 已转义），返回 (结果, 总数)。"""
+        clauses = ["1=1"]
+        params: list = []
+        if person_id is not None:
+            clauses.append("person_id = ?")
+            params.append(person_id)
+        if scope_type is not None:
+            clauses.append("scope_type = ?")
+            params.append(scope_type)
+        keyword = (query or "").strip()
+        if keyword:
+            escaped = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            clauses.append("content LIKE ? ESCAPE '\\'")
+            params.append(f"%{escaped}%")
+        where = " AND ".join(clauses)
+        with self._lock:
+            total = int(self._conn.execute(f"SELECT COUNT(*) AS c FROM memories WHERE {where}", params).fetchone()["c"])
+            rows = self._conn.execute(
+                f"SELECT * FROM memories WHERE {where} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                [*params, max(1, limit), max(0, offset)],
+            ).fetchall()
+        return [Memory.from_row(row) for row in rows], total
 
     def get_memories_by_ids(self, ids: Sequence[int]) -> list[Memory]:
         ids = [int(i) for i in ids]
@@ -624,6 +736,128 @@ class MemoryStore:
             return float(raw) if raw is not None else default
         except ValueError:
             return default
+
+    # ------------------------------------------------------------------
+    # decision_log
+    # ------------------------------------------------------------------
+
+    def add_decision_log(
+        self,
+        *,
+        platform: str,
+        chat_id: str,
+        chat_type: str = "group",
+        sender_id: str = "",
+        sender_name: str = "",
+        text: str = "",
+        should_reply: bool = False,
+        reason: str = "",
+        hard_trigger: str = "",
+        score: float = 0.0,
+        threshold: float = 0.0,
+        factors: dict | None = None,
+        now: float | None = None,
+    ) -> int:
+        """记录一次回复决策；WebUI 的「最近决策」直接读它。"""
+        now = time.time() if now is None else now
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                INSERT INTO decision_log(platform, chat_id, chat_type, sender_id, sender_name, text,
+                                         should_reply, reason, hard_trigger, score, threshold, factors, created_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    platform,
+                    str(chat_id),
+                    chat_type,
+                    str(sender_id),
+                    sender_name,
+                    text,
+                    int(bool(should_reply)),
+                    reason,
+                    hard_trigger or "",
+                    float(score),
+                    float(threshold),
+                    json.dumps(factors or {}, ensure_ascii=False),
+                    now,
+                ),
+            )
+            self._conn.commit()
+        return int(cur.lastrowid)
+
+    def list_decision_logs(
+        self,
+        *,
+        chat_id: str | None = None,
+        platform: str | None = None,
+        limit: int = 50,
+        since: float | None = None,
+    ) -> list[dict]:
+        """最近的决策，按时间倒序。"""
+        sql = "SELECT * FROM decision_log WHERE 1=1"
+        params: list = []
+        if chat_id is not None:
+            sql += " AND chat_id = ?"
+            params.append(str(chat_id))
+        if platform is not None:
+            sql += " AND platform = ?"
+            params.append(platform)
+        if since is not None:
+            sql += " AND created_at >= ?"
+            params.append(since)
+        sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
+        params.append(max(1, limit))
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [self._row_to_decision(row) for row in rows]
+
+    def decision_stats(self, since: float | None = None) -> dict:
+        """决策汇总：总数、回复数、硬触发数。"""
+        sql = "SELECT COUNT(*) AS total, SUM(should_reply) AS replies, SUM(hard_trigger <> '') AS hard FROM decision_log"
+        params: list = []
+        if since is not None:
+            sql += " WHERE created_at >= ?"
+            params.append(since)
+        with self._lock:
+            row = self._conn.execute(sql, params).fetchone()
+        total = int(row["total"] or 0)
+        replies = int(row["replies"] or 0)
+        return {
+            "decisions": total,
+            "decision_replies": replies,
+            "hard_triggers": int(row["hard"] or 0),
+            "reply_rate": (replies / total) if total else 0.0,
+        }
+
+    def trim_decision_log(self, keep: int = 3000) -> int:
+        """只保留最近 keep 条决策记录，避免库无限增长。"""
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM decision_log WHERE id NOT IN (SELECT id FROM decision_log ORDER BY id DESC LIMIT ?)",
+                (max(1, keep),),
+            )
+            self._conn.commit()
+        return cur.rowcount
+
+    @staticmethod
+    def _row_to_decision(row: sqlite3.Row) -> dict:
+        return {
+            "id": row["id"],
+            "platform": row["platform"],
+            "chat_id": row["chat_id"],
+            "chat_type": row["chat_type"],
+            "sender_id": row["sender_id"],
+            "sender_name": row["sender_name"],
+            "text": row["text"],
+            "should_reply": bool(row["should_reply"]),
+            "reason": row["reason"],
+            "hard_trigger": row["hard_trigger"] or None,
+            "score": row["score"],
+            "threshold": row["threshold"],
+            "factors": json.loads(row["factors"] or "{}"),
+            "created_at": row["created_at"],
+        }
 
 
 def make_person_id(platform: str, platform_uid: str) -> str:

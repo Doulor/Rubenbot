@@ -1,6 +1,7 @@
 """命令行入口：``rubenbot -c config.yaml``。
 
-同时支持 ``python -m rubenbot``。
+同时支持 ``python -m rubenbot``。WebUI（第二阶段）与 bot 同进程：
+配置里 ``webui.enabled: true``（默认）时随 bot 一起拉起。
 """
 
 from __future__ import annotations
@@ -9,6 +10,7 @@ import argparse
 import asyncio
 import logging
 import sys
+from pathlib import Path
 
 from .adapters.console import ConsoleAdapter
 from .adapters.snowluma import SnowLumaAdapter
@@ -18,6 +20,9 @@ from .llm import LLMClient
 from .memory.store import MemoryStore
 from .persona import DEFAULT_PERSONA, load_persona
 from .plugins.loader import PluginManager
+from .web.logbuffer import install as install_log_buffer
+
+logger = logging.getLogger(__name__)
 
 
 def setup_logging(level: str = "INFO") -> None:
@@ -25,6 +30,11 @@ def setup_logging(level: str = "INFO") -> None:
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # WebUI 的「日志」页从这个环形缓冲读，挂不上也不影响运行
+    try:
+        install_log_buffer()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def build_adapters(config: Config):
@@ -65,17 +75,50 @@ def build_bot(config: Config) -> tuple[RubenBot, LLMClient, MemoryStore]:
     return bot, llm, store
 
 
-async def _run(config: Config) -> None:
+async def _run(config: Config, config_path: str = "config.yaml", *, no_webui: bool = False) -> None:
     bot, llm, store = build_bot(config)
+    webui = None
+    if config.webui.enabled and not no_webui:
+        webui = await _start_webui(bot, config_path)
     if not bot.adapters:
         logging.error("没有启用任何适配器，请在配置里设置 adapters.console: {} 或 adapters.snowluma")
+        if webui is not None:
+            logging.info("仍然启动 WebUI：http://%s:%s（bot 无适配器）", webui.host, webui.port)
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await webui.stop()
+                await llm.close()
+                store.close()
         return
     try:
         await bot.run()
     finally:
+        if webui is not None:
+            await webui.stop()
         await bot.shutdown()
         await llm.close()
         store.close()
+
+
+async def _start_webui(bot: RubenBot, config_path: str):
+    """按配置拉起 WebUI；失败只警告，不阻塞 bot 本身。"""
+    from .web.auth import BindSecurityError
+    from .web.server import start_webui
+    from .web.state import WebState
+
+    try:
+        state = WebState.from_bot(bot, config_path)
+        return await start_webui(state)
+    except BindSecurityError as exc:
+        # 安全底线：拒绝启动而不是悄悄改绑
+        logging.error("WebUI 拒绝启动：%s", exc)
+        raise
+    except ImportError as exc:
+        logging.warning("WebUI 未启动（缺少可选依赖，可 pip install 'rubenbot[webui]'）：%s", exc)
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("WebUI 启动失败：%s", exc)
+    return None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -83,6 +126,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("-c", "--config", default="config.yaml", help="配置文件路径")
     parser.add_argument("--console", action="store_true", help="强制启用 ConsoleAdapter")
     parser.add_argument("--init-persona", action="store_true", help="把默认人格写到配置的路径后退出")
+    parser.add_argument("--no-webui", action="store_true", help="本次不启动 WebUI（覆盖配置）")
+    parser.add_argument(
+        "--webui-only",
+        action="store_true",
+        help="只启动 WebUI（不连任何适配器），调试界面用",
+    )
     parser.add_argument("--log-level", default=None, help="日志级别，覆盖配置")
     args = parser.parse_args(argv)
 
@@ -104,8 +153,35 @@ def main(argv: list[str] | None = None) -> int:
     if args.console:
         config.adapters["console"] = config.adapters.get("console") or {}
 
+    if args.webui_only:
+        from .web.auth import BindSecurityError
+        from .web.server import run_webui_standalone
+        from .web.state import WebState
+
+        store = MemoryStore(config.database_path)
+        state = WebState(
+            config=config,
+            store=store,
+            config_path=Path(args.config),
+            plugins=None,
+            signer=None,
+        )
+        from .web.auth import SessionSigner
+
+        state.signer = SessionSigner(config.webui.password, ttl_hours=config.webui.session_hours)
+        try:
+            asyncio.run(run_webui_standalone(state))
+        except BindSecurityError as exc:
+            print(f"WebUI 拒绝启动：{exc}", file=sys.stderr)
+            return 2
+        except KeyboardInterrupt:
+            print("\n再见。")
+        finally:
+            store.close()
+        return 0
+
     try:
-        asyncio.run(_run(config))
+        asyncio.run(_run(config, args.config, no_webui=args.no_webui))
     except KeyboardInterrupt:
         print("\n再见。")
     return 0

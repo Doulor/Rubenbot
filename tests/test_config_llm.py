@@ -228,3 +228,34 @@ def test_parse_json_payload():
     assert parse_json_payload('结果如下：[{"x": 1}] 以上') == [{"x": 1}]
     assert parse_json_payload("") is None
     assert parse_json_payload("不是 JSON") is None
+
+
+# WebUI 配置
+
+def test_webui_config_defaults_and_from_dict():
+    cfg = Config()
+    assert cfg.webui.enabled is True
+    assert cfg.webui.host == "127.0.0.1"
+    assert cfg.webui.port == 8765
+    assert cfg.webui.password == ""
+
+    loaded = Config.from_dict(
+        {"webui": {"enabled": False, "host": "0.0.0.0", "port": 9000, "password": "pw", "unknown": 1}}
+    )
+    assert loaded.webui.enabled is False
+    assert loaded.webui.host == "0.0.0.0"
+    assert loaded.webui.port == 9000
+    assert loaded.webui.password == "pw"
+
+
+def test_is_loopback_host():
+    from rubenbot.config import is_loopback_host
+
+    assert is_loopback_host("127.0.0.1")
+    assert is_loopback_host("127.9.9.9")
+    assert is_loopback_host("localhost")
+    assert is_loopback_host("::1")
+    assert is_loopback_host("")
+    assert not is_loopback_host("0.0.0.0")
+    assert not is_loopback_host("192.168.1.2")
+    assert not is_loopback_host("example.com")

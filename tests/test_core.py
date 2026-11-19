@@ -371,3 +371,27 @@ def test_console_adapter_parse_and_send():
     assert named.sender_name == "阿花"
     asyncio.run(adapter.send("摸鱼群", [Segment.text("收到")]))
     assert "Ruben: 收到" in out.getvalue()
+
+
+def test_decision_written_to_store_log(config, store):
+    """每次决策都要落 decision_log，WebUI 的「最近决策」读它。"""
+    bot, _ = make_bot(config, store, ScriptedLLM({"chat": ["嗯"]}))
+    asyncio.run(bot.handle_event(private_event("在吗")))
+    logs = store.list_decision_logs()
+    assert len(logs) == 1
+    entry = logs[0]
+    assert entry["chat_id"] == "u1"
+    assert entry["sender_name"] == "阿花"
+    assert entry["should_reply"] is True
+    assert entry["hard_trigger"] == "private"
+
+
+def test_group_decision_log_has_factors(config, store):
+    config.decision.base = 0.05
+    bot, _ = make_bot(config, store, ScriptedLLM())
+    asyncio.run(bot.handle_event(group_event()))
+    entry = store.list_decision_logs(chat_id="g1")[0]
+    assert entry["should_reply"] is False
+    assert entry["reason"] == "below_threshold"
+    assert entry["factors"]["base"] == 0.05
+    assert "momentum" in entry["factors"]

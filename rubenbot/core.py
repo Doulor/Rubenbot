@@ -106,6 +106,9 @@ class RubenBot:
         aliases = config.decision.aliases or [config.chat.bot_name]
         self.decision_engine = DecisionEngine(config.decision, aliases=aliases, rng=self.rng)
         self.last_decision: dict[str, ReplyDecision] = {}
+        # 启动时间与最近一次处理消息的时间，供 WebUI 概览使用
+        self.started_at: float = time.time()
+        self.last_message_at: float | None = None
         # 每个会话的消息处理锁，保证串行，避免同一会话并发回复混乱
         self._chat_locks: dict[str, asyncio.Lock] = {}
         self._bg_task: asyncio.Task | None = None
@@ -287,6 +290,7 @@ class RubenBot:
         now = time.time()
         decision = self.decide(event, now=now)
         self.last_decision[self.decision_engine.chat_key(event)] = decision
+        self._log_decision(round_, event, decision, now)
         logger.info(
             "决策 %s/%s %s：%s %s",
             event.platform,
@@ -329,6 +333,39 @@ class RubenBot:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("插件 on_after_reply 异常：%s", exc)
 
+    def _log_decision(self, round_: MergedRound, event: MessageEvent, decision: ReplyDecision, now: float) -> None:
+        """把决策写入 decision_log，供 WebUI 展示；写库失败不影响主流程。"""
+        factors = decision.factors
+        try:
+            self.store.add_decision_log(
+                platform=event.platform,
+                chat_id=event.chat_id,
+                chat_type=event.chat_type,
+                sender_id=event.sender_id,
+                sender_name=event.sender_name,
+                text=event.text,
+                should_reply=decision.should_reply,
+                reason=decision.reason,
+                hard_trigger=decision.hard_trigger or "",
+                score=decision.score,
+                threshold=decision.threshold,
+                factors={
+                    "base": factors.base,
+                    "momentum": factors.momentum,
+                    "relevance": factors.relevance,
+                    "ratio_penalty": factors.ratio_penalty,
+                    "cooldown_penalty": factors.cooldown_penalty,
+                    "multiplier": factors.multiplier,
+                    "noise": factors.noise,
+                    "share": factors.share,
+                }
+                if factors is not None
+                else {},
+                now=now,
+            )
+        except Exception as exc:  # noqa: BLE001 - 观测数据写不进去也不能影响回复
+            logger.warning("写入决策日志失败：%s", exc)
+
     async def _record(self, event: MessageEvent, now: float) -> None:
         """落流水 + 更新人物；bot 自己发的消息不进流水。"""
         if not event.text.strip():
@@ -345,6 +382,7 @@ class RubenBot:
             ts=now,
         )
         self._last_activity[f"{event.platform}:{event.chat_id}"] = now
+        self.last_message_at = now
         logger.debug("记录消息 %s: %s", person_id, event.text[:60])
 
     # ------------------------------------------------------------------

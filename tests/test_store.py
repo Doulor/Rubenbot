@@ -161,3 +161,112 @@ def test_messages_have_timestamps(store):
     store.add_raw_message(platform="console", chat_id="g", sender_id="u", text="hi")
     msg = store.recent_messages("g")[0]
     assert msg.ts >= before
+
+
+# 决策日志
+
+def test_decision_log_crud_and_stats(store):
+    first = store.add_decision_log(
+        platform="console",
+        chat_id="g1",
+        sender_id="u1",
+        sender_name="阿花",
+        text="在吗",
+        should_reply=True,
+        reason="willing",
+        score=0.9,
+        threshold=0.85,
+        factors={"base": 0.1, "momentum": 0.8},
+        now=100.0,
+    )
+    store.add_decision_log(
+        platform="console",
+        chat_id="g1",
+        text="@Ruben",
+        should_reply=True,
+        reason="mentioned",
+        hard_trigger="mentioned",
+        score=1.0,
+        threshold=0.85,
+        now=200.0,
+    )
+    store.add_decision_log(platform="console", chat_id="g2", text="路过", now=300.0)
+
+    assert first == 1
+    all_items = store.list_decision_logs()
+    assert [item["chat_id"] for item in all_items] == ["g2", "g1", "g1"]
+    assert store.list_decision_logs(chat_id="g1", limit=1)[0]["text"] == "@Ruben"
+
+    stats = store.decision_stats()
+    assert stats["decisions"] == 3
+    assert stats["decision_replies"] == 2
+    assert stats["hard_triggers"] == 1
+    assert stats["reply_rate"] == 2 / 3
+
+    only_recent = store.decision_stats(since=250.0)
+    assert only_recent["decisions"] == 1
+
+    store.trim_decision_log(keep=2)
+    assert len(store.list_decision_logs()) == 2
+
+
+def test_decision_log_factors_roundtrip_unicode(store):
+    store.add_decision_log(
+        platform="console",
+        chat_id="群一",
+        text="今天好累啊",
+        factors={"base": 0.1, "noise": -0.03},
+    )
+    item = store.list_decision_logs()[0]
+    assert item["text"] == "今天好累啊"
+    assert item["factors"] == {"base": 0.1, "noise": -0.03}
+
+
+def test_search_memories_and_counts(store):
+    store.add_memory("p:1", "TA 在杭州做后端")
+    store.add_memory("p:1", "TA 喜欢爬山")
+    store.add_memory("p:2", "TA 养猫", scope_type="group", scope_id="g1", now=50.0)
+
+    items, total = store.search_memories("杭州")
+    assert total == 1 and items[0].content == "TA 在杭州做后端"
+
+    items, total = store.search_memories("TA")
+    assert total == 3
+
+    items, total = store.search_memories("", person_id="p:1")
+    assert total == 2
+
+    items, total = store.search_memories("", scope_type="group")
+    assert total == 1 and items[0].scope_id == "g1"
+
+    items, total = store.search_memories("", limit=1, offset=1)
+    assert total == 3 and len(items) == 1
+
+    # 通配符按字面匹配
+    store.add_memory("p:3", "完成度 80%")
+    assert store.search_memories("80%")[1] == 1
+    assert store.search_memories("_")[1] == 0
+
+
+def test_people_with_counts_and_chats(store):
+    store.upsert_person("console", "u1", "阿花", now=10.0)
+    store.upsert_person("console", "u2", "老周", now=20.0)
+    store.add_memory("console:u1", "事实一")
+    store.add_memory("console:u1", "事实二")
+
+    rows = store.list_people_with_counts()
+    counts = {person.person_id: count for person, count in rows}
+    assert counts == {"console:u1": 2, "console:u2": 0}
+    assert store.count_people() == 2
+
+    store.add_raw_message(platform="console", chat_id="g1", sender_id="u1", text="hi", ts=5.0)
+    store.add_raw_message(platform="console", chat_id="g1", sender_id="__bot__", text="yo", ts=8.0, processed=True)
+    store.add_raw_message(platform="console", chat_id="u2", sender_id="u2", text="私聊", chat_type="private", ts=9.0)
+
+    chats = store.list_chats()
+    assert chats[0]["chat_id"] == "u2" and chats[0]["chat_type"] == "private"
+    g1 = next(chat for chat in chats if chat["chat_id"] == "g1")
+    assert g1["message_count"] == 2 and g1["last_ts"] == 8.0
+
+    counts = store.chat_counts()
+    assert counts == {"messages": 3, "replies": 1, "chats": 2}

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 from dataclasses import dataclass, field
@@ -135,12 +136,43 @@ class PluginsConfig:
 
 
 @dataclass
+class WebUIConfig:
+    """WebUI 服务配置（第二阶段）。
+
+    默认只绑 127.0.0.1；绑到非本地地址时必须设置 ``password``，否则拒绝启动。
+    口令可以用 ``${ENV_VAR}`` 从环境变量读，避免写进配置文件。
+    """
+
+    enabled: bool = True
+    host: str = "127.0.0.1"
+    port: int = 8765
+    password: str = ""
+    # 登录会话有效期（小时）
+    session_hours: float = 72.0
+
+
+def is_loopback_host(host: str) -> bool:
+    """判断绑定地址是否只对本机可见。
+
+    ``localhost``、``::1``、以及整个 127.0.0.0/8 都算本地；空字符串按本地处理。
+    """
+    value = (host or "").strip()
+    if value in {"", "localhost"}:
+        return True
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
+
+
+@dataclass
 class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     chat: ChatConfig = field(default_factory=ChatConfig)
     decision: DecisionConfig = field(default_factory=DecisionConfig)
     plugins: PluginsConfig = field(default_factory=PluginsConfig)
+    webui: WebUIConfig = field(default_factory=WebUIConfig)
     persona_path: str = "data/SOUL.md"
     database_path: str = "data/rubenbot.db"
     adapters: dict[str, Any] = field(default_factory=dict)
@@ -173,6 +205,7 @@ class Config:
         chat = ChatConfig(**{k: v for k, v in (data.get("chat") or {}).items() if _has(ChatConfig, k)})
         decision = _load_decision(data.get("decision") or {})
         plugins = PluginsConfig(**{k: v for k, v in (data.get("plugins") or {}).items() if _has(PluginsConfig, k)})
+        webui = WebUIConfig(**{k: v for k, v in (data.get("webui") or {}).items() if _has(WebUIConfig, k)})
         persona = data.get("persona") or {}
         if isinstance(persona, str):
             persona = {"path": persona}
@@ -184,7 +217,13 @@ class Config:
             "log_level": data.get("log_level", "INFO"),
         }
         return cls(
-            llm=llm, memory=memory, chat=chat, decision=decision, plugins=plugins, **basics
+            llm=llm,
+            memory=memory,
+            chat=chat,
+            decision=decision,
+            plugins=plugins,
+            webui=webui,
+            **basics,
         )
 
 

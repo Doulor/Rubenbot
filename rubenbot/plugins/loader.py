@@ -50,6 +50,8 @@ class Plugin:
     after_reply_hooks: list[MessageHook] = field(default_factory=list)
     commands: dict[str, Command] = field(default_factory=dict)
     enabled: bool = True
+    # 是否真的执行过 register；加载时被禁用的插件是 False
+    loaded: bool = False
 
 
 class PluginContext:
@@ -155,6 +157,7 @@ class PluginManager:
         if not callable(register):
             raise AttributeError("plugin.py 缺少 register(ctx) 函数")
         register(PluginContext(plugin, self))
+        plugin.loaded = True
 
     # ------------------------------------------------------------------
     # 分发
@@ -235,6 +238,27 @@ class PluginManager:
                     "on_before_reply": len(p.before_reply_hooks),
                     "on_after_reply": len(p.after_reply_hooks),
                 },
+                "path": str(p.path),
             }
             for p in self.plugins.values()
         ]
+
+    def set_enabled(self, name: str, enabled: bool) -> bool:
+        """运行时启用/禁用插件，返回是否找到该插件。
+
+        禁用只是让分发时跳过它（已注册的钩子留着，再次启用立即生效）；
+        启用一个加载时被跳过的插件时，会现场执行它的 ``register``。
+        这个开关只在内存里，重启后以配置文件为准。
+        """
+        plugin = self.plugins.get(name)
+        if plugin is None:
+            return False
+        if enabled and not plugin.loaded:
+            try:
+                self._load_plugin(plugin)
+            except Exception as exc:  # noqa: BLE001 - 插件失败不能拖垮宿主
+                logger.warning("启用插件 %s 失败：%s", name, exc)
+                return False
+        plugin.enabled = enabled
+        logger.info("插件 %s 已%s", name, "启用" if enabled else "禁用")
+        return True
