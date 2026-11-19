@@ -96,5 +96,17 @@ adapters:
       # 发 QQ 空间说说（send_qzone_msg），默认关：对外发布内容，需显式打开
       qzone: false
 
+  # Telegram（Bot API 长轮询，不需要公网回调地址）
+  # telegram:
+  #   # 找 @BotFather 创建 bot 拿 token；建议放环境变量，不要提交到仓库
+  #   bot_token: "${RUBENBOT_TELEGRAM_TOKEN}"
+  #   # getUpdates 长轮询挂起时长（秒），同时决定单次请求超时
+  #   poll_timeout: 30
+  #   # 只处理这些 chat_id 的消息（用户 id 或群 id，可写负数）；留空表示不限。
+  #   # 群 id 形如 -1001234567890，配置后其他会话的消息直接忽略。
+  #   allowed_chat_ids: []
+  #   # getUpdates 的 offset 落盘位置：重启后不重复处理旧消息；留空则不落盘
+  #   offset_file: "data/telegram_offset.json"
+
 background_check_minutes: 5
 log_level: "INFO"
