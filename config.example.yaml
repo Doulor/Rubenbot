@@ -95,6 +95,13 @@ adapters:
       emoji_like: true
       # 发 QQ 空间说说（send_qzone_msg），默认关：对外发布内容，需显式打开
       qzone: false
+  # QQ 官方机器人（q.qq.com 开放平台，与上面的 OneBot 通道完全独立）
+  # 凭证在开放平台「开发设置」里拿；client_secret 支持 ${ENV_VAR} 展开
+  # qq_official:
+  #   app_id: "${QQBOT_APP_ID}"
+  #   client_secret: "${QQBOT_CLIENT_SECRET}"
+  #   sandbox: false            # true 走沙箱域名 sandbox.api.sgroup.qq.com
+  #   download_images: true     # 入站图片附件下载后转 base64 放进 image 段
 
 background_check_minutes: 5
 log_level: "INFO"

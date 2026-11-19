@@ -151,6 +151,41 @@ class WebUIConfig:
     session_hours: float = 72.0
 
 
+@dataclass
+class QQOfficialConfig:
+    """QQ 官方机器人（q.qq.com 开放平台）配置。
+
+    ``client_secret`` 建议写 ``${ENV_VAR}`` 从环境变量读，避免明文进仓库。
+    ``sandbox`` 打开后走沙箱域名 ``sandbox.api.sgroup.qq.com``，用于提审前联调。
+    """
+
+    app_id: str = ""
+    client_secret: str = ""
+    sandbox: bool = False
+    # 入站图片附件是否下载（转 base64 放进内部 image 段）
+    download_images: bool = True
+
+    @property
+    def configured(self) -> bool:
+        """app_id 与 client_secret 都填了才算可用。"""
+        return bool(self.app_id and self.client_secret)
+
+    @classmethod
+    def from_options(cls, options: dict[str, Any]) -> "QQOfficialConfig":
+        """从 ``adapters.qq_official`` 配置段解析；缺省/类型不对的字段回落默认值。
+
+        ``${ENV_VAR}`` 展开在 :meth:`Config.load` 阶段已经做过，这里不用重复。
+        """
+        if not isinstance(options, dict):
+            return cls()
+        return cls(
+            app_id=str(options.get("app_id") or ""),
+            client_secret=str(options.get("client_secret") or ""),
+            sandbox=options.get("sandbox") is True,
+            download_images=options.get("download_images") is not False,
+        )
+
+
 def is_loopback_host(host: str) -> bool:
     """判断绑定地址是否只对本机可见。
 
@@ -191,6 +226,10 @@ class Config:
         """某个适配器的配置段；未配置或不是 dict 时返回空 dict。"""
         options = self.adapters.get(name)
         return options if isinstance(options, dict) else {}
+
+    def qq_official_options(self) -> QQOfficialConfig:
+        """``adapters.qq_official`` 段的强类型视图。"""
+        return QQOfficialConfig.from_options(self.adapter_options("qq_official"))
 
     def adapter_capability_enabled(self, adapter_name: str, config_key: str, default: bool = True) -> bool:
         """读取 ``adapters.<adapter>.capabilities.<config_key>`` 开关。
