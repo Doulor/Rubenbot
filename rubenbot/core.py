@@ -15,6 +15,7 @@ import logging
 import random
 import re
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -45,10 +46,203 @@ from .plugins.loader import PluginContext, PluginManager
 
 logger = logging.getLogger(__name__)
 
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？!?…~～])\s*|\n+")
 # 适配器异常后的重启退避（秒）
 ADAPTER_RESTART_MIN = 1.0
 ADAPTER_RESTART_MAX = 30.0
+
+# ----------------------------------------------------------------------
+# 发送节奏与文本后处理（借鉴 MaiBot 研读 #2 的最小版）
+# ----------------------------------------------------------------------
+
+# 打字时间估算：中文约 0.3s/字，其他字符约 0.15s/字，每条另加回车时间；
+# 单字消息乘 3；纯图片/表情条固定 1s。倍率与单条上限在调用处应用。
+_CJK_SECONDS = 0.3
+_OTHER_SECONDS = 0.15
+_ENTER_SECONDS = 0.3
+_SINGLE_CHAR_FACTOR = 3.0
+_STICKER_SECONDS = 1.0
+
+# 句子切分点；切分时必须避开括号、引号、URL、行内代码
+_SENTENCE_ENDS = frozenset("。！？!?…~～")
+# 成对符号：开 -> 关（ASCII 引号开闭同型）
+_BRACKET_PAIRS = {
+    "（": "）",
+    "(": ")",
+    "「": "」",
+    "『": "』",
+    "【": "】",
+    "《": "》",
+    "〈": "〉",
+    "[": "]",
+    "{": "}",
+    "“": "”",
+    "‘": "’",
+    '"': '"',
+}
+_URL_RE = re.compile(
+    r"https?://[^\s<>\"'（）()【】「」『』，。！？；：、]+",
+    re.IGNORECASE,
+)
+
+# 括号动作清理：只删「短、纯中文、命中动作/语气词」的括号内容。
+# 含数字/英文/符号（例如颜文字）、或拿不准的一律保留。
+_ACTION_PAREN_RE = re.compile(r"[（(]([^（）()\n]{1,12})[）)]")
+_TONE_RE = re.compile(r"^[嗯啊哦噢喔呀哈呵嘿嘻呜嘤喵汪诶欸唉哎呃唔]+$")
+_ACTION_WORDS = frozenset(
+    {
+        # 面部表情
+        "笑", "笑了笑", "轻笑", "微笑", "大笑", "坏笑", "苦笑", "干笑", "偷笑",
+        "冷笑", "傻笑", "捂脸", "捧脸", "眨眼", "眨眨眼", "脸红", "皱眉",
+        "皱了皱眉", "翻白眼", "白眼", "憋笑", "捂嘴", "捂嘴笑", "擦泪", "哭",
+        "哭了", "流泪",
+        # 肢体动作
+        "点头", "点了点头", "点点头", "摇头", "摇了摇头", "摇摇头", "耸肩",
+        "耸了耸肩", "摊手", "摊了摊手", "歪头", "偏头", "摆手", "摆了摆手",
+        "挥手", "挥挥手", "鼓掌", "拍手", "起身", "坐下", "伸懒腰", "摸摸头",
+        "摸了摸头", "挠头", "挠了挠头", "托腮", "低头", "抬头", "打滚", "溜走",
+        "比心", "点赞", "握手", "鞠躬", "敬礼", "抱拳", "干杯", "抱头",
+        # 声音/神态
+        "叹气", "叹了口气", "轻叹", "叹气声", "打了个哈欠", "哈欠", "嘀咕",
+        "嘟囔", "碎碎念", "哼唧", "清了清嗓子", "咳咳", "咳", "沉默",
+        "沉默片刻", "沉思", "想了想", "思考", "轻声", "小声", "低声",
+    }
+)
+# 纯语气/感叹的短词（不表动作，也不承载语义）
+_INTERJECTIONS = frozenset({"啊这", "好家伙", "哎嘿", "嘿嘿", "哈哈", "呜呜"})
+
+
+def _is_cjk(char: str) -> bool:
+    """是否中文汉字（不含中文标点，标点按「其他字符」计）。"""
+    code = ord(char)
+    return (
+        0x4E00 <= code <= 0x9FFF
+        or 0x3400 <= code <= 0x4DBF
+        or 0xF900 <= code <= 0xFAFF
+    )
+
+
+def estimate_typing_seconds(segments: Sequence[Any]) -> float:
+    """估算一条消息的原始打字时间（秒），不含全局倍率和单条上限。
+
+    只统计文本段的字符：中文 0.3s/字、其他非空白字符 0.15s/字，再加
+    0.3s 回车时间；整条只有一个字时乘以 3。没有文本（纯图片/表情）固定 1s。
+    """
+    normalized = [as_segment(segment) for segment in segments]
+    text = "".join(seg.render() for seg in normalized if seg.type == "text")
+    if not text.strip():
+        return _STICKER_SECONDS
+    chars = [ch for ch in text if not ch.isspace()]
+    cjk = sum(1 for ch in chars if _is_cjk(ch))
+    others = len(chars) - cjk
+    seconds = cjk * _CJK_SECONDS + others * _OTHER_SECONDS
+    if len(chars) == 1:
+        seconds *= _SINGLE_CHAR_FACTOR
+    return seconds + _ENTER_SECONDS
+
+
+def _find_closing(text: str, start: int, open_char: str, close_char: str) -> int:
+    """从 ``start`` 起找配对的结束符号下标；找不到返回 -1（按普通字符处理）。"""
+    depth = 1
+    index = start
+    while index < len(text):
+        char = text[index]
+        if open_char != close_char and char == open_char:
+            depth += 1
+        elif char == close_char:
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    return -1
+
+
+def split_sentences(text: str) -> list[str]:
+    """按句末标点和换行切句，但不在括号、引号、URL、行内代码中间断开。
+
+    颜文字通常整体落在括号里（如 ``(≧▽≦)``）；``QAQ``、``OTZ`` 这类不含
+    句末标点的符号/字母串本身不会被切断。
+    """
+    parts: list[str] = []
+    buffer: list[str] = []
+    index = 0
+    length = len(text)
+
+    def flush() -> None:
+        piece = "".join(buffer).strip()
+        if piece:
+            parts.append(piece)
+        buffer.clear()
+
+    while index < length:
+        char = text[index]
+        # URL：整段跳过，避免在 ? ! 等处切断
+        if char in "hH":
+            match = _URL_RE.match(text, index)
+            if match:
+                buffer.append(match.group(0))
+                index = match.end()
+                continue
+        # 行内代码：`...`
+        if char == "`":
+            end = text.find("`", index + 1)
+            if end != -1:
+                buffer.append(text[index : end + 1])
+                index = end + 1
+                continue
+        # 括号/引号：整段保留到配对的结束符号
+        if char in _BRACKET_PAIRS:
+            end = _find_closing(text, index + 1, char, _BRACKET_PAIRS[char])
+            if end != -1:
+                buffer.append(text[index : end + 1])
+                index = end + 1
+                continue
+        buffer.append(char)
+        index += 1
+        if char in _SENTENCE_ENDS or char == "\n":
+            # 吃掉切分点后的空白（含连续换行），拼接回来时不丢内容
+            while index < length and text[index].isspace():
+                index += 1
+            flush()
+    flush()
+    return parts
+
+
+def strip_action_parens(text: str) -> str:
+    """移除括号包裹的动作描写，如「（笑）」「（点头）」。
+
+    保守规则：只处理括号内 ≤6 字、纯中文、且命中动作词表或纯语气词的内容；
+    含数字/英文/符号（例如颜文字）或拿不准的括号原样保留。
+    """
+    if not text:
+        return text
+
+    def replace(match: re.Match[str]) -> str:
+        inner = match.group(1).strip()
+        if not inner or len(inner) > 6:
+            return match.group(0)
+        if not all(_is_cjk(ch) for ch in inner):
+            return match.group(0)
+        if inner in _ACTION_WORDS or inner in _INTERJECTIONS or _TONE_RE.match(inner):
+            return ""
+        return match.group(0)
+
+    cleaned = _ACTION_PAREN_RE.sub(replace, text)
+    # 删除后可能留下连续空格/行首空格
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    return cleaned.strip()
+
+
+def _strip_segments_actions(segments: list[Segment]) -> list[Segment]:
+    """对消息段列表做动作括号清理：只改文本段，清空后的文本段直接去掉。"""
+    cleaned: list[Segment] = []
+    for segment in segments:
+        if segment.type != "text":
+            cleaned.append(segment)
+            continue
+        text = strip_action_parens(str(segment.data.get("text", "")))
+        if text:
+            cleaned.append(Segment.text(text))
+    return cleaned
 
 
 def format_scene(event: MessageEvent, display: str) -> str:
@@ -125,6 +319,8 @@ class RubenBot:
         self.merger = MessageMerger(
             config.decision.merge_window_seconds,
             config.decision.hard_merge_window_seconds,
+            batch_max=config.decision.batch_max_seconds,
+            urgent=config.decision.urgent_seconds,
         )
         aliases = config.decision.aliases or [config.chat.bot_name]
         self.decision_engine = DecisionEngine(config.decision, aliases=aliases, rng=self.rng)
@@ -173,6 +369,8 @@ class RubenBot:
         # 合并窗口：新值对之后到达的消息生效
         self.merger.window = max(0.0, float(config.decision.merge_window_seconds))
         self.merger.hard_window = max(0.0, float(config.decision.hard_merge_window_seconds))
+        self.merger.batch_max = max(0.0, float(config.decision.batch_max_seconds))
+        self.merger.urgent = max(0.0, float(config.decision.urgent_seconds))
         # 旧客户端在后台关掉，不阻塞保存请求
         if rebuild_llm and isinstance(old_llm, LLMClient):
             try:
@@ -341,7 +539,12 @@ class RubenBot:
                 return
 
         hard = self.decision_engine.is_hard_trigger(event)
-        ready = self.merger.add(event, now, hard=hard is not None)
+        ready = self.merger.add(
+            event,
+            now,
+            hard=hard is not None,
+            urgent=hard in ("mentioned", "reply_to_bot"),
+        )
         for round_ in ready:
             await self.process_round(round_)
 
@@ -557,7 +760,11 @@ class RubenBot:
         return (reply or "").strip()
 
     def split_reply(self, reply: str) -> list[str]:
-        """按句/长度拆成 2~3 条短消息。"""
+        """按句/长度拆成 2~3 条短消息。
+
+        短回复（不超过一条上限）不拆；切句时避开括号、引号、颜文字、URL
+        与行内代码，不会从它们中间断开。贪心合并到接近 ``split_part_chars``。
+        """
         reply = reply.strip()
         if not reply:
             return []
@@ -565,9 +772,7 @@ class RubenBot:
         limit = max(8, self.config.chat.split_part_chars)
         if len(reply) <= limit or max_parts == 1:
             return [reply]
-        sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(reply) if s and s.strip()]
-        if not sentences:
-            sentences = [reply]
+        sentences = split_sentences(reply) or [reply]
         # 贪心合并到接近 limit，且不超过 max_parts
         parts: list[str] = []
         current = ""
@@ -584,6 +789,16 @@ class RubenBot:
             parts = parts[: max_parts - 1] + ["".join(parts[max_parts - 1 :])]
         return parts
 
+    def typing_delay(self, segments: list[Segment]) -> float:
+        """一条消息发出前的等待时间：按字符估算 × 全局倍率，再截到单条上限。
+
+        倍率或上限配成 0 都表示不等待；第一条消息由调用方直接发出，不经过这里。
+        """
+        raw = estimate_typing_seconds(segments)
+        speed = max(0.0, float(self.config.chat.type_speed))
+        cap = max(0.0, float(self.config.chat.type_delay_max_seconds))
+        return min(raw * speed, cap) if speed > 0 else 0.0
+
     async def send_reply(
         self,
         event: MessageEvent,
@@ -594,18 +809,30 @@ class RubenBot:
         """拆条发送，并把 bot 自己的话写进流水（``processed=True``，不参与记忆抽取）。
 
         ``reply`` 可以是纯文本（按句拆条），也可以是一组消息段：段列表原样
-        交给适配器，整条消息只发一次，不做二次拆分。
+        交给适配器，整条消息只发一次，不做二次拆分。多条之间有按字数估算
+        的打字停顿（第一条立即发）。
         """
         adapter = self.adapters.get(event.platform)
         if adapter is None:
             logger.warning("没有平台 %s 的适配器，无法回复", event.platform)
             return
+        strip_actions = bool(getattr(self.config.chat, "strip_action_parens", False))
         if isinstance(reply, str):
-            parts: list[list[Segment]] = [[Segment.text(part)] for part in self.split_reply(reply)]
+            text_reply = strip_action_parens(reply) if strip_actions else reply
+            parts: list[list[Segment]] = [[Segment.text(part)] for part in self.split_reply(text_reply)]
         else:
             segments = [as_segment(segment) for segment in reply]
+            if strip_actions:
+                segments = _strip_segments_actions(segments)
             parts = [segments] if segments else []
+        if not parts:
+            # 拆条后什么都不剩（例如动作括号清理后为空）：不发，也不记发言
+            return
         for index, segments in enumerate(parts):
+            if index > 0:
+                delay = self.typing_delay(segments)
+                if delay > 0:
+                    await asyncio.sleep(delay)
             text = render_segments(segments)
             try:
                 await adapter.send(event.chat_id, segments, chat_type=event.chat_type)
@@ -622,8 +849,6 @@ class RubenBot:
                 text=text,
                 processed=True,
             )
-            if index < len(parts) - 1 and self.config.chat.split_delay_seconds > 0:
-                await asyncio.sleep(self.config.chat.split_delay_seconds)
         # 发言时间交给决策引擎：动量加成与发言后冷却都依赖它
         self.decision_engine.note_reply(self.decision_engine.chat_key(event), time.time() if now is None else now)
 

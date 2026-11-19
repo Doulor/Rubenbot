@@ -73,7 +73,7 @@ def store():
 @pytest.fixture()
 def config() -> Config:
     cfg = Config()
-    cfg.chat.split_delay_seconds = 0
+    cfg.chat.type_speed = 0
     cfg.chat.bot_name = "Ruben"
     # 单测默认关掉合并窗口，让 handle_event 同步处理完
     cfg.decision.merge_window_seconds = 0

@@ -56,6 +56,8 @@ class MergedRound:
     last_at: float = 0.0
     deadline: float = 0.0
     hard: bool = False
+    # 批次里出现过 @/回复 bot 的消息；一旦为真，截止时间不再延后
+    urgent: bool = False
 
     @property
     def key(self) -> tuple[str, str, str]:
@@ -93,14 +95,29 @@ class MessageMerger:
       因为对方插话通常意味着前一个人这一段说完了；
     - 同一发送者在窗口内继续发，延长截止时间并合并；
     - 硬触发消息使用短窗口（``hard_window``），设为 0 表示立即处理；
+    - **整批上限**：批次从首条消息起最多等 ``batch_max`` 秒，到点必放出
+      （0 表示不设上限）；
+    - **@ 上限**：批次里出现 @/回复 bot 的消息时，截止时间提前到
+      「首条 + ``urgent``」秒（0 表示不启用）；
+    - **到期不续命**：批次一旦到期封口，新的同人消息不再延长它，而是让
+      旧批次先放出、自己进新批次；
     - 窗口设为 0 时所有消息都立即处理。
 
     所有时间都由调用方传入，因此单测可以用假时钟精确控制。
     """
 
-    def __init__(self, window: float = 4.0, hard_window: float = 1.0):
+    def __init__(
+        self,
+        window: float = 4.0,
+        hard_window: float = 1.0,
+        *,
+        batch_max: float = 10.0,
+        urgent: float = 2.0,
+    ):
         self.window = max(0.0, float(window))
         self.hard_window = max(0.0, float(hard_window))
+        self.batch_max = max(0.0, float(batch_max))
+        self.urgent = max(0.0, float(urgent))
         self._pending: dict[tuple[str, str, str], MergedRound] = {}
 
     def __len__(self) -> int:
@@ -113,8 +130,27 @@ class MessageMerger:
     def _window_for(self, hard: bool) -> float:
         return self.hard_window if hard else self.window
 
-    def add(self, event: MessageEvent, now: float, *, hard: bool = False) -> list[MergedRound]:
-        """加入一条消息，返回此刻应当处理的轮次（按时间先后）。"""
+    def _deadline_for(self, round_: MergedRound, now: float, hard: bool, urgent: bool) -> float:
+        """统一截止时间计算：窗口 / 整批上限 / @ 上限取最早者。"""
+        deadline = now + self._window_for(hard)
+        if self.batch_max > 0:
+            deadline = min(deadline, round_.first_at + self.batch_max)
+        if urgent and self.urgent > 0:
+            deadline = min(deadline, round_.first_at + self.urgent)
+        return deadline
+
+    def add(
+        self,
+        event: MessageEvent,
+        now: float,
+        *,
+        hard: bool = False,
+        urgent: bool = False,
+    ) -> list[MergedRound]:
+        """加入一条消息，返回此刻应当处理的轮次（按时间先后）。
+
+        ``urgent`` 表示这条消息 @/回复了 bot，会把本批截止时间提前。
+        """
         ready: list[MergedRound] = []
         key = (event.platform, event.chat_id, event.sender_id)
 
@@ -124,6 +160,10 @@ class MessageMerger:
                 ready.append(self._pending.pop(other_key))
 
         round_ = self._pending.get(key)
+        if round_ is not None and round_.deadline <= now:
+            # 已到期封口的旧批次：先放出，新消息另起一批（不再续命）
+            ready.append(self._pending.pop(key))
+            round_ = None
         if round_ is None:
             round_ = MergedRound(
                 platform=event.platform,
@@ -138,7 +178,8 @@ class MessageMerger:
         round_.last_at = now
         round_.sender_name = event.sender_name or round_.sender_name
         round_.hard = round_.hard or hard
-        round_.deadline = now + self._window_for(round_.hard)
+        round_.urgent = round_.urgent or urgent
+        round_.deadline = self._deadline_for(round_, now, round_.hard, round_.urgent)
 
         # 窗口为 0（或硬窗口为 0 的硬触发）时立即放行
         if round_.deadline <= now:

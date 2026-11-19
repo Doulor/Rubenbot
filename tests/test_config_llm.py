@@ -24,11 +24,16 @@ def test_config_defaults():
     assert cfg.memory.inject_limit == 20
     assert cfg.decision.merge_window_seconds == 4.0
     assert cfg.decision.hard_merge_window_seconds == 1.0
+    assert cfg.decision.batch_max_seconds == 10.0
+    assert cfg.decision.urgent_seconds == 2.0
     assert cfg.decision.cooldown_seconds == 30.0
     assert cfg.decision.ratio_threshold == 0.2
     assert cfg.decision.veto_marker == "[不回复]"
     assert cfg.decision.groups == {}
     assert cfg.chat.split_max_parts == 3
+    assert cfg.chat.type_speed == 1.0
+    assert cfg.chat.type_delay_max_seconds == 4.0
+    assert cfg.chat.strip_action_parens is False
     assert cfg.enabled_adapters == []
 
 

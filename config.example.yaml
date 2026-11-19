@@ -36,7 +36,13 @@ chat:
   history_size: 30
   split_max_parts: 3
   split_part_chars: 60
-  split_delay_seconds: 0.6
+  # 打字节奏：按字数估算两条消息之间的停顿，中文字约 0.3s/字、其他约 0.15s/字，
+  # 每条另加 0.3s 回车时间；type_speed 是全局倍率（0 = 不等待）
+  type_speed: 1.0
+  # 单条停顿上限（秒），防止长文等太久；0 表示不等待
+  type_delay_max_seconds: 4.0
+  # 发送前移除括号里的动作描写（如「（笑）」）；默认关闭
+  strip_action_parens: false
   history_ttl_hours: 12
 
 # 回复决策（意愿系统）：群里什么时候开口
@@ -45,6 +51,10 @@ decision:
   merge_window_seconds: 4
   # 硬触发（私聊/@/回复/叫名字）走短窗口；0 表示立即处理
   hard_merge_window_seconds: 1
+  # 整批上限：从首条消息算起最多等这么久就放出；0 表示不设上限
+  batch_max_seconds: 10
+  # 批次里有人 @/回复 bot 时，截止时间提前到「首条 + 这么多秒」；0 表示不启用
+  urgent_seconds: 2
   # 叫到这些名字/别名就算硬触发；留空则用 chat.bot_name
   aliases: []
 
