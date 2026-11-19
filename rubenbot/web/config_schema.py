@@ -68,6 +68,10 @@ def structured_config(config: Config) -> dict[str, Any]:
     decision = asdict(config.decision)
     llm = asdict(config.llm)
     api_key = llm.pop("api_key", "")
+    # 抽取/归纳模型留空表示跟随对话模型，表单里统一用空串，避免 null 与 ""
+    # 在「打开设置 → 原样保存」时被误判成改动
+    llm["extract_model"] = llm.get("extract_model") or ""
+    llm["consolidate_model"] = llm.get("consolidate_model") or ""
     webui = asdict(config.webui)
     password = webui.pop("password", "")
     access_token = snow.get("access_token", "")

@@ -357,6 +357,48 @@ def test_put_structured_requires_restart_fields(client, config_path, state):
     assert {"database_path", "persona.path", "adapters.console", "webui.port"} <= set(pending)
 
 
+def test_resaving_form_untouched_reports_no_changes(client, config_path):
+    """打开设置原样保存：不应误报「已生效」或把值写歪。"""
+    view = client.get("/api/config").json()["structured"]
+    view.pop("secrets")
+    response = client.put("/api/config", json={"config": view})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["applied"] == []
+    assert body["requires_restart"] == []
+    assert body["relogin"] is False
+    # 密钥仍然保留在文件里
+    assert read_yaml(config_path)["llm"]["api_key"] == "sk-original-key"
+
+    # 再原样存一次同样无变化（第一次保存后表单视图应与提交的一致）
+    again = body["structured"]
+    again.pop("secrets")
+    second = client.put("/api/config", json={"config": again})
+    assert second.status_code == 200
+    assert second.json()["applied"] == []
+    assert second.json()["message"] == "配置已保存（与当前一致，无需变更）"
+
+
+def test_group_override_change_is_reported_applied(client, config_path):
+    initial = client.get("/api/config").json()["structured"]["decision"]["groups"]
+    assert initial == {}
+    response = client.put(
+        "/api/config",
+        json={"config": {"decision": {"groups": {"g9": {"activity_multiplier": 2}}}}},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["resolution"]["decision.groups"] == "hot"
+    assert "decision" in response.json()["applied"]
+    written = read_yaml(config_path)
+    assert written["decision"]["groups"]["g9"]["activity_multiplier"] == 2.0
+
+    # 删除群覆盖也算改动，且文件里真的删掉了
+    response = client.put("/api/config", json={"config": {"decision": {"groups": {}}}})
+    assert response.status_code == 200
+    assert "decision" in response.json()["applied"]
+    assert "g9" not in read_yaml(config_path)["decision"]["groups"]
+
+
 def test_legacy_text_mode_still_works(client, config_path):
     response = client.put("/api/config", json={"text": "chat:\n  bot_name: 小R\n"})
     assert response.status_code == 200

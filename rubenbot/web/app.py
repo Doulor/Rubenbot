@@ -788,7 +788,11 @@ async def _save_structured_config(state: WebState, payload: Any) -> dict[str, An
             leaves = ["database_path"]
         else:
             leaves = _leaf_paths(group, value)
-        if not leaves:
+            # 群覆盖单独整段比较（增删群、改某群参数都只算这一项），
+            # 避免每个群各占一行，也避免删群时被当成「没有变化」
+            if group == "decision" and isinstance(value, dict) and "groups" in value:
+                leaves = [path for path in leaves if not path.startswith("decision.groups.")]
+        if not leaves and not (group == "decision" and isinstance(value, dict) and "groups" in value):
             continue
         hot_changed = False
         for leaf in leaves:
@@ -797,6 +801,11 @@ async def _save_structured_config(state: WebState, payload: Any) -> dict[str, An
                 continue
             resolution[leaf] = "hot"
             if _get_path(before, leaf) != _get_path(after, leaf):
+                hot_changed = True
+        if group == "decision" and isinstance(value, dict) and "groups" in value:
+            # 群覆盖整段比较：删掉某个群后 leaf 列表可能为空，仍要报生效
+            resolution["decision.groups"] = "hot"
+            if _get_path(before, "decision.groups") != _get_path(after, "decision.groups"):
                 hot_changed = True
         if hot_changed:
             applied_groups.append(group)
@@ -854,6 +863,11 @@ def _config_snapshot(config: Config) -> dict[str, Any]:
                     flat[f"{path}.{sub_key}"] = sub_item
             else:
                 flat[path] = item
+    # 「留空」在这几个字段上有两种等价写法（None 与空串），比较时统一，
+    # 否则「打开设置直接保存」会被误判为改过
+    for path in ("llm.extract_model", "llm.consolidate_model"):
+        if flat.get(path) is None:
+            flat[path] = ""
     return flat
 
 
