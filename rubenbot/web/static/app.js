@@ -3149,6 +3149,30 @@ function mcpServerEditor(draft) {
     } }, icon("plus"), "添加服务器")));
 }
 
+/** 仅在操作电脑页读取审计；刷新记录不改动表单草稿。 */
+function computerAuditCard() {
+  const rows = h("div", { class: "rows", "aria-live": "polite" }, skeleton(2));
+  const refresh = h("button", { type: "button", class: "btn btn-sm", onclick: load }, icon("refresh"), "刷新");
+  async function load() {
+    refresh.disabled = true;
+    try {
+      const { items } = await api.get("/api/computer/audit?limit=30");
+      const contexts = { host: "真机", sandbox: "访客沙盒" };
+      rows.replaceChildren(...(items.length ? items.map(item => h("div", { class: "plugin-row" },
+        h("div", { class: "row-main" },
+          h("div", { class: "row-title mono" }, item.tool),
+          h("div", { class: "row-sub" }, `${fmtDateTime(item.created_at)} · ${item.who} · ${contexts[item.context] || item.context}`),
+          h("div", { class: "row-sub" }, `参数 ${item.args_summary.arg_count} 项，输入 ${item.args_summary.input_bytes} 字节 · 耗时 ${item.duration_ms} 毫秒`)),
+        h("span", { class: `tag ${item.success ? "good" : "bad"}` }, item.success ? "成功" : "失败")))
+        : [h("p", { class: "field-hint" }, "还没有电脑操作记录。") ]));
+    } catch (err) {
+      if (!(err instanceof Unauthorized)) rows.replaceChildren(h("p", { class: "field-hint" }, "无法读取操作记录，请刷新重试。"));
+    } finally { refresh.disabled = false; }
+  }
+  load();
+  return card("操作审计", { hint: "最近 30 次操作，仅显示参数用量，不显示命令或文件内容。", actions: [refresh], body: rows });
+}
+
 /** 工具卡只读；按需刷新，不因查看状态发起连接。 */
 function mcpStatusCard() {
   const states = { disabled: "已停用", connecting: "连接中", connected: "已连接", disconnected: "已断开", unavailable: "未运行" };
@@ -3538,6 +3562,20 @@ function settingsCardSpecs(draft, secrets, pluginsAvailable) {
           ],
           draft
         ),
+      }),
+    },
+    {
+      path: "computer.enabled",
+      node: card("操作电脑", {
+        hint: "默认关闭。启用后，只有白名单账号可用 bot 的系统权限操作真机，其他账号使用各自的访客沙盒。",
+        body: fieldGrid([
+          { path: "computer.enabled", label: "启用电脑工具", kind: "switch", wide: true },
+          { path: "computer.whitelist", label: "真机白名单", kind: "list", wide: true,
+            placeholder: "平台:发送者账号", hint: "完整匹配账号，不按昵称、群号或私聊授权。默认仅有本地终端账号 console:console:me；移除所有账号后无人可操作真机。" },
+          { path: "computer.sandbox_quota_mb", label: "每位访客的容量（MiB）", kind: "number", step: "1", min: 1, max: 10240 },
+          { path: "computer.command_timeout_seconds", label: "命令超时（秒）", kind: "number", step: "1", min: 1, max: 600 },
+          { path: "computer.output_limit_bytes", label: "输出上限（字节）", kind: "number", step: "1", min: 32, max: 1048576 },
+        ], draft),
       }),
     },
     {
@@ -4269,7 +4307,9 @@ async function renderSettingsGroup(view, groupId, sub) {
     state.settingsNotice = null;
   }
 
-  const extras = page.id === "system" ? systemExtras(data) : page.id === "emoji" ? [stickerLibraryCard()] : [];
+  const extras = page.id === "system" ? systemExtras(data) : [];
+  if (page.id === "emoji") extras.push(stickerLibraryCard());
+  if (page.id === "computer") extras.push(computerAuditCard());
   const hasContent = cards.length > 0 || extras.length > 0;
   const stack = hasContent
     ? h("div", { class: "settings-stack" }, ...cards, ...extras)

@@ -252,6 +252,7 @@ def test_settings_layout_pages_and_groups():
     assert [page["id"] for page in groups["settings"]["pages"]] == [
         "model",
         "search",
+        "computer",
         "mcp",
         "reminder",
         "adapters",

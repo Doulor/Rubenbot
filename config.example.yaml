@@ -91,6 +91,17 @@ search:
   timeout_seconds: 10      # 单次搜索请求超时（秒），整条链共用
   cooldown_seconds: 30     # 每会话两次真实搜索之间的冷却，整条链只过一次闸；冷却内只返回提示
 
+# 操作电脑默认关。白名单只按「平台:发送者账号」完整匹配，不按昵称、群号或私聊授权。
+computer:
+  enabled: false
+  # 省略时只信任本地 Console 的默认账号（平台 console，发送者 console:me）。
+  # 显式填 [] 表示无人能操作真机；不继承插件的 owner_ids。
+  # 白名单用户能以 bot 的系统账号操作真机，只填写可信账号，不要填密钥或环境变量。
+  # whitelist: ["console:console:me"]
+  sandbox_quota_mb: 100        # 每位访客的沙盒容量（MiB），范围 1–10240
+  command_timeout_seconds: 60  # 单次命令时限（秒），范围 1–600
+  output_limit_bytes: 32768    # 输出字节数上限，范围 32–1048576
+
 # MCP 客户端：可选安装 pip install -e '.[mcp]'；只配置可信服务器。
 # 修改后重启 bot。env/headers 支持 ${ENV_VAR}，不要把密钥写进命令行。
 mcp:
