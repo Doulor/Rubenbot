@@ -689,14 +689,15 @@ class RubenBot:
             self.emotion.ensure_tracking()
         except Exception as exc:  # noqa: BLE001 - 情绪状态失败不能拖住启动
             logger.warning("初始化情绪状态失败：%s", exc)
-        # 发现外部工具与接收首条消息并行；慢服务器不会阻塞正常聊天。
-        mcp_start = asyncio.create_task(self.mcp.start())
-        tasks = [asyncio.create_task(self._run_adapter(adapter)) for adapter in self.adapters.values()]
-        self._bg_task = asyncio.create_task(self._background_loop())
-        self._merge_task = asyncio.create_task(self._merge_loop())
-        self._scheduler_task = asyncio.create_task(self.scheduler.run(self._stop))
-        self._proactive_task = asyncio.create_task(self._proactive_loop())
+        tasks = []
         try:
+            # 首条消息也使用发现完毕的工具目录；离线服务仅等待首次尝试，不等待重连。
+            await self.mcp.start()
+            tasks = [asyncio.create_task(self._run_adapter(adapter)) for adapter in self.adapters.values()]
+            self._bg_task = asyncio.create_task(self._background_loop())
+            self._merge_task = asyncio.create_task(self._merge_loop())
+            self._scheduler_task = asyncio.create_task(self.scheduler.run(self._stop))
+            self._proactive_task = asyncio.create_task(self._proactive_loop())
             if tasks:
                 await asyncio.gather(*tasks)
             else:
@@ -721,8 +722,6 @@ class RubenBot:
             self._proactive_task = None
             for task in tasks:
                 task.cancel()
-            mcp_start.cancel()
-            await asyncio.gather(mcp_start, return_exceptions=True)
             await self.mcp.stop()
 
     async def _run_adapter(self, adapter: BaseAdapter) -> None:

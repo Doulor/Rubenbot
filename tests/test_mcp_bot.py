@@ -22,12 +22,6 @@ def private():
                         sender_id="u1", sender_name="阿花", text="帮我复述一下")
 
 
-async def until(ready):
-    async with asyncio.timeout(10):
-        while not ready():
-            await asyncio.sleep(0.01)
-
-
 class EchoLLM(ScriptedLLM):
     """第一轮请求外部工具，第二轮拿到 tool 消息再回答。"""
 
@@ -53,7 +47,7 @@ def test_registered_mcp_tool_reaches_model_and_returns_result(config, store):
     adapter = RecordingAdapter()
 
     async def chat(on_event):
-        await until(lambda: bot.mcp.tools())
+        assert bot.mcp.status()[0]["state"] == "connected"
         await on_event(private())
 
     adapter.start = chat
@@ -74,7 +68,7 @@ def test_missing_server_does_not_interrupt_chat(config, store, tmp_path):
     adapter = RecordingAdapter()
 
     async def chat(on_event):
-        await until(lambda: bot.mcp.status()[0]["last_error"])
+        assert bot.mcp.status()[0]["last_error"]
         await on_event(private())
 
     adapter.start = chat
