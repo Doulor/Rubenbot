@@ -1,0 +1,71 @@
+{
+  "id": "group_insights",
+  "name": "群发言统计与总结",
+  "version": "1.0.0",
+  "description": "群里问「水群榜」或「总结一下」时，当场算出发言 Top5 或按话题补课",
+  "author": "RubenBot",
+  "min_core_version": "0.1.0",
+  "permissions": ["read_messages", "send_messages", "llm"],
+  "config_schema": [
+    {
+      "key": "stats_window_days",
+      "type": "integer",
+      "default": 1,
+      "description": "发言统计的默认窗口（天）；问法里说「近 7 天 / 这周」时按 7 天算"
+    },
+    {
+      "key": "stats_triggers",
+      "type": "string_list",
+      "default": [
+        "水群榜",
+        "水群排行",
+        "发言统计",
+        "发言榜",
+        "发言排行",
+        "活跃榜",
+        "活跃排行",
+        "谁话最多",
+        "谁发言最多",
+        "谁最话痨",
+        "话最多"
+      ],
+      "description": "发言统计的触发词；命中任意一个且 @bot / 叫了 bot 名字才响应（写空列表即关闭统计）"
+    },
+    {
+      "key": "summary_triggers",
+      "type": "string_list",
+      "default": [
+        "总结一下",
+        "总结下",
+        "群总结",
+        "今天都聊了啥",
+        "今天聊了啥",
+        "都聊了啥",
+        "聊了啥",
+        "补课"
+      ],
+      "description": "群聊总结的触发词；统计触发词优先于总结触发词（写空列表即关闭总结）"
+    },
+    {
+      "key": "summary_max_messages",
+      "type": "integer",
+      "default": 200,
+      "description": "单次总结最多取多少条消息（与今日全部消息取较少者）"
+    },
+    {
+      "key": "summary_cooldown_minutes",
+      "type": "number",
+      "default": 10,
+      "description": "同群总结冷却（分钟）；冷却内重复触发回上次结果"
+    },
+    {
+      "key": "require_addressing",
+      "type": "boolean",
+      "default": true,
+      "description": "是否要求 @bot、回复 bot 或叫 bot 名字才触发（关掉则任何群友提到触发词都响应）"
+    }
+  ],
+  "hooks": ["on_message"],
+  "category": "工具",
+  "icon": "📊"
+}
