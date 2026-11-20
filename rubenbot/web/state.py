@@ -22,6 +22,7 @@ from ..config import Config
 from ..memory.store import MemoryStore
 from ..persona import Persona, load_persona
 from ..plugins.loader import PluginManager
+from ..stickers import StickerStore
 from .auth import SessionSigner
 from .logbuffer import install
 
@@ -119,6 +120,16 @@ class WebState:
 
     def recent_decisions(self, *, limit: int = 8, chat_id: str | None = None) -> list[dict[str, Any]]:
         return self.store.list_decision_logs(limit=limit, chat_id=chat_id)
+
+    def sticker_store(self) -> StickerStore:
+        """返回与运行中 bot 共享的表情库实例。"""
+        if self.bot is not None and hasattr(self.bot, "stickers"):
+            return self.bot.stickers
+        store = self.extras.get("sticker_store")
+        if store is None:
+            store = StickerStore(self.config.stickers.dir)
+            self.extras["sticker_store"] = store
+        return store
 
     def plugin_list(self) -> list[dict[str, Any]]:
         """插件列表：有插件管理器时用它的实时状态，否则只按配置与目录展示。

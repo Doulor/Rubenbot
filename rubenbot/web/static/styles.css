@@ -1585,6 +1585,26 @@ button {
   color: var(--on-accent-container);
 }
 
+.sticker-library-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 12px;
+}
+.sticker-tile {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface-2);
+}
+.sticker-tile img, .sticker-missing {
+  display: block;
+  width: 100%;
+  aspect-ratio: 1;
+  object-fit: contain;
+  background: var(--surface-1);
+}
+.sticker-missing { display: grid; place-items: center; color: var(--muted); font-size: 12px; }
+.sticker-tile-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px; font-size: 12px; }
 .market-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));

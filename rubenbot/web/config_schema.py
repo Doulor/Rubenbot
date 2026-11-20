@@ -80,12 +80,7 @@ SETTINGS_GROUPS: tuple[dict[str, Any], ...] = (
             {
                 "id": "emoji",
                 "title": "表情",
-                "sub": "贴表情与表情包插件",
-                # 表情插件目前没有结构化配置入口：不编造字段，只说明现状
-                "empty": (
-                    "还没有可在这里配置的表情项。贴表情已由适配器网关按需判断，"
-                    "表情包插件（sticker）的参数在插件目录的 config.example.yaml 里。"
-                ),
+                "sub": "收集与回复后补发表情",
             },
         ),
     },
@@ -127,7 +122,8 @@ _SETTINGS_PAGE_RULES: tuple[tuple[str, str], ...] = (
     ("memory", "memory"),
     ("emotion", "emotion"),
     ("voice", "voice"),
-    # persona 页是 SOUL 编辑器，没有结构化字段；表情页暂时也没有
+    ("stickers", "emoji"),
+    # persona 页是 SOUL 编辑器
     # ---- 设置 ----
     ("llm", "model"),
     ("search", "search"),
@@ -262,6 +258,12 @@ def structured_config(config: Config) -> dict[str, Any]:
             "enabled_conversations": list(config.gateway.enabled_conversations),
         },
         "emotion": asdict(config.emotion),
+        "stickers": {
+            "enabled": config.stickers.enabled,
+            "collect": config.stickers.collect,
+            "send_probability": config.stickers.send_probability,
+            "cooldown_seconds": config.stickers.cooldown_seconds,
+        },
         "plugins": {
             "dir": config.plugins.dir,
             "enabled": list(config.plugins.enabled),
@@ -912,6 +914,24 @@ def _validate_proactive(section: dict[str, Any], v: _Validator) -> dict[str, Any
     return out
 
 
+def _validate_stickers(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key in ("enabled", "collect"):
+        if key in section:
+            value = v.boolean(section[key], f"stickers.{key}")
+            if value is not None:
+                out[key] = value
+    if "send_probability" in section:
+        value = v.number(section["send_probability"], "stickers.send_probability", minimum=0, maximum=1)
+        if value is not None:
+            out["send_probability"] = float(value)
+    if "cooldown_seconds" in section:
+        value = v.number(section["cooldown_seconds"], "stickers.cooldown_seconds", minimum=0)
+        if value is not None:
+            out["cooldown_seconds"] = float(value)
+    return out
+
+
 def _validate_plugins(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
     out: dict[str, Any] = {}
     if "dir" in section:
@@ -1090,6 +1110,9 @@ def validate_structured(payload: dict[str, Any]) -> dict[str, Any]:
     emotion = _section(payload, "emotion", v)
     if emotion is not None:
         update["emotion"] = _validate_emotion(emotion, v)
+    stickers = _section(payload, "stickers", v)
+    if stickers is not None:
+        update["stickers"] = _validate_stickers(stickers, v)
     plugins = _section(payload, "plugins", v)
     if plugins is not None:
         update["plugins"] = _validate_plugins(plugins, v)

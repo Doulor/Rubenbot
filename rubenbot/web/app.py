@@ -23,7 +23,9 @@
 - ``PUT  /api/chats/{id}/decision`` 保存群决策配置（写 config.yaml）
 - ``GET  /api/decisions``       决策日志（可按 chat_id 过滤）
 - ``GET  /api/emotion``         当前心情 + 好感 Top5/Bottom3 + 最近变化流水（只读）
+- ``GET  /api/stickers``        表情库列表；``GET /api/stickers/{id}/image`` 取图片；``DELETE`` 删除
 - ``GET  /api/plugins``         插件列表（含目录里发现但未启用的）
+- ``GET/PUT /api/plugins/{id}/config`` 读写已安装插件配置
 - ``POST /api/plugins/{name}``  启用/禁用：热生效并写回 plugins.enabled
 - ``GET  /api/market``          插件市场：数据来源 + 本地/索引合并后的卡片列表
 - ``POST /api/market/plugins/{id}/install``   从索引安装（默认不启用）
@@ -816,6 +818,41 @@ def create_app(state: WebState):
         items = state.store.list_decision_logs(chat_id=chat_id or None, limit=limit)
         return {"ok": True, "items": items}
 
+    @app.get("/api/stickers")
+    async def list_stickers(request: Request):
+        require_session(request)
+        store = state.sticker_store()
+        items = []
+        for sticker in store.find_by_tags(None):
+            items.append({
+                "id": sticker.id,
+                "tags": list(sticker.tags),
+                "image_url": f"/api/stickers/{sticker.id}/image" if store.path_of(sticker) else None,
+                "created_at": sticker.created_at,
+            })
+        return {"ok": True, "items": items}
+
+    @app.get("/api/stickers/{sticker_id}/image")
+    async def sticker_image(sticker_id: str, request: Request):
+        require_session(request)
+        store = state.sticker_store()
+        sticker = store.get(sticker_id)
+        path = store.path_of(sticker)
+        if sticker is None or path is None:
+            raise ApiError(404, "表情图片不存在")
+        return FileResponse(path)
+
+    @app.delete("/api/stickers/{sticker_id}")
+    async def delete_sticker(sticker_id: str, request: Request):
+        require_session(request)
+        try:
+            deleted = state.sticker_store().delete(sticker_id)
+        except Exception as exc:  # noqa: BLE001
+            raise ApiError(500, f"删除表情失败：{exc}") from exc
+        if not deleted:
+            raise ApiError(404, "表情不存在")
+        return {"ok": True, "id": sticker_id}
+
     @app.get("/api/emotion")
     async def get_emotion(request: Request, limit: int = 12):
         """情绪与好感度状态卡（只读）：心情 + 好感 Top5/Bottom3 + 最近变化。
@@ -905,6 +942,25 @@ def create_app(state: WebState):
     # 这些路由用同步函数（不是 async def）：索引拉取最多会阻塞 5 秒、
     # 下载与解压更久，交给 FastAPI 的线程池跑，别把整个 WebUI 的事件循环卡住。
     market = MarketService(state)
+
+    @app.get("/api/plugins/{plugin_id}/config")
+    def plugin_config(plugin_id: str, request: Request):
+        require_session(request)
+        try:
+            payload = market.get_plugin_config(plugin_id)
+        except MarketError as exc:
+            raise ApiError(exc.status, exc.message) from exc
+        return {"ok": True, **payload}
+
+    @app.put("/api/plugins/{plugin_id}/config")
+    async def put_plugin_config(plugin_id: str, request: Request):
+        require_session(request)
+        body = await _json_body(request)
+        try:
+            payload = market.save_plugin_config(plugin_id, body.get("values"))
+        except MarketError as exc:
+            raise ApiError(exc.status, exc.message) from exc
+        return {"ok": True, **payload, "restart_required": True, "message": "插件配置已保存，重启 bot 后生效。"}
 
     @app.get("/api/market")
     def market_snapshot(request: Request):
