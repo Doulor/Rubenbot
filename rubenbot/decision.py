@@ -227,12 +227,15 @@ class DecisionFactors:
     score: float = 0.0
     threshold: float = 0.0
     share: float = 0.0
+    # 心情对阈值的微调量（开心/兴奋为负、委屈/低落为正；平静时为 0）
+    mood_adjust: float = 0.0
 
     def describe(self) -> str:
         return (
             f"基础{self.base:.2f} 动量+{self.momentum:.2f} "
             f"相关+{self.relevance:.2f} 占比-{self.ratio_penalty:.2f} "
             f"冷却-{self.cooldown_penalty:.2f} 倍率x{self.multiplier:.2f}"
+            + (f" 心情{self.mood_adjust:+.2f}" if self.mood_adjust else "")
             + (f" 随机{self.noise:+.2f}" if self.noise else "")
         )
 
@@ -436,11 +439,13 @@ class DecisionEngine:
         recent_messages: Sequence[Any] = (),
         relevance: float = 0.0,
         hard_trigger: str | None = None,
+        mood_adjust: float = 0.0,
     ) -> ReplyDecision:
         """对一条（或合并后的一轮）群消息评分。
 
         ``recent_messages`` 只需有 ``sender_id`` 属性；``relevance`` 是记忆检索的
-        最高分（未命中为 0）。硬触发（含私聊）直接通过，不受冷却/静默影响。
+        最高分（未命中为 0）。``mood_adjust`` 是心情对阈值的微调量（加到阈值
+        上，负数更容易开口）；硬触发直接通过，不受它和冷却/静默影响。
         """
         now = time.time() if now is None else now
         hard = hard_trigger if hard_trigger is not None else self.is_hard_trigger(event)
@@ -457,17 +462,23 @@ class DecisionEngine:
         cfg = self.config
         settings = self.group_settings(event.chat_id)
         chat_key = self.chat_key(event)
+        try:
+            adjust = float(mood_adjust)
+        except (TypeError, ValueError):
+            adjust = 0.0
+        threshold = cfg.threshold + adjust
         factors = DecisionFactors(
             base=cfg.base if settings.base is None else settings.base,
             multiplier=settings.activity_multiplier,
-            threshold=cfg.threshold,
+            threshold=threshold,
+            mood_adjust=adjust,
         )
 
         # 静默时段：普通消息直接闭嘴，硬触发在上面已经放行
         if in_quiet_hours(now, self._quiet_ranges(settings)):
             factors.score = 0.0
             return ReplyDecision(
-                False, "quiet_hours", 0.0, cfg.threshold, None, factors
+                False, "quiet_hours", 0.0, threshold, None, factors
             )
 
         # 对话动量：刚参与过这个会话，对方还在继续说，加分随时间指数衰减
@@ -492,7 +503,7 @@ class DecisionEngine:
                 if factors.share >= cfg.ratio_silence:
                     factors.score = 0.0
                     return ReplyDecision(
-                        False, "ratio_silence", 0.0, cfg.threshold, None, factors
+                        False, "ratio_silence", 0.0, threshold, None, factors
                     )
 
         # 发言后冷却：刚发过言的短时间内压低意愿（硬触发已在上面放行）
@@ -504,11 +515,11 @@ class DecisionEngine:
         score = positive * max(0.0, factors.multiplier) - factors.ratio_penalty - factors.cooldown_penalty
 
         # 阈值附近加随机扰动，避免每次都在同一个位置机械地卡线
-        if cfg.threshold_noise > 0 and abs(score - cfg.threshold) <= cfg.threshold_noise_band:
+        if cfg.threshold_noise > 0 and abs(score - threshold) <= cfg.threshold_noise_band:
             factors.noise = self.rng.uniform(-cfg.threshold_noise, cfg.threshold_noise)
             score += factors.noise
 
         factors.score = score
-        should = score >= cfg.threshold
+        should = score >= threshold
         reason = "willing" if should else "below_threshold"
-        return ReplyDecision(should, reason, score, cfg.threshold, None, factors)
+        return ReplyDecision(should, reason, score, threshold, None, factors)

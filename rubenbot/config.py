@@ -276,6 +276,71 @@ class DecisionConfig:
 
 
 @dataclass
+class EmotionConfig:
+    """情绪与好感度参数（确定性规则，全部幅度集中在这里）。
+
+    设计原则见 SPEC「情绪与好感度」：状态变化只由代码按规则计算，模型
+    不参与打分；变化写 ``affinity_log`` 可追溯；生成侧只注入一句状态描述，
+    另外对意愿阈值做小幅微调。
+    """
+
+    # 总开关：关掉后不记录、不注入、不调阈值，行为回到没有这套系统之前
+    enabled: bool = True
+
+    # ---- 好感度 ----
+    affinity_baseline: float = 50.0
+    affinity_min: float = 0.0
+    affinity_max: float = 100.0
+    # 与 bot 对话一轮的加分，以及每人每日（本地时间）累计上限
+    chat_delta: float = 0.2
+    chat_daily_cap: float = 2.0
+    # 被夸/感谢、被骂/恶语（都要先确认是在对 bot 说）
+    praise_delta: float = 1.0
+    insult_delta: float = -2.0
+    # 每周向基线回归的比例（惰性计算，见 EmotionEngine.current_affinity）
+    decay_weekly: float = 0.05
+
+    # ---- 情绪：事件 → 状态 ----
+    praise_mood: str = "开心"
+    praise_intensity: float = 0.6
+    insult_mood: str = "委屈"
+    insult_intensity: float = 0.6
+    # 群里热闹且 bot 参与多 → 兴奋
+    excitement_mood: str = "兴奋"
+    excitement_intensity: float = 0.4
+    excitement_window_seconds: float = 600.0
+    excitement_min_messages: int = 6
+    excitement_min_bot_messages: int = 2
+    # 长时间没人理 → 无聊
+    boredom_mood: str = "无聊"
+    boredom_intensity: float = 0.3
+    boredom_after_seconds: float = 3 * 3600.0
+    # 情绪强度向平静衰减的半衰期
+    half_life_seconds: float = 3600.0
+    # 强度低于这个值就视为平静（不再注入、不再调阈值）
+    min_intensity: float = 0.05
+
+    # 意愿阈值微调：正数更难开口，负数更容易开口（按当前心情取）
+    threshold_adjust: dict[str, float] = field(
+        default_factory=lambda: {
+            "开心": -0.05,
+            "兴奋": -0.05,
+            "无聊": -0.03,
+            "委屈": 0.05,
+            "低落": 0.05,
+        }
+    )
+
+    def adjust_for(self, mood: str) -> float:
+        """某心情对应的阈值微调量；没配置就是 0。"""
+        value = self.threshold_adjust.get(mood, 0.0)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+
+@dataclass
 class TwoStageConfig:
     """两段式生成：先「想」再「说」。"""
 
@@ -435,6 +500,7 @@ class Config:
     chat: ChatConfig = field(default_factory=ChatConfig)
     decision: DecisionConfig = field(default_factory=DecisionConfig)
     generation: GenerationConfig = field(default_factory=GenerationConfig)
+    emotion: EmotionConfig = field(default_factory=EmotionConfig)
     plugins: PluginsConfig = field(default_factory=PluginsConfig)
     webui: WebUIConfig = field(default_factory=WebUIConfig)
     persona_path: str = "data/SOUL.md"
@@ -510,6 +576,7 @@ class Config:
         chat = ChatConfig(**{k: v for k, v in (data.get("chat") or {}).items() if _has(ChatConfig, k)})
         decision = _load_decision(data.get("decision") or {})
         generation = _load_generation(data.get("generation") or {})
+        emotion = _load_emotion(data.get("emotion") or {})
         plugins = PluginsConfig(**{k: v for k, v in (data.get("plugins") or {}).items() if _has(PluginsConfig, k)})
         webui = WebUIConfig(**{k: v for k, v in (data.get("webui") or {}).items() if _has(WebUIConfig, k)})
         persona = data.get("persona") or {}
@@ -528,6 +595,7 @@ class Config:
             chat=chat,
             decision=decision,
             generation=generation,
+            emotion=emotion,
             plugins=plugins,
             webui=webui,
             **basics,
@@ -585,6 +653,70 @@ def _load_generation(data: dict[str, Any]) -> GenerationConfig:
     two_stage_raw = data.get("two_stage")
     enabled = isinstance(two_stage_raw, dict) and two_stage_raw.get("enabled") is True
     return GenerationConfig(two_stage=TwoStageConfig(enabled=enabled))
+
+
+def _load_emotion(data: dict[str, Any]) -> EmotionConfig:
+    """解析 emotion 段：标量宽松解析，阈值微调表单独处理。
+
+    写错类型不挡启动：能按默认值的类型转换的就用，转不了回落默认值；
+    ``threshold_adjust`` 只接受「心情 → 数字」的映射，非数字的值忽略
+    （保持默认表里对应的项）。
+    """
+    if not isinstance(data, dict):
+        return EmotionConfig()
+    defaults = EmotionConfig()
+    plain: dict[str, Any] = {}
+    for key, value in data.items():
+        if key == "threshold_adjust" or not _has(EmotionConfig, key):
+            continue
+        coerced = _coerce_like_default(value, getattr(defaults, key))
+        if coerced is not None:
+            plain[key] = coerced
+    config = EmotionConfig(**plain)
+    raw_adjust = data.get("threshold_adjust")
+    if isinstance(raw_adjust, dict):
+        adjust = dict(config.threshold_adjust)
+        for mood, value in raw_adjust.items():
+            name = str(mood).strip()
+            if not name or isinstance(value, bool):
+                continue
+            try:
+                adjust[name] = float(value)
+            except (TypeError, ValueError):
+                continue
+        config.threshold_adjust = adjust
+    return config
+
+
+def _coerce_like_default(value: Any, default: Any) -> Any:
+    """按默认值的类型宽松转换配置值；类型对不上或转不了时返回 None（用默认值）。
+
+    配置里 ``enabled: "false"`` 这类手误不该让整个 bot 起不来：布尔字段只认
+    明确的 true/false（字符串也行），数值字段能转数字就转，其他情况留空。
+    """
+    if value is None:
+        return None
+    if isinstance(default, bool):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in {"true", "yes", "on", "1"}:
+                return True
+            if text in {"false", "no", "off", "0"}:
+                return False
+        return None
+    if isinstance(default, (int, float)):
+        if isinstance(value, bool):
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return int(number) if isinstance(default, int) else number
+    if isinstance(default, str):
+        return "" if value is None else str(value)
+    return None
 
 
 def _has(dataclass_type: type, key: str) -> bool:

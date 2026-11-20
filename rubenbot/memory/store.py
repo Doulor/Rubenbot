@@ -195,6 +195,33 @@ CREATE TABLE IF NOT EXISTS conversation_summaries (
     covered_until_msg_id INTEGER NOT NULL DEFAULT 0,
     updated_at           REAL NOT NULL
 );
+
+-- 好感度：每人一行（惰性折算衰减，读时按 updated_at 算，不落衰减值）
+CREATE TABLE IF NOT EXISTS person_affinity (
+    person_id  TEXT PRIMARY KEY,
+    score      REAL NOT NULL DEFAULT 50,
+    updated_at REAL NOT NULL
+);
+
+-- 好感度变化流水：每笔加减（含衰减）都记下来，WebUI 可查
+CREATE TABLE IF NOT EXISTS affinity_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    person_id  TEXT NOT NULL,
+    delta      REAL NOT NULL,
+    reason     TEXT NOT NULL DEFAULT '',
+    place      TEXT NOT NULL DEFAULT '',          -- platform:chat_id，便于按场合翻
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_affinity_log_person ON affinity_log(person_id, created_at);
+
+-- 心情（一期全局一份）：单行，id 固定为 1
+CREATE TABLE IF NOT EXISTS bot_mood (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    mood       TEXT NOT NULL DEFAULT '平静',
+    intensity  REAL NOT NULL DEFAULT 0,
+    since      REAL NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL DEFAULT 0
+);
 """
 
 
@@ -354,6 +381,28 @@ class ConversationSummary:
     conversation_id: str
     summary: str = ""
     covered_until_msg_id: int = 0
+    updated_at: float = 0.0
+
+
+@dataclass
+class AffinityEntry:
+    """好感度变化流水里的一笔。"""
+
+    id: int
+    person_id: str
+    delta: float
+    reason: str
+    place: str
+    created_at: float
+
+
+@dataclass
+class BotMood:
+    """bot 当前的心情（一期全局一份）。"""
+
+    mood: str = "平静"
+    intensity: float = 0.0
+    since: float = 0.0
     updated_at: float = 0.0
 
 
@@ -1675,6 +1724,13 @@ class MemoryStore:
                             "SELECT COUNT(*) AS c FROM pending_asks WHERE person_id = ?", (person_id,)
                         ).fetchone()["c"]
                     ),
+                    # 好感度流水条数；person_affinity 本身只算一行
+                    "affinity_logs": int(
+                        self._conn.execute(
+                            "SELECT COUNT(*) AS c FROM affinity_log WHERE person_id = ?", (person_id,)
+                        ).fetchone()["c"]
+                    ),
+                    "affinity": 1 if self.get_affinity(person_id) is not None else 0,
                 }
                 self._conn.execute("DELETE FROM memories WHERE person_id = ?", (person_id,))
                 self._conn.execute("DELETE FROM events WHERE person_id = ?", (person_id,))
@@ -1682,13 +1738,17 @@ class MemoryStore:
                 self._conn.execute("DELETE FROM profiles WHERE person_id = ?", (person_id,))
                 self._conn.execute("DELETE FROM rulings WHERE person_id = ?", (person_id,))
                 self._conn.execute("DELETE FROM pending_asks WHERE person_id = ?", (person_id,))
+                # 好感度与流水也属于「关于这个人的记录」，一起清掉
+                self._conn.execute("DELETE FROM affinity_log WHERE person_id = ?", (person_id,))
+                self._conn.execute("DELETE FROM person_affinity WHERE person_id = ?", (person_id,))
                 self._conn.execute(
                     "INSERT INTO memory_log(action, person_id, before_json, after_json, reason, created_at, reverted)"
                     " VALUES('purge', ?, '[]', '[]', ?, ?, 1)",
                     (
                         person_id,
                         (
-                            f"{reason or '本人要求清空记忆'}；删除计数={json.dumps(counts, ensure_ascii=False)}"
+                            f"{reason or '本人要求清空记忆'}；删除计数="
+                            f"{json.dumps(counts, ensure_ascii=False)}"
                             "；正文不保留，不可撤销"
                         ),
                         now,
@@ -1699,6 +1759,145 @@ class MemoryStore:
                 self._conn.rollback()
                 raise
         return counts
+
+    # ------------------------------------------------------------------
+    # 好感度与心情（情绪系统的存储侧；规则计算在 rubenbot.emotion）
+    # ------------------------------------------------------------------
+
+    def get_affinity(self, person_id: str) -> float | None:
+        """读某人存下来的好感度原始值；没有记录返回 None（由规则层用基线）。
+
+        注意这里不做衰减折算：衰减是规则层按 ``updated_at`` 惰性算的，
+        存储侧只负责原样存取。
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT score FROM person_affinity WHERE person_id = ?", (person_id,)
+            ).fetchone()
+        return float(row["score"]) if row else None
+
+    def affinity_updated_at(self, person_id: str) -> float | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT updated_at FROM person_affinity WHERE person_id = ?", (person_id,)
+            ).fetchone()
+        return float(row["updated_at"]) if row else None
+
+    def set_affinity(self, person_id: str, score: float, *, now: float | None = None) -> None:
+        """写入好感度绝对值与更新时间（不做日志；日志按变化笔数写）。"""
+        now = time.time() if now is None else now
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO person_affinity(person_id, score, updated_at) VALUES(?, ?, ?)
+                ON CONFLICT(person_id) DO UPDATE SET
+                    score = excluded.score,
+                    updated_at = excluded.updated_at
+                """,
+                (person_id, float(score), float(now)),
+            )
+            self._conn.commit()
+
+    def add_affinity_log(
+        self,
+        person_id: str,
+        delta: float,
+        *,
+        reason: str = "",
+        place: str = "",
+        now: float | None = None,
+    ) -> int:
+        """记一笔好感度变化（正负都记；调用方已过滤掉四舍五入后为 0 的变化）。"""
+        now = time.time() if now is None else now
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO affinity_log(person_id, delta, reason, place, created_at) VALUES(?, ?, ?, ?, ?)",
+                (person_id, float(delta), reason, place, float(now)),
+            )
+            self._conn.commit()
+        return int(cur.lastrowid)
+
+    def list_affinity_logs(
+        self,
+        *,
+        person_id: str | None = None,
+        limit: int = 50,
+        since: float | None = None,
+    ) -> list[AffinityEntry]:
+        """好感度流水，按时间倒序。"""
+        sql = "SELECT * FROM affinity_log WHERE 1=1"
+        params: list = []
+        if person_id is not None:
+            sql += " AND person_id = ?"
+            params.append(person_id)
+        if since is not None:
+            sql += " AND created_at >= ?"
+            params.append(float(since))
+        sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [AffinityEntry(**dict(row)) for row in rows]
+
+    def daily_affinity_gain(self, person_id: str, since: float, *, reason: str | None = None) -> float:
+        """某人在 ``since`` 之后累计的**正向**变化（每日上限用；可按原因过滤）。"""
+        sql = (
+            "SELECT COALESCE(SUM(delta), 0) AS total FROM affinity_log"
+            " WHERE person_id = ? AND created_at >= ? AND delta > 0"
+        )
+        params: list = [person_id, float(since)]
+        if reason is not None:
+            sql += " AND reason = ?"
+            params.append(reason)
+        with self._lock:
+            row = self._conn.execute(sql, params).fetchone()
+        return float(row["total"] or 0.0)
+
+    def list_affinities(self) -> list[tuple[str, float, float]]:
+        """全部有记录的人：``(person_id, score, updated_at)``（阈值判定在规则层）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT person_id, score, updated_at FROM person_affinity ORDER BY person_id"
+            ).fetchall()
+        return [(row["person_id"], float(row["score"]), float(row["updated_at"])) for row in rows]
+
+    def get_mood(self) -> BotMood | None:
+        """当前心情；从没写过时返回 None。"""
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM bot_mood WHERE id = 1").fetchone()
+        if row is None:
+            return None
+        return BotMood(
+            mood=row["mood"],
+            intensity=float(row["intensity"]),
+            since=float(row["since"]),
+            updated_at=float(row["updated_at"]),
+        )
+
+    def set_mood(
+        self,
+        mood: str,
+        intensity: float,
+        *,
+        since: float | None = None,
+        now: float | None = None,
+    ) -> None:
+        """写入当前心情（单行 upsert）。``since`` 不变时由调用方传原值。"""
+        now = time.time() if now is None else now
+        since = now if since is None else float(since)
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO bot_mood(id, mood, intensity, since, updated_at) VALUES(1, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    mood = excluded.mood,
+                    intensity = excluded.intensity,
+                    since = excluded.since,
+                    updated_at = excluded.updated_at
+                """,
+                (mood, float(intensity), since, float(now)),
+            )
+            self._conn.commit()
 
     # ------------------------------------------------------------------
     # meta（后台任务的游标等）
