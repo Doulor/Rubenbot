@@ -22,6 +22,7 @@
 - ``GET  /api/chats/{id}/decision`` 群决策配置
 - ``PUT  /api/chats/{id}/decision`` 保存群决策配置（写 config.yaml）
 - ``GET  /api/decisions``       决策日志（可按 chat_id 过滤）
+- ``GET  /api/emotion``         当前心情 + 好感 Top5/Bottom3 + 最近变化流水（只读）
 - ``GET  /api/plugins``         插件列表（含目录里发现但未启用的）
 - ``POST /api/plugins/{name}``  启用/禁用：热生效并写回 plugins.enabled
 - ``GET  /api/logs``            运行日志尾部
@@ -50,6 +51,7 @@ from ..adapters.base import MessageEvent
 from ..config import Config, GroupDecisionConfig, is_loopback_host
 from ..core import format_scene
 from ..decision import parse_quiet_hours
+from ..emotion import EmotionEngine
 from ..memory.store import make_person_id
 from ..persona import DEFAULT_PERSONA, Persona, load_persona
 from .auth import COOKIE_NAME, BindSecurityError, check_bind_security, mask_secret
@@ -756,6 +758,26 @@ def create_app(state: WebState):
         items = state.store.list_decision_logs(chat_id=chat_id or None, limit=limit)
         return {"ok": True, "items": items}
 
+    @app.get("/api/emotion")
+    async def get_emotion(request: Request, limit: int = 12):
+        """情绪与好感度状态卡（只读）：心情 + 好感 Top5/Bottom3 + 最近变化。
+
+        运行中的 bot 用同一个引擎（时间口径与注入一致）；没有 bot 的独立
+        WebUI 模式现场建一个，只读不改库。
+        """
+        require_session(request)
+        limit = max(1, min(int(limit), 100))
+        # 有运行中的 bot 就用它的引擎（窗口与注入同一份状态）；独立 WebUI
+        # 模式没有 bot，现场建一个只读引擎。
+        engine = getattr(state.bot, "emotion", None) or EmotionEngine(
+            state.store, state.config.emotion
+        )
+        try:
+            payload = engine.status(recent_limit=limit)
+        except sqlite3.Error as exc:
+            raise ApiError(500, f"读取情绪状态失败：{exc}") from exc
+        return {"ok": True, **payload}
+
     # ------------------------------------------------------------------
     # 插件
     # ------------------------------------------------------------------
@@ -1128,6 +1150,7 @@ def _save_message(applied: list[str], requires_restart: list[str]) -> str:
         "chat": "聊天与回复",
         "decision": "回复意愿",
         "generation": "生成",
+        "emotion": "情绪与好感度",
         "plugins": "插件",
         "webui": "WebUI",
         "persona": "人格",
