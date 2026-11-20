@@ -237,9 +237,14 @@ plugins:
   # enabled: ["hello"]
   command_prefix: "/"
 
+stickers:
+  # 表情库目录：图片本体放 files/，索引是 index.json（运行时数据，
+  # 已在 .gitignore 里排除）。sticker 插件往这里收集/查找表情。
+  dir: "data/stickers"
+
 market:
   # 插件市场索引地址：索引仓库 plugins.json 的 raw 地址。
-  # 留空或拉取失败（5 秒超时）时回退到内置官方索引（随框架发布的 4 个官方插件）。
+  # 留空或拉取失败（5 秒超时）时回退到内置官方索引（随框架发布的 5 个官方插件）。
   # index_url: "https://raw.githubusercontent.com/Doulor/Rubenbot-plugins/main/plugins.json"
   index_url: ""
 
@@ -258,6 +263,9 @@ adapters:
       # 语音回复（record 段）。只在 voice.tts_mode 打开时才用；默认开，
       # 关掉即语音回复一律改发文字
       voice: true
+      # 发表情（send_sticker 能力，sticker 插件用）：优先 mface 原生段、
+      # 没有原生引用就退图片段；默认开。关掉即不发表情，插件静默跳过。
+      sticker: true
       # 发 QQ 空间说说（send_qzone_msg），默认关：对外发布内容，需显式打开
       qzone: false
       # ---- QQ 空间互动（经 get_cookies 拿登录态后直调空间 Web 接口）----
@@ -284,10 +292,12 @@ adapters:
   #   allowed_chat_ids: []
   #   # getUpdates 的 offset 落盘位置：重启后不重复处理旧消息；留空则不落盘
   #   offset_file: "data/telegram_offset.json"
-  #   # 平台特有能力开关：语音回复（sendVoice / sendAudio）。只在 voice.tts_mode
-  #   # 打开时才用；写成 false 则语音回复一律改发文字
+  #   # 平台特有能力开关：语音回复（sendVoice / sendAudio）与发表情
+  #   # （sendSticker）。语音只在 voice.tts_mode 打开时才用，写成 false 则
+  #   # 一律改发文字；表情写 false 则 sticker 插件静默跳过
   #   capabilities:
   #     voice: true
+  #     sticker: true
   # QQ 官方机器人（q.qq.com 开放平台，与上面的 OneBot 通道完全独立）
   # 凭证在开放平台「开发设置」里拿；client_secret 支持 ${ENV_VAR} 展开
   # qq_official:
@@ -295,6 +305,8 @@ adapters:
   #   client_secret: "${QQBOT_CLIENT_SECRET}"
   #   sandbox: false            # true 走沙箱域名 sandbox.api.sgroup.qq.com
   #   download_images: true     # 入站图片附件下载后转 base64 放进 image 段
+  #   capabilities:
+  #     sticker: true           # 发表情（QQ 官方没有原生表情接口，按图片兜底）
 
 background_check_minutes: 5
 log_level: "INFO"
