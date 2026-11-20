@@ -11,9 +11,9 @@ WebUI 用与 ``config.yaml`` 同构的嵌套字典编辑配置，这个模块负
 - :func:`merge_config`：把规范字典合并进现有 YAML，保留未知键；
   ``decision.groups`` 和 ``adapters`` 这类整体语义的段按表单为准替换/更新。
 
-密钥字段（``llm.api_key``、``search.api_key``、``adapters.snowluma.access_token``、
-``webui.password``）提交空值表示保留原值：校验阶段直接把这些键从更新里
-剔除，因此脱敏占位符和空字符串都不会写回文件。
+密钥字段（``llm.api_key``、``search.tavily.api_key`` / ``search.deepseek.api_key``、
+``adapters.snowluma.access_token``、``webui.password``）提交空值表示保留原值：校验阶段
+直接把这些键从更新里剔除，因此脱敏占位符和空字符串都不会写回文件。
 """
 
 from __future__ import annotations
@@ -38,7 +38,8 @@ SNOWLUMA_DEFAULTS = {
 # 表单视图里永远留空的密钥字段（键是点分路径）
 SECRET_PATHS = (
     "llm.api_key",
-    "search.api_key",
+    "search.tavily.api_key",
+    "search.deepseek.api_key",
     "adapters.snowluma.access_token",
     "webui.password",
 )
@@ -80,7 +81,13 @@ def structured_config(config: Config) -> dict[str, Any]:
     webui = asdict(config.webui)
     password = webui.pop("password", "")
     search = asdict(config.search)
-    search_key = search.pop("api_key", "")
+    # 两个渠道的 key 一律留空（提示前端「已设置，留空不改」）
+    search_keys = {}
+    for name in SEARCH_PROVIDERS:
+        channel = search.get(name) if isinstance(search.get(name), dict) else {}
+        search_keys[name] = channel.get("api_key", "")
+        if isinstance(search.get(name), dict):
+            search[name]["api_key"] = ""
     access_token = snow.get("access_token", "")
 
     return {
@@ -88,7 +95,7 @@ def structured_config(config: Config) -> dict[str, Any]:
         "persona": {"path": config.persona_path},
         "database_path": config.database_path,
         "memory": asdict(config.memory),
-        "search": {**search, "api_key": ""},
+        "search": search,
         "chat": asdict(config.chat),
         "decision": decision,
         "generation": asdict(config.generation),
@@ -112,7 +119,8 @@ def structured_config(config: Config) -> dict[str, Any]:
         "log_level": config.log_level,
         "secrets": {
             "llm.api_key": bool(api_key),
-            "search.api_key": bool(search_key),
+            "search.tavily.api_key": bool(search_keys.get("tavily")),
+            "search.deepseek.api_key": bool(search_keys.get("deepseek")),
             "adapters.snowluma.access_token": bool(access_token),
             "webui.password": bool(password),
         },
@@ -376,21 +384,42 @@ def _validate_rolling_summary(section: dict[str, Any], v: _Validator) -> dict[st
 
 
 def _validate_search(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
-    """联网搜索：provider 只认两家；key 与 llm 一样，空值表示保留原值。"""
+    """联网搜索：order 只认已知渠道；各渠道 key 与 llm 一样，空值表示保留原值。"""
     out: dict[str, Any] = {}
-    if "provider" in section:
-        value = v.text(section["provider"], "search.provider", max_len=30)
-        if value is not None:
-            provider = value.lower()
-            if provider not in SEARCH_PROVIDERS:
-                v.fail("search.provider", f"只能是 {' / '.join(SEARCH_PROVIDERS)} 之一")
+    if "order" in section:
+        raw = section["order"]
+        if isinstance(raw, str):
+            raw = [item for item in raw.split(",")]
+        if not isinstance(raw, (list, tuple)):
+            v.fail("search.order", "应为渠道列表")
+        else:
+            order: list[str] = []
+            for item in raw:
+                name = str(item or "").strip().lower()
+                if not name:
+                    continue
+                if name not in SEARCH_PROVIDERS:
+                    v.fail("search.order", f"只能是 {' / '.join(SEARCH_PROVIDERS)} 中的渠道")
+                    break
+                if name not in order:
+                    order.append(name)
             else:
-                out["provider"] = provider
-    if "api_key" in section:
-        copied = {"api_key": section["api_key"]}
-        _prune_secret(copied, "api_key")
-        if "api_key" in copied:
-            out["api_key"] = str(copied["api_key"])
+                if not order:
+                    v.fail("search.order", "至少放一个渠道")
+                else:
+                    out["order"] = order
+    for name in SEARCH_PROVIDERS:
+        channel = section.get(name)
+        if channel is None:
+            continue
+        if not isinstance(channel, dict):
+            v.fail(f"search.{name}", "应为对象")
+            continue
+        if "api_key" in channel:
+            copied = {"api_key": channel["api_key"]}
+            _prune_secret(copied, "api_key")
+            if "api_key" in copied:
+                out.setdefault(name, {})["api_key"] = str(copied["api_key"])
     if "timeout_seconds" in section:
         number = v.number(section["timeout_seconds"], "search.timeout_seconds", minimum=0.1)
         if number is not None:

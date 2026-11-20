@@ -323,15 +323,19 @@ def test_put_structured_secrets_blank_keeps_original(client, config_path):
 
 
 def test_search_section_structured_view_and_secret(config):
-    """搜索分组出现在表单视图里；key 按密码型处理（留空 + secrets 标记）。"""
-    config.search.api_key = "sk-search"
+    """搜索分组出现在表单视图里；两个渠道的 key 按密码型处理（留空 + secrets 标记）。"""
+    config.search.tavily.api_key = "tvly-search"
+    config.search.deepseek.api_key = "sk-search"
     view = structured_config(config)
-    assert view["search"]["provider"] == "bocha"
+    assert view["search"]["order"] == ["tavily", "deepseek"]
     assert view["search"]["timeout_seconds"] == 10.0
     assert view["search"]["cooldown_seconds"] == 30.0
-    assert view["search"]["api_key"] == ""
-    assert view["secrets"]["search.api_key"] is True
-    assert "search.api_key" in SECRET_PATHS
+    assert view["search"]["tavily"]["api_key"] == ""
+    assert view["search"]["deepseek"]["api_key"] == ""
+    assert view["secrets"]["search.tavily.api_key"] is True
+    assert view["secrets"]["search.deepseek.api_key"] is True
+    assert "search.tavily.api_key" in SECRET_PATHS
+    assert "search.deepseek.api_key" in SECRET_PATHS
 
 
 def test_put_structured_search_section(client, config_path, state):
@@ -340,8 +344,9 @@ def test_put_structured_search_section(client, config_path, state):
         json={
             "config": {
                 "search": {
-                    "provider": "tavily",
-                    "api_key": "tvly-key",
+                    "order": ["deepseek", "tavily"],
+                    "tavily": {"api_key": "tvly-key"},
+                    "deepseek": {"api_key": "sk-ds-key"},
                     "timeout_seconds": "5",
                     "cooldown_seconds": "0",
                 }
@@ -351,27 +356,43 @@ def test_put_structured_search_section(client, config_path, state):
     assert response.status_code == 200, response.text
     data = read_yaml(config_path)
     assert data["search"] == {
-        "provider": "tavily",
-        "api_key": "tvly-key",
+        "order": ["deepseek", "tavily"],
+        "tavily": {"api_key": "tvly-key"},
+        "deepseek": {"api_key": "sk-ds-key"},
         "timeout_seconds": 5.0,
         "cooldown_seconds": 0.0,
     }
-    assert state.config.search.provider == "tavily"
-    assert state.config.search.api_key == "tvly-key"
+    assert state.config.search.order == ["deepseek", "tavily"]
+    assert state.config.search.tavily.api_key == "tvly-key"
+    assert state.config.search.deepseek.api_key == "sk-ds-key"
 
     # 空 key 表示保留原值，不会把文件里的 key 清掉
     again = client.put(
-        "/api/config", json={"config": {"search": {"provider": "bocha", "api_key": ""}}}
+        "/api/config",
+        json={
+            "config": {
+                "search": {
+                    "order": "tavily, deepseek",
+                    "tavily": {"api_key": ""},
+                    "deepseek": {"api_key": ""},
+                }
+            }
+        },
     )
     assert again.status_code == 200, again.text
-    assert read_yaml(config_path)["search"]["api_key"] == "tvly-key"
-    assert read_yaml(config_path)["search"]["provider"] == "bocha"
+    data = read_yaml(config_path)
+    assert data["search"]["order"] == ["tavily", "deepseek"]
+    assert data["search"]["tavily"]["api_key"] == "tvly-key"
+    assert data["search"]["deepseek"]["api_key"] == "sk-ds-key"
 
 
-def test_validate_search_rejects_unknown_provider():
+def test_validate_search_rejects_unknown_channel():
     with pytest.raises(ConfigValidationError) as info:
-        validate_structured({"search": {"provider": "bing"}})
-    assert any(item["field"] == "search.provider" for item in info.value.fields)
+        validate_structured({"search": {"order": ["tavily", "bing"]}})
+    assert any(item["field"] == "search.order" for item in info.value.fields)
+    with pytest.raises(ConfigValidationError) as info:
+        validate_structured({"search": {"order": []}})
+    assert any(item["field"] == "search.order" for item in info.value.fields)
     with pytest.raises(ConfigValidationError) as info:
         validate_structured({"search": {"cooldown_seconds": -1}})
     assert any(item["field"] == "search.cooldown_seconds" for item in info.value.fields)
