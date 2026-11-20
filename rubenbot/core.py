@@ -266,6 +266,20 @@ def strip_action_parens(text: str) -> str:
     return cleaned.strip()
 
 
+_TRANSCRIPT_PREFIX_RE = re.compile(r"^\[\d{1,2}:\d{2}\]\s*\[[^\]]*\]\s*")
+
+
+def strip_transcript_prefix(text: str) -> str:
+    """剥掉回复开头的转录行前缀，如 ``[10:00] [我] ``。
+
+    模型偶尔会模仿历史里的 ``[HH:MM] [昵称] 正文`` 格式，把前缀也生成出来。
+    只剥开头、只剥一次；正文中间出现的同样样式不动。
+    """
+    if not text:
+        return text
+    return _TRANSCRIPT_PREFIX_RE.sub("", text, count=1)
+
+
 def _strip_segments_actions(segments: list[Segment]) -> list[Segment]:
     """对消息段列表做动作括号清理：只改文本段，清空后的文本段直接去掉。"""
     cleaned: list[Segment] = []
@@ -839,7 +853,11 @@ class RubenBot:
         return f"（引用 [{name}]：{snippet}）"
 
     def render_history(self, messages: list) -> list[dict[str, str]]:
-        """把流水渲染成对话消息：``[HH:MM] [昵称] 正文``，bot 自己标 ``[我]``。
+        """把流水渲染成对话消息：别人的是 ``[HH:MM] [昵称] 正文``，bot 自己的只要正文。
+
+        bot 的历史就是它说过的话，必须是干净正文：带上 ``[HH:MM] [我]`` 前缀后，
+        模型会模仿这个格式，把自己的回复也生成成转录行（线上出过这种串台）。
+        别人的消息保留前缀，模型需要知道群里谁在说话。
 
         被引用的消息只在**本批历史**里按 ``reply_to_id`` 查；查不到就只标
         「（引用了一条消息）」。附注放在正文后的独立括号里，不属于正文。
@@ -852,8 +870,11 @@ class RubenBot:
         rendered: list[dict[str, str]] = []
         for msg in messages:
             is_bot = msg.sender_id == BOT_SENDER_ID
-            name = "我" if is_bot else (msg.sender_name or msg.sender_id)
-            content = f"[{self._format_clock(msg.ts)}] [{name}] {msg.text}"
+            if is_bot:
+                content = msg.text
+            else:
+                name = msg.sender_name or msg.sender_id
+                content = f"[{self._format_clock(msg.ts)}] [{name}] {msg.text}"
             content += self._quote_suffix(msg, index)
             rendered.append({"role": "assistant" if is_bot else "user", "content": content})
         return rendered
@@ -1155,6 +1176,8 @@ class RubenBot:
         strip_actions = bool(getattr(self.config.chat, "strip_action_parens", False))
         if isinstance(reply, str):
             text_reply = strip_action_parens(reply) if strip_actions else reply
+            # 模型可能模仿历史格式把转录行前缀一起生成出来，发送前剥掉兜底
+            text_reply = strip_transcript_prefix(text_reply)
             parts: list[list[Segment]] = [[Segment.text(part)] for part in self.split_reply(text_reply)]
         else:
             segments = [as_segment(segment) for segment in reply]
