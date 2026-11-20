@@ -221,3 +221,42 @@ SnowLuma 适配器（OneBot v11）：
 ## 借鉴原则（多萝 2026-11-20 凌晨定）
 
 研读 MaiBot 等成熟框架只为取长补短：每条借鉴必须先过「它解决的问题我们是否真有、搬进来是否破坏现有架构的干净」两问，不为借鉴而借鉴，不让外部设计污染本系统的结构。借鉴清单（findings）由协调者筛选后才排实现，宁缺毋滥。
+
+## 插件市场设计（2026-11-20 多萝确认）
+
+目标：插件从「目录里放着的代码」升级为有 manifest、有版本、有权限声明的标准件；WebUI 只设一个入口——市场页与插件页合并，已装与可装同列表，靠状态区分，不做独立商店、不自建后端。
+
+### manifest 规范（每个插件目录根部一份 manifest.json，必填）
+
+- `id`（全局唯一，英文短横线）、`name`、`version`（semver）、`description`（一句话）、`author`
+- `min_core_version`：要求的框架最低版本，过低时禁止安装并在卡片上标明
+- `permissions`：能力声明数组，枚举固定：`read_messages`（读消息/历史）、`send_messages`（发消息）、`capabilities`（调用能力层，如贴表情）、`qzone_write`（空间写操作）、`scheduler`（定时任务）、`llm`（调用模型）、`network`（出网请求）
+- `config_schema`：配置项声明（key/类型/默认/说明），供设置界面自动渲染表单（二期落地，一期先解析存下）
+- `hooks`：用到的钩子名列表（on_message / on_command / scheduled 等，与 loader 的 register(ctx) 对应）
+
+loader 加载时校验 manifest：缺失或字段不全的插件拒绝加载并在 WebUI 标「不合规」；现有 4 个插件（hello / privacy / emoji_react / qzone_post）一期全部补 manifest 迁移。
+
+### 分发：GitHub 索引仓库
+
+- 索引仓库 `Doulor/Rubenbot-plugins`：根目录 `plugins.json`（条目：id / name / version / description / author / permissions / path），每个插件一个目录（代码 + manifest.json）。
+- bot 侧索引地址可配置（`market.index_url`），拉取失败或未配置时回退到框架内置的官方索引（随框架发布的 4 个官方插件），市场页明确标注当前索引来源与「索引不可用」状态，不许静默空白。
+- 安装 = 拉索引仓库对应插件目录落盘到 `plugins/` → 校验 manifest 与 min_core_version → 默认不启用，用户在卡片上手动启用（与「插件默认关」一致）。
+- 更新：索引 version 高于已装 manifest version 时卡片挂「可更新」角标，一键更新（保留该插件的配置段，只换代码与 manifest）。
+
+### 市场页（WebUI，替换现插件页）
+
+- 布局：顶部搜索 + 分类标签（互动 / 空间 / 工具 / 系统），下面卡片网格。
+- 卡片元素：图标（manifest 可选 icon，无则用首字母块）、名字、一句话说明、版本号、权限徽标组、作者、状态按钮（安装 / 启用 / 停用 / 更新 / 卸载，随状态切换）。
+- 状态机：未安装 → 已安装（未启用）→ 已启用；另有「可更新」「不合规」「核心版本过低」标记态。
+- 详情抽屉：完整说明、版本与更新日志（如有）、权限清单、配置表单（二期）。
+- 安装确认框：列全 permissions 逐项说明，含 qzone_write / scheduler 的插件额外标红提示；确认后才落盘。
+
+### 安全原则（只有一条硬规矩）
+
+插件是任意 Python 代码，安装即完全信任：安装前必须过权限确认框；`qzone_write`、`scheduler` 属高权限，非官方索引来源的插件默认禁止启用这两项，需在详情里单独放行。一期不做签名、沙箱、投稿审核（无第三方投稿场景，不提前造）。
+
+### 分期
+
+- 一期：manifest 规范 + loader 校验 + 4 插件迁移 + 索引拉取/回退 + 市场页（卡片/状态机/装卸启停/更新角标/安装确认）。
+- 二期：config_schema 自动配置表单、索引定时刷新与更新提醒。
+- 三期（有第三方插件再说）：投稿流程、权限分级放行、签名。
