@@ -181,6 +181,7 @@ bot 对每个人的好感度、以及自己当下的心情，都由确定性规�
 | `plugins/qzone_post/` | 说说发布插件（命令 / 定时 / 概率触发）；自动互动开关默认关闭（默认不启用，需显式开启） |
 | `plugins/image_gen/` | 画图插件：「画一张 / 画个 <描述>」调用自定义生图端点（OpenAI 兼容，硅基流动为预设示例），带冷却、每日上限与本地黑名单（默认关闭，需配齐端点 / 密钥 / 模型） |
 | `plugins/music/` | 点歌插件：「点歌 / 我想听 <歌名>」搜网易云，音乐段发送，失败降级文字 + 封面（默认关闭，无需 key） |
+| [`plugins/link_parse/`](plugins/link_parse/README.md) | 把 B 站视频资料、网页标题与正文摘录作为本轮对话的外部参考（默认关闭） |
 | `plugins/group_insights/` | 群发言统计与群聊总结：「水群榜」Top5 / 「总结一下」按话题补课（默认关闭，需显式启用） |
 | `rubenbot/sticker_behavior.py` | 核心表情包行为：收集群聊表情入库、按概率与冷却补一张，只经能力层 `send_sticker` 发送（默认关闭） |
 | `data/SOUL.md` | 默认人格示例 |
@@ -387,7 +388,7 @@ plugins:
 | `llm` | 调用核心的大模型接口（会产生费用） | |
 | `network` | 向外部网络发起请求 | |
 
-带高风险权限的插件，安装确认框里会额外标红提示。框架自带的 6 个官方插件（hello / privacy / qzone_post / music / image_gen / group_insights）都已声明真实 manifest，可作参考。
+带高风险权限的插件，安装确认框里会额外标红提示。框架自带的 7 个官方插件（hello / privacy / qzone_post / music / image_gen / group_insights / link_parse）都已声明真实 manifest，可作参考。
 
 在插件目录下新建 `plugins/<name>/plugin.py`，暴露 `register(ctx)`：
 

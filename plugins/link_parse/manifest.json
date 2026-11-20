@@ -1,0 +1,21 @@
+{
+  "id": "link_parse",
+  "name": "链接解析",
+  "version": "1.0.0",
+  "description": "把群聊或私聊中的 B 站视频资料、网页标题与正文摘录作为本轮对话的外部参考，不单独发消息。",
+  "author": "RubenBot",
+  "min_core_version": "0.1.0",
+  "permissions": ["read_messages", "network"],
+  "config_schema": [
+    {"key": "mode", "type": "string", "default": "on_mention", "description": "on_mention：被点名或被问到才解析；auto：收到链接就预取"},
+    {"key": "cooldown_seconds", "type": "number", "default": 60, "description": "自动模式每会话两次新抓取的间隔（0–86400 秒）"},
+    {"key": "daily_limit", "type": "int", "default": 100, "description": "自动模式每天的新抓取总次数（0–100000，0 不抓）"},
+    {"key": "cache_ttl_seconds", "type": "number", "default": 3600, "description": "成功结果的缓存时间（0–604800 秒，0 不缓存）"},
+    {"key": "max_bytes", "type": "int", "default": 1048576, "description": "每页最多读取的字节数（1–4194304）"},
+    {"key": "timeout_seconds", "type": "number", "default": 6, "description": "单链接总超时（0.1–30 秒，包含 DNS、跳转和读取）"},
+    {"key": "sites", "type": "list", "default": ["bilibili", "generic"], "description": "允许的站点：bilibili（含 b23.tv）、generic（其他网页）；删掉即关闭"}
+  ],
+  "hooks": ["on_message", "on_before_reply"],
+  "category": "工具",
+  "icon": "🔗"
+}
