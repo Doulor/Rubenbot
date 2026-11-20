@@ -1,8 +1,8 @@
 /* RubenBot 控制台
  *
  * 设计语言：FlClash v0.9 桌面版的 Material You（M3）动态色，种子色为橙色。
- * - 明色是暖奶油底，暗色是暖深棕底；卡片靠 tonal（色调深浅）分层，不靠描边。
- * - 大圆角卡片（28px），内嵌子卡 20px，输入框 16px，交互元素一律药丸形。
+ * - 明色是暖奶油底，暗色是暖深棕底；卡片靠 tonal（色调深浅）与分层投影区分，不靠描边。
+ * - 大圆角卡片（30px），内嵌子卡 20px，输入框 16px，交互元素一律药丸形。
  * - 强调色、发光阴影、圆角全部走变量；换种子色只改 --seed 一处。
  * - 侧栏选中态是药丸形色调填充；移动端侧栏收成底部悬浮 dock。
  *
@@ -24,10 +24,16 @@
   --seed: #f2790c;
 
   /* 圆角档位：卡片 / 内嵌子卡 / 输入框 / 药丸 */
-  --r-card: 28px;
+  --r-card: 30px;
   --r-inner: 20px;
   --r-field: 16px;
   --r-pill: 999px;
+
+  /* 仪表盘的四层表面复用原调色板：暗色内嵌层逐级提亮，不加边框。 */
+  --page-fill: var(--bg);
+  --card-fill: var(--surface);
+  --block-fill: var(--surface-soft);
+  --inset-fill: var(--surface-sunk);
 
   --sidebar-w: 252px;
   --content-max: 1240px;
@@ -86,8 +92,8 @@ html[data-theme="light"] {
   --bad: #9c3b2f;
   --bad-soft: #ffe2db;
 
-  --shadow-card: 0 1px 2px rgba(90, 50, 20, 0.03);
-  --shadow-pop: 0 26px 64px -20px rgba(70, 35, 10, 0.35);
+  --shadow-card: 0 .5px 1px #0000000d, 0 2px 6px #0000000a, 0 12px 32px -6px #00000017;
+  --shadow-pop: 0 1px 3px #0000000f, 0 10px 24px #00000014, 0 32px 64px -12px #00000038;
   --scrim: rgba(38, 22, 10, 0.38);
   --grid-line: rgba(90, 55, 30, 0.06);
 }
@@ -134,8 +140,8 @@ html[data-theme="dark"] {
   --bad: #ffb4a4;
   --bad-soft: #3d1e18;
 
-  --shadow-card: 0 1px 0 rgba(255, 220, 190, 0.02);
-  --shadow-pop: 0 28px 70px -20px rgba(0, 0, 0, 0.65);
+  --shadow-card: 0 1px 2px #00000080, 0 10px 28px -6px #0000008c;
+  --shadow-pop: 0 2px 6px #00000080, 0 32px 64px -12px #000000b3;
   --scrim: rgba(8, 4, 2, 0.55);
   --grid-line: rgba(255, 220, 190, 0.05);
 }
@@ -480,7 +486,7 @@ button {
 /* ---------------- 卡片（tonal，无描边） ---------------- */
 
 .card {
-  background: var(--surface);
+  background: var(--card-fill);
   border: 0;
   border-radius: var(--r-card);
   box-shadow: var(--shadow-card);
@@ -612,7 +618,7 @@ button {
   height: 26px;
   padding: 0 11px;
   border-radius: var(--r-pill);
-  background: var(--surface-sunk);
+  background: var(--inset-fill);
   color: var(--text-soft);
   font-size: 12px;
   font-weight: 500;
@@ -1424,7 +1430,7 @@ button {
   height: 28px;
   padding: 0 4px 0 11px;
   border-radius: var(--r-pill);
-  background: var(--surface-sunk);
+  background: var(--inset-fill);
   border: 0;
   font-family: var(--font-mono);
   font-size: 11.5px;
@@ -1591,13 +1597,13 @@ button {
   gap: 12px;
   padding: 18px 20px 16px;
   border-radius: var(--r-inner);
-  background: var(--surface);
+  background: var(--card-fill);
   box-shadow: var(--shadow-card);
   min-width: 0;
 }
 
 .market-card.is-enabled {
-  background: var(--surface-soft);
+  background: var(--block-fill);
 }
 
 .market-card-head {
@@ -1847,7 +1853,7 @@ button {
   flex-direction: column;
   gap: 2px;
   padding: 10px;
-  background: var(--surface);
+  background: var(--card-fill);
   border-radius: var(--r-inner);
 }
 
@@ -2031,7 +2037,7 @@ button {
   border: 0;
   border-radius: var(--r-inner);
   padding: 14px 16px;
-  background: var(--surface-soft);
+  background: var(--block-fill);
 }
 
 .group-item-head {
