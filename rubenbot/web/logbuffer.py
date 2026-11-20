@@ -33,6 +33,11 @@ class RingBufferHandler(logging.Handler):
                 "logger": record.name,
                 "message": message,
             }
+            # 只接受写日志时明确提供的身份字段，不从正文猜测账号或群号。
+            for key in ("platform", "chat_type", "chat_id", "sender_id", "sender_name", "person_id"):
+                value = getattr(record, key, None)
+                if isinstance(value, str) and value:
+                    item[key] = value
         except Exception:  # noqa: BLE001 - 日志处理器自己不能抛异常
             return
         with _lock:

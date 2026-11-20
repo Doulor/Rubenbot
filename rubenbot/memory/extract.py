@@ -201,12 +201,12 @@ class MemoryExtractor:
         # 不记模式：不建画像、不进时间线；消息仍标记已处理，避免反复查库
         if self._is_norecord(person_id):
             self.store.mark_processed([m.id for m in messages])
-            logger.info("跳过不记模式的用户：%s", person_id)
+            logger.info("跳过不记模式的用户：%s", person_id, extra={"person_id": person_id})
             return ExtractResult(person_id=person_id, skipped_norecord=True)
         try:
             extraction = await self._ask_model(sender, messages)
         except Exception as exc:  # noqa: BLE001 - 单次抽取失败不应影响其他
-            logger.warning("抽取失败（%s）：%s", person_id, exc)
+            logger.warning("抽取失败（%s）：%s", person_id, exc, extra={"person_id": person_id})
             return ExtractResult(person_id=person_id, error=str(exc))
 
         audience = audience_for_chat(sender.chat_type, sender.chat_id)
@@ -273,7 +273,7 @@ class MemoryExtractor:
         try:
             return self.store.is_norecord(person_id)
         except Exception as exc:  # noqa: BLE001 - 隐私检查失败不能拖垮抽取
-            logger.warning("查询隐私设置失败（%s）：%s", person_id, exc)
+            logger.warning("查询隐私设置失败（%s）：%s", person_id, exc, extra={"person_id": person_id})
             return False
 
     def _expiry_ts(self, fact: ExtractedFact, base_ts: float) -> float | None:

@@ -31,6 +31,17 @@ SCHEMA = """CREATE TABLE IF NOT EXISTS people (
     UNIQUE(platform, platform_uid)
 );
 
+-- 名称缓存：群名片按群隔离；头像地址按需生成，不存图片。
+CREATE TABLE IF NOT EXISTS identity_cache (
+    platform    TEXT NOT NULL,
+    object_id   TEXT NOT NULL,
+    kind        TEXT NOT NULL DEFAULT 'user',
+    name        TEXT NOT NULL DEFAULT '',
+    group_id    TEXT NOT NULL DEFAULT '',
+    updated_at  REAL NOT NULL,
+    PRIMARY KEY(platform, object_id, kind, group_id)
+);
+
 CREATE TABLE IF NOT EXISTS memories (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     person_id   TEXT NOT NULL,
@@ -272,6 +283,7 @@ CREATE TABLE IF NOT EXISTS gateway_audit (
     source       TEXT NOT NULL DEFAULT 'model',     -- model / event / system
     platform     TEXT NOT NULL DEFAULT '',
     chat_id      TEXT NOT NULL DEFAULT '',
+    chat_type    TEXT NOT NULL DEFAULT '',
     action       TEXT NOT NULL,
     params       TEXT NOT NULL DEFAULT '{}',        -- 参数摘要（JSON，已截断）
     ok           INTEGER NOT NULL DEFAULT 0,
@@ -543,11 +555,79 @@ class MemoryStore:
             _migrate_raw_messages(self._conn)
             _migrate_memories(self._conn)
             self._conn.executescript(SCHEMA)
+            if "chat_type" not in {row[1] for row in self._conn.execute("PRAGMA table_info(gateway_audit)")}:
+                self._conn.execute("ALTER TABLE gateway_audit ADD COLUMN chat_type TEXT NOT NULL DEFAULT ''")
             self._conn.commit()
 
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+    # ------------------------------------------------------------------
+    # identity_cache
+    # ------------------------------------------------------------------
+
+    def upsert_identity(
+        self,
+        platform: str,
+        object_id: str,
+        *,
+        kind: str = "user",
+        name: str = "",
+        group_id: str = "",
+        now: float | None = None,
+    ) -> None:
+        """群名片只属于该群；空名称不覆盖已有资料。"""
+        if not name.strip():
+            return
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO identity_cache(platform, object_id, kind, group_id, name, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(platform, object_id, kind, group_id) DO UPDATE SET
+                       name = excluded.name, updated_at = excluded.updated_at
+                   WHERE identity_cache.name <> excluded.name""",
+                (platform, object_id, kind, group_id, name, time.time() if now is None else now),
+            )
+
+    def get_identity(self, platform: str, object_id: str, kind: str = "user", *, group_id: str = "") -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM identity_cache WHERE platform = ? AND object_id = ? AND kind = ? AND group_id = ?",
+                (platform, object_id, kind, group_id),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def group_platforms(self, chat_id: str) -> list[str]:
+        """返回某群号实际出现过的平台，去重排序，避免配置页跨平台猜身份。"""
+        chat_id = str(chat_id or "")
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT DISTINCT platform FROM identity_cache
+                WHERE object_id = ? AND kind = 'group'
+                UNION
+                SELECT DISTINCT platform FROM raw_messages
+                WHERE chat_id = ? AND chat_type = 'group'
+                ORDER BY platform
+                """,
+                (chat_id, chat_id),
+            ).fetchall()
+        return [str(row["platform"]) for row in rows if row["platform"]]
+
+    def list_identities(self, *, platform: str | None = None, kind: str | None = None) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM identity_cache WHERE 1=1"
+        params: list[Any] = []
+        if platform is not None:
+            sql += " AND platform = ?"
+            params.append(str(platform))
+        if kind is not None:
+            sql += " AND kind = ?"
+            params.append(str(kind))
+        sql += " ORDER BY updated_at DESC, object_id"
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
 
     # ------------------------------------------------------------------
     # people
@@ -2240,6 +2320,7 @@ class MemoryStore:
         *,
         chat_id: str | None = None,
         platform: str | None = None,
+        chat_type: str | None = None,
         limit: int = 50,
         since: float | None = None,
     ) -> list[dict]:
@@ -2252,6 +2333,9 @@ class MemoryStore:
         if platform is not None:
             sql += " AND platform = ?"
             params.append(platform)
+        if chat_type is not None:
+            sql += " AND chat_type = ?"
+            params.append(chat_type)
         if since is not None:
             sql += " AND created_at >= ?"
             params.append(since)
@@ -2581,6 +2665,7 @@ class MemoryStore:
         source: str = "model",
         platform: str = "",
         chat_id: str = "",
+        chat_type: str = "",
         params: dict | None = None,
         ok: bool = False,
         result: str = "",
@@ -2597,15 +2682,16 @@ class MemoryStore:
         with self._lock:
             cur = self._conn.execute(
                 """
-                INSERT INTO gateway_audit(ts, source, platform, chat_id, action, params, ok,
+                INSERT INTO gateway_audit(ts, source, platform, chat_id, chat_type, action, params, ok,
                                           result, reject_reason, sensitive)
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     now,
                     str(source or "model"),
                     str(platform or ""),
                     str(chat_id or ""),
+                    chat_type,
                     str(action or ""),
                     params_text[:1000],
                     1 if ok else 0,

@@ -126,6 +126,90 @@ def seed(store: MemoryStore) -> None:
 # ----------------------------------------------------------------------
 
 
+def test_log_identity_fields_are_searchable_without_guessing_message_ids(client, store):
+    import logging
+
+    from rubenbot.web.logbuffer import RingBufferHandler
+
+    store.upsert_person("telegram", "68", "早茶")
+    handler = RingBufferHandler()
+    logger = logging.getLogger("test.identity")
+    for fields, message in [({}, "订单号 999"), ({"platform": "telegram", "chat_type": "private",
+                                 "chat_id": "68", "sender_id": "68", "sender_name": "早茶"}, "收到消息")]:
+        handler.emit(logger.makeRecord(logger.name, logging.INFO, __file__, 1, message, (), None, extra=fields))
+    for query in ["早茶", "68", "telegram:68"]:
+        rows = client.get("/api/logs", params={"q": query}).json()["items"]
+        assert len(rows) == 1
+        assert rows[0]["person_identity"]["name"] == "早茶"
+        assert rows[0]["chat_identity"]["kind"] == "private"
+    plain = client.get("/api/logs", params={"q": "999"}).json()["items"][0]
+    assert "person_identity" not in plain and "chat_identity" not in plain
+
+
+def test_people_memory_and_decision_identities(client, store):
+    from rubenbot.memory.store import ProfileLine
+
+    seed(store)
+    store.upsert_identity("snowluma", "g1", kind="group", name="夜读会")
+    store.upsert_identity("snowluma", "1001", name="花老师", group_id="g1")
+    store.upsert_identity("snowluma", "1001", name="全局昵称")
+    store.add_memory("snowluma:1001", "在群里领读", scope_type="group", scope_id="g1")
+    store.save_profile("snowluma:1001", stable_lines=[ProfileLine(text="喜欢阅读")], status_lines=[])
+    store.add_event("snowluma:1001", "讨论新书", source_chat="snowluma:g1", audience="group:g1")
+    person = client.get("/api/people", params={"q": "全局昵称"}).json()["items"][0]
+    assert person["identity"]["avatar_url"] == "https://q1.qlogo.cn/g?b=qq&nk=1001&s=640"
+    detail = client.get("/api/people/snowluma:1001").json()
+    assert detail["profile"]["stable_text"] == "喜欢阅读"
+    assert detail["timeline"][0]["chat_identity"]["name"] == "夜读会"
+    assert next(m for m in detail["memories"] if m["scope_type"] == "group")["chat_identity"]["name"] == "夜读会"
+    for decision in (client.get("/api/overview").json()["recent_decisions"][0],
+                     client.get("/api/decisions").json()["items"][0]):
+        assert decision["sender_identity"]["name"] == "花老师"
+        assert decision["chat_identity"]["name"] == "夜读会"
+
+
+def test_gateway_audit_preserves_chat_kind_and_unknown_legacy_rows(client, store):
+    store.upsert_person("snowluma", "42", "甲")
+    store.upsert_identity("snowluma", "42", kind="group", name="棋社")
+    for kind in ("group", "private", ""):
+        store.add_gateway_audit(action="test", platform="snowluma", chat_id="42", chat_type=kind)
+    legacy, private, group = [row["chat_identity"] for row in client.get("/api/gateway/audit").json()["items"]]
+    assert (legacy["id"], legacy["name"], legacy["avatar_url"]) == ("42", "未知会话", "")
+    assert private["name"] == "甲" and private["kind"] == "private"
+    assert group["name"] == "棋社" and group["kind"] == "group"
+
+
+def test_group_directory_fetches_once_and_manual_member_refresh_uses_source_group(client, state, store):
+    from types import SimpleNamespace
+    from rubenbot.config import GroupDecisionConfig
+
+    calls = []
+
+    class Adapter:
+        async def refresh_identities(self, *, chat_id, person_id):
+            calls.append((chat_id, person_id))
+            if person_id:
+                return [{"id": person_id, "kind": "user", "group_id": chat_id, "name": "花老师"}]
+            return [{"id": "88", "kind": "group", "name": "新书群"}]
+
+    state.bot = SimpleNamespace(adapters={"snowluma": Adapter()})
+    state.config.decision.groups["404"] = GroupDecisionConfig()
+    for _ in range(2):
+        groups = {row["chat_id"]: row for row in client.get("/api/chats").json()["items"]}
+        assert groups["88"]["chat_identity"]["name"] == "新书群"
+        assert groups["404"]["chat_identity"]["name"] == "未知群"
+        assert groups["404"]["chat_identity"]["avatar_url"] == ""
+    assert calls == [(None, None)]
+    body = {"platform": "snowluma", "chat_id": "88", "person_id": "72"}
+    assert client.post("/api/identities/refresh", json=body).json()["refreshed"] == 1
+    assert store.get_identity("snowluma", "72", group_id="88")["name"] == "花老师"
+    assert store.get_identity("snowluma", "72") is None
+
+
+def test_identity_refresh_requires_session(locked_client):
+    assert locked_client.post("/api/identities/refresh", json={"platform": "snowluma"}).status_code == 401
+
+
 def test_health_open_without_auth(client):
     response = client.get("/api/health")
     assert response.status_code == 200

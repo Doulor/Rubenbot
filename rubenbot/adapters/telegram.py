@@ -376,6 +376,7 @@ class TelegramAdapter(BaseAdapter):
             chat_id=str(chat_id),
             sender_id=str(sender_id),
             sender_name=_sender_name(sender),
+            chat_name=str(chat.get("title") or ""),
             text=render_segments(segments),
             reply_to_id=str(reply_to_id) if reply_to_id is not None else None,
             mentions_bot=self._mentions_bot(message) or reply_to_bot,

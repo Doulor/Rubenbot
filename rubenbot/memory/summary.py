@@ -145,7 +145,8 @@ class RollingSummarizer:
                 )
             except Exception as exc:  # noqa: BLE001 - 单会话失败不影响其他会话
                 logger.warning(
-                    "会话 %s:%s 摘要失败：%s", chat["platform"], chat["chat_id"], exc
+                    "会话 %s:%s 摘要失败：%s", chat["platform"], chat["chat_id"], exc,
+                    extra={key: chat[key] for key in ("platform", "chat_id", "chat_type")},
                 )
                 results.append(
                     SummaryResult(
@@ -186,6 +187,7 @@ class RollingSummarizer:
         if not batch:
             return None
 
+        context = {"platform": platform, "chat_id": chat_id, "chat_type": batch[-1].chat_type}
         old_summary = (current.summary if current else "") or ""
         prompt = self._build_prompt(old_summary, batch)
         try:
@@ -193,7 +195,7 @@ class RollingSummarizer:
                 prompt, role="summary", task="rolling_summary", temperature=0.3
             )
         except Exception as exc:  # noqa: BLE001 - 摘要失败不阻塞，下一轮再试
-            logger.warning("生成会话摘要失败（%s）：%s", conversation_id, exc)
+            logger.warning("生成会话摘要失败（%s）：%s", conversation_id, exc, extra=context)
             return SummaryResult(
                 conversation_id=conversation_id,
                 covered_until_msg_id=covered,
@@ -202,7 +204,7 @@ class RollingSummarizer:
 
         summary = trim_summary(_clean_output(raw), settings.max_chars)
         if not summary:
-            logger.warning("会话摘要为空，保留旧摘要（%s）", conversation_id)
+            logger.warning("会话摘要为空，保留旧摘要（%s）", conversation_id, extra=context)
             return SummaryResult(
                 conversation_id=conversation_id,
                 covered_until_msg_id=covered,
@@ -218,6 +220,7 @@ class RollingSummarizer:
             conversation_id,
             len(batch),
             covered_until,
+            extra=context,
         )
         return SummaryResult(
             conversation_id=conversation_id,

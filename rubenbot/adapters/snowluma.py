@@ -305,6 +305,29 @@ class SnowLumaAdapter(BaseAdapter):
         except Exception:  # noqa: BLE001
             return False
 
+    async def refresh_identities(
+        self, *, chat_id: str | None = None, person_id: str | None = None
+    ) -> list[dict[str, str]]:
+        """读取 OneBot 展示信息，返回 WebUI 身份缓存可消费的统一行。
+
+        不下载头像。指定群和用户时只取这名成员的名片，不枚举全群。
+        """
+        uid = str(person_id or "").removeprefix("snowluma:")
+        gid = str(chat_id or "").removeprefix("group:")
+        if uid and gid:
+            payload = await self.call_api("get_group_member_info", {"group_id": _to_id(gid), "user_id": _to_id(uid)})
+            data = payload.get("data") or {}
+            return [{"id": uid, "kind": "user", "group_id": gid, "name": data.get("card") or data.get("nickname") or ""}]
+        if uid:
+            payload = await self.call_api("get_stranger_info", {"user_id": _to_id(uid)})
+            return [{"id": uid, "kind": "user", "name": (payload.get("data") or {}).get("nickname") or ""}]
+        if gid:
+            payload = await self.call_api("get_group_info", {"group_id": _to_id(gid)})
+            return [{"id": gid, "kind": "group", "name": (payload.get("data") or {}).get("group_name") or ""}]
+        payload = await self.call_api("get_group_list", {})
+        return [{"id": str(row["group_id"]), "kind": "group", "name": row.get("group_name") or ""}
+                for row in (payload.get("data") or []) if isinstance(row, dict) and row.get("group_id")]
+
     # ------------------------------------------------------------------
     # 平台能力
     # ------------------------------------------------------------------

@@ -191,7 +191,7 @@ class Consolidator:
             try:
                 results.append(await self.consolidate_person(person_id, now=now))
             except Exception as exc:  # noqa: BLE001 - 单人失败不影响其他人
-                logger.warning("归纳失败（%s）：%s", person_id, exc)
+                logger.warning("归纳失败（%s）：%s", person_id, exc, extra={"person_id": person_id})
                 results.append(ConsolidateResult(person_id=person_id, error=str(exc)))
         # 只有全部成功才推进时间游标；有失败则下一轮还会重试
         if results and all(r.error is None for r in results):
