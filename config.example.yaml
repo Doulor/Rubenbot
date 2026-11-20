@@ -71,6 +71,14 @@ memory:
     keep_recent: 30              # 始终保留的最新原文条数，不参与压缩
     max_chars: 800               # 摘要总长上限（五段合计），更新时模型需在此取舍
 
+# 联网搜索：给模型一个 web_search 工具（仿 recall 的工具接法）
+# 不填 api_key 时工具不注册，模型看不见它；日志会打一行「联网搜索未配置，已跳过」
+search:
+  provider: "bocha"        # bocha（博查）或 tavily
+  api_key: "${RUBENBOT_SEARCH_KEY}"
+  timeout_seconds: 10      # 单次搜索请求超时（秒）
+  cooldown_seconds: 30     # 每会话两次真实搜索之间的冷却，冷却内只返回提示不发请求
+
 chat:
   bot_name: "Ruben"
   history_size: 30

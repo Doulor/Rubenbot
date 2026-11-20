@@ -276,6 +276,37 @@ class DecisionConfig:
 
 
 @dataclass
+class SearchConfig:
+    """联网搜索（LLM 工具 ``web_search``）的配置。
+
+    ``provider`` 目前支持 ``bocha``（博查）与 ``tavily``，写错回落 ``bocha``；
+    ``api_key`` 与 ``llm.api_key`` 一样支持 ``${ENV_VAR}``（加载时已统一展开）。
+    没配 ``api_key`` 时工具不注册，模型看不见它。
+    """
+
+    provider: str = "bocha"
+    api_key: str = ""
+    timeout_seconds: float = 10.0
+    # 每个会话两次真实搜索之间的冷却；冷却内直接返回提示文本，不发请求
+    cooldown_seconds: float = 30.0
+
+    def __post_init__(self) -> None:
+        provider = str(self.provider or "").strip().lower()
+        self.provider = provider if provider in SEARCH_PROVIDERS else "bocha"
+        self.api_key = str(self.api_key or "").strip()
+        self.timeout_seconds = max(0.1, _as_float(self.timeout_seconds, 10.0))
+        self.cooldown_seconds = max(0.0, _as_float(self.cooldown_seconds, 30.0))
+
+    @property
+    def configured(self) -> bool:
+        """填了 api_key 才算可用（provider 不需要额外校验）。"""
+        return bool(self.api_key)
+
+
+SEARCH_PROVIDERS: tuple[str, ...] = ("bocha", "tavily")
+
+
+@dataclass
 class PluginsConfig:
     """插件目录与启停。
 
@@ -417,6 +448,7 @@ def is_loopback_host(host: str) -> bool:
 class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
+    search: SearchConfig = field(default_factory=SearchConfig)
     chat: ChatConfig = field(default_factory=ChatConfig)
     decision: DecisionConfig = field(default_factory=DecisionConfig)
     plugins: PluginsConfig = field(default_factory=PluginsConfig)
@@ -491,6 +523,9 @@ class Config:
     def from_dict(cls, data: dict[str, Any]) -> "Config":
         llm = LLMConfig(**{k: v for k, v in (data.get("llm") or {}).items() if _has(LLMConfig, k)})
         memory = _load_memory(data.get("memory") or {})
+        search = SearchConfig(
+            **{k: v for k, v in (data.get("search") or {}).items() if _has(SearchConfig, k)}
+        )
         chat = ChatConfig(**{k: v for k, v in (data.get("chat") or {}).items() if _has(ChatConfig, k)})
         decision = _load_decision(data.get("decision") or {})
         plugins = PluginsConfig(**{k: v for k, v in (data.get("plugins") or {}).items() if _has(PluginsConfig, k)})
@@ -508,6 +543,7 @@ class Config:
         return cls(
             llm=llm,
             memory=memory,
+            search=search,
             chat=chat,
             decision=decision,
             plugins=plugins,
