@@ -346,6 +346,26 @@ def _validate_memory(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
             flag = v.boolean(section[key], f"memory.{key}")
             if flag is not None:
                 out[key] = flag
+    rolling = _section(section, "rolling_summary", v)
+    if rolling is not None:
+        out["rolling_summary"] = _validate_rolling_summary(rolling, v)
+    return out
+
+
+def _validate_rolling_summary(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
+    """滚动摘要的嵌套配置：开关 + 三个上限。"""
+    out: dict[str, Any] = {}
+    if "enabled" in section:
+        flag = v.boolean(section["enabled"], "memory.rolling_summary.enabled")
+        if flag is not None:
+            out["enabled"] = flag
+    for key, minimum in (("trigger_after", 1), ("keep_recent", 0), ("max_chars", 100)):
+        if key in section:
+            number = v.number(
+                section[key], f"memory.rolling_summary.{key}", minimum=minimum, integer=True
+            )
+            if number is not None:
+                out[key] = int(number)
     return out
 
 

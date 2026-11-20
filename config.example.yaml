@@ -64,6 +64,12 @@ memory:
   gate_ask_high_sensitivity: true # 高敏感跨场合项是否进待问队列
   recall_tool_enabled: true      # 模型支持工具调用时开放 recall 工具
   recall_tool_max_rounds: 2      # recall 工具循环最多几轮
+  # 会话滚动摘要：把本会话的早期对话压成五段式摘要，prompt 里放「摘要 + 近期原文」
+  rolling_summary:
+    enabled: true                # 总开关；关闭后上下文组装与以前一致
+    trigger_after: 60            # 未摘要的原文超过这么多条触发一次压缩
+    keep_recent: 30              # 始终保留的最新原文条数，不参与压缩
+    max_chars: 800               # 摘要总长上限（五段合计），更新时模型需在此取舍
 
 chat:
   bot_name: "Ruben"

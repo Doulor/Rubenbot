@@ -186,6 +186,15 @@ CREATE TABLE IF NOT EXISTS llm_usage (
 );
 CREATE INDEX IF NOT EXISTS idx_llm_usage_ts ON llm_usage(ts);
 CREATE INDEX IF NOT EXISTS idx_llm_usage_task ON llm_usage(task);
+
+-- 会话滚动摘要：每个会话一行，早期对话压成结构化摘要；covered_until_msg_id
+-- 之前的原文已被摘要覆盖，拼上下文时不再重复带入。
+CREATE TABLE IF NOT EXISTS conversation_summaries (
+    conversation_id      TEXT PRIMARY KEY,        -- platform:chat_id
+    summary              TEXT NOT NULL DEFAULT '',
+    covered_until_msg_id INTEGER NOT NULL DEFAULT 0,
+    updated_at           REAL NOT NULL
+);
 """
 
 
@@ -336,6 +345,16 @@ class PendingSender:
     sender_id: str
     sender_name: str
     count: int
+
+
+@dataclass
+class ConversationSummary:
+    """某个会话的滚动摘要（每个会话一行；covered_until 之前的原文已被覆盖）。"""
+
+    conversation_id: str
+    summary: str = ""
+    covered_until_msg_id: int = 0
+    updated_at: float = 0.0
 
 
 @dataclass
@@ -1378,11 +1397,13 @@ class MemoryStore:
         platform: str | None = None,
         *,
         real_only: bool = False,
+        after_id: int = 0,
     ) -> list[RawMessage]:
         """按时间正序返回某会话最近的消息。
 
         ``real_only=True`` 时排除系统/工具条目（sender_id 以 ``__`` 开头，
-        bot 自己的 ``__bot__`` 不算），窗口只按真实消息计。
+        bot 自己的 ``__bot__`` 不算），窗口只按真实消息计。``after_id`` 只取
+        流水中 id 更大的消息（滚动摘要已覆盖的部分不再带入）。
         """
         sql = "SELECT * FROM raw_messages WHERE chat_id = ?"
         params: list = [str(chat_id)]
@@ -1392,6 +1413,9 @@ class MemoryStore:
         if since is not None:
             sql += " AND ts >= ?"
             params.append(since)
+        if after_id:
+            sql += " AND id > ?"
+            params.append(int(after_id))
         if real_only:
             # 不用 LIKE：``_`` 是 LIKE 的通配符，这里按前缀切片精确比较
             sql += " AND (substr(sender_id, 1, ?) <> ? OR sender_id = ?)"
@@ -1472,6 +1496,90 @@ class MemoryStore:
                 "SELECT MAX(ts) AS ts FROM raw_messages WHERE chat_id = ?", (str(chat_id),)
             ).fetchone()
         return row["ts"] if row and row["ts"] is not None else None
+
+    # ------------------------------------------------------------------
+    # conversation_summaries（会话滚动摘要）
+    # ------------------------------------------------------------------
+
+    def get_conversation_summary(self, conversation_id: str) -> ConversationSummary | None:
+        """取某个会话的摘要；没有摘要返回 None。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM conversation_summaries WHERE conversation_id = ?",
+                (str(conversation_id),),
+            ).fetchone()
+        return ConversationSummary(**dict(row)) if row else None
+
+    def set_conversation_summary(
+        self,
+        conversation_id: str,
+        summary: str,
+        covered_until_msg_id: int,
+        *,
+        now: float | None = None,
+    ) -> None:
+        """写入/更新某个会话的摘要与覆盖游标（只增不减由调用方保证）。"""
+        now = time.time() if now is None else now
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO conversation_summaries(conversation_id, summary, covered_until_msg_id, updated_at)
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(conversation_id) DO UPDATE SET
+                    summary = excluded.summary,
+                    covered_until_msg_id = excluded.covered_until_msg_id,
+                    updated_at = excluded.updated_at
+                """,
+                (str(conversation_id), summary, int(covered_until_msg_id), now),
+            )
+            self._conn.commit()
+
+    def raw_messages_after(
+        self,
+        chat_id: str,
+        *,
+        platform: str | None = None,
+        after_id: int = 0,
+        limit: int | None = None,
+        real_only: bool = False,
+    ) -> list[RawMessage]:
+        """按时间正序取 raw_messages.id > ``after_id`` 的消息（摘要增量用）。"""
+        sql = "SELECT * FROM raw_messages WHERE chat_id = ? AND id > ?"
+        params: list = [str(chat_id), int(after_id)]
+        if platform is not None:
+            sql += " AND platform = ?"
+            params.append(platform)
+        if real_only:
+            sql += " AND (substr(sender_id, 1, ?) <> ? OR sender_id = ?)"
+            params.extend([len(SYSTEM_SENDER_PREFIX), SYSTEM_SENDER_PREFIX, BOT_SENDER_ID])
+        sql += " ORDER BY id ASC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [self._row_to_raw(row) for row in rows]
+
+    def count_raw_messages_after(
+        self,
+        chat_id: str,
+        *,
+        platform: str | None = None,
+        after_id: int = 0,
+        real_only: bool = False,
+    ) -> int:
+        """统计 ``after_id`` 之后的原文条数（摘要触发判断用）。"""
+        sql = "SELECT COUNT(*) AS c FROM raw_messages WHERE chat_id = ? AND id > ?"
+        params: list = [str(chat_id), int(after_id)]
+        if platform is not None:
+            sql += " AND platform = ?"
+            params.append(platform)
+        if real_only:
+            sql += " AND (substr(sender_id, 1, ?) <> ? OR sender_id = ?)"
+            params.extend([len(SYSTEM_SENDER_PREFIX), SYSTEM_SENDER_PREFIX, BOT_SENDER_ID])
+        with self._lock:
+            row = self._conn.execute(sql, params).fetchone()
+        return int(row["c"])
 
     @staticmethod
     def _row_to_raw(row: sqlite3.Row) -> RawMessage:

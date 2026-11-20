@@ -2579,6 +2579,18 @@ async function renderSettings(view) {
         draft
       ),
     }),
+    card("滚动摘要", {
+      hint: "把本会话的早期对话压成摘要，prompt 里只放摘要 + 近期原文",
+      body: fieldGrid(
+        [
+          { path: "memory.rolling_summary.enabled", label: "启用滚动摘要", kind: "switch", hint: "关闭后行为与以前一致：只带最近原文" },
+          { path: "memory.rolling_summary.trigger_after", label: "触发条数", kind: "number", step: "1", min: 1, hint: "未摘要的原文超过这么多条时压缩一次" },
+          { path: "memory.rolling_summary.keep_recent", label: "保留近期原文", kind: "number", step: "1", min: 0, hint: "始终不压缩的最新原文条数" },
+          { path: "memory.rolling_summary.max_chars", label: "摘要上限（字）", kind: "number", step: "50", min: 100, hint: "五段式摘要的总长上限，更新时模型需在此取舍" },
+        ],
+        draft
+      ),
+    }),
     card("聊天与回复", {
       hint: "回复长度与上下文",
       body: fieldGrid(

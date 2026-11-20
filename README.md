@@ -49,10 +49,11 @@ RubenBot 是一个以**记忆**为核心的拟人社交聊天 bot 框架。它�
                     └─────────────────┘
 ```
 
-主循环之外还有一个后台任务（默认每 5 分钟检查一次），负责两件事：
+主循环之外还有一个后台任务（默认每 5 分钟检查一次），负责三件事：
 
 - **抽取**：某个会话待处理消息攒够 `extract_every_n` 条，或会话静默超过 `extract_silence_seconds` 时，按发送者分别让模型从流水里提炼「关于这个人的耐久事实」。
 - **归纳**：某人的新增记忆达到阈值，或距上次归纳超过间隔时，让模型提议 `merge` / `drop`，再由代码逐条校验执行。
+- **滚动摘要**（默认开）：某个会话在摘要水位之后积累的原文超过 `trigger_after` 条时，把除最近 `keep_recent` 条之外的那批消息增量折叠进五段式摘要；之后拼上下文时只带「摘要块 + 水位之后的原文」。摘要只压缩本会话的对话历史，和跨会话的人物记忆各管各的。
 
 ### 记忆层数据流
 
@@ -106,6 +107,7 @@ RubenBot 是一个以**记忆**为核心的拟人社交聊天 bot 框架。它�
 | `rubenbot/memory/gate.py` | 唯一的分寸审查口：跨场合记忆的放行/扣下/待询问判断（fail closed） |
 | `rubenbot/memory/extract.py` | 批量抽取 + 去重 + 标记已处理 |
 | `rubenbot/memory/consolidate.py` | 归纳提议的解析、校验与执行 |
+| `rubenbot/memory/summary.py` | 会话滚动摘要：本会话早期对话压成五段式摘要，增量折叠、带水位与开关 |
 | `rubenbot/adapters/base.py` | `BaseAdapter`、`MessageEvent`、`Segment` |
 | `rubenbot/adapters/console.py` | stdin/stdout 调试适配器 |
 | `rubenbot/adapters/snowluma.py` | OneBot v11 正向 WS 收事件 + HTTP API 发送 |
@@ -187,7 +189,7 @@ ConsoleAdapter 的输入格式：
 pytest
 ```
 
-当前共 594 个测试，覆盖存储 CRUD / 变更日志与撤销、检索打分、抽取去重、归纳校验（不许新词、20% 上限、user 来源不可删）、画像提炼与时间线压缩、记忆读取侧（索引 / 预拉取 / 预算裁剪 / 跨会话 / 分寸审查 / 隐私命令）、回复决策（合并窗口、动量衰减、占比抑制、冷却、硬触发、生成否决）、主循环、插件、SnowLuma 事件解析，以及 Console + 假 LLM 的端到端流程。
+当前共 684 个测试，覆盖存储 CRUD / 变更日志与撤销、检索打分、抽取去重、归纳校验（不许新词、20% 上限、user 来源不可删）、画像提炼与时间线压缩、记忆读取侧（索引 / 预拉取 / 预算裁剪 / 跨会话 / 分寸审查 / 隐私命令）、会话滚动摘要（触发 / 水位 / 增量折叠 / 上下文组装 / 开关与容错）、回复决策（合并窗口、动量衰减、占比抑制、冷却、硬触发、生成否决）、主循环、插件、SnowLuma 事件解析，以及 Console + 假 LLM 的端到端流程。
 
 ---
 
@@ -214,6 +216,7 @@ pytest
 | | `cross_session_hours` `self_inject_hours` `self_inject_limit` | 私聊跨会话摘要与自我注入的回看窗口 |
 | | `gate_confidence_threshold` `gate_ask_high_sensitivity` | 分寸审查的置信度下限与灰区询问开关 |
 | | `recall_tool_enabled` `recall_tool_max_rounds` | recall 工具循环开关与轮数（模型不支持时自动退化） |
+| | `rolling_summary` | 会话滚动摘要（默认开）：`enabled` / `trigger_after`（未摘要原文超过多少条触发，默认 60）/ `keep_recent`（始终保留的最新原文条数，默认 30）/ `max_chars`（五段式摘要总长上限，默认 800）；摘要用 `summary` 角色生成，未配置时回退 chat |
 | `chat` | `history_size` | 上下文带入的最近消息条数（只计真实消息，系统/工具条目不占窗口） |
 | | `history_ttl_hours` | 超过这个时间的旧消息不再拼进上下文 |
 | | `dedupe_ttl_seconds` | 入站去重窗口：同一平台消息 id 在此窗口内重复到达即丢弃（默认 300 秒，0 关闭） |
