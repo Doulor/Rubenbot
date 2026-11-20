@@ -205,7 +205,7 @@ def test_loader_rejects_invalid_manifest(tmp_path):
 
 
 def test_official_plugins_all_have_valid_manifest():
-    for name in ("hello", "privacy", "qzone_post", "music", "image_gen", "group_insights", "sticker"):
+    for name in ("hello", "privacy", "qzone_post", "music", "image_gen", "group_insights"):
         manifest = load_manifest(OFFICIAL_DIR / name)
         assert manifest.id == name
         assert manifest.permissions
@@ -223,7 +223,7 @@ def test_official_plugins_all_have_valid_manifest():
 def test_builtin_index_lists_official_plugins():
     entries = builtin_index(OFFICIAL_DIR)
     by_id = {entry.id: entry for entry in entries}
-    assert {"hello", "privacy", "qzone_post", "music", "image_gen", "group_insights", "sticker"} <= set(by_id)
+    assert {"hello", "privacy", "qzone_post", "music", "image_gen", "group_insights"} <= set(by_id)
     assert set(by_id["qzone_post"].permissions) == {
         "read_messages", "send_messages", "qzone_write", "scheduler", "llm"
     }
@@ -260,7 +260,7 @@ def test_index_unavailable_falls_back_to_builtin(tmp_path):
     assert "超时" in snapshot["index"]["error"]
     # 回退后页面数据不能空
     assert {item["id"] for item in snapshot["items"]} >= {
-        "hello", "privacy", "qzone_post", "music", "image_gen", "group_insights", "sticker"
+        "hello", "privacy", "qzone_post", "music", "image_gen", "group_insights"
     }
 
 
@@ -323,6 +323,40 @@ def test_snapshot_merges_local_and_index(tmp_path):
     snapshot = market.snapshot()
     by_id = {item["id"]: item for item in snapshot["items"]}
     assert by_id["alpha"]["state"] == "enabled"
+
+
+def test_plugin_config_defaults_and_save(tmp_path):
+    root = tmp_path / "plugins"
+    alpha = root / "alpha"
+    alpha.mkdir(parents=True)
+    (alpha / "plugin.py").write_text(PLUGIN_SOURCE, encoding="utf-8")
+    write_manifest(alpha, "alpha", config_schema=[
+        {"key": "enabled", "type": "boolean", "default": False, "description": "开关"},
+        {"key": "count", "type": "integer", "default": 2, "description": "数量"},
+        {"key": "ratio", "type": "number", "default": 0.5, "description": "比例"},
+        {"key": "name", "type": "string", "default": "默认", "description": "名字"},
+        {"key": "tags", "type": "string_list", "default": [], "description": "标签"},
+    ])
+    (alpha / "config.yaml").write_text("count: 4\nunknown: keep\n", encoding="utf-8")
+    state = make_state(tmp_path, plugins_dir=root)
+    state.plugins.discover()
+    market = MarketService(state)
+    values = market.get_plugin_config("alpha")["values"]
+    assert values == {"enabled": False, "count": 4, "ratio": 0.5, "name": "默认", "tags": []}
+    saved = market.save_plugin_config("alpha", {"enabled": True, "count": 7, "ratio": 0.25, "name": "新名", "tags": ["a"]})
+    assert saved["values"]["count"] == 7
+    assert "unknown: keep" in (alpha / "config.yaml").read_text(encoding="utf-8")
+    with pytest.raises(MarketError) as excinfo:
+        market.save_plugin_config("alpha", {"count": "bad"})
+    assert excinfo.value.status == 422
+
+
+def test_plugin_config_rejects_bad_id_and_empty_schema(tmp_path):
+    state = make_state(tmp_path)
+    market = MarketService(state)
+    with pytest.raises(MarketError) as excinfo:
+        market.get_plugin_config("../outside")
+    assert excinfo.value.status == 404
 
 
 def test_local_invalid_plugin_shows_reason(tmp_path):
