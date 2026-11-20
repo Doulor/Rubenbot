@@ -1,14 +1,18 @@
 """画图插件：群聊/私聊里「画一张 <描述>」调用生图接口，把图发回去。
 
-一期只接硅基流动（siliconflow，``POST /v1/images/generations``），需要自备
-key；没配 key 时插件照常加载但**不注册触发**，只打一行日志（与联网搜索批次
-同一惯例）。
+接口走 OpenAI 兼容形状：``POST {base_url}/images/generations``，请求体
+``{model, prompt, size}``，Bearer 鉴权。端点、密钥、模型由配置三件套给出，
+硅基流动只是预设示例之一；三者缺任一时插件照常加载但**不注册触发**，
+只打一行日志（与联网搜索批次同一惯例）。
 
 流程：识别触发词 → 本地黑名单 → 单人冷却 → 每日全群上限 → 调接口
 → 下载图片字节落到插件 data 目录（接口返回的临时 URL 不长期引用）
 → 以图片段发送。描述直接用用户原话，不让模型改写提示词。
 
-内容边界：依赖服务商自身审核；provider 返回审核失败时如实回「这个画不了」。
+响应兼容标准 OpenAI 的 ``data[0].url`` / ``data[0].b64_json`` 与硅基流动的
+``images[0].url``；解析不到按失败降级。
+
+内容边界：依赖服务商自身审核；服务商返回审核失败时如实回「这个画不了」。
 所有失败都降级成一句话，不吞请求、不抛异常打断对话。
 """
 
@@ -32,11 +36,9 @@ from rubenbot.adapters.base import Segment
 
 logger = logging.getLogger(__name__)
 
-# 硅基流动生图接口
-SILICONFLOW_URL = "https://api.siliconflow.cn/v1/images/generations"
-DEFAULT_PROVIDER = "siliconflow"
-DEFAULT_MODEL = "Kwai-Kolors/Kolors"
-SUPPORTED_PROVIDERS = ("siliconflow",)
+# 生图接口走 OpenAI 兼容形状：{base_url}/images/generations
+DEFAULT_BASE_URL = ""
+DEFAULT_SIZE = "1024x1024"
 
 API_TIMEOUT = 60.0
 # 图片下载超时：临时 URL 一般很快就给
@@ -69,11 +71,16 @@ DEFAULT_BLACKLIST: tuple[str, ...] = (
 
 @dataclass(frozen=True)
 class ImageGenConfig:
-    """归一化后的插件配置；类型不对的项退回默认值，不让配置错误炸掉插件。"""
+    """归一化后的插件配置；类型不对的项退回默认值，不让配置错误炸掉插件。
 
-    provider: str = DEFAULT_PROVIDER
+    ``base_url`` / ``api_key`` / ``model`` 是生图三件套：只走 OpenAI 兼容端点，
+    不绑定具体厂商（硅基流动等只是预设示例）。``size`` 原样进请求体。
+    """
+
+    base_url: str = DEFAULT_BASE_URL
     api_key: str = ""
-    model: str = DEFAULT_MODEL
+    model: str = ""
+    size: str = DEFAULT_SIZE
     triggers: tuple[str, ...] = DEFAULT_TRIGGERS
     cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS
     daily_limit: int = DEFAULT_DAILY_LIMIT
@@ -81,24 +88,19 @@ class ImageGenConfig:
 
     @property
     def configured(self) -> bool:
-        """配了 key 才注册触发；空 key / 没展开的 ${ENV} 都算没配。"""
-        return bool(self.api_key.strip())
+        """三件套齐全才注册触发；空值 / 没展开的 ${ENV} 都算缺。"""
+        return bool(self.base_url.strip() and self.api_key.strip() and self.model.strip())
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any] | None) -> "ImageGenConfig":
         raw = data if isinstance(data, Mapping) else {}
-        provider = str(raw.get("provider") or DEFAULT_PROVIDER).strip().lower()
-        if provider not in SUPPORTED_PROVIDERS:
-            logger.warning(
-                "image_gen 的生图服务商 %s 暂不支持，改用 %s", provider, DEFAULT_PROVIDER
-            )
-            provider = DEFAULT_PROVIDER
         triggers = _as_list(raw.get("triggers"))
         blacklist = _as_list(raw.get("blacklist"))
         return cls(
-            provider=provider,
+            base_url=str(raw.get("base_url") or "").strip().rstrip("/"),
             api_key=_expand_env(str(raw.get("api_key") or "")).strip(),
-            model=str(raw.get("model") or DEFAULT_MODEL).strip() or DEFAULT_MODEL,
+            model=str(raw.get("model") or "").strip(),
+            size=str(raw.get("size") or DEFAULT_SIZE).strip() or DEFAULT_SIZE,
             triggers=triggers if triggers is not None else DEFAULT_TRIGGERS,
             cooldown_seconds=_as_non_negative(
                 raw.get("cooldown_seconds"), DEFAULT_COOLDOWN_SECONDS
@@ -106,6 +108,11 @@ class ImageGenConfig:
             daily_limit=_as_non_negative_int(raw.get("daily_limit"), DEFAULT_DAILY_LIMIT),
             blacklist=blacklist if blacklist is not None else DEFAULT_BLACKLIST,
         )
+
+    @property
+    def endpoint(self) -> str:
+        """生图接口地址：``{base_url}/images/generations``。"""
+        return f"{self.base_url}/images/generations"
 
 
 def read_config(directory: str | Path | None = None) -> ImageGenConfig:
@@ -184,12 +191,15 @@ def parse_trigger(text: str, triggers: tuple[str, ...] | list[str]) -> str | Non
 def parse_response(data: Any) -> tuple[str, str] | None:
     """从生图响应里取 ``(图片, 扩展名)``。
 
-    图片是 URL 时原样返回（由调用方下载）；也兼容 ``b64_json`` 实现。
-    没有可用图片返回 None。
+    兼容两种形状：标准 OpenAI 的 ``data[0].url`` / ``data[0].b64_json``，
+    以及硅基流动的 ``images[0].url``；都没有时返回 None。图片是 URL 时
+    原样返回（由调用方下载），``b64_json`` 带上 ".png" 提示。
     """
     if not isinstance(data, Mapping):
         return None
-    images = data.get("images") or data.get("data")
+    images = data.get("data")
+    if not isinstance(images, list) or not images:
+        images = data.get("images")
     if not isinstance(images, list) or not images:
         return None
     first = images[0]
@@ -374,20 +384,17 @@ class ImageGenerator:
         payload = {
             "model": self.config.model,
             "prompt": prompt,
-            "image_size": "1024x1024",
-            "batch_size": 1,
-            "num_inference_steps": 20,
-            "guidance_scale": 7.5,
+            "size": self.config.size,
         }
         try:
             response = await client.post(
-                SILICONFLOW_URL,
+                self.config.endpoint,
                 headers={"Authorization": f"Bearer {self.config.api_key}"},
                 json=payload,
                 timeout=API_TIMEOUT,
             )
         except httpx.HTTPError as exc:
-            logger.warning("image_gen 请求 %s 失败：%s", self.config.provider, exc)
+            logger.warning("image_gen 请求 %s 失败：%s", self.config.endpoint, exc)
             return GenResult(False, error="生图服务连不上，稍后再试试")
 
         if response.status_code >= 400:
@@ -556,17 +563,27 @@ def _as_non_negative_int(value: Any, default: int) -> int:
 
 
 def register(ctx) -> None:
-    """插件入口：配了 key 才注册消息钩子；没配只留一行日志。"""
+    """插件入口：三件套齐全才注册消息钩子；缺任一只留一行日志。"""
     config = load_config(ctx)
     if not config.configured:
-        logger.info("image_gen 未配置 api_key，画图触发未注册")
+        missing = [
+            name
+            for name, value in (
+                ("base_url", config.base_url),
+                ("api_key", config.api_key),
+                ("model", config.model),
+            )
+            if not value.strip()
+        ]
+        logger.info("image_gen 未配置 %s，画图触发未注册", " / ".join(missing))
         return
     generator = ImageGenerator(config, data_dir=data_dir_for(ctx))
     ctx.extras["image_gen"] = generator
     ctx.on_message(generator.on_message)
     ctx.on_stop(generator.aclose)
     logger.debug(
-        "image_gen 已注册（模型 %s，冷却 %.0fs，每日上限 %s）",
+        "image_gen 已注册（端点 %s，模型 %s，冷却 %.0fs，每日上限 %s）",
+        config.endpoint,
         config.model,
         config.cooldown_seconds,
         config.daily_limit or "不限",

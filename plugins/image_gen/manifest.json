@@ -1,29 +1,35 @@
 {
   "id": "image_gen",
   "name": "画图",
-  "version": "1.0.0",
-  "description": "「画一张 <描述>」调用硅基流动生图，下载图片后以图片段发送；带冷却、每日上限与本地黑名单",
+  "version": "1.1.0",
+  "description": "「画一张 <描述>」调用 OpenAI 兼容生图端点（硅基流动为预设示例），下载图片后以图片段发送；带冷却、每日上限与本地黑名单",
   "author": "RubenBot",
   "min_core_version": "0.1.0",
   "permissions": ["read_messages", "send_messages", "network"],
   "config_schema": [
     {
-      "key": "provider",
+      "key": "base_url",
       "type": "string",
-      "default": "siliconflow",
-      "description": "生图服务商（目前只支持 siliconflow）"
+      "default": "",
+      "description": "生图端点根地址（OpenAI 兼容，如 https://api.siliconflow.cn/v1），不带结尾斜杠"
     },
     {
       "key": "api_key",
       "type": "string",
-      "default": "${RUBENBOT_IMAGE_KEY}",
-      "description": "服务商密钥，支持 ${ENV_VAR} 占位；留空则不注册触发"
+      "default": "",
+      "description": "端点密钥，支持 ${ENV_VAR} 占位"
     },
     {
       "key": "model",
       "type": "string",
-      "default": "Kwai-Kolors/Kolors",
-      "description": "生图模型名"
+      "default": "",
+      "description": "生图模型名（如 Kwai-Kolors/Kolors）；base_url / api_key / model 齐全才注册触发"
+    },
+    {
+      "key": "size",
+      "type": "string",
+      "default": "1024x1024",
+      "description": "出图尺寸，原样作为 size 传给端点"
     },
     {
       "key": "triggers",

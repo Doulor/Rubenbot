@@ -1,16 +1,32 @@
 # image_gen 插件配置（删掉本文件即使用 plugin.py 里的默认值）
 #
-# 没配 api_key 时插件照常加载，但**不注册画图触发**（启动日志会说明）。
-# 支持 ${ENV_VAR} 占位，建议把 key 放环境变量，不要写进仓库。
+# 生图端点不绑定厂商，走 OpenAI 兼容形状：
+#   POST {base_url}/images/generations，body {model, prompt, size}
+# 下面三件套（base_url / api_key / model）**齐全才注册画图触发**；
+# 缺任一 → 插件照常加载但不触发，启动日志会说明缺了哪项。
+# api_key 支持 ${ENV_VAR} 占位，建议把 key 放环境变量，不要写进仓库。
 
-# 生图服务商：目前只支持 siliconflow（硅基流动）
-provider: siliconflow
+# ---- 预设示例一：硅基流动 ----
+# base_url: "https://api.siliconflow.cn/v1"
+# api_key: "${IMAGE_API_KEY}"      # 去 https://cloud.siliconflow.cn 申请
+# model: "Kwai-Kolors/Kolors"
+#
+# ---- 预设示例二：任意 OpenAI 兼容端点（官方 / 中转站 / 自建）----
+# base_url: "https://api.openai.com/v1"
+# api_key: "${IMAGE_API_KEY}"
+# model: "gpt-image-1"
 
-# 服务商密钥；去 https://cloud.siliconflow.cn 申请
-api_key: "${RUBENBOT_IMAGE_KEY}"
+# 生图端点根地址（含 /v1 这类版本前缀，不要带结尾斜杠）
+base_url: ""
 
-# 生图模型；默认 Kwai-Kolors/Kolors
-model: "Kwai-Kolors/Kolors"
+# 端点密钥
+api_key: ""
+
+# 生图模型名
+model: ""
+
+# 出图尺寸；原样作为 size 传给端点
+size: "1024x1024"
 
 # 触发词：消息以其中之一开头即触发（「画一张 <描述>」「画个 <描述>」等）
 triggers: ["画一张", "画个", "画一幅", "帮我画", "生成图片"]
