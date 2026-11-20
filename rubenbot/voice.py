@@ -5,9 +5,11 @@
 ``message.voice`` 能力翻译。provider 可插拔，风格与 :mod:`rubenbot.search`
 保持一致：没配凭据就什么都不做（``build_voice`` 返回 ``None``），不发起请求。
 
-- STT：``siliconflow``（默认，SenseVoiceSmall）与 ``openai_compatible``
+- STT：``siliconflow``（默认，SenseVoiceSmall）、``openai_compatible``
   （任意 OpenAI 兼容 base_url，给中转站留口），都是 multipart 上传、
-  取响应里的 ``text``。
+  取响应里的 ``text``；``qq_native`` 不下载音频，改由 SnowLuma 适配器的
+  ``fetch_ptt_text`` 动作取 QQ 官方转写。多个后端按 :attr:`VoiceConfig.stt_providers`
+  的顺序顺延，全失败才留 ``[语音]`` 占位。
 - TTS：``custom``（默认，任意 OpenAI 兼容 ``/audio/speech`` 接口）与
   ``siliconflow``（CosyVoice2，配了 key 才可用）。
 
@@ -51,6 +53,11 @@ _AUDIO_MIME = {
     ".ogg": "audio/ogg",
     ".opus": "audio/ogg",
 }
+
+# 平台原生转写：用消息 id 换转写文本，失败时抛异常让调用方顺延
+NativeTranscriber = Callable[[str], Awaitable[str | None]]
+# 惰性取音频：只在轮到 HTTP 后端时调用，返回 ``(bytes, filename, mime)``
+AudioLoader = Callable[[], Awaitable[tuple[bytes, str, str] | None]]
 
 
 def build_voice(config: VoiceConfig) -> "VoiceService | None":
@@ -219,38 +226,125 @@ class VoiceService:
 
     async def transcribe_voice(
         self,
-        audio: bytes | str | Path,
+        audio: bytes | str | Path | None = None,
         *,
         filename: str = "",
         mime: str = "",
+        message_id: str | None = None,
+        native: NativeTranscriber | None = None,
+        audio_loader: AudioLoader | None = None,
     ) -> str | None:
-        """把一段音频转成文字；失败/未配置/超限都返回 None，不抛异常。
+        """把一段语音转成文字；失败/未配置/超限都返回 None，不抛异常。
 
         ``audio`` 可以是字节，也可以是本地文件路径（例如已经落到临时文件的
-        语音条）。
+        语音条）；传 ``None`` 并给出 ``audio_loader`` 时，只有轮到 HTTP 后端
+        才真正去下载音频——``qq_native`` 打头时能省掉一次下载。
+
+        ``message_id`` + ``native`` 由调用方在来源平台支持原生转写
+        （SnowLuma 的 ``fetch_ptt_text``）时提供：链上轮到 ``qq_native`` 就用
+        消息 id 直接换文本；原生转写失败或返回空文本时照常顺延到下一个
+        已配置的后端。
         """
-        if not self.config.stt_configured:
+        providers = self.config.stt_providers
+        if not providers:
             return None
+        content: bytes | None = None
         if isinstance(audio, (str, Path)):
             path = Path(audio)
             filename = filename or path.name
             try:
-                audio = path.read_bytes()
+                content = path.read_bytes()
             except OSError as exc:
                 logger.warning("读取待转写音频失败（%s）：%s", path, exc)
                 return None
-        if not audio:
+        elif audio is not None:
+            content = bytes(audio)
+        if content is not None:
+            if not content:
+                content = None
+            elif self._audio_too_large(content):
+                return None
+            else:
+                mime = _guess_mime(filename, mime)
+                filename = _audio_filename(mime, filename or "voice.amr")
+
+        errors: list[str] = []
+        for provider in providers:
+            if provider == "qq_native":
+                text, reason = await self._transcribe_native(native, message_id)
+            else:
+                if content is None and audio_loader is not None:
+                    source = await self._load_audio(audio_loader)
+                    if source is not None:
+                        content, filename, mime = source
+                if content is None:
+                    text, reason = None, "没有可转写的音频"
+                else:
+                    text, reason = await self._transcribe_http(
+                        provider, content, filename, mime
+                    )
+            if text:
+                logger.info("语音转写成功（provider=%s）", provider)
+                return text
+            errors.append(f"{provider}: {reason}")
+            logger.info("语音转写降级（%s）：%s", provider, reason)
+        logger.warning("语音转写全部失败（%s）", "；".join(errors))
+        return None
+
+    async def _load_audio(
+        self, audio_loader: AudioLoader
+    ) -> tuple[bytes, str, str] | None:
+        """惰性取音频（只在轮到 HTTP 后端时调用）；空/超限按失败处理。"""
+        try:
+            source = await audio_loader()
+        except Exception as exc:  # noqa: BLE001 - 取音频失败只顺延
+            logger.warning("读取语音条失败：%s", exc)
             return None
-        if len(audio) > self.config.stt_max_bytes:
-            logger.info(
-                "语音超过单条上限（%s 字节 > %s 字节），跳过转写",
-                len(audio),
-                self.config.stt_max_bytes,
-            )
+        if source is None:
+            return None
+        content, filename, mime = source
+        if not content or self._audio_too_large(content):
             return None
         mime = _guess_mime(filename, mime)
-        filename = _audio_filename(mime, filename or "voice.amr")
-        url, headers = self._stt_endpoint()
+        return bytes(content), _audio_filename(mime, filename or "voice.amr"), mime
+
+    def _audio_too_large(self, content: bytes) -> bool:
+        limit = self.config.stt_max_bytes
+        if len(content) <= limit:
+            return False
+        logger.info(
+            "语音超过单条上限（%s 字节 > %s 字节），跳过转写",
+            len(content),
+            limit,
+        )
+        return True
+
+    async def _transcribe_native(
+        self,
+        native: NativeTranscriber | None,
+        message_id: str | None,
+    ) -> tuple[str | None, str]:
+        """平台原生转写：来源不是 SnowLuma / 拿不到消息 id 时返回跳过原因。"""
+        if native is None or not message_id:
+            return None, "来源平台不支持原生转写（或缺少 message_id）"
+        try:
+            text = await native(str(message_id))
+        except Exception as exc:  # noqa: BLE001 - 原生转写失败只顺延
+            return None, f"原生转写失败：{exc}"
+        value = str(text or "").strip()
+        if not value:
+            return None, "原生转写返回空文本"
+        return value, ""
+
+    async def _transcribe_http(
+        self,
+        provider: str,
+        audio: bytes,
+        filename: str,
+        mime: str,
+    ) -> tuple[str | None, str]:
+        """HTTP 转写（siliconflow / openai_compatible）：返回 ``(文本, 失败原因)``。"""
+        url, headers = self._stt_endpoint(provider)
         try:
             client = await self._get_client()
             response = await client.post(
@@ -263,22 +357,20 @@ class VoiceService:
             response.raise_for_status()
             payload = response.json()
         except (httpx.HTTPError, ValueError) as exc:
-            logger.warning("语音转写失败（%s）：%s", self.config.stt_provider, exc)
-            return None
+            return None, f"HTTP 转写失败：{exc}"
         text = ""
         if isinstance(payload, Mapping):
             text = str(payload.get("text") or "").strip()
         if not text:
-            logger.info("语音转写返回空文本（%s）", self.config.stt_provider)
-            return None
-        return text
+            return None, "HTTP 转写返回空文本"
+        return text, ""
 
-    def _stt_endpoint(self) -> tuple[str, dict[str, str]]:
+    def _stt_endpoint(self, provider: str) -> tuple[str, dict[str, str]]:
         """转写接口地址与鉴权头：siliconflow 固定地址，兼容模式用 base_url。"""
         headers: dict[str, str] = {}
         if self.config.stt_api_key:
             headers["Authorization"] = f"Bearer {self.config.stt_api_key}"
-        if self.config.stt_provider == "openai_compatible":
+        if provider == "openai_compatible":
             base = self.config.stt_base_url.rstrip("/")
             return base + "/audio/transcriptions", headers
         return SILICONFLOW_STT_URL, headers

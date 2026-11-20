@@ -592,7 +592,7 @@ def test_put_structured_voice_section(client, config_path, state):
         json={
             "config": {
                 "voice": {
-                    "stt_provider": "openai_compatible",
+                    "stt_provider": "qq_native",
                     "stt_base_url": "https://relay.example/v1",
                     "stt_api_key": "sk-stt",
                     "tts_mode": "reply_voice",
@@ -608,7 +608,7 @@ def test_put_structured_voice_section(client, config_path, state):
     )
     assert response.status_code == 200, response.text
     data = read_yaml(config_path)["voice"]
-    assert data["stt_provider"] == "openai_compatible"
+    assert data["stt_provider"] == "qq_native"
     assert data["stt_base_url"] == "https://relay.example/v1"
     assert data["tts_mode"] == "reply_voice"
     assert data["tts_provider"] == "custom"

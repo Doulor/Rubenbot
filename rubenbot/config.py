@@ -489,7 +489,8 @@ class SearchConfig:
 
 
 # 语音转写（STT）与语音合成（TTS）的可选后端
-STT_PROVIDERS: tuple[str, ...] = ("siliconflow", "openai_compatible")
+# qq_native 走 SnowLuma 的 fetch_ptt_text（QQ 官方转写），仅该适配器可用
+STT_PROVIDERS: tuple[str, ...] = ("qq_native", "siliconflow", "openai_compatible")
 TTS_PROVIDERS: tuple[str, ...] = ("custom", "siliconflow")
 # tts_mode：off 从不发语音；reply_voice 对方发语音时用语音回；
 # on_request 在 reply_voice 基础上，被明确要求用语音说时也发
@@ -500,8 +501,11 @@ TTS_MODES: tuple[str, ...] = ("off", "reply_voice", "on_request")
 class VoiceConfig:
     """语音双向：入站语音条转写（STT）与出站语音回复（TTS）。
 
-    STT 未配置（siliconflow 缺 ``stt_api_key``，或 openai_compatible 缺
-    ``stt_base_url``）时语音消息只记 ``[语音]`` 占位，不发起任何请求。
+    STT 没配任何可用后端时语音消息只记 ``[语音]`` 占位，不发起任何请求。
+    ``qq_native`` 走 SnowLuma 的 ``fetch_ptt_text``（QQ 官方转写），只对
+    SnowLuma 来源生效；失败/空文本时按 :attr:`stt_providers` 的顺序顺延到
+    下一个已配置的 HTTP 后端，全失败才留占位。
+
     TTS 默认 ``off``；``custom``（默认后端）是任意 OpenAI 兼容的
     ``/audio/speech`` 接口，缺 base_url 或 model 视为未配置，降级发文字。
     """
@@ -557,11 +561,33 @@ class VoiceConfig:
         self.tts_max_chars = max(1, _as_int(self.tts_max_chars, 60))
 
     @property
+    def stt_providers(self) -> tuple[str, ...]:
+        """转写尝试顺序：首选后端在前，后面是其余已配置的 HTTP 后端。
+
+        ``qq_native`` 不是通用后端，只有被选为首选时才进链；siliconflow 看
+        ``stt_api_key``，openai_compatible 看 ``stt_base_url``，没配的跳过。
+        配错/没配时返回空元组，调用方直接留 ``[语音]`` 占位。
+        """
+        order: list[str] = []
+        for name in (self.stt_provider, "siliconflow", "openai_compatible", "qq_native"):
+            if name in order:
+                continue
+            if name == "qq_native":
+                if self.stt_provider != "qq_native":
+                    continue
+            elif name == "siliconflow":
+                if not self.stt_api_key:
+                    continue
+            elif name == "openai_compatible":
+                if not self.stt_base_url:
+                    continue
+            order.append(name)
+        return tuple(order)
+
+    @property
     def stt_configured(self) -> bool:
-        """STT 是否可用：siliconflow 看 key，openai_compatible 看 base_url。"""
-        if self.stt_provider == "openai_compatible":
-            return bool(self.stt_base_url)
-        return bool(self.stt_api_key)
+        """STT 是否可用：链上至少有一个后端（qq_native 只要求被选中）。"""
+        return bool(self.stt_providers)
 
     @property
     def tts_enabled(self) -> bool:

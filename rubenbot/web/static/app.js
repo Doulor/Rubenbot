@@ -3193,17 +3193,18 @@ async function renderSettings(view) {
             path: "voice.stt_provider",
             label: "语音转写后端",
             kind: "select",
-            hint: "硅基流动（SenseVoiceSmall）或任意 OpenAI 兼容接口",
+            hint: "首选后端；失败或空文本会顺延到其他已配置的后端。qq_native 仅 SnowLuma 可用",
             options: [
               { value: "siliconflow", label: "硅基流动 SiliconFlow" },
               { value: "openai_compatible", label: "OpenAI 兼容接口" },
+              { value: "qq_native", label: "QQ 原生转写（仅 SnowLuma）" },
             ],
           },
           {
             path: "voice.stt_api_key",
             label: "转写 API Key",
             kind: "password",
-            hint: "留空表示保留原值；不填则语音消息只记 [语音] 占位",
+            hint: "留空表示保留原值；不填则语音消息只记 [语音] 占位（qq_native 不需要）",
             secretSet: Boolean(secrets["voice.stt_api_key"]),
           },
           {

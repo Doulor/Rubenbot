@@ -1109,6 +1109,9 @@ class RubenBot:
         判断都读它）；转写成功就把 ``[语音] 文本`` 拼进正文与流水，
         没有可转写的内容就至少让正文保留一个 ``[语音]``——纯语音条原本是
         空正文，会在落流水时被当成空消息丢掉。
+
+        来源适配器支持原生转写（SnowLuma 的 ``fetch_ptt_text``）时只传消息
+        id，音频按需下载：``qq_native`` 打头时一次下载请求都不发。
         """
         records = [segment for segment in event.segments or [] if segment.type == "record"]
         if not records:
@@ -1116,28 +1119,79 @@ class RubenBot:
         event.raw["has_voice"] = True
         transcripts: list[str] = []
         if self.voice is not None:
-            for segment in records:
+            adapter = self.adapters.get(event.platform)
+            native = self._native_transcriber(adapter)
+            for index, segment in enumerate(records):
                 if self._voice_too_long(segment):
                     logger.info(
                         "语音时长超过上限（%.0f 秒），跳过转写",
                         self.config.voice.stt_max_seconds,
                     )
                     continue
+
+                # 原生转写按消息取文本，只对第一段生效；同一条消息里还有别的
+                # 语音段时走音频下载，避免把整条转写重复拼进正文
+                segment_native = native if index == 0 else None
+
+                async def loader(data: Mapping[str, Any] = segment.data) -> Any:
+                    return await self.voice.fetch_audio(data)
+
                 try:
-                    source = await self.voice.fetch_audio(segment.data)
-                except Exception as exc:  # noqa: BLE001 - 取音频失败只降级
-                    logger.warning("读取语音条失败：%s", exc)
-                    source = None
-                if source is None:
-                    continue
-                audio, filename, mime = source
-                text = await self.voice.transcribe_voice(audio, filename=filename, mime=mime)
+                    text = await self.voice.transcribe_voice(
+                        None,
+                        message_id=event.platform_msg_id,
+                        native=segment_native,
+                        audio_loader=loader,
+                    )
+                except Exception as exc:  # noqa: BLE001 - 转写失败只降级
+                    logger.warning("语音转写异常：%s", exc)
+                    text = None
                 if text:
                     transcripts.append(text)
         body = " ".join(part.strip() for part in transcripts if part.strip())
         content = f"{VOICE_PREFIX}{body}" if body else VOICE_PLACEHOLDER
         event.text = self._replace_voice_placeholder(event.text, content)
         logger.debug("语音条转写：%s", content[:60])
+
+    def _native_transcriber(self, adapter: BaseAdapter | None) -> Any:
+        """来源平台的原生转写口；不支持时返回 None（交给 HTTP 后端）。
+
+        返回 ``async (message_id) -> text``：经适配器声明的
+        ``message.transcribe`` 能力调用，失败抛 ``CapabilityError``，由语音层
+        顺延到下一个后端。
+        """
+        if adapter is None:
+            return None
+        declared = set(getattr(adapter, "capabilities", frozenset()) or ())
+        if "message.transcribe" not in declared:
+            return None
+        config_key = (getattr(adapter, "capability_config_keys", None) or {}).get(
+            "message.transcribe"
+        )
+        if config_key:
+            default = (getattr(adapter, "capability_defaults", None) or {}).get(
+                "message.transcribe", True
+            )
+            if not self.config.adapter_capability_enabled(
+                adapter.name, config_key, default=default
+            ):
+                logger.info(
+                    "适配器 %s 的原生转写已在配置中关闭，改走 HTTP 转写", adapter.name
+                )
+                return None
+
+        async def transcribe(message_id: str) -> str | None:
+            result = await adapter.call_capability(
+                "message.transcribe", message_id=message_id
+            )
+            if isinstance(result, Mapping):
+                for key in ("text", "transcript", "content"):
+                    if result.get(key) is not None:
+                        return str(result[key])
+                return ""
+            return None if result is None else str(result)
+
+        return transcribe
 
     def _voice_too_long(self, segment: Segment) -> bool:
         """语音段自带时长（秒）时按上限判断；没有元数据就交给字节上限兜底。"""

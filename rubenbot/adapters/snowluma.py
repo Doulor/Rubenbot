@@ -56,6 +56,7 @@ class SnowLumaAdapter(BaseAdapter):
     capabilities = frozenset(
         {
             "message.emoji_like",
+            "message.transcribe",
             "message.voice",
             "qzone.publish",
             "qzone.feeds",
@@ -68,6 +69,7 @@ class SnowLumaAdapter(BaseAdapter):
     capability_config_keys = {
         "message.emoji_like": "emoji_like",
         "message.voice": "voice",
+        "message.transcribe": "transcribe",
         "qzone.publish": "qzone",
         # 空间只读能力共用一个开关；写操作各自独立，默认全关
         "qzone.feeds": "feeds",
@@ -261,6 +263,8 @@ class SnowLumaAdapter(BaseAdapter):
         """调用 SnowLuma 扩展动作；失败统一抛 :class:`CapabilityError`。"""
         if name == "message.voice":
             return await self._send_voice(kwargs)
+        if name == "message.transcribe":
+            return await self._transcribe_ptt(kwargs)
         if name == "message.emoji_like":
             message_id = kwargs.get("message_id")
             emoji_id = kwargs.get("emoji_id", kwargs.get("emoji"))
@@ -402,6 +406,41 @@ class SnowLumaAdapter(BaseAdapter):
             except OSError:  # pragma: no cover - 删不掉不致命
                 pass
         return payload.get("data", payload) if isinstance(payload, dict) else payload
+
+    async def _transcribe_ptt(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """message.transcribe：调 SnowLuma 的 ``fetch_ptt_text`` 取 QQ 官方转写。
+
+        上游说明这个动作的线格式来自逆向、未经真机验证，失败或返回空文本
+        都如实抛 :class:`CapabilityError`（由语音层顺延到下一个 STT 后端），
+        绝不臆造文本。响应形状各实现不一，这里宽松地取常见字段。
+        """
+        message_id = kwargs.get("message_id")
+        if message_id in (None, ""):
+            raise CapabilityError("message.transcribe 需要 message_id")
+        payload = await self._extension_api(
+            "message.transcribe", "fetch_ptt_text", {"message_id": _to_id(message_id)}
+        )
+        text = _ptt_text(payload)
+        if not text:
+            raise CapabilityError(f"fetch_ptt_text 没有返回文本：{payload!r}"[:300])
+        return {"text": text}
+
+
+def _ptt_text(payload: Any) -> str:
+    """从 ``fetch_ptt_text`` 的响应里挖转写文本（各实现字段名不一）。"""
+    if isinstance(payload, str):
+        return payload.strip()
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("text", "transcript", "ptt_text", "result", "data"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, dict):
+            nested = _ptt_text(value)
+            if nested:
+                return nested
+    return ""
 
 
 def _to_id(value: str | int) -> int | str:

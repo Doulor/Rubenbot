@@ -14,7 +14,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from rubenbot.adapters.base import MessageEvent, Segment
+from rubenbot.adapters.base import CapabilityError, MessageEvent, Segment
 from rubenbot.adapters.snowluma import SnowLumaAdapter
 from rubenbot.adapters.telegram import TelegramAdapter
 from rubenbot.config import Config, VoiceConfig
@@ -109,6 +109,29 @@ def test_voice_config_defaults_and_fallbacks():
         ).tts_configured
         is True
     )
+
+
+def test_stt_provider_chain_order():
+    """首选后端在前，其余已配置的 HTTP 后端按固定顺序顺延。"""
+    assert VoiceConfig(stt_api_key="k").stt_providers == ("siliconflow",)
+    assert (
+        VoiceConfig(
+            stt_provider="openai_compatible",
+            stt_api_key="k",
+            stt_base_url="https://relay.example/v1",
+        ).stt_providers
+        == ("openai_compatible", "siliconflow")
+    )
+    assert (
+        VoiceConfig(stt_provider="qq_native", stt_api_key="k").stt_providers
+        == ("qq_native", "siliconflow")
+    )
+    # qq_native 不是通用后端：没被选为首选时不进链
+    assert VoiceConfig(stt_api_key="k").stt_providers == ("siliconflow",)
+    # 要选中 qq_native 但没配其他后端也能用（不需要 key）
+    assert VoiceConfig(stt_provider="qq_native").stt_providers == ("qq_native",)
+    assert VoiceConfig(stt_provider="qq_native").stt_configured is True
+    assert VoiceConfig().stt_providers == ()
 
 
 def test_config_loads_voice_section_and_env(tmp_path, monkeypatch):
@@ -239,6 +262,81 @@ def test_transcribe_reads_local_file(tmp_path):
     assert asyncio.run(service.transcribe_voice(source)) == "文件里的声音"
 
 
+def test_qq_native_transcribes_by_message_id_without_download():
+    """qq_native 打头：只用 message_id 换文本，不下载音频、不发 HTTP 请求。"""
+    calls = []
+    seen = []
+
+    async def native(message_id):
+        calls.append(message_id)
+        return "  群里说的  "
+
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover - 不该被调用
+        seen.append(request)
+        return httpx.Response(200, json={"text": "不该走这里"})
+
+    service = make_service(handler, stt_provider="qq_native")
+    text = asyncio.run(
+        service.transcribe_voice(None, message_id="12345", native=native)
+    )
+    assert text == "群里说的"
+    assert calls == ["12345"]
+    assert seen == []
+
+
+def test_qq_native_failure_falls_back_to_http_backend():
+    """原生转写抛错或返回空文本：顺延到下一个已配置的 HTTP 后端。"""
+    for behaviour in ("raise", "empty"):
+        hit = []
+
+        async def native(message_id, behaviour=behaviour):
+            if behaviour == "raise":
+                raise RuntimeError("fetch_ptt_text failed")
+            return "   "
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            hit.append(str(request.url))
+            return httpx.Response(200, json={"text": "HTTP 转过来了"})
+
+        service = make_service(handler, stt_provider="qq_native")
+        text = asyncio.run(
+            service.transcribe_voice(
+                b"amr-bytes", filename="voice.amr", message_id="1", native=native
+            )
+        )
+        assert text == "HTTP 转过来了"
+        assert hit == [SILICONFLOW_STT_URL]
+
+
+def test_qq_native_skipped_when_source_not_supported():
+    """非 SnowLuma 来源（没有 native 口）：qq_native 直接跳过，走 HTTP 后端。"""
+    hit = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        hit.append(str(request.url))
+        return httpx.Response(200, json={"text": "来自 HTTP"})
+
+    service = make_service(handler, stt_provider="qq_native")
+    assert (
+        asyncio.run(service.transcribe_voice(b"amr-bytes", filename="voice.amr", message_id="1"))
+        == "来自 HTTP"
+    )
+    assert hit == [SILICONFLOW_STT_URL]
+
+
+def test_qq_native_all_fail_returns_none():
+    """全链失败（原生失败 + 唯一 HTTP 后端也没配好）：返回 None，上层留占位。"""
+    async def native(message_id):
+        raise RuntimeError("boom")
+
+    service = VoiceService(
+        VoiceConfig(stt_provider="qq_native"), transport=httpx.MockTransport(lambda r: None)
+    )
+    assert (
+        asyncio.run(service.transcribe_voice(None, message_id="1", native=native)) is None
+    )
+
+
 def test_fetch_audio_sources(tmp_path):
     service = make_service(lambda request: httpx.Response(200, content=b"from-url"))
 
@@ -339,6 +437,7 @@ def test_siliconflow_tts_posts_and_returns_audio():
     # 没有单独的 TTS key 时复用 STT 的 key
     assert seen["auth"] == "Bearer k-stt"
     assert seen["body"]["input"] == "你好呀"
+    # 硅基流动的 model 留空时用预置模型
     assert seen["body"]["model"] == "FunAudioLLM/CosyVoice2-0.5B"
     assert seen["body"]["voice"] == "FunAudioLLM/CosyVoice2-0.5B:alex"
 
@@ -364,6 +463,8 @@ class FakeVoice:
         self.transcript = transcript
         self.audio = audio
         self.transcribe_calls = 0
+        self.transcribe_kwargs: list[dict] = []
+        self.load_calls = 0
         self.synthesize_calls: list[str] = []
 
     async def fetch_audio(self, data):
@@ -372,8 +473,23 @@ class FakeVoice:
             return None
         return base64.b64decode(raw), "voice.amr", "audio/amr"
 
-    async def transcribe_voice(self, audio, *, filename="", mime=""):
+    async def transcribe_voice(self, audio=None, *, filename="", mime="", **kwargs):
         self.transcribe_calls += 1
+        self.transcribe_kwargs.append(kwargs)
+        native = kwargs.get("native")
+        if audio is None and native is not None:
+            # 模拟 qq_native：只用 message_id 换文本；失败则顺延到音频来源
+            try:
+                text = await native(kwargs.get("message_id"))
+                if text:
+                    return text
+            except Exception:  # noqa: BLE001 - 与真实实现一致：只顺延
+                pass
+        if audio is None and kwargs.get("audio_loader") is not None:
+            self.load_calls += 1
+            source = await kwargs["audio_loader"]()
+            if source is None:
+                return None
         return self.transcript
 
     async def synthesize(self, text):
@@ -847,3 +963,168 @@ def test_qq_official_does_not_declare_voice():
     from rubenbot.adapters.qq_official import QQOfficialAdapter
 
     assert "message.voice" not in QQOfficialAdapter.capabilities
+    assert "message.transcribe" not in QQOfficialAdapter.capabilities
+
+
+# ----------------------------------------------------------------------
+# STT 原生转写：SnowLuma fetch_ptt_text 能力
+# ----------------------------------------------------------------------
+
+
+def make_snowluma(handler, **kwargs) -> SnowLumaAdapter:
+    client = httpx.AsyncClient(
+        base_url="http://127.0.0.1:3000", transport=httpx.MockTransport(handler)
+    )
+    return SnowLumaAdapter(http_client=client, **kwargs)
+
+
+def snowluma_voice_event(message_id="777", text="[语音]") -> MessageEvent:
+    return MessageEvent(
+        platform="snowluma",
+        chat_type="group",
+        chat_id="55555",
+        sender_id="10001",
+        sender_name="阿花",
+        text=text,
+        segments=[Segment("record", {"file": "voice.amr", "base64": "QUJD"})],
+        platform_msg_id=message_id,
+    )
+
+
+def test_snowluma_declares_transcribe_capability():
+    assert "message.transcribe" in SnowLumaAdapter.capabilities
+    assert SnowLumaAdapter.capability_config_keys["message.transcribe"] == "transcribe"
+
+
+def test_snowluma_fetch_ptt_text_success_by_message_id():
+    """SnowLuma 来源：直接用消息 id 调 fetch_ptt_text，不下载音频。"""
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.url.path, json.loads(request.content)))
+        if request.url.path == "/fetch_ptt_text":
+            return httpx.Response(200, json={"status": "ok", "data": {"text": "  明天见  "}})
+        return httpx.Response(200, content=b"audio-bytes")
+
+    async def scenario():
+        adapter = make_snowluma(handler)
+        try:
+            result = await adapter.call_capability("message.transcribe", message_id="777")
+        finally:
+            await adapter._client.aclose()
+        return result
+
+    assert asyncio.run(scenario()) == {"text": "明天见"}
+    assert calls == [("/fetch_ptt_text", {"message_id": 777})]
+
+
+def test_snowluma_fetch_ptt_text_empty_raises():
+    """上游线格式未经真机验证：空文本如实报错，由语音层顺延而不是编一个。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"status": "ok", "data": {}})
+
+    async def scenario():
+        adapter = make_snowluma(handler)
+        try:
+            await adapter.call_capability("message.transcribe", message_id="777")
+        finally:
+            await adapter._client.aclose()
+
+    with pytest.raises(CapabilityError, match="没有返回文本"):
+        asyncio.run(scenario())
+
+
+def test_snowluma_fetch_ptt_text_requires_message_id():
+    async def scenario():
+        adapter = make_snowluma(lambda request: httpx.Response(200, json={}))
+        try:
+            await adapter.call_capability("message.transcribe", message_id="")
+        finally:
+            await adapter._client.aclose()
+
+    with pytest.raises(CapabilityError, match="message_id"):
+        asyncio.run(scenario())
+
+
+def test_prepare_voice_uses_native_transcribe_for_snowluma(config, store):
+    """主循环接线：SnowLuma 来源打标后走适配器能力，转写结果进正文。"""
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        return httpx.Response(200, json={"status": "ok", "data": {"text": "走官方转写"}})
+
+    adapter = make_snowluma(handler)
+    bot, _ = make_bot(config, store, adapter=adapter, voice=FakeVoice(transcript="不该用这个"))
+    config.voice.stt_provider = "qq_native"
+    event = snowluma_voice_event()
+
+    async def scenario():
+        await bot.handle_event(event)
+        await adapter._client.aclose()
+
+    asyncio.run(scenario())
+    assert event.text == "[语音] 走官方转写"
+    assert calls == ["/fetch_ptt_text"]
+    messages = store.recent_messages("55555", platform="snowluma")
+    assert messages[0].text == "[语音] 走官方转写"
+
+
+def test_prepare_voice_falls_back_when_native_fails(config, store):
+    """原生转写失败：顺延到已配置的 HTTP 后端，正文仍是转写文本。"""
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        return httpx.Response(500, text="fetch_ptt_text unsupported")
+
+    adapter = make_snowluma(handler)
+    voice = FakeVoice(transcript="HTTP 后端转的")
+    bot, _ = make_bot(config, store, adapter=adapter, voice=voice)
+    config.voice.stt_provider = "qq_native"
+    event = snowluma_voice_event()
+
+    async def scenario():
+        await bot.handle_event(event)
+        await adapter._client.aclose()
+
+    asyncio.run(scenario())
+    assert event.text == "[语音] HTTP 后端转的"
+    # 原生动作尝试过一次，随后走了 HTTP 后端（假服务的 audio_loader）
+    assert calls == ["/fetch_ptt_text"]
+    assert voice.load_calls == 1
+
+
+def test_prepare_voice_skips_native_for_other_platforms(config, store):
+    """来源不是 SnowLuma：不调原生能力，直接走 HTTP 后端。"""
+    voice = FakeVoice(transcript="HTTP 转的")
+    bot, adapter = make_bot(config, store, voice=voice)
+    config.voice.stt_provider = "qq_native"
+    event = voice_event()
+    asyncio.run(bot.handle_event(event))
+    assert event.text == "[语音] HTTP 转的"
+    assert voice.load_calls == 1
+    assert voice.transcribe_kwargs[0]["native"] is None
+
+
+def test_prepare_voice_respects_transcribe_capability_switch(config, store):
+    """配置里关掉原生转写开关：不再调能力，直接走 HTTP 后端。"""
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        return httpx.Response(200, json={"status": "ok", "data": {"text": "不该被调用"}})
+
+    adapter = make_snowluma(handler)
+    bot, _ = make_bot(config, store, adapter=adapter, voice=FakeVoice(transcript="HTTP 转的"))
+    config.voice.stt_provider = "qq_native"
+    config.adapters["snowluma"] = {"capabilities": {"transcribe": False}}
+    event = snowluma_voice_event()
+
+    async def scenario():
+        await bot.handle_event(event)
+        await adapter._client.aclose()
+
+    asyncio.run(scenario())
+    assert event.text == "[语音] HTTP 转的"
+    assert calls == []
