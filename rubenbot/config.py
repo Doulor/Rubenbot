@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import math
 import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -842,6 +844,96 @@ class GatewayConfig:
 
 
 @dataclass
+class MCPServerConfig:
+    name: str = ""
+    transport: str = "stdio"
+    enabled: bool = True
+    command: str = field(default="", repr=False)
+    args: list[str] = field(default_factory=list, repr=False)
+    env: dict[str, str] = field(default_factory=dict, repr=False)
+    url: str = field(default="", repr=False)
+    headers: dict[str, str] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def parse(cls, raw: Any, *, partial: bool = False, expand_env: bool = False) -> "MCPServerConfig":
+        """严格解析单项；诊断只写字段名，不带可能含凭据的输入值。"""
+        if expand_env:
+            raw = _expand_env(raw)
+        if not isinstance(raw, dict):
+            raise ValueError("应为配置对象")
+        item = cls(**{k: v for k, v in raw.items() if _has(cls, k)})
+        if not isinstance(item.name, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", item.name):
+            raise ValueError("name 只能包含英文字母、数字、下划线或短横线")
+        if "__" in item.name:
+            raise ValueError("name 不能包含双下划线")
+        if item.transport not in ("stdio", "http") or not isinstance(item.enabled, bool):
+            raise ValueError("transport 应为 stdio/http，enabled 应为布尔值")
+        if not isinstance(item.args, list) or not all(isinstance(x, str) for x in item.args):
+            raise ValueError("args 应为字符串列表")
+        for mapping in (item.env, item.headers):
+            if not isinstance(mapping, dict) or not all(
+                isinstance(k, str) and isinstance(v, str) for k, v in mapping.items()
+            ):
+                raise ValueError("env 和 headers 应为字符串键值表")
+        if not isinstance(item.command, str) or not isinstance(item.url, str):
+            raise ValueError("command 和 url 应为字符串")
+        if not partial and item.enabled and item.transport == "stdio" and not item.command.strip():
+            raise ValueError("stdio 需要 command")
+        if not partial and item.enabled and item.transport == "http":
+            try:
+                parsed = urlsplit(item.url)
+                valid = parsed.scheme in ("http", "https") and parsed.hostname
+            except ValueError:
+                valid = False
+            if not valid:
+                raise ValueError("http 需要含主机名的 HTTP(S) url")
+        return item
+
+
+@dataclass
+class MCPConfig:
+    servers: list[MCPServerConfig] = field(default_factory=list)
+    connect_timeout: float = 10
+    call_timeout: float = 30
+    max_result_bytes: int = 32768
+
+
+def _load_mcp(data: Any) -> MCPConfig:
+    config = MCPConfig()
+    if not isinstance(data, dict):
+        return config
+    for key in ("connect_timeout", "call_timeout", "max_result_bytes"):
+        try:
+            raw = data[key]
+            value = float(raw)
+            if isinstance(raw, bool) or not math.isfinite(value) or value <= 0:
+                raise ValueError
+            if key == "max_result_bytes" and (value < 32 or not value.is_integer()):
+                raise ValueError
+            setattr(config, key, int(value) if key == "max_result_bytes" else value)
+        except KeyError:
+            pass
+        except (TypeError, ValueError, OverflowError):
+            logger.warning("mcp.%s 无效，改用默认值", key)
+    servers = data.get("servers", [])
+    if not isinstance(servers, list):
+        logger.warning("mcp.servers 不是列表，已跳过")
+        return config
+    names = set()
+    for index, raw in enumerate(servers):
+        try:
+            item = MCPServerConfig.parse(raw)
+            if item.name in names:
+                raise ValueError("name 重复")
+        except ValueError as exc:
+            logger.warning("跳过 mcp.servers[%d]：%s", index, exc)
+            continue
+        names.add(item.name)
+        config.servers.append(item)
+    return config
+
+
+@dataclass
 class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
@@ -858,6 +950,7 @@ class Config:
     reminder: ReminderConfig = field(default_factory=ReminderConfig)
     proactive: ProactiveConfig = field(default_factory=ProactiveConfig)
     gateway: GatewayConfig = field(default_factory=GatewayConfig)
+    mcp: MCPConfig = field(default_factory=MCPConfig)
     persona_path: str = "data/SOUL.md"
     persona_examples_path: str = "data/reply_examples.json"
     persona_examples_enabled: bool = True
@@ -990,6 +1083,7 @@ class Config:
             reminder=reminder,
             proactive=proactive,
             gateway=gateway,
+            mcp=_load_mcp(data.get("mcp")),
             **basics,
         )
 
