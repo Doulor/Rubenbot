@@ -260,3 +260,10 @@ loader 加载时校验 manifest：缺失或字段不全的插件拒绝加载并�
 - 一期：manifest 规范 + loader 校验 + 4 插件迁移 + 索引拉取/回退 + 市场页（卡片/状态机/装卸启停/更新角标/安装确认）。
 - 二期：config_schema 自动配置表单、索引定时刷新与更新提醒。
 - 三期（有第三方插件再说）：投稿流程、权限分级放行、签名。
+
+## 表情包设计（2026-11-20 多萝确认）
+
+- 能力层新增 `send_sticker` 原语：给一个表情引用，当前会话能发就发。适配器各自翻译——SnowLuma/QQ 走 mface 或图片段，Telegram 走原生 sendSticker（file_id），QQ 官方走图片兜底，Console 走文本占位。不支持的平台抛 `CapabilityNotSupported`，按既有能力降级惯例处理。
+- 表情库：一份本体（图片文件 + 标签 + 平台原生引用）。发送时优先用目标平台的原生引用（如 Telegram file_id），没有才退到图片文件发送；发送成功后把平台回给的原生引用回填进库，下次直达。
+- `sticker` 插件（本节的交付主体）：负责收集（群里出现的表情自动入库、去重）、打标签、决定何时发哪张。插件只经能力层行事，不感知平台差异。它是第一个严格按插件市场 manifest 规范写的插件，permissions = read_messages + send_messages + capabilities，作为市场样例。
+- 同批顺带修适配器装配线缺口：`build_adapters` 目前只装配 console 与 snowluma，Telegram 与 QQ 官方适配器类已存在但从未接线——补齐装配分支、配置示例与装配测试（生产只用 SnowLuma，此缺口不影响线上，但框架完整性要补）。
