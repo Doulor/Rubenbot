@@ -105,8 +105,34 @@ def test_onebot_to_segments_variants():
     assert onebot_to_segments([{"type": "image", "data": {"file": "a.jpg"}}]) == "[图片]"
 
 
+def test_mface_is_normalized_to_sticker_with_native_ref():
+    event = parse_onebot_event(
+        group_payload(
+            message=[{"type": "mface", "data": {"emoji_id": "商城-1", "summary": "猫"}}]
+        )
+    )
+    assert event is not None
+    assert event.segments == [
+        {
+            "type": "sticker",
+            "data": {
+                "native_ref": {
+                    "kind": "mface",
+                    "data": {"emoji_id": "商城-1", "summary": "猫"},
+                }
+            },
+        }
+    ]
+
+
 def test_segment_to_onebot():
     assert segment_to_onebot(Segment.text("hi")) == {"type": "text", "data": {"text": "hi"}}
+
+
+def test_segment_to_onebot_restores_normalized_mface_ref():
+    assert segment_to_onebot(
+        Segment("sticker", {"native_ref": {"kind": "mface", "data": {"emoji_id": "1"}}})
+    ) == {"type": "mface", "data": {"emoji_id": "1"}}
     assert segment_to_onebot(Segment.image("http://x/a.png")) == {
         "type": "image",
         "data": {"file": "http://x/a.png"},

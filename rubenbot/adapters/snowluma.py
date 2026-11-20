@@ -671,6 +671,13 @@ def onebot_message_segments(message: Any) -> list[Segment]:
         raw_data = item.get("data") or {}
         if not isinstance(raw_data, dict):
             raw_data = {}
+        if seg_type == "mface":
+            # mface 是 OneBot/QQ 的原生商城表情段；入站边界统一为 sticker，
+            # 原生段按既有 native_ref 结构保留，发送时再由适配器还原。
+            segments.append(
+                Segment.sticker(native_ref={"kind": "mface", "data": dict(raw_data)})
+            )
+            continue
         fields = _SEGMENT_FIELDS.get(seg_type)
         if fields is None:
             # 未知类型原样保留，便于插件/后续扩展按名处理

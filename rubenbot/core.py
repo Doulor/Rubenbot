@@ -58,6 +58,7 @@ from .proactive import ProactiveOpener, is_acceptable_opener
 from .reminder import REMINDER_TOOL, build_reminder_prompt, describe_fire_at, resolve_fire_at
 from .scheduler import Scheduler
 from .stickers import StickerStore
+from .sticker_behavior import StickerBehavior
 from .voice import VOICE_PLACEHOLDER, VOICE_PREFIX, VoiceService, build_voice
 
 logger = logging.getLogger(__name__)
@@ -496,6 +497,11 @@ class RubenBot:
         self.event_judge = EventJudge(llm, store, persona.text)
         # 表情库：图片本体 + JSON 索引；首次使用时按配置目录惰性创建
         self._stickers: StickerStore | None = stickers
+        self.sticker_behavior = StickerBehavior(
+            config.stickers,
+            store_getter=lambda: self.stickers,
+            rng=random.Random(),
+        )
         self.adapters: dict[str, BaseAdapter] = {}
         self.plugins = plugins
         self.context = BotContext(
@@ -571,6 +577,7 @@ class RubenBot:
         old_search_config = self.config.search
         old_voice_config = self.config.voice
         self.config = config
+        self.sticker_behavior.config = config.stickers
         if rebuild_llm:
             # 重建 LLM 客户端（改了 base_url / api_key / 超时等都需要新客户端）
             self.llm = LLMClient(config.llm, usage_recorder=make_usage_recorder(self.store))
@@ -1196,6 +1203,8 @@ class RubenBot:
         await self.prepare_voice(event)
         await self._record(event, now)
 
+        # 核心表情行为与旧插件 on_message 使用同一时机执行。
+        await self.sticker_behavior.on_message(self.context, event)
         # 插件 on_message：可修改事件或直接拦截（返回 False）
         if self.plugins is not None:
             self.context.event = event
@@ -1287,6 +1296,7 @@ class RubenBot:
             return
 
         await self.send_reply(event, reply, now=now)
+        await self.sticker_behavior.on_after_reply(self.context, event, reply)
         if self.plugins is not None:
             try:
                 await self.plugins.run_after_reply(self.context, event, reply)

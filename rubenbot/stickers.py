@@ -205,16 +205,52 @@ class StickerStore:
             self._save()
             return True
 
+    def delete(self, sticker_id: str) -> bool:
+        """删除一条表情及其图片本体；不存在时返回 False。"""
+        with self._lock:
+            existing = self._stickers.get(str(sticker_id or "").strip())
+            if existing is None:
+                return False
+            path = self._safe_file_path(existing)
+            if path is not None:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+            self._stickers.pop(existing.id, None)
+            try:
+                self._save(raise_errors=True)
+            except Exception:
+                self._stickers[existing.id] = existing
+                if path is not None and not path.exists():
+                    # 删除索引失败时尽量恢复图片，避免内存与磁盘分裂。
+                    logger.warning("表情索引删除失败，图片已移除：%s", path)
+                raise
+            return True
+
     # ------------------------------------------------------------------
     # 文件与索引
     # ------------------------------------------------------------------
 
     def path_of(self, sticker: Sticker | None) -> Path | None:
-        """图片本体的绝对路径；纯引用条目或文件缺失时返回 None。"""
+        """图片本体的绝对路径；纯引用条目或不安全文件返回 None。"""
+        path = self._safe_file_path(sticker)
+        return path if path is not None and path.is_file() else None
+
+    def _safe_file_path(self, sticker: Sticker | None) -> Path | None:
+        """只接受表情库 files/ 下的普通文件，拒绝越界与符号链接。"""
         if sticker is None or not sticker.file:
             return None
-        path = self.root / sticker.file
-        return path if path.is_file() else None
+        relative = Path(sticker.file)
+        if relative.is_absolute() or relative.parts[:1] != (FILES_DIR,):
+            return None
+        path = self.root / relative
+        try:
+            if path.is_symlink() or path.resolve().parent != (self.root / FILES_DIR).resolve():
+                return None
+        except OSError:
+            return None
+        return path
 
     def reference(self, sticker: Sticker) -> dict[str, Any]:
         """表情引用：能力层 ``send_sticker`` 的入参结构。
@@ -273,7 +309,7 @@ class StickerStore:
             if sticker.id:
                 self._stickers[sticker.id] = sticker
 
-    def _save(self) -> None:
+    def _save(self, *, raise_errors: bool = False) -> None:
         payload = {
             "version": INDEX_VERSION,
             "stickers": [item.to_dict() for item in self._stickers.values()],
@@ -283,8 +319,10 @@ class StickerStore:
             tmp = self.index_path.with_name(self.index_path.name + ".tmp")
             tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
             os.replace(tmp, self.index_path)
-        except Exception as exc:  # noqa: BLE001 - 落盘失败只记日志，内存里仍可用
+        except Exception as exc:  # noqa: BLE001 - 普通写入失败只记日志，内存里仍可用
             logger.warning("保存表情库索引失败：%s", exc)
+            if raise_errors:
+                raise RuntimeError(f"保存表情库索引失败：{exc}") from exc
 
 
 def _merge_tags(existing: Iterable[str], extra: Iterable[Any]) -> tuple[str, ...]:

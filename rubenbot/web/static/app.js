@@ -2082,6 +2082,56 @@ function detailDrawer(item) {
 }
 
 /** 卡片的操作按钮组：按状态机切换安装 / 启用 / 停用 / 更新 / 卸载。 */
+async function pluginConfigDialog(item) {
+  const dialog = $("#dialog");
+  const close = () => dialog.close();
+  dialog.replaceChildren(h("div", { class: "dialog-body" }, h("p", {}, "正在读取配置…")));
+  dialog.showModal();
+  try {
+    const data = await api.get(`/api/plugins/${encodeURIComponent(item.id)}/config`);
+    const draft = { ...(data.values || {}) };
+    const fields = h("div", { style: { display: "grid", gap: "14px" } });
+    for (const spec of data.schema || []) {
+      const key = String(spec.key || "");
+      const kind = String(spec.type || "string").toLowerCase();
+      const label = spec.description || key;
+      let control;
+      if (kind === "bool" || kind === "boolean") {
+        control = switchField(Boolean(draft[key]), (value) => { draft[key] = value; }, { label });
+      } else if (["int", "integer", "float", "number"].includes(kind)) {
+        control = numberField(draft[key], (value) => { draft[key] = value === "" ? "" : Number(value); });
+      } else if (["list", "string_list"].includes(kind)) {
+        control = listEditor(draft[key], (value) => { draft[key] = value; });
+      } else {
+        control = textField(draft[key], (value) => { draft[key] = value; });
+      }
+      fields.append(h("label", { class: "field" }, h("span", { class: "field-label" }, label), control));
+    }
+    const save = h("button", { class: "btn btn-primary", type: "button" }, "保存配置");
+    save.addEventListener("click", async () => {
+      save.disabled = true;
+      try {
+        const result = await api.put(`/api/plugins/${encodeURIComponent(item.id)}/config`, { values: draft });
+        toast(result.message || "插件配置已保存");
+        close();
+      } catch (err) {
+        if (!(err instanceof Unauthorized)) toast(err.message || "保存失败", "error");
+      } finally {
+        save.disabled = false;
+      }
+    });
+    dialog.replaceChildren(
+      h("div", { class: "dialog-head" }, h("h2", {}, `配置「${item.name}」`), h("button", { class: "icon-button", type: "button", onclick: close }, icon("close"))),
+      h("div", { class: "dialog-body" }, h("div", { class: "notice" }, icon("warning"), "保存后重启 bot 生效。"), fields),
+      h("div", { class: "dialog-foot" }, h("button", { class: "btn", type: "button", onclick: close }, "取消"), save)
+    );
+  } catch (err) {
+    if (!(err instanceof Unauthorized)) {
+      dialog.replaceChildren(h("div", { class: "dialog-body" }, h("p", {}, err.message || "读取配置失败"), h("button", { class: "btn", type: "button", onclick: close }, "关闭")));
+    }
+  }
+}
+
 function marketActions(item, refresh) {
   const buttons = [];
   const run = (path, body, message) => async (event) => {
@@ -2125,6 +2175,9 @@ function marketActions(item, refresh) {
           "更新"
         )
       );
+    }
+    if (item.has_config) {
+      buttons.push(h("button", { class: "btn btn-sm btn-ghost", type: "button", onclick: () => pluginConfigDialog(item) }, "配置"));
     }
     if (item.state === "enabled") {
       buttons.push(
@@ -3627,6 +3680,18 @@ function settingsCardSpecs(draft, secrets, pluginsAvailable) {
       }),
     },
     {
+      path: "stickers.enabled",
+      node: card("表情包行为", {
+        hint: "核心功能默认关闭；保存后立即生效",
+        body: fieldGrid([
+          { path: "stickers.enabled", label: "启用表情包行为", kind: "switch", hint: "关闭时不收集、不补发表情，也不会创建表情库" },
+          { path: "stickers.collect", label: "收集群聊表情", kind: "switch", hint: "把群里的图片、贴纸和商城表情去重后存入表情库" },
+          { path: "stickers.send_probability", label: "回复后补发概率", kind: "number", step: "0.01", min: 0, max: 1, hint: "每次正常回复后补发表情的概率（0–1）" },
+          { path: "stickers.cooldown_seconds", label: "会话冷却（秒）", kind: "number", step: "1", min: 0, hint: "同一平台会话两次补发表情的最短间隔" },
+        ], draft),
+      }),
+    },
+    {
       path: "emotion.threshold_adjust",
       node: card("情绪阈值微调", {
         hint: "按当前心情调整开口阈值：正数更难开口，负数更容易",
@@ -3805,6 +3870,50 @@ function settingsCardSpecs(draft, secrets, pluginsAvailable) {
 }
 
 /** 只有系统页展示的纯前端设置（主题、原始 YAML），不参与配置字段归类。 */
+function stickerLibraryCard() {
+  const box = h("div", { class: "sticker-library-grid" });
+  const load = async () => {
+    try {
+      const data = await api.get("/api/stickers");
+      const items = data.items || [];
+      if (!items.length) {
+        box.replaceChildren(emptyState("image", "表情库还是空的", "打开收集后，群聊里的图片和贴纸会自动入库。"));
+        return;
+      }
+      const tiles = items.map((item) => {
+        const remove = h("button", {
+          class: "icon-btn-sm danger",
+          type: "button",
+          title: "删除",
+          "aria-label": `删除表情 ${item.id}`,
+          onclick: async () => {
+            if (!window.confirm("确定删除这条表情吗？")) return;
+            try {
+              await api.del(`/api/stickers/${encodeURIComponent(item.id)}`);
+              toast("表情已删除");
+              await load();
+            } catch (err) {
+              if (!(err instanceof Unauthorized)) toast(err.message || "删除失败", "error");
+            }
+          },
+        }, icon("trash"));
+        const image = item.image_url
+          ? h("img", { src: item.image_url, alt: (item.tags || []).join("、") || "表情" })
+          : h("div", { class: "sticker-missing" }, "无图片");
+        return h("article", { class: "sticker-tile" }, image,
+          h("div", { class: "sticker-tile-foot" },
+            h("span", {}, (item.tags || []).join("、") || "未分类"), remove));
+      });
+      box.replaceChildren(...tiles);
+    } catch (err) {
+      if (!(err instanceof Unauthorized)) box.replaceChildren(emptyState("warning", "表情库读取失败", err.message));
+    }
+  };
+  const cardNode = card("表情库", { hint: "图片本体与索引存放在 stickers.dir", body: box });
+  load();
+  return cardNode;
+}
+
 function systemExtras(data) {
   const themeButton = (value, label) =>
     h("button", { type: "button", "data-theme-choice": value, onclick: () => applyTheme(value) }, label);
@@ -4037,8 +4146,8 @@ async function renderSettingsGroup(view, groupId, sub) {
     state.settingsNotice = null;
   }
 
-  const extras = page.id === "system" ? systemExtras(data) : [];
-  const hasContent = cards.length > 0;
+  const extras = page.id === "system" ? systemExtras(data) : page.id === "emoji" ? [stickerLibraryCard()] : [];
+  const hasContent = cards.length > 0 || extras.length > 0;
   const stack = hasContent
     ? h("div", { class: "settings-stack" }, ...cards, ...extras)
     : page.empty

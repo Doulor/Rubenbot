@@ -248,9 +248,9 @@ def test_settings_layout_pages_and_groups():
         "system",
     ]
     emoji = next(page for page in groups["bot"]["pages"] if page["id"] == "emoji")
-    assert emoji["empty"], "表情页没有字段时必须给空状态说明"
-    # 空状态不能编造配置项：表情页只说明现状
-    assert not any(page == "emoji" for page in assign_pages(structured_config(Config())).keys())
+    assert "empty" not in emoji
+    assigned = assign_pages(structured_config(Config()))
+    assert {"stickers.enabled", "stickers.collect", "stickers.send_probability", "stickers.cooldown_seconds"} <= set(assigned["emoji"])
     # 人设页是 SOUL 编辑器，没有结构化字段
     assert "persona" not in assign_pages(structured_config(Config()))
 

@@ -605,15 +605,27 @@ class VoiceConfig:
 
 @dataclass
 class StickerConfig:
-    """表情库位置。
+    """表情包行为与表情库位置。
 
-    图片本体与 ``index.json`` 都放在这个目录（默认 ``data/stickers``）；
-    该目录是运行时数据，已在 ``.gitignore`` 里排除。
+    ``enabled`` 是总开关，默认关闭以保持升级后的零动作行为；只有打开后，
+    ``collect`` 才会收集群聊表情，回复后才会按概率补发表情。
     """
 
+    enabled: bool = False
+    collect: bool = False
+    send_probability: float = 0.15
+    cooldown_seconds: float = 300.0
     dir: str = "data/stickers"
 
     def __post_init__(self) -> None:
+        self.enabled = self.enabled is True
+        self.collect = self.collect is True
+        if isinstance(self.send_probability, bool) or not isinstance(self.send_probability, (int, float)):
+            self.send_probability = 0.15
+        self.send_probability = min(1.0, max(0.0, float(self.send_probability)))
+        if isinstance(self.cooldown_seconds, bool) or not isinstance(self.cooldown_seconds, (int, float)):
+            self.cooldown_seconds = 300.0
+        self.cooldown_seconds = max(0.0, float(self.cooldown_seconds))
         self.dir = str(self.dir or "").strip() or "data/stickers"
 
 

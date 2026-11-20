@@ -24,6 +24,7 @@ import dataclasses
 import io
 import json
 import logging
+import math
 import shutil
 import stat
 import tempfile
@@ -488,6 +489,7 @@ class MarketService:
             "core_too_old": core_too_old,
             "download_available": bool(entry and entry.has_download),
             "has_index": entry is not None,
+            "has_config": bool(manifest.get("config_schema")) if valid else False,
             "local_path": item.get("path"),
         }
 
@@ -516,8 +518,146 @@ class MarketService:
             "core_too_old": core_too_old,
             "download_available": entry.has_download,
             "has_index": True,
+            "has_config": False,
             "local_path": None,
         }
+
+    def get_plugin_config(self, plugin_id: str) -> dict[str, Any]:
+        """读取已安装插件的 schema 与配置值；不回显疑似密钥。"""
+        local = self._local_plugin(plugin_id)
+        if local is None or not local.get("valid"):
+            raise MarketError(f"插件不存在：{plugin_id}", status=404)
+        manifest = local.get("manifest") or {}
+        schema = manifest.get("config_schema") or []
+        if not schema:
+            raise MarketError(f"插件 {plugin_id} 没有可配置项", status=409)
+        directory = self._safe_local_dir(local)
+        raw = self._read_plugin_yaml(directory)
+        values: dict[str, Any] = {}
+        secrets: dict[str, bool] = {}
+        schema_fields = self._schema_fields(schema)
+        if not schema_fields:
+            raise MarketError(f"插件 {plugin_id} 的配置 schema 不合规", status=409)
+        for field in schema_fields:
+            key = field["key"]
+            if key in raw:
+                value = raw[key]
+            else:
+                value = field.get("default")
+            if field["type"] in {"string", "text"} and self._is_secret(key):
+                secrets[key] = bool(value)
+                value = ""
+            values[key] = value
+        return {"schema": schema, "values": values, "secrets": secrets}
+
+    def save_plugin_config(self, plugin_id: str, values: Any) -> dict[str, Any]:
+        """按 manifest schema 校验并原子写入插件目录 config.yaml。"""
+        local = self._local_plugin(plugin_id)
+        if local is None or not local.get("valid"):
+            raise MarketError(f"插件不存在：{plugin_id}", status=404)
+        manifest = local.get("manifest") or {}
+        schema = manifest.get("config_schema") or []
+        if not schema:
+            raise MarketError(f"插件 {plugin_id} 没有可配置项", status=409)
+        if not isinstance(values, dict):
+            raise MarketError("values 必须是对象", status=422)
+        allowed = {field["key"] for field in self._schema_fields(schema)}
+        unknown = sorted(set(values) - allowed)
+        if unknown:
+            raise MarketError(f"包含未声明的配置项：{', '.join(unknown)}", status=422)
+        directory = self._safe_local_dir(local)
+        existing = self._read_plugin_yaml(directory)
+        errors: list[dict[str, str]] = []
+        updated = dict(existing)
+        for field in self._schema_fields(schema):
+            key, kind = field["key"], field["type"]
+            if key not in values:
+                continue
+            value = values[key]
+            if self._is_secret(key) and value in (None, ""):
+                continue
+            parsed, message = self._coerce_schema_value(value, kind)
+            if message:
+                errors.append({"field": key, "message": message})
+            else:
+                updated[key] = parsed
+        if errors:
+            raise MarketError("插件配置校验失败：" + "；".join(item["field"] + " " + item["message"] for item in errors), status=422)
+        self._write_plugin_yaml(directory, updated)
+        return self.get_plugin_config(plugin_id)
+
+    def _schema_fields(self, schema: Any) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in schema:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("key") or "").strip()
+            kind = str(item.get("type") or "string").strip().lower()
+            if not key or key in seen or kind not in {"bool", "boolean", "int", "integer", "float", "number", "string", "text", "list", "string_list"}:
+                continue
+            seen.add(key)
+            result.append({**item, "key": key, "type": kind})
+        return result
+
+    @staticmethod
+    def _is_secret(key: str) -> bool:
+        lower = key.lower()
+        return any(token in lower for token in ("key", "token", "secret", "password"))
+
+    @staticmethod
+    def _coerce_schema_value(value: Any, kind: str) -> tuple[Any, str | None]:
+        if kind in {"bool", "boolean"}:
+            return (value, None) if isinstance(value, bool) else (None, "必须是布尔值")
+        if kind in {"int", "integer"}:
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not float(value).is_integer():
+                return None, "必须是整数"
+            return int(value), None
+        if kind in {"float", "number"}:
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                return None, "必须是数字"
+            return float(value), None
+        if kind in {"list", "string_list"}:
+            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                return None, "必须是字符串列表"
+            return [item.strip() for item in value if item.strip()], None
+        if not isinstance(value, str):
+            return None, "必须是字符串"
+        return value, None
+
+    def _safe_local_dir(self, local: dict[str, Any]) -> Path:
+        root = self._plugins_root().resolve()
+        directory = Path(str(local.get("path") or "")).resolve()
+        if not _is_within(directory, root, allow_equal=False) or not (directory / "manifest.json").is_file():
+            raise MarketError("插件目录不安全，拒绝访问", status=400)
+        return directory
+
+    @staticmethod
+    def _read_plugin_yaml(directory: Path) -> dict[str, Any]:
+        import yaml
+        path = directory / "config.yaml"
+        if not path.exists():
+            return {}
+        if path.is_symlink():
+            raise MarketError("插件配置文件是符号链接，拒绝访问", status=400)
+        try:
+            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except Exception as exc:
+            raise MarketError(f"插件 config.yaml 无法读取：{exc}", status=422) from exc
+        if not isinstance(data, dict):
+            raise MarketError("插件 config.yaml 顶层必须是对象", status=422)
+        return data
+
+    @staticmethod
+    def _write_plugin_yaml(directory: Path, data: dict[str, Any]) -> None:
+        import os
+        import yaml
+        path = directory / "config.yaml"
+        if path.is_symlink():
+            raise MarketError("插件配置文件是符号链接，拒绝写入", status=400)
+        temp = path.with_name(f".{path.name}.tmp")
+        temp.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        os.replace(temp, path)
 
     def find_entry(self, plugin_id: str) -> IndexEntry:
         entries, _source = self.index()
