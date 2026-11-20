@@ -18,7 +18,7 @@ dependencies = [
 
 [project.optional-dependencies]
 mcp = ["mcp>=1.30,<2"]
-dev = ["pytest>=8", "rubenbot[mcp]"]
+dev = ["pytest>=8", "rubenbot[mcp,webui]"]
 webui = ["fastapi>=0.110", "uvicorn>=0.29"]
 
 [project.scripts]
@@ -33,4 +33,5 @@ include = ["rubenbot*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 addopts = "-q"
