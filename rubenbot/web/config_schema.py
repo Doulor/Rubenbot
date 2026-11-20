@@ -87,6 +87,7 @@ def structured_config(config: Config) -> dict[str, Any]:
         "memory": asdict(config.memory),
         "chat": asdict(config.chat),
         "decision": decision,
+        "generation": asdict(config.generation),
         "plugins": {
             "dir": config.plugins.dir,
             "enabled": list(config.plugins.enabled),
@@ -388,6 +389,24 @@ def _validate_chat(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
     return out
 
 
+def _validate_generation(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    two_stage = section.get("two_stage")
+    if two_stage is None:
+        return out
+    if not isinstance(two_stage, dict):
+        v.fail("generation.two_stage", "应为对象")
+        return out
+    entry: dict[str, Any] = {}
+    if "enabled" in two_stage:
+        flag = v.boolean(two_stage["enabled"], "generation.two_stage.enabled")
+        if flag is not None:
+            entry["enabled"] = flag
+    if entry:
+        out["two_stage"] = entry
+    return out
+
+
 def _validate_decision(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
     out: dict[str, Any] = {}
     number_fields = {
@@ -588,6 +607,9 @@ def validate_structured(payload: dict[str, Any]) -> dict[str, Any]:
     decision = _section(payload, "decision", v)
     if decision is not None:
         update["decision"] = _validate_decision(decision, v)
+    generation = _section(payload, "generation", v)
+    if generation is not None:
+        update["generation"] = _validate_generation(generation, v)
     plugins = _section(payload, "plugins", v)
     if plugins is not None:
         update["plugins"] = _validate_plugins(plugins, v)

@@ -276,6 +276,21 @@ class DecisionConfig:
 
 
 @dataclass
+class TwoStageConfig:
+    """两段式生成：先「想」再「说」。"""
+
+    # 默认关闭；关时保持原来的单段直出，行为完全不变
+    enabled: bool = False
+
+
+@dataclass
+class GenerationConfig:
+    """回复生成的策略配置。"""
+
+    two_stage: TwoStageConfig = field(default_factory=TwoStageConfig)
+
+
+@dataclass
 class PluginsConfig:
     """插件目录与启停。
 
@@ -419,6 +434,7 @@ class Config:
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     chat: ChatConfig = field(default_factory=ChatConfig)
     decision: DecisionConfig = field(default_factory=DecisionConfig)
+    generation: GenerationConfig = field(default_factory=GenerationConfig)
     plugins: PluginsConfig = field(default_factory=PluginsConfig)
     webui: WebUIConfig = field(default_factory=WebUIConfig)
     persona_path: str = "data/SOUL.md"
@@ -493,6 +509,7 @@ class Config:
         memory = _load_memory(data.get("memory") or {})
         chat = ChatConfig(**{k: v for k, v in (data.get("chat") or {}).items() if _has(ChatConfig, k)})
         decision = _load_decision(data.get("decision") or {})
+        generation = _load_generation(data.get("generation") or {})
         plugins = PluginsConfig(**{k: v for k, v in (data.get("plugins") or {}).items() if _has(PluginsConfig, k)})
         webui = WebUIConfig(**{k: v for k, v in (data.get("webui") or {}).items() if _has(WebUIConfig, k)})
         persona = data.get("persona") or {}
@@ -510,6 +527,7 @@ class Config:
             memory=memory,
             chat=chat,
             decision=decision,
+            generation=generation,
             plugins=plugins,
             webui=webui,
             **basics,
@@ -558,6 +576,15 @@ def _load_decision(data: dict[str, Any]) -> DecisionConfig:
                 quiet_hours=[str(item) for item in quiet],
             )
     return config
+
+
+def _load_generation(data: dict[str, Any]) -> GenerationConfig:
+    """解析 generation 段；只接受写明的布尔开关，写错类型回落默认（关闭）。"""
+    if not isinstance(data, dict):
+        return GenerationConfig()
+    two_stage_raw = data.get("two_stage")
+    enabled = isinstance(two_stage_raw, dict) and two_stage_raw.get("enabled") is True
+    return GenerationConfig(two_stage=TwoStageConfig(enabled=enabled))
 
 
 def _has(dataclass_type: type, key: str) -> bool:

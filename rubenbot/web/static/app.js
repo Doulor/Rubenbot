@@ -2642,6 +2642,20 @@ async function renderSettings(view) {
         draft
       ),
     }),
+    card("生成", {
+      hint: "决定回复之后怎么写出正文",
+      body: fieldGrid(
+        [
+          {
+            path: "generation.two_stage.enabled",
+            label: "两段式生成",
+            kind: "switch",
+            hint: "先让快速模型想一段简短指导，再按指导写正文；第一段失败会自动回退单段直出",
+          },
+        ],
+        draft
+      ),
+    }),
     card("回复意愿", {
       hint: "群聊里什么时候开口",
       body: fieldGrid(

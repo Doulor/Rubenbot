@@ -1127,6 +1127,7 @@ def _save_message(applied: list[str], requires_restart: list[str]) -> str:
         "memory": "记忆",
         "chat": "聊天与回复",
         "decision": "回复意愿",
+        "generation": "生成",
         "plugins": "插件",
         "webui": "WebUI",
         "persona": "人格",
