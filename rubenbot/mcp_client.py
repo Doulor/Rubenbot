@@ -9,6 +9,7 @@ import os
 import re
 import sys
 from contextlib import AsyncExitStack
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import monotonic
@@ -108,14 +109,16 @@ class MCPManager:
     def __init__(self, config: MCPConfig):
         self.config = config
         self._servers = {s.name: _Server(s, "disconnected" if s.enabled else "disabled") for s in config.servers}
-        self._tasks: list[asyncio.Task] = []
+        self._tasks: dict[asyncio.Task, asyncio.Event] = {}
+        self._stopping = False
 
     def status(self) -> list[dict]:
         return [dict(name=s.config.name, transport=s.config.transport, state=s.state,
                      tool_count=len(s.schemas), last_error=s.last_error) for s in self._servers.values()]
 
     def tools(self) -> list[dict]:
-        return [schema for s in self._servers.values() for schema in s.schemas.values()]
+        """在线工具快照：每台首次发现前为空；刷新中保留上次完整目录，断线即撤下。"""
+        return deepcopy([schema for s in self._servers.values() for schema in s.schemas.values()])
 
     async def call(self, name: str, arguments: Any) -> str:
         """只执行在线目录里的工具；不重试调用（上次请求可能已产生副作用）。"""
@@ -169,20 +172,26 @@ class MCPManager:
                         server, tool, (monotonic() - started) * 1000, ok)
 
     async def start(self) -> None:
-        if self._tasks:
-            return
-        for s in self._servers.values():
-            if not s.config.enabled:
-                continue
-            attempted = asyncio.Event()
-            self._tasks.append(asyncio.create_task(self._supervise(s, attempted), name=f"mcp:{s.config.name}"))
+        """并行连接，所有调用者都等到每台启用服务已发布目录或已记录首次错误。"""
+        if not self._tasks:
+            for s in self._servers.values():
+                if s.config.enabled:
+                    attempted = asyncio.Event()
+                    task = asyncio.create_task(self._supervise(s, attempted), name=f"mcp:{s.config.name}")
+                    self._tasks[task] = attempted
+        for attempted in tuple(self._tasks.values()):
             await attempted.wait()
 
     async def stop(self) -> None:
+        self._stopping = True
         for task in self._tasks:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
+        # 尚未获得调度就被取消的会话不会进入 _supervise 的 finally。
+        for attempted in self._tasks.values():
+            attempted.set()
         self._tasks.clear()
+        self._stopping = False
 
     async def _supervise(self, s: _Server, attempted: asyncio.Event) -> None:
         delay = _BACKOFF
@@ -197,6 +206,9 @@ class MCPManager:
             finally:
                 s.state = "disconnected"
                 attempted.set()
+            # 传输退出时可能把取消包成普通异常；显式停机后绝不再重连。
+            if self._stopping:
+                return
             if monotonic() - started >= _MAX_BACKOFF:
                 delay = _BACKOFF
             await asyncio.sleep(delay)
@@ -219,7 +231,9 @@ class MCPManager:
                     session = await stack.enter_async_context(ClientSession(read, write, message_handler=on_message))
                     await session.initialize()
                     s.refresh.clear()
-                    s.schemas = await _discover(session, s.config.name)
+                    schemas = await _discover(session, s.config.name)
+                # 同一事件循环中不让出控制权，一起发布会话、完整目录和在线状态。
+                s.schemas = schemas
                 s.session = session
                 s.state = "connected"
                 s.last_error = ""
