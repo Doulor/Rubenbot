@@ -111,6 +111,10 @@ def structured_config(config: Config) -> dict[str, Any]:
             **asdict(config.proactive),
             "quiet_hours": list(config.proactive.quiet_hours),
         },
+        "gateway": {
+            **asdict(config.gateway),
+            "enabled_conversations": list(config.gateway.enabled_conversations),
+        },
         "emotion": asdict(config.emotion),
         "plugins": {
             "dir": config.plugins.dir,
@@ -799,6 +803,33 @@ def _validate_market(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
     return out
 
 
+def _validate_gateway(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
+    """网关与事件通道：开关、会话白名单、安静时段与额度。"""
+    out: dict[str, Any] = {}
+    for key in ("enabled", "judge_events", "allow_sensitive"):
+        if key in section:
+            value = v.boolean(section[key], f"gateway.{key}")
+            if value is not None:
+                out[key] = value
+    if "enabled_conversations" in section:
+        value = v.string_list(section["enabled_conversations"], "gateway.enabled_conversations")
+        if value is not None:
+            out["enabled_conversations"] = value
+    if "quiet_hours" in section:
+        value = v.text(section["quiet_hours"], "gateway.quiet_hours", allow_empty=True, max_len=120)
+        if value is not None:
+            if value and parse_quiet_hours([value]) == []:
+                v.fail("gateway.quiet_hours", "格式应为 HH:MM-HH:MM，留空表示不设安静时段")
+            else:
+                out["quiet_hours"] = value
+    for key in ("daily_budget_per_conversation", "global_daily_cap"):
+        if key in section:
+            number = v.number(section[key], f"gateway.{key}", minimum=0, integer=True)
+            if number is not None:
+                out[key] = int(number)
+    return out
+
+
 def _validate_adapters(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for name in ADAPTER_NAMES:
@@ -907,6 +938,9 @@ def validate_structured(payload: dict[str, Any]) -> dict[str, Any]:
     proactive = _section(payload, "proactive", v)
     if proactive is not None:
         update["proactive"] = _validate_proactive(proactive, v)
+    gateway = _section(payload, "gateway", v)
+    if gateway is not None:
+        update["gateway"] = _validate_gateway(gateway, v)
     emotion = _section(payload, "emotion", v)
     if emotion is not None:
         update["emotion"] = _validate_emotion(emotion, v)

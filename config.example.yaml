@@ -196,6 +196,18 @@ proactive:
   relevance_bonus: 0.10        # 群近期话题命中记忆时最多加多少分
   relevance_scale: 8.0         # 检索分数归一尺度
 
+# 通用适配器网关 + 事件通道：默认全关。
+# 开启后模型可以查适配器的接口目录（adapter_actions）并按需调用（adapter_call），
+# 平台推送的 notice / request 事件也会进事件流（judge_events 打开时才做快判）。
+gateway:
+  enabled: false               # 总开关：关时模型看不见网关工具
+  enabled_conversations: []    # 允许用网关的会话（platform:chat_id）；群聊要显式列出，私聊主人恒可
+  judge_events: false          # 事件判断总开关（快判）；关时事件只落库
+  allow_sensitive: false       # 踢人/禁言/撤回/申请处理等敏感动作，需显式打开
+  quiet_hours: "23:00-08:00"   # 安静时段：非必判事件只记录，不当场动作
+  daily_budget_per_conversation: 20   # 每会话每天主动类动作上限
+  global_daily_cap: 200        # 全局每天动作上限（熔断）
+
 # 情绪与好感度：状态全部由代码规则算，模型不参与打分；只做背景注入与阈值微调
 emotion:
   enabled: true                 # 总开关：关掉后不记录、不注入、不调阈值

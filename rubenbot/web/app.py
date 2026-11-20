@@ -564,6 +564,50 @@ def create_app(state: WebState):
         require_session(request)
         return {"ok": True, **state.usage_summary(days=max(1, min(days, 90)))}
 
+    # ------------------------------------------------------------------
+    # 事件通道与网关审计（只读）
+    # ------------------------------------------------------------------
+
+    @app.get("/api/events")
+    async def platform_events(
+        request: Request,
+        kind: str | None = None,
+        pending: bool | None = None,
+        platform: str | None = None,
+        limit: int = 50,
+    ):
+        """平台事件（notice / request）最近记录；``pending`` 只看未处理申请。"""
+        require_session(request)
+        limit = max(1, min(int(limit), 200))
+        items = state.store.list_platform_events(
+            kind=kind or None,
+            pending=pending,
+            platform=platform or None,
+            limit=limit,
+        )
+        return {
+            "ok": True,
+            "items": items,
+            "pending_requests": state.store.count_pending_platform_events(),
+        }
+
+    @app.get("/api/gateway/audit")
+    async def gateway_audit(
+        request: Request,
+        action: str | None = None,
+        sensitive: bool | None = None,
+        limit: int = 50,
+    ):
+        """网关调用审计（只读）：成功与拒绝都列，sensitive 动作带标记。"""
+        require_session(request)
+        limit = max(1, min(int(limit), 200))
+        items = state.store.list_gateway_audit(
+            action=action or None,
+            sensitive=sensitive,
+            limit=limit,
+        )
+        return {"ok": True, "items": items}
+
     @app.get("/api/memories")
     async def list_memories(
         request: Request,

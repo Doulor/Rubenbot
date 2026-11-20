@@ -17,6 +17,8 @@ import abc
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Iterable, Mapping
 
+from .platform import PlatformEvent
+
 # 非文本消息段在纯文本投影里的占位符；text 直接取 data["text"]
 SEGMENT_PLACEHOLDERS: dict[str, str] = {
     "image": "[图片]",
@@ -157,6 +159,11 @@ class MessageEvent:
 
 
 EventCallback = Callable[[MessageEvent], Awaitable[None]]
+PlatformEventCallback = Callable[[PlatformEvent], Awaitable[None]]
+
+
+class ActionNotSupported(RuntimeError):
+    """适配器没有实现通用动作通道（``call_action``）。"""
 
 
 class BaseAdapter(abc.ABC):
@@ -170,6 +177,15 @@ class BaseAdapter(abc.ABC):
     capability_config_keys: dict[str, str] = {}
     # 配置未写开关时的默认值（不在表里的能力默认开启）
     capability_defaults: dict[str, bool] = {}
+
+    # 非消息平台事件的回调；能解析 notice/request 的适配器由核心注入
+    platform_event_callback: PlatformEventCallback | None = None
+    # 协议端自己的账号 id（用于过滤「自己引发的事件」）；拿不到时为 None
+    self_id: str | None = None
+
+    def set_platform_event_callback(self, callback: PlatformEventCallback | None) -> None:
+        """注入平台事件回调（核心入口用；不支持的适配器忽略即可）。"""
+        self.platform_event_callback = callback
 
     @abc.abstractmethod
     async def start(self, on_event: EventCallback) -> None:
@@ -196,3 +212,20 @@ class BaseAdapter(abc.ABC):
         （语音回复等核心直调场景同样只降级，不影响正常回复）。
         """
         raise CapabilityNotSupported(self.name, name)
+
+    # ------------------------------------------------------------------
+    # 通用动作通道（适配器网关的执行层）
+    # ------------------------------------------------------------------
+
+    async def call_action(self, name: str, params: dict[str, Any] | None = None) -> Any:
+        """按目录里的动作名调用平台接口；默认实现表示不支持。
+
+        未实现的适配器（如 Telegram / QQ 官方）保持默认实现——网关据此
+        不注册工具，模型完全看不见做不到的接口。子类实现时只做「名字 →
+        平台接口」的翻译，风险分级、冷却与审计都在核心层。
+        """
+        raise ActionNotSupported(f"适配器 {self.name} 不支持通用动作通道")
+
+    def supports_actions(self) -> bool:
+        """是否实现了通用动作通道（网关工具注册的硬条件之一）。"""
+        return type(self).call_action is not BaseAdapter.call_action

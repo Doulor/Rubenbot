@@ -730,6 +730,40 @@ def is_loopback_host(host: str) -> bool:
 
 
 @dataclass
+class GatewayConfig:
+    """通用适配器网关 + 事件通道（感知与行动）的配置。
+
+    默认全关：网关不开时模型看不见 ``adapter_actions`` / ``adapter_call``，
+    事件通道也只在 ``judge_events`` 打开时才做快判（落库照常进行，便于观察）。
+    ``quiet_hours`` 与 ``proactive.quiet_hours`` 同格式：``HH:MM-HH:MM``。
+    """
+
+    # 总开关：关时网关工具不注册、目录不可见
+    enabled: bool = False
+    # 允许使用网关的会话（platform:chat_id 或裸 chat_id）；私聊主人会话恒可
+    enabled_conversations: list[str] = field(default_factory=list)
+    # 事件判断总开关（快判）；关时事件只落库
+    judge_events: bool = False
+    # sensitive 动作默认禁调；显式打开才允许，且审计标红
+    allow_sensitive: bool = False
+    # 安静时段：非必判事件只挂起记录，必判事件也只记录 + 挂待办
+    quiet_hours: str = "23:00-08:00"
+    # 每会话每天主动类动作上限
+    daily_budget_per_conversation: int = 20
+    # 全局每天动作上限（熔断）
+    global_daily_cap: int = 200
+
+    def __post_init__(self) -> None:
+        cleaned: list[str] = []
+        for item in self.enabled_conversations or []:
+            name = str(item or "").strip()
+            if name and name not in cleaned:
+                cleaned.append(name)
+        self.enabled_conversations = cleaned
+        self.quiet_hours = str(self.quiet_hours or "").strip()
+
+
+@dataclass
 class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
@@ -744,6 +778,7 @@ class Config:
     webui: WebUIConfig = field(default_factory=WebUIConfig)
     reminder: ReminderConfig = field(default_factory=ReminderConfig)
     proactive: ProactiveConfig = field(default_factory=ProactiveConfig)
+    gateway: GatewayConfig = field(default_factory=GatewayConfig)
     persona_path: str = "data/SOUL.md"
     database_path: str = "data/rubenbot.db"
     adapters: dict[str, Any] = field(default_factory=dict)
@@ -827,6 +862,7 @@ class Config:
         webui = WebUIConfig(**{k: v for k, v in (data.get("webui") or {}).items() if _has(WebUIConfig, k)})
         reminder = _load_reminder(data.get("reminder") or {})
         proactive = _load_proactive(data.get("proactive") or {})
+        gateway = _load_gateway(data.get("gateway") or {})
         persona = data.get("persona") or {}
         if isinstance(persona, str):
             persona = {"path": persona}
@@ -851,6 +887,7 @@ class Config:
             webui=webui,
             reminder=reminder,
             proactive=proactive,
+            gateway=gateway,
             **basics,
         )
 
@@ -869,6 +906,33 @@ def _load_reminder(data: dict[str, Any]) -> ReminderConfig:
             data.get("max_delay_minutes"), default.max_delay_minutes, minimum=1
         ),
         max_text_chars=_as_int(data.get("max_text_chars"), default.max_text_chars, minimum=20),
+    )
+
+
+def _load_gateway(data: dict[str, Any]) -> GatewayConfig:
+    """解析 gateway 段：宽松取值，写错类型回落默认，不让配置问题挡住启动。"""
+    if not isinstance(data, dict):
+        return GatewayConfig()
+    default = GatewayConfig()
+    conversations = data.get("enabled_conversations", default.enabled_conversations)
+    if isinstance(conversations, (str, int)):
+        conversations = [conversations]
+    if not isinstance(conversations, (list, tuple)):
+        conversations = []
+    return GatewayConfig(
+        enabled=data.get("enabled") is True,
+        enabled_conversations=[str(item) for item in conversations if str(item).strip()],
+        judge_events=data.get("judge_events") is True,
+        allow_sensitive=data.get("allow_sensitive") is True,
+        quiet_hours=str(data.get("quiet_hours", default.quiet_hours) or "").strip(),
+        daily_budget_per_conversation=_as_int(
+            data.get("daily_budget_per_conversation"),
+            default.daily_budget_per_conversation,
+            minimum=0,
+        ),
+        global_daily_cap=_as_int(
+            data.get("global_daily_cap"), default.global_daily_cap, minimum=0
+        ),
     )
 
 

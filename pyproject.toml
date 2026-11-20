@@ -26,6 +26,10 @@ rubenbot = "rubenbot.__main__:main"
 [tool.setuptools.packages.find]
 include = ["rubenbot*"]
 
+# 网关接口目录是数据文件（JSON），打包时要跟着走
+[tool.setuptools.package-data]
+"rubenbot.gateway" = ["catalogs/*.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

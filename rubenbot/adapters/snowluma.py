@@ -37,6 +37,7 @@ from .base import (
     as_segment,
     render_segments,
 )
+from .platform import KIND_NOTICE, KIND_REQUEST, PlatformEvent
 from .qzone import QzoneClient
 
 logger = logging.getLogger(__name__)
@@ -200,11 +201,27 @@ class SnowLumaAdapter(BaseAdapter):
                     self._bot_message_ids.add(str(data["message_id"]))
         event = parse_onebot_event(data, self_id=self.self_id)
         if event is None:
+            # 非消息事件：notice / request 归一成统一平台事件；心跳等直接忽略
+            await self._dispatch_platform_event(data)
             return
         if event.reply_to_id and event.reply_to_id in self._bot_message_ids:
             event.mentions_bot = True
         if self._on_event is not None:
             await self._on_event(event)
+
+    async def _dispatch_platform_event(self, data: dict[str, Any]) -> None:
+        """把 notice / request 交给核心入口；自身引发的事件在入口过滤。
+
+        入口过滤放在这里也放在核心（双保险）：这里能拿到协议端的 self_id，
+        核心层则不依赖适配器是否传对。meta_event 的心跳没有语义，直接丢弃。
+        """
+        callback = self.platform_event_callback
+        if callback is None:
+            return
+        event = parse_onebot_platform_event(data, self_id=self.self_id)
+        if event is None:
+            return
+        await callback(event)
 
     # ------------------------------------------------------------------
     # 发送
@@ -226,6 +243,23 @@ class SnowLumaAdapter(BaseAdapter):
         if isinstance(payload, dict) and payload.get("status") == "failed":
             raise RuntimeError(f"OneBot API {action} 失败：{payload}")
         return payload if isinstance(payload, dict) else {"data": payload}
+
+    async def call_action(self, name: str, params: dict[str, Any] | None = None) -> Any:
+        """通用动作通道：动作名原样作为 OneBot 接口名，走现有 HTTP 通道。
+
+        风险分级、冷却与审计都由核心层（``rubenbot.gateway``）负责，这里
+        只做协议层调用；失败抛 :class:`CapabilityError`（带上游信息），
+        由网关收敛成给模型看的错误摘要。
+        """
+        action = str(name or "").strip()
+        if not action:
+            raise CapabilityError("动作名不能为空")
+        try:
+            payload = await self.call_api(action, dict(params or {}))
+        except Exception as exc:  # noqa: BLE001 - 网关负责把失败原因回给模型
+            raise CapabilityError(f"{action} 失败：{exc}") from exc
+        return payload.get("data", payload) if isinstance(payload, dict) else payload
+
 
     async def send(self, chat_id: str, segments: list[Segment], *, chat_type: str = "group") -> str | None:
         action = "send_private_msg" if chat_type == "private" else "send_group_msg"
@@ -580,6 +614,169 @@ def _mentions_self(message: Any, self_id: str | None) -> bool:
     elif isinstance(message, str):
         return self_id in _CQ_AT_RE.findall(message)
     return False
+
+
+def parse_onebot_platform_event(
+    data: dict[str, Any], *, self_id: str | None = None
+) -> PlatformEvent | None:
+    """OneBot v11 的 notice / request 事件 -> 统一 :class:`PlatformEvent`。
+
+    只看 ``post_type`` 为 notice / request 的推送；meta_event（心跳）与
+    message（已由 :func:`parse_onebot_event` 处理）一律返回 None。
+    ``self_id`` 只用于判定「这件事是不是冲着 bot 来的」，自身引发的事件
+    在核心入口统一过滤，这里不丢，便于审计。
+    """
+    post_type = str(data.get("post_type") or "")
+    if post_type not in ("notice", "request"):
+        return None
+    effective_self = self_id or (str(data["self_id"]) if data.get("self_id") is not None else None)
+    notice_type = str(data.get("notice_type") or "")
+    request_type = str(data.get("request_type") or "")
+    sub_type = str(data.get("sub_type") or "")
+    group_id = data.get("group_id")
+    user_id = data.get("user_id")
+    target_id = data.get("target_id")
+    operator_id = data.get("operator_id")
+
+    kind = KIND_REQUEST if post_type == "request" else KIND_NOTICE
+    event_type = request_type if kind == KIND_REQUEST else notice_type
+    if not event_type:
+        return None
+
+    conversation_type = "group" if group_id not in (None, "") else "private"
+    conversation_id = str(group_id) if conversation_type == "group" else str(user_id or "")
+    actor_id = str(user_id) if user_id not in (None, "") else str(operator_id or "")
+    actor_name = _onebot_name(data)
+
+    # 戳一戳：target_id 是被戳的人；戳到 bot 才算「必判」
+    targets_bot = False
+    if kind == KIND_NOTICE and notice_type == "notify" and sub_type == "poke":
+        targets_bot = effective_self is not None and str(target_id) == effective_self
+    elif kind == KIND_NOTICE and notice_type == "poke":
+        targets_bot = effective_self is not None and str(target_id or user_id) == effective_self
+
+    description = _describe_platform_event(
+        kind=kind,
+        event_type=event_type,
+        sub_type=sub_type,
+        actor_name=actor_name,
+        actor_id=actor_id,
+        target_id=str(target_id) if target_id not in (None, "") else "",
+        group_id=str(group_id) if group_id not in (None, "") else "",
+        data=data,
+        targets_bot=targets_bot,
+    )
+
+    return PlatformEvent(
+        platform="snowluma",
+        kind=kind,
+        type=event_type,
+        sub_type=sub_type,
+        actor_id=actor_id,
+        actor_name=actor_name,
+        target_id=str(target_id) if target_id not in (None, "") else "",
+        target_name="",
+        conversation_type=conversation_type,
+        conversation_id=conversation_id,
+        description=description,
+        raw={
+            key: data[key]
+            for key in (
+                "post_type",
+                "notice_type",
+                "request_type",
+                "sub_type",
+                "group_id",
+                "user_id",
+                "target_id",
+                "operator_id",
+                "message_id",
+                "duration",
+                "comment",
+                "flag",
+            )
+            if data.get(key) is not None
+        },
+        ts=float(data["time"]) if isinstance(data.get("time"), (int, float)) else 0.0,
+        platform_event_id=str(data.get("flag") or data.get("message_id") or ""),
+        pending=kind == KIND_REQUEST,
+        targets_bot=targets_bot,
+    )
+
+
+def _onebot_name(data: dict[str, Any]) -> str:
+    """事件里尽量取一个可读的名字（不同实现字段不一）。"""
+    for key in ("sender", "user"):
+        value = data.get(key)
+        if isinstance(value, dict):
+            name = value.get("card") or value.get("nickname") or value.get("name")
+            if name:
+                return str(name)
+    for key in ("nickname", "target_name"):
+        if data.get(key):
+            return str(data[key])
+    return ""
+
+
+# 事件类型的可读名（只影响描述文案，不认识的原样用类型名）
+_NOTICE_LABELS = {
+    "group_increase": "进群",
+    "group_decrease": "退群/被踢",
+    "group_ban": "禁言变动",
+    "group_admin": "管理员变动",
+    "group_recall": "撤回群消息",
+    "friend_recall": "撤回私聊消息",
+    "friend_add": "添加好友",
+    "group_upload": "上传群文件",
+    "group_card": "群名片变更",
+    "notify": "通知",
+}
+_REQUEST_LABELS = {
+    "friend": "好友申请",
+    "group": "入群申请/邀请",
+}
+
+
+def _describe_platform_event(
+    *,
+    kind: str,
+    event_type: str,
+    sub_type: str,
+    actor_name: str,
+    actor_id: str,
+    target_id: str,
+    group_id: str,
+    data: dict[str, Any],
+    targets_bot: bool = False,
+) -> str:
+    """一句话描述：给模型看的事件描述，不含平台内部术语。"""
+    who = actor_name or actor_id or "某人"
+    if kind == KIND_REQUEST:
+        label = _REQUEST_LABELS.get(event_type, f"{event_type} 申请")
+        where = f"群 {group_id}" if group_id else "私聊"
+        comment = str(data.get("comment") or "").strip()
+        tail = f"：{comment}" if comment else ""
+        return f"{who} 发来{label}（{where}）{tail}"
+    if event_type == "notify" and sub_type == "poke":
+        return f"{who} 戳了戳你" if targets_bot else f"{who} 戳了戳某人"
+    label = _NOTICE_LABELS.get(event_type, event_type)
+    if event_type == "group_increase":
+        return f"{who} 加入了群 {group_id}"
+    if event_type == "group_decrease":
+        reason = "被踢出" if sub_type == "kick" else "主动退出"
+        return f"{who} {reason}群 {group_id}"
+    if event_type == "group_ban":
+        duration = data.get("duration")
+        if sub_type == "ban" and duration:
+            return f"{who} 在群 {group_id} 被禁言 {int(duration)} 秒"
+        return f"{who} 在群 {group_id} 被解除禁言"
+    if event_type in ("group_recall", "friend_recall"):
+        return f"{who} 撤回了一条消息（消息 id {data.get('message_id', '?')}）"
+    if event_type == "group_admin":
+        action = "成为管理员" if sub_type == "set" else "被取消管理员"
+        return f"{who} 在群 {group_id} {action}"
+    where = f"群 {group_id}" if group_id else "私聊"
+    return f"{who} 触发了{label}（{where}）"
 
 
 def parse_onebot_event(data: dict[str, Any], *, self_id: str | None = None) -> MessageEvent | None:
