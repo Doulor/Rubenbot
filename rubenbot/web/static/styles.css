@@ -73,13 +73,6 @@ html[data-theme="light"] {
   --hero-2: #fb8b1e;
   --hero-3: #f2790c;
   --on-hero: #321400;
-  /* 主按钮的发光阴影：多层 drop-shadow，柔和地铺在按钮周围 */
-  --glow-near: color-mix(in oklab, var(--seed) 62%, transparent);
-  --glow-mid: color-mix(in oklab, var(--seed) 50%, transparent);
-  --glow-far: color-mix(in oklab, var(--seed) 30%, transparent);
-  --glow-near-hover: color-mix(in oklab, var(--seed) 72%, transparent);
-  --glow-mid-hover: color-mix(in oklab, var(--seed) 58%, transparent);
-  --glow-far-hover: color-mix(in oklab, var(--seed) 36%, transparent);
 
   --good: #2f6b45;
   --good-soft: #dff1e4;
@@ -128,13 +121,6 @@ html[data-theme="dark"] {
   --hero-2: #fb8b1e;
   --hero-3: #ef7300;
   --on-hero: #321400;
-  /* 暗底上稍微收敛一点，避免发光糊成一片 */
-  --glow-near: color-mix(in oklab, var(--seed) 58%, transparent);
-  --glow-mid: color-mix(in oklab, var(--seed) 42%, transparent);
-  --glow-far: color-mix(in oklab, var(--seed) 24%, transparent);
-  --glow-near-hover: color-mix(in oklab, var(--seed) 68%, transparent);
-  --glow-mid-hover: color-mix(in oklab, var(--seed) 50%, transparent);
-  --glow-far-hover: color-mix(in oklab, var(--seed) 30%, transparent);
 
   --good: #9bd8ae;
   --good-soft: #1e3325;
@@ -559,71 +545,27 @@ button {
 
 /* ---------------- 概览英雄卡 ---------------- */
 
+/* 平整的 tonal 表面卡：没有任何装饰，只借用 .card 的表面与圆角；
+   内边距、字号层级与下面 KPI 磁贴（.kpi）保持一致 */
 .hero {
-  position: relative;
-  isolation: isolate;
-  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  padding: 20px 22px 19px;
+}
+
+.hero-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 28px;
-  min-height: 208px;
-  padding: 28px 34px;
-  border-radius: var(--r-card);
-  background: var(--surface);
-  box-shadow: var(--shadow-card);
-}
-
-/* 右下角色调波浪 */
-.hero::after {
-  content: "";
-  position: absolute;
-  z-index: 0;
-  left: -6%;
-  right: -6%;
-  bottom: -178px;
-  height: 250px;
-  border-radius: 50% 50% 0 0 / 100% 100% 0 0;
-  background: color-mix(in oklab, var(--seed) 13%, var(--surface));
-  opacity: 0.85;
-  pointer-events: none;
-}
-
-/* 右上角柔和的强调色光晕，衬托主按钮 */
-.hero::before {
-  content: "";
-  position: absolute;
-  z-index: 0;
-  top: 50%;
-  right: 26px;
-  width: 320px;
-  height: 320px;
-  transform: translateY(-50%);
-  border-radius: 50%;
-  background: radial-gradient(
-    circle,
-    color-mix(in oklab, var(--seed) 20%, transparent) 0%,
-    color-mix(in oklab, var(--seed) 8%, transparent) 45%,
-    transparent 70%
-  );
-  pointer-events: none;
-}
-
-.hero > * {
-  position: relative;
-  z-index: 1;
-}
-
-.hero-copy {
-  min-width: 0;
+  gap: 12px;
 }
 
 .hero-status {
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  height: 30px;
-  padding: 0 13px;
+  height: 26px;
+  padding: 0 11px;
   border-radius: var(--r-pill);
   background: var(--good-soft);
   color: var(--good);
@@ -639,30 +581,30 @@ button {
 
 .hero-title {
   margin: 14px 0 0;
-  font-size: clamp(24px, 2.4vw, 32px);
+  font-size: 26px;
   font-weight: 600;
-  letter-spacing: -0.03em;
-  line-height: 1.15;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
 }
 
 .hero-sub {
   margin: 6px 0 0;
-  color: var(--text-soft);
-  font-size: 13.5px;
+  color: var(--muted);
+  font-size: 12.5px;
 }
 
 .hero-chips {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
-  margin-top: 18px;
+  margin-top: 16px;
 }
 
 .hero-chip {
   display: inline-flex;
   align-items: center;
-  height: 28px;
-  padding: 0 13px;
+  height: 26px;
+  padding: 0 11px;
   border-radius: var(--r-pill);
   background: var(--surface-sunk);
   color: var(--text-soft);
@@ -670,58 +612,12 @@ button {
   font-weight: 500;
 }
 
-/* 大号橙色 cookie / 花瓣形主按钮，带柔和发光 */
+/* 普通 tonal 药丸按钮；形制来自 .btn / .btn-sm，这里只保证不被压缩 */
 .hero-action {
   flex: none;
-  width: 116px;
-  height: 116px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 4px;
-  border: 0;
-  cursor: pointer;
-  /* 四瓣「饼干」形；形状来自 index.html 的 #cookie 裁剪路径 */
-  border-radius: 36%;
-  clip-path: url(#cookie);
-  background: linear-gradient(150deg, var(--hero-1), var(--hero-2) 62%, var(--hero-3));
-  color: var(--on-hero);
-  font-size: 12.5px;
-  font-weight: 600;
-  letter-spacing: 0.02em;
-  /* 裁剪会把 box-shadow 一起裁掉，发光用 drop-shadow 画在外层 */
-  filter: drop-shadow(0 10px 16px var(--glow-near))
-    drop-shadow(0 22px 34px var(--glow-mid)) drop-shadow(0 38px 64px var(--glow-far));
-  transition: transform 0.28s var(--ease), filter 0.28s var(--ease);
-}
-
-/* clip-path 会裁掉 box-shadow；同尺寸的发光层放在按钮后面 */
-.hero-action .icon {
-  width: 26px;
-  height: 26px;
-}
-
-.hero-action:hover {
-  transform: translateY(-2px) scale(1.03);
-  filter: drop-shadow(0 12px 18px var(--glow-near-hover))
-    drop-shadow(0 26px 40px var(--glow-mid-hover)) drop-shadow(0 44px 74px var(--glow-far-hover));
-}
-
-.hero-action:active {
-  transform: scale(0.96);
 }
 
 @media (max-width: 640px) {
-  .hero {
-    padding: 22px 22px 26px;
-    min-height: 0;
-    align-items: flex-start;
-  }
-  .hero-action {
-    width: 86px;
-    height: 86px;
-  }
   .hero-chips {
     margin-top: 14px;
   }
@@ -2309,19 +2205,7 @@ button {
 
 @media (max-width: 560px) {
   .hero {
-    gap: 16px;
-  }
-  .hero-action {
-    width: 78px;
-    height: 78px;
-    font-size: 11.5px;
-  }
-  .hero-action .icon {
-    width: 21px;
-    height: 21px;
-  }
-  .hero-sub {
-    font-size: 12.5px;
+    padding: 18px;
   }
   .hero-chip {
     height: 25px;
