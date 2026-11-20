@@ -3882,23 +3882,49 @@ function systemExtras(data) {
  * 分组、页面与字段归属都来自后端 ``/api/config`` 的 ``layout``；
  * 这里只负责按当前页面筛卡片并渲染。
  */
+function settingsMenuSkeleton(title) {
+  return h(
+    "nav",
+    { class: "settings-menu", "aria-label": `${title}分类`, "aria-busy": "true" },
+    h("div", { class: "settings-menu-group" }, title),
+    ...Array.from({ length: 5 }, (_, index) =>
+      h("div", { class: "skeleton", style: { height: "36px", width: `${72 - index * 6}%`, margin: "2px 12px" } })
+    )
+  );
+}
+
 async function renderSettingsGroup(view, groupId, sub) {
+  // 先把页头和分类菜单骨架放进 DOM；配置接口慢时也能立即确认已切页。
+  const groupTitle = groupId === "bot" ? "机器人" : "设置";
+  const groupSub = groupId === "bot"
+    ? "人设、聊天、表达、记忆、情绪、语音与表情"
+    : "模型、搜索、主动触达、适配器与运行环境";
+  setHeader(groupTitle, groupSub, []);
+  const menuHost = settingsMenuSkeleton(groupTitle);
+  const content = h(
+    "div",
+    { class: "settings-content" },
+    h("div", { class: "card" }, h("div", { class: "card-body" }, skeleton(3)))
+  );
+  view.replaceChildren(h("div", { class: "settings-layout" }, menuHost, content));
+
   const data = await api.get("/api/config");
   const layout = data.layout || { groups: [] };
   const { group, page } = findPage(layout, groupId, sub);
   if (!group || !page) {
-    view.replaceChildren(emptyState("warning", "没有这个分类", "刷新页面后再试"));
+    menuHost.replaceChildren();
+    content.replaceChildren(emptyState("warning", "没有这个分类", "刷新页面后再试"));
     return;
   }
   setHeader(`${group.title} · ${page.title}`, page.sub || group.sub, []);
-
   const menu = settingsMenu(layout, group, page);
-  const content = h("div", { class: "settings-content" });
+  menuHost.replaceChildren(...menu.childNodes);
+  menuHost.setAttribute("aria-label", `${group.title}分类`);
+  menuHost.removeAttribute("aria-busy");
 
   // 人设页是 SOUL 编辑器，不走结构化表单；保存、备份与热重载保持原样
   if (page.id === "persona" && group.id === "bot") {
     content.replaceChildren(...(await personaNodes()));
-    view.replaceChildren(h("div", { class: "settings-layout" }, menu, content));
     return;
   }
 
@@ -4023,7 +4049,6 @@ async function renderSettingsGroup(view, groupId, sub) {
   content.replaceChildren(
     ...[saveBar, noticeBox, errorBox, pendingCard, stack].filter((node) => node && (node !== saveBar || hasContent))
   );
-  view.replaceChildren(h("div", { class: "settings-layout" }, menu, content));
 }
 
 async function renderBot(view, sub) {
