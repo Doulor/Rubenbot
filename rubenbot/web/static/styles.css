@@ -219,9 +219,9 @@ button {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  padding: 20px 14px 16px;
+  padding: 16px 12px 14px;
   background: var(--sidebar);
-  border-right: 0;
+  border-right: 1px solid var(--hairline);
   overflow-y: auto;
 }
 
@@ -420,12 +420,12 @@ button {
 
 .main {
   min-width: 0;
-  padding: 30px clamp(22px, 3.6vw, 48px) 56px;
+  padding: 24px clamp(16px, 3.2vw, 40px) 48px;
 }
 
 .page-head {
   max-width: var(--content-max);
-  margin: 0 auto 22px;
+  margin: 0 auto 20px;
   display: flex;
   align-items: flex-end;
   justify-content: space-between;
@@ -458,7 +458,7 @@ button {
   margin: 0 auto;
   display: flex;
   flex-direction: column;
-  gap: 18px;
+  gap: 16px;
 }
 
 /* 仅实际换页完成时淡入；常驻容器不随轮询重新入场。 */
