@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Sequence
 
 from .adapters.base import MessageEvent
-from .config import DecisionConfig, GroupDecisionConfig
+from .config import DecisionConfig, GroupDecisionConfig, ProactiveConfig
 
 logger = logging.getLogger(__name__)
 
@@ -427,6 +427,41 @@ class DecisionEngine:
         return parse_quiet_hours(settings.quiet_hours)
 
     # ---- 评分 ----
+
+    def evaluate_opener(
+        self,
+        config: ProactiveConfig,
+        *,
+        relevance: float = 0.0,
+    ) -> ReplyDecision:
+        """「主动开口」场景的意愿评分：复用同一套评分结构与阈值扰动。
+
+        与普通群消息不同，主动开口时机的动量、发言占比、冷却都没有意义
+        （它是一个冷启动的独立场景），所以只保留「基础分 + 话题相关性」，
+        基础分给得很低，阈值附近的随机扰动保持同样的手感。
+        """
+        relevance_bonus = config.relevance_bonus * min(
+            1.0, max(0.0, relevance) / max(1e-6, config.relevance_scale)
+        )
+        factors = DecisionFactors(
+            base=config.base,
+            relevance=relevance_bonus,
+            threshold=config.threshold,
+        )
+        score = factors.base + factors.relevance
+        if config.threshold_noise > 0 and abs(score - config.threshold) <= config.threshold_noise_band:
+            factors.noise = self.rng.uniform(-config.threshold_noise, config.threshold_noise)
+            score += factors.noise
+        factors.score = score
+        should = score >= config.threshold
+        return ReplyDecision(
+            should,
+            "proactive_ok" if should else "proactive_below",
+            score,
+            config.threshold,
+            None,
+            factors,
+        )
 
     def evaluate(
         self,

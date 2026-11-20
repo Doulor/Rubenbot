@@ -51,12 +51,14 @@ def tool_call(call_id="c1", name="recall", arguments=None):
     }
 
 
-def make_bot(store, llm, *, recall_enabled=True) -> tuple[RubenBot, RecordingAdapter]:
+def make_bot(store, llm, *, recall_enabled=True, reminder_enabled=False) -> tuple[RubenBot, RecordingAdapter]:
     config = Config()
     config.chat.split_delay_seconds = 0
     config.decision.merge_window_seconds = 0
     config.decision.hard_merge_window_seconds = 0
     config.memory.recall_tool_enabled = recall_enabled
+    # 提醒工具默认开着；这组用例只测 recall，关掉它保证「没有工具」的退化路径
+    config.reminder.enabled = reminder_enabled
     bot = RubenBot(config, store, llm, Persona("Ruben", "你是 Ruben"))
     adapter = RecordingAdapter()
     bot.register_adapter(adapter)

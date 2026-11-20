@@ -680,6 +680,34 @@ def create_app(state: WebState):
         return {"ok": True}
 
     # ------------------------------------------------------------------
+    # 提醒（只读列表：一期不做取消工具，这里只给用户看一眼）
+    # ------------------------------------------------------------------
+
+    @app.get("/api/reminders")
+    async def list_reminders(request: Request, limit: int = 100):
+        require_session(request)
+        limit = max(1, min(int(limit), 500))
+        jobs = state.store.list_scheduled_jobs(status="pending", kind="reminder", limit=limit)
+        return {
+            "ok": True,
+            "items": [
+                {
+                    "id": job.id,
+                    "kind": job.kind,
+                    "platform": job.platform,
+                    "chat_id": job.chat_id,
+                    "chat_type": job.chat_type,
+                    "fire_at": job.fire_at,
+                    "text": str(job.payload.get("text") or ""),
+                    "requester_name": str(job.payload.get("requester_name") or ""),
+                    "created_by": job.created_by,
+                    "created_at": job.created_at,
+                }
+                for job in jobs
+            ],
+        }
+
+    # ------------------------------------------------------------------
     # 人物
     # ------------------------------------------------------------------
 

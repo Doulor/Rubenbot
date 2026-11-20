@@ -195,6 +195,23 @@ CREATE TABLE IF NOT EXISTS conversation_summaries (
     covered_until_msg_id INTEGER NOT NULL DEFAULT 0,
     updated_at           REAL NOT NULL
 );
+
+-- 定时任务：一期只支持一次性时间点（提醒）；进程重启后 pending 任务继续生效
+CREATE TABLE IF NOT EXISTS scheduled_jobs (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind       TEXT NOT NULL DEFAULT 'reminder',  -- reminder / 未来的其他类型，别混用
+    platform   TEXT NOT NULL DEFAULT '',
+    chat_id    TEXT NOT NULL DEFAULT '',
+    chat_type  TEXT NOT NULL DEFAULT 'group',
+    fire_at    REAL NOT NULL,                     -- 到点时间（epoch 秒）
+    payload    TEXT NOT NULL DEFAULT '{}',        -- JSON，提醒内容等
+    status     TEXT NOT NULL DEFAULT 'pending',   -- pending / done / cancelled
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    fired_at   REAL
+);
+CREATE INDEX IF NOT EXISTS idx_scheduled_due ON scheduled_jobs(status, fire_at);
+CREATE INDEX IF NOT EXISTS idx_scheduled_chat ON scheduled_jobs(platform, chat_id, status);
 """
 
 
@@ -355,6 +372,31 @@ class ConversationSummary:
     summary: str = ""
     covered_until_msg_id: int = 0
     updated_at: float = 0.0
+
+
+@dataclass
+class ScheduledJob:
+    """一条定时任务（一期只有提醒）。
+
+    ``payload`` 是 JSON 字符串：提醒的正文、创建会话等随任务走的附加信息。
+    状态：``pending`` 等待执行，``done`` 已执行（含迟到标记），
+    ``cancelled`` 被取消（一期没有取消工具，留列给以后）。
+    """
+
+    id: int | None = None
+    kind: str = "reminder"
+    platform: str = ""
+    chat_id: str = ""
+    chat_type: str = "group"
+    fire_at: float = 0.0
+    payload: dict = field(default_factory=dict)
+    status: str = "pending"
+    created_by: str = ""
+    created_at: float = field(default_factory=time.time)
+    fired_at: float | None = None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
 
 
 @dataclass
@@ -1699,6 +1741,153 @@ class MemoryStore:
                 self._conn.rollback()
                 raise
         return counts
+
+    # ------------------------------------------------------------------
+    # scheduled_jobs（定时任务；一期只有提醒）
+    # ------------------------------------------------------------------
+
+    def add_scheduled_job(
+        self,
+        *,
+        kind: str,
+        fire_at: float,
+        platform: str,
+        chat_id: str,
+        chat_type: str = "group",
+        payload: dict | None = None,
+        created_by: str = "",
+        now: float | None = None,
+    ) -> ScheduledJob:
+        """新增一条待执行的定时任务。"""
+        now = time.time() if now is None else now
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                INSERT INTO scheduled_jobs(kind, platform, chat_id, chat_type, fire_at, payload,
+                                           status, created_by, created_at, fired_at)
+                VALUES(?, ?, ?, ?, ?, ?, 'pending', ?, ?, NULL)
+                """,
+                (
+                    str(kind or "reminder"),
+                    str(platform),
+                    str(chat_id),
+                    str(chat_type or "group"),
+                    float(fire_at),
+                    json.dumps(payload or {}, ensure_ascii=False),
+                    str(created_by or ""),
+                    now,
+                ),
+            )
+            self._conn.commit()
+            job_id = int(cur.lastrowid)
+        return self.get_scheduled_job(job_id)  # type: ignore[return-value]
+
+    def get_scheduled_job(self, job_id: int) -> ScheduledJob | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM scheduled_jobs WHERE id = ?", (int(job_id),)
+            ).fetchone()
+        return self._row_to_job(row) if row else None
+
+    def due_scheduled_jobs(self, now: float, *, limit: int = 50) -> list[ScheduledJob]:
+        """到期且仍待执行的任务，按到期时间先后返回。"""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM scheduled_jobs
+                WHERE status = 'pending' AND fire_at <= ?
+                ORDER BY fire_at ASC, id ASC LIMIT ?
+                """,
+                (float(now), max(1, int(limit))),
+            ).fetchall()
+        return [self._row_to_job(row) for row in rows]
+
+    def list_scheduled_jobs(
+        self,
+        *,
+        status: str | None = "pending",
+        kind: str | None = None,
+        platform: str | None = None,
+        chat_id: str | None = None,
+        limit: int = 100,
+    ) -> list[ScheduledJob]:
+        sql = "SELECT * FROM scheduled_jobs WHERE 1=1"
+        params: list = []
+        if status is not None:
+            sql += " AND status = ?"
+            params.append(status)
+        if kind is not None:
+            sql += " AND kind = ?"
+            params.append(kind)
+        if platform is not None:
+            sql += " AND platform = ?"
+            params.append(platform)
+        if chat_id is not None:
+            sql += " AND chat_id = ?"
+            params.append(str(chat_id))
+        sql += " ORDER BY fire_at ASC, id ASC LIMIT ?"
+        params.append(max(1, int(limit)))
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [self._row_to_job(row) for row in rows]
+
+    def count_pending_jobs(
+        self,
+        *,
+        kind: str | None = None,
+        platform: str | None = None,
+        chat_id: str | None = None,
+    ) -> int:
+        """统计待执行任务数（提醒上限检查用）。"""
+        sql = "SELECT COUNT(*) AS c FROM scheduled_jobs WHERE status = 'pending'"
+        params: list = []
+        if kind is not None:
+            sql += " AND kind = ?"
+            params.append(kind)
+        if platform is not None:
+            sql += " AND platform = ?"
+            params.append(platform)
+        if chat_id is not None:
+            sql += " AND chat_id = ?"
+            params.append(str(chat_id))
+        with self._lock:
+            row = self._conn.execute(sql, params).fetchone()
+        return int(row["c"] or 0)
+
+    def finish_scheduled_job(
+        self, job_id: int, *, status: str = "done", now: float | None = None
+    ) -> bool:
+        """把任务置为 done / cancelled；只有 pending 的会被改动。"""
+        if status not in ("done", "cancelled"):
+            raise ValueError(f"未知任务状态：{status}")
+        now = time.time() if now is None else now
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE scheduled_jobs SET status = ?, fired_at = ? WHERE id = ? AND status = 'pending'",
+                (status, now, int(job_id)),
+            )
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    @staticmethod
+    def _row_to_job(row: sqlite3.Row) -> ScheduledJob:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            payload = {}
+        return ScheduledJob(
+            id=row["id"],
+            kind=row["kind"],
+            platform=row["platform"],
+            chat_id=row["chat_id"],
+            chat_type=row["chat_type"],
+            fire_at=row["fire_at"],
+            payload=payload if isinstance(payload, dict) else {},
+            status=row["status"],
+            created_by=row["created_by"] or "",
+            created_at=row["created_at"],
+            fired_at=row["fired_at"],
+        )
 
     # ------------------------------------------------------------------
     # meta（后台任务的游标等）

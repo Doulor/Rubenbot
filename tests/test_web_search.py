@@ -660,7 +660,7 @@ def test_web_search_tool_registered_when_configured():
     asyncio.run(bot.handle_event(event("今天有什么新闻")))
     assert adapter.texts == ["看新闻说今天有暴雨"]
     names = {tool["function"]["name"] for tool in llm.tools_seen[0]}
-    assert names == {"recall", "web_search"}
+    assert names == {"recall", "web_search", "set_reminder"}
     tool_message = next(m for m in llm.last_messages if m.get("role") == "tool")
     assert RESULT_HEADER in tool_message["content"]
     assert "Python 3.13 发布" in tool_message["content"]
@@ -673,9 +673,9 @@ def test_web_search_not_registered_without_key():
     bot, adapter = make_bot(llm)
     assert bot.searcher is None
     asyncio.run(bot.handle_event(event("在吗")))
-    # 没有配置搜索时，模型只看到 recall；系统提示也不提联网搜索
+    # 没有配置搜索时，模型看不到 web_search；系统提示也不提联网搜索
     names = {tool["function"]["name"] for tool in llm.tools_seen[0]}
-    assert names == {"recall"}
+    assert names == {"recall", "set_reminder"}
     system = llm.last_messages[0]["content"]
     assert "可以联网搜索" not in system
     assert adapter.texts == ["在的"]
@@ -687,19 +687,19 @@ def test_web_search_not_registered_when_chain_has_no_keys():
     config = Config()
     assert config.search.configured is False
     assert bot.searcher is None
-    assert [tool["function"]["name"] for tool in bot.tool_definitions()] == ["recall"]
+    assert [tool["function"]["name"] for tool in bot.tool_definitions()] == ["recall", "set_reminder"]
 
 
 def test_search_tool_works_when_recall_disabled():
-    """recall 关掉但配了搜索：工具循环照常跑，只给 web_search。"""
+    """recall 关掉但配了搜索：工具循环照常跑，web_search 照常注册。"""
     llm = ToolLLM([{"content": "好"}])
     bot, _ = make_bot(
         llm, search=SearchConfig(deepseek=SearchChannelConfig(api_key="k-test"))
     )
     bot.config.memory.recall_tool_enabled = False
-    assert [tool["function"]["name"] for tool in bot.tool_definitions()] == ["web_search"]
+    assert [tool["function"]["name"] for tool in bot.tool_definitions()] == ["set_reminder", "web_search"]
     asyncio.run(bot.handle_event(event("在吗")))
-    assert {tool["function"]["name"] for tool in llm.tools_seen[0]} == {"web_search"}
+    assert {tool["function"]["name"] for tool in llm.tools_seen[0]} == {"web_search", "set_reminder"}
 
 
 def test_system_prompt_has_search_guide_when_configured():

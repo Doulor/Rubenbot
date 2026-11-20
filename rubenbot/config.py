@@ -233,6 +233,50 @@ class ChatConfig:
 
 
 @dataclass
+class ReminderConfig:
+    """提醒工具（``set_reminder``）参数。
+
+    提醒只回应用户明确请求：模型在对话里自己决定调工具，核心不开任何
+    自动提醒。每会话待执行提醒有上限，防止模型被反复要求时无限堆积。
+    """
+
+    enabled: bool = True
+    # 每个会话（platform:chat_id）最多同时挂多少个待执行提醒
+    max_pending_per_chat: int = 5
+    # 单条提醒最多延迟多久（分钟）；超过的请求直接拒绝，避免误设远期任务
+    max_delay_minutes: int = 60 * 24 * 30
+    # 提醒正文的截断长度
+    max_text_chars: int = 200
+
+
+@dataclass
+class ProactiveConfig:
+    """冷场开口（主动触达）参数。默认关闭，宁可漏、不可扰。
+
+    ``base`` / ``threshold`` 是「主动开口」场景的意愿评分参数：基础分给得
+    很低、阈值附近有随机扰动，所以大多数时候评估不通过就不开口。``relevance``
+    加分来自群聊最近消息与记忆的检索命中（有话题积累才更容易开口）。
+    """
+
+    enabled: bool = False
+    # 群里安静多久才考虑开口（小时）
+    idle_hours: float = 6.0
+    # 安静时段，默认深夜到早上不开口；格式同 decision.groups 的 quiet_hours
+    quiet_hours: list[str] = field(default_factory=lambda: ["23:00-08:00"])
+    # 每群每日最多主动开口几次
+    daily_limit: int = 1
+    # 一次评估不开口后，隔多久再评估（分钟），避免每 10 秒都花一次生成
+    cooldown_minutes: float = 60.0
+    # 意愿评分（主动开口场景）
+    base: float = 0.08
+    threshold: float = 0.15
+    threshold_noise: float = 0.10
+    threshold_noise_band: float = 0.12
+    relevance_bonus: float = 0.10
+    relevance_scale: float = 8.0
+
+
+@dataclass
 class GroupDecisionConfig:
     """单个群的决策覆盖项；未写的字段沿用全局默认。"""
 
@@ -527,6 +571,8 @@ class Config:
     generation: GenerationConfig = field(default_factory=GenerationConfig)
     plugins: PluginsConfig = field(default_factory=PluginsConfig)
     webui: WebUIConfig = field(default_factory=WebUIConfig)
+    reminder: ReminderConfig = field(default_factory=ReminderConfig)
+    proactive: ProactiveConfig = field(default_factory=ProactiveConfig)
     persona_path: str = "data/SOUL.md"
     database_path: str = "data/rubenbot.db"
     adapters: dict[str, Any] = field(default_factory=dict)
@@ -603,6 +649,8 @@ class Config:
         generation = _load_generation(data.get("generation") or {})
         plugins = PluginsConfig(**{k: v for k, v in (data.get("plugins") or {}).items() if _has(PluginsConfig, k)})
         webui = WebUIConfig(**{k: v for k, v in (data.get("webui") or {}).items() if _has(WebUIConfig, k)})
+        reminder = _load_reminder(data.get("reminder") or {})
+        proactive = _load_proactive(data.get("proactive") or {})
         persona = data.get("persona") or {}
         if isinstance(persona, str):
             persona = {"path": persona}
@@ -622,8 +670,52 @@ class Config:
             generation=generation,
             plugins=plugins,
             webui=webui,
+            reminder=reminder,
+            proactive=proactive,
             **basics,
         )
+
+
+def _load_reminder(data: dict[str, Any]) -> ReminderConfig:
+    """解析 reminder 段：宽松取值，写错类型回落默认，不让配置问题挡住启动。"""
+    if not isinstance(data, dict):
+        return ReminderConfig()
+    default = ReminderConfig()
+    return ReminderConfig(
+        enabled=data.get("enabled") is not False,
+        max_pending_per_chat=_as_int(
+            data.get("max_pending_per_chat"), default.max_pending_per_chat, minimum=0
+        ),
+        max_delay_minutes=_as_int(
+            data.get("max_delay_minutes"), default.max_delay_minutes, minimum=1
+        ),
+        max_text_chars=_as_int(data.get("max_text_chars"), default.max_text_chars, minimum=20),
+    )
+
+
+def _load_proactive(data: dict[str, Any]) -> ProactiveConfig:
+    """解析 proactive 段：宽松取值，写错类型回落默认，不让配置问题挡住启动。"""
+    if not isinstance(data, dict):
+        return ProactiveConfig()
+    default = ProactiveConfig()
+    quiet = data.get("quiet_hours", default.quiet_hours)
+    if isinstance(quiet, str):
+        quiet = [quiet]
+    if not isinstance(quiet, (list, tuple)):
+        quiet = default.quiet_hours
+    return ProactiveConfig(
+        enabled=data.get("enabled") is True,
+        idle_hours=max(0.1, _as_float(data.get("idle_hours"), default.idle_hours)),
+        quiet_hours=[str(item) for item in quiet],
+        daily_limit=_as_int(data.get("daily_limit"), default.daily_limit, minimum=0),
+        cooldown_minutes=max(0.0, _as_float(data.get("cooldown_minutes"), default.cooldown_minutes)),
+        base=_as_float(data.get("base"), default.base),
+        threshold=_as_float(data.get("threshold"), default.threshold),
+        threshold_noise=_as_float(data.get("threshold_noise"), default.threshold_noise),
+        threshold_noise_band=_as_float(data.get("threshold_noise_band"), default.threshold_noise_band),
+        relevance_bonus=_as_float(data.get("relevance_bonus"), default.relevance_bonus),
+        relevance_scale=max(0.1, _as_float(data.get("relevance_scale"), default.relevance_scale)),
+    )
 
 
 def _load_memory(data: dict[str, Any]) -> MemoryConfig:

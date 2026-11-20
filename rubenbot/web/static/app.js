@@ -938,6 +938,42 @@ const memoryState = {
   limit: 50,
 };
 
+/** 只读的待执行提醒：没有取消入口（一期不做取消工具），只在记忆页顺带展示。 */
+function remindersCard() {
+  const body = h("div", { class: "rows" }, skeleton(2));
+  const wrap = card("待执行提醒", {
+    hint: "只读；到点后 bot 会在原会话说一句",
+    flush: true,
+    body,
+  });
+  api
+    .get("/api/reminders?limit=50")
+    .then((result) => {
+      if (!result.items.length) {
+        body.replaceChildren(emptyState("pulse", "没有待执行的提醒", "用户明确要求「提醒我」时，模型会创建提醒"));
+        return;
+      }
+      body.replaceChildren(
+        ...result.items.map((item) =>
+          h(
+            "div",
+            { class: "row" },
+            h("div", { class: "row-main" },
+              h("div", { class: "row-title" }, item.text),
+              h("div", { class: "row-sub" },
+                `${platformName(item.platform)} · ${item.chat_type === "private" ? "私聊" : `群 ${item.chat_id}`}` +
+                `${item.requester_name ? ` · ${item.requester_name}` : ""} · 由 ${item.created_by || "未知"} 设定`)),
+            h("div", { class: "row-side" }, h("span", { class: "tag accent" }, fmtDateTime(item.fire_at)))
+          )
+        )
+      );
+    })
+    .catch(() => {
+      body.replaceChildren(emptyState("warning", "提醒列表加载失败", "稍后刷新页面试试"));
+    });
+  return wrap;
+}
+
 async function renderMemory(view) {
   const data = await api.get("/api/people?limit=500");
   memoryState.people = data.items;
@@ -990,7 +1026,7 @@ async function renderMemory(view) {
   );
 
   const content = h("div", { id: "memory-content" });
-  view.replaceChildren(h("section", { class: "card" }, toolbar, content));
+  view.replaceChildren(h("section", { class: "card" }, toolbar, content), remindersCard());
 
   function tabButton(value, label) {
     return h(
@@ -2412,6 +2448,8 @@ function groupName(key) {
     memory: "记忆",
     chat: "聊天与回复",
     decision: "回复意愿",
+    reminder: "提醒",
+    proactive: "冷场开口",
     plugins: "插件",
     webui: "WebUI",
     persona: "人格",
@@ -2717,6 +2755,37 @@ async function renderSettings(view) {
     card("每群覆盖", {
       hint: "单独调节某个群",
       body: groupsEditor(draft, secrets),
+    }),
+    card("提醒", {
+      hint: "模型被明确要求「提醒我」时创建，不自动提醒",
+      body: fieldGrid(
+        [
+          { path: "reminder.enabled", label: "启用提醒工具", kind: "switch", hint: "关闭后模型无法设置提醒，已设的提醒照常触发" },
+          { path: "reminder.max_pending_per_chat", label: "每会话提醒上限", kind: "number", step: "1", min: 0, max: 50, hint: "同一会话最多同时挂多少条待执行提醒" },
+          { path: "reminder.max_delay_minutes", label: "最远提前（分钟）", kind: "number", step: "60", min: 1, hint: "超过这个跨度的提醒请求会被拒绝" },
+          { path: "reminder.max_text_chars", label: "提醒正文上限（字）", kind: "number", step: "10", min: 20, max: 2000, hint: "超出部分会被截断" },
+        ],
+        draft
+      ),
+    }),
+    card("冷场开口", {
+      hint: "默认关闭：群里长时间没人才可能主动说一句，宁可漏不可扰",
+      body: fieldGrid(
+        [
+          { path: "proactive.enabled", label: "启用冷场开口", kind: "switch", hint: "只在群聊里生效，私聊不主动开口" },
+          { path: "proactive.idle_hours", label: "安静多久才考虑（小时）", kind: "number", step: "0.5", min: 0.1, hint: "距上一条消息超过这个时长" },
+          { path: "proactive.daily_limit", label: "每群每日上限", kind: "number", step: "1", min: 0, max: 100, hint: "每个群每天最多主动开口几次" },
+          { path: "proactive.cooldown_minutes", label: "评估冷却（分钟）", kind: "number", step: "5", min: 0, hint: "没开口时，隔多久再评估一次" },
+          { path: "proactive.quiet_hours", label: "不开口时段", kind: "list", wide: true, placeholder: "例如 23:00-08:00", hint: "格式 HH:MM-HH:MM，可写多个；这段时间内不主动开口" },
+          { path: "proactive.base", label: "基础意愿", kind: "number", step: "0.01", min: 0, max: 1, hint: "主动开口场景的基础分，给得低大多数时候不开口" },
+          { path: "proactive.threshold", label: "开口阈值", kind: "number", step: "0.01", min: 0, max: 1, hint: "分数达到多少才开口" },
+          { path: "proactive.threshold_noise", label: "阈值随机扰动", kind: "number", step: "0.01", min: 0, max: 1, hint: "阈值附近的随机波动幅度" },
+          { path: "proactive.threshold_noise_band", label: "扰动生效范围", kind: "number", step: "0.01", min: 0, max: 1, hint: "离阈值多近才摇骰子" },
+          { path: "proactive.relevance_bonus", label: "相关性加成", kind: "number", step: "0.01", min: 0, max: 10, hint: "群里近期话题命中记忆时最多加多少分" },
+          { path: "proactive.relevance_scale", label: "相关性归一尺度", kind: "number", step: "0.5", min: 0.1, hint: "检索分数除以它后封顶" },
+        ],
+        draft
+      ),
     }),
     card("插件", {
       hint: "默认全关，逐个启用",

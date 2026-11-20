@@ -252,6 +252,85 @@ def test_quiet_hours_validation():
         validate_structured({"decision": {"groups": {"g1": {"quiet_hours": ["25:00-30:00"]}}}})
 
 
+# ----------------------------------------------------------------------
+# 提醒与冷场开口
+# ----------------------------------------------------------------------
+
+
+def test_structured_config_lists_reminder_and_proactive(config):
+    view = structured_config(config)
+    assert view["reminder"]["enabled"] is True
+    assert view["reminder"]["max_pending_per_chat"] == 5
+    assert view["proactive"]["enabled"] is False
+    assert view["proactive"]["idle_hours"] == 6.0
+    assert view["proactive"]["quiet_hours"] == ["23:00-08:00"]
+    assert view["proactive"]["daily_limit"] == 1
+
+
+def test_validate_reminder_and_proactive():
+    update = validate_structured(
+        {
+            "reminder": {"enabled": False, "max_pending_per_chat": "3", "max_delay_minutes": 60},
+            "proactive": {
+                "enabled": True,
+                "idle_hours": "4.5",
+                "daily_limit": "2",
+                "quiet_hours": ["22:30-07:00"],
+                "base": "0.05",
+                "threshold": "0.2",
+            },
+        }
+    )
+    assert update["reminder"] == {
+        "enabled": False,
+        "max_pending_per_chat": 3,
+        "max_delay_minutes": 60,
+    }
+    assert update["proactive"]["enabled"] is True
+    assert update["proactive"]["idle_hours"] == 4.5
+    assert update["proactive"]["daily_limit"] == 2
+    assert update["proactive"]["quiet_hours"] == ["22:30-07:00"]
+    assert update["proactive"]["base"] == 0.05
+
+
+@pytest.mark.parametrize(
+    "payload,field",
+    [
+        ({"reminder": {"max_pending_per_chat": -1}}, "reminder.max_pending_per_chat"),
+        ({"reminder": {"max_text_chars": 5}}, "reminder.max_text_chars"),
+        ({"proactive": {"idle_hours": 0}}, "proactive.idle_hours"),
+        ({"proactive": {"daily_limit": 101}}, "proactive.daily_limit"),
+        ({"proactive": {"threshold": 1.5}}, "proactive.threshold"),
+        ({"proactive": {"quiet_hours": ["25:00-26:00"]}}, "proactive.quiet_hours"),
+    ],
+)
+def test_validate_reminder_and_proactive_rejects_bad(payload, field):
+    with pytest.raises(ConfigValidationError) as info:
+        validate_structured(payload)
+    assert any(item["field"] == field for item in info.value.fields)
+
+
+def test_proactive_config_written_and_hot_applied(client, config_path, state):
+    saved = client.put(
+        "/api/config",
+        json={
+            "config": {
+                "proactive": {"enabled": True, "idle_hours": 3, "quiet_hours": ["00:00-07:00"]},
+                "reminder": {"max_pending_per_chat": 2},
+            }
+        },
+    )
+    assert saved.status_code == 200, saved.text
+    body = saved.json()
+    assert "proactive" in body["applied"] and "reminder" in body["applied"]
+    raw = read_yaml(config_path)
+    assert raw["proactive"]["enabled"] is True
+    assert raw["proactive"]["quiet_hours"] == ["00:00-07:00"]
+    assert raw["reminder"]["max_pending_per_chat"] == 2
+    assert state.config.proactive.enabled is True
+    assert state.config.reminder.max_pending_per_chat == 2
+
+
 def test_merge_config_keeps_unknown_keys():
     merged = merge_config(
         {"chat": {"bot_name": "Ruben", "extra": 1}, "custom": {"a": 2}},

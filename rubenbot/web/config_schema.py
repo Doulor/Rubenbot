@@ -99,6 +99,11 @@ def structured_config(config: Config) -> dict[str, Any]:
         "chat": asdict(config.chat),
         "decision": decision,
         "generation": asdict(config.generation),
+        "reminder": asdict(config.reminder),
+        "proactive": {
+            **asdict(config.proactive),
+            "quiet_hours": list(config.proactive.quiet_hours),
+        },
         "plugins": {
             "dir": config.plugins.dir,
             "enabled": list(config.plugins.enabled),
@@ -553,6 +558,70 @@ def _validate_groups(value: Any, v: _Validator) -> dict[str, Any] | None:
     return result
 
 
+def _validate_reminder(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    if "enabled" in section:
+        flag = v.boolean(section["enabled"], "reminder.enabled")
+        if flag is not None:
+            out["enabled"] = flag
+    for key, minimum, maximum in (
+        ("max_pending_per_chat", 0, 50),
+        ("max_delay_minutes", 1, 60 * 24 * 365),
+        ("max_text_chars", 20, 2000),
+    ):
+        if key in section:
+            number = v.number(
+                section[key], f"reminder.{key}", minimum=minimum, maximum=maximum, integer=True
+            )
+            if number is not None:
+                out[key] = int(number)
+    return out
+
+
+def _validate_proactive(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
+    """冷场开口：开关 + 静默时段 + 三条门槛 + 一套低意愿评分参数。"""
+    out: dict[str, Any] = {}
+    if "enabled" in section:
+        flag = v.boolean(section["enabled"], "proactive.enabled")
+        if flag is not None:
+            out["enabled"] = flag
+    if "quiet_hours" in section:
+        quiet = v.string_list(section["quiet_hours"], "proactive.quiet_hours")
+        if quiet is not None:
+            parsed = parse_quiet_hours(quiet)
+            if len(parsed) != len(quiet):
+                v.fail("proactive.quiet_hours", "格式应为 HH:MM-HH:MM，例如 23:00-08:00")
+            else:
+                out["quiet_hours"] = quiet
+    for key, minimum in (
+        ("idle_hours", 0.1),
+        ("cooldown_minutes", 0),
+    ):
+        if key in section:
+            number = v.number(section[key], f"proactive.{key}", minimum=minimum)
+            if number is not None:
+                out[key] = float(number)
+    if "daily_limit" in section:
+        number = v.number(
+            section["daily_limit"], "proactive.daily_limit", minimum=0, maximum=100, integer=True
+        )
+        if number is not None:
+            out["daily_limit"] = int(number)
+    for key, minimum, maximum in (
+        ("base", 0, 1),
+        ("threshold", 0, 1),
+        ("threshold_noise", 0, 1),
+        ("threshold_noise_band", 0, 1),
+        ("relevance_bonus", 0, 10),
+        ("relevance_scale", 0.1, None),
+    ):
+        if key in section:
+            number = v.number(section[key], f"proactive.{key}", minimum=minimum, maximum=maximum)
+            if number is not None:
+                out[key] = float(number)
+    return out
+
+
 def _validate_plugins(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
     out: dict[str, Any] = {}
     if "dir" in section:
@@ -674,6 +743,12 @@ def validate_structured(payload: dict[str, Any]) -> dict[str, Any]:
     generation = _section(payload, "generation", v)
     if generation is not None:
         update["generation"] = _validate_generation(generation, v)
+    reminder = _section(payload, "reminder", v)
+    if reminder is not None:
+        update["reminder"] = _validate_reminder(reminder, v)
+    proactive = _section(payload, "proactive", v)
+    if proactive is not None:
+        update["proactive"] = _validate_proactive(proactive, v)
     plugins = _section(payload, "plugins", v)
     if plugins is not None:
         update["plugins"] = _validate_plugins(plugins, v)
