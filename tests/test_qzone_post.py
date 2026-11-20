@@ -26,6 +26,11 @@ def write_plugin(tmp_path: Path, config_yaml: str = "") -> Path:
     plugin_dir.mkdir(parents=True)
     src = PLUGIN_DIR / "qzone_post" / "plugin.py"
     (plugin_dir / "plugin.py").write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+    # loader 要求 manifest.json；直接带上真实插件的那一份
+    (plugin_dir / "manifest.json").write_text(
+        (PLUGIN_DIR / "qzone_post" / "manifest.json").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
     if config_yaml:
         (plugin_dir / "config.yaml").write_text(config_yaml, encoding="utf-8")
     return root

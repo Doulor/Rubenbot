@@ -13,7 +13,7 @@ from rubenbot.memory.store import MemoryStore, ProfileLine
 from rubenbot.persona import Persona
 from rubenbot.plugins.loader import PluginManager
 
-from conftest import RecordingAdapter, ScriptedLLM
+from conftest import RecordingAdapter, ScriptedLLM, write_manifest
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent / "plugins"
 NOW = 1_795_000_000.0
@@ -37,6 +37,9 @@ def make_bot(tmp_path: Path):
     plugin_dir.mkdir(parents=True)
     (plugin_dir / "plugin.py").write_text(
         (PLUGIN_DIR / "privacy" / "plugin.py").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (plugin_dir / "manifest.json").write_text(
+        (PLUGIN_DIR / "privacy" / "manifest.json").read_text(encoding="utf-8"), encoding="utf-8"
     )
     store = MemoryStore(":memory:")
     config = Config()
