@@ -176,6 +176,7 @@ bot 对每个人的好感度、以及自己当下的心情，都由确定性规�
 | `plugins/privacy/` | 内置插件：`/隐私` 命令（档位 / 自查 / 清空）与灰区询问投递（默认关闭，需显式启用） |
 | `plugins/qzone_post/` | 说说发布插件（命令 / 定时 / 概率触发）；自动互动开关默认关闭（默认不启用，需显式开启） |
 | `plugins/emoji_react/` | 贴表情反应插件：跟随回复 / 关键词触发（默认关闭，需显式启用） |
+| `plugins/image_gen/` | 画图插件：「画一张 / 画个 <描述>」调用硅基流动生图，带冷却、每日上限与本地黑名单（默认关闭，需配 key） |
 | `plugins/music/` | 点歌插件：「点歌 / 我想听 <歌名>」搜网易云，音乐段发送，失败降级文字 + 封面（默认关闭，无需 key） |
 | `data/SOUL.md` | 默认人格示例 |
 
@@ -378,7 +379,7 @@ plugins:
 | `llm` | 调用核心的大模型接口（会产生费用） | |
 | `network` | 向外部网络发起请求 | |
 
-带高风险权限的插件，安装确认框里会额外标红提示。框架自带的 5 个官方插件（hello / privacy / emoji_react / qzone_post / music）都已声明真实 manifest，可作参考。
+带高风险权限的插件，安装确认框里会额外标红提示。框架自带的 6 个官方插件（hello / privacy / emoji_react / qzone_post / music / image_gen）都已声明真实 manifest，可作参考。
 
 在插件目录下新建 `plugins/<name>/plugin.py`，暴露 `register(ctx)`：
 
@@ -415,11 +416,12 @@ WebUI 的「插件市场」页就是原来的插件页：已安装与可安装�
 
 索引仓库 `Doulor/Rubenbot-plugins` 需要你自己搭（根目录 `plugins.json` + 每个插件一个目录）；代码只依赖「可配置 URL + 拉不到就回退内置」。
 
-### 点歌插件（music）
+### 点歌与画图插件
 
-默认不启用（进 `plugins.enabled` 才生效），配置在插件目录的 `config.example.yaml` 里说明。
+两个插件都默认不启用（进 `plugins.enabled` 才生效），配置在各自主目录的 `config.example.yaml` 里说明。
 
 - **`music`（点歌）**：群里/私聊发「点歌 <歌名>」或「我想听 <歌名>」。搜网易云公开搜索接口（免 key，带浏览器 UA 与 Referer），取第一首用 OneBot `music` 段（`type: netease` + 歌曲 id）发送；协议端不支持音乐段（或非 SnowLuma 平台）时降级成「歌名 — 歌手 + 链接」文字，有封面再附一张封面图。单人冷却默认 60 秒；搜不到就明说没找到，接口挂了回「搜不到，换个关键词试试」并记日志，绝不随便塞一首不相关的。
+- **`image_gen`（画图）**：群里/私聊发「画一张 <描述>」「画个 <描述>」。描述直接用原话，不改写提示词；调硅基流动 `POST /v1/images/generations`（默认 `Kwai-Kolors/Kolors`），取 `images[0].url` 后**下载图片字节**再以图片段发送，并在插件 `data/` 目录留一份（不把临时 URL 当图床）。**没配 `api_key` 时插件照常加载但不注册触发**，启动日志会说明。内容边界靠服务商审核 + 本地关键词黑名单（`blacklist` 可改，命中直接拒绝）；provider 审核失败时如实回「这个画不了」。单人冷却默认 120 秒、每会话每日上限默认 20 张，超限会回剩余等待 / 明日再来。
 
 ---
 

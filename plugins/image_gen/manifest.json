@@ -1,0 +1,56 @@
+{
+  "id": "image_gen",
+  "name": "画图",
+  "version": "1.0.0",
+  "description": "「画一张 <描述>」调用硅基流动生图，下载图片后以图片段发送；带冷却、每日上限与本地黑名单",
+  "author": "RubenBot",
+  "min_core_version": "0.1.0",
+  "permissions": ["read_messages", "send_messages", "network"],
+  "config_schema": [
+    {
+      "key": "provider",
+      "type": "string",
+      "default": "siliconflow",
+      "description": "生图服务商（目前只支持 siliconflow）"
+    },
+    {
+      "key": "api_key",
+      "type": "string",
+      "default": "${RUBENBOT_IMAGE_KEY}",
+      "description": "服务商密钥，支持 ${ENV_VAR} 占位；留空则不注册触发"
+    },
+    {
+      "key": "model",
+      "type": "string",
+      "default": "Kwai-Kolors/Kolors",
+      "description": "生图模型名"
+    },
+    {
+      "key": "triggers",
+      "type": "list",
+      "default": ["画一张", "画个", "画一幅", "帮我画", "生成图片"],
+      "description": "触发词，消息以其中之一开头即触发"
+    },
+    {
+      "key": "cooldown_seconds",
+      "type": "number",
+      "default": 120,
+      "description": "单人两次画图之间的冷却秒数"
+    },
+    {
+      "key": "daily_limit",
+      "type": "number",
+      "default": 20,
+      "description": "每个会话每天最多生成几张（0 = 不限）"
+    },
+    {
+      "key": "blacklist",
+      "type": "list",
+      "default": ["儿童色情", "幼女", "恋童", "血腥", "分尸", "虐杀"],
+      "description": "本地关键词黑名单，描述命中就拒绝；留空表示只用服务商审核"
+    }
+  ],
+  "hooks": ["on_message", "on_stop"],
+  "category": "工具",
+  "icon": "🎨"
+}
