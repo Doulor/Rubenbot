@@ -39,6 +39,7 @@ from typing import Any
 import httpx
 
 from .base import (
+    SEND_STICKER,
     BaseAdapter,
     CapabilityError,
     CapabilityNotSupported,
@@ -47,6 +48,7 @@ from .base import (
     Segment,
     as_segment,
     render_segments,
+    sticker_native_ref,
 )
 
 logger = logging.getLogger(__name__)
@@ -77,9 +79,9 @@ class TelegramAdapter(BaseAdapter):
 
     name = "telegram"
 
-    # 语音回复：sendVoice；音频需要能够转成文字的另一侧
-    capabilities: frozenset[str] = frozenset({"message.voice"})
-    capability_config_keys = {"message.voice": "voice"}
+    # 语音回复：sendVoice；表情：sendSticker（file_id 直达，没有就上传图片）
+    capabilities: frozenset[str] = frozenset({"message.voice", SEND_STICKER})
+    capability_config_keys = {"message.voice": "voice", SEND_STICKER: "sticker"}
 
     def __init__(
         self,
@@ -352,7 +354,7 @@ class TelegramAdapter(BaseAdapter):
         elif isinstance(caption, str) and caption:
             segments.append(Segment.text(caption))
         if not segments:
-            # 贴纸 / 文件等本轮不支持的形态：跳过，避免空消息进上下文
+            # 文件等本轮不支持的形态：跳过，避免空消息进上下文
             return None
 
         reply_to = message.get("reply_to_message")
@@ -613,7 +615,9 @@ class TelegramAdapter(BaseAdapter):
         return await self._call(method, payload, files=files)
 
     async def call_capability(self, name: str, **kwargs: Any) -> Any:
-        """平台能力：message.voice 直接把音频字节发成语音；其余不支持。"""
+        """平台能力：message.voice 发语音、send_sticker 发表情；其余不支持。"""
+        if name == SEND_STICKER:
+            return await self._send_sticker(kwargs)
         if name != "message.voice":
             raise CapabilityNotSupported(self.name, name)
         data = kwargs.get("audio") or kwargs.get("data") or b""
@@ -637,6 +641,45 @@ class TelegramAdapter(BaseAdapter):
         except Exception as exc:  # noqa: BLE001 - 能力失败收敛成统一异常
             raise CapabilityError(f"message.voice 失败：{exc}") from exc
         return result
+
+    async def _send_sticker(self, kwargs: dict[str, Any]) -> Any:
+        """send_sticker：有 file_id 走原生 sendSticker，没有就上传图片当表情发。
+
+        返回值统一成 ``{"message_id": ..., "file_id": ...}``（能力层据此回填
+        表情库）；``file_id`` 优先取平台返回的，平台没给时用请求里那个。
+        图片上传只接受本地文件 / base64 / URL——都没有就报错，由上层降级。
+        """
+        chat_id = kwargs.get("chat_id")
+        if chat_id in (None, ""):
+            raise CapabilityError("send_sticker 需要 chat_id")
+        sticker = kwargs.get("sticker")
+        native = sticker_native_ref(sticker, self.name)
+        file_id = _native_file_id(native)
+        payload: dict[str, Any] = {"chat_id": _to_id(chat_id)}
+        try:
+            if file_id:
+                payload["sticker"] = file_id
+                result = await self._call("sendSticker", payload)
+                return _sticker_result(result, _result_file_id(result) or file_id)
+            source = _sticker_upload(sticker)
+            if source is None:
+                url = _sticker_url(sticker)
+                if not url:
+                    raise CapabilityError("send_sticker 缺少可用的表情引用或图片文件")
+                # URL 也交给 Bot API 自己拉取；返回的 file_id 同样能回填
+                payload["sticker"] = url
+                result = await self._call("sendSticker", payload)
+                return _sticker_result(result, _result_file_id(result) or "")
+            raw, mime = source
+            filename = "sticker" + (mimetypes.guess_extension(mime or "") or ".webp")
+            result = await self._call(
+                "sendSticker", payload, files={"sticker": (filename, raw, mime or "image/webp")}
+            )
+            return _sticker_result(result, _result_file_id(result) or "")
+        except CapabilityError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 能力失败收敛成统一异常
+            raise CapabilityError(f"send_sticker 失败：{exc}") from exc
 
 
 # ----------------------------------------------------------------------
@@ -745,3 +788,83 @@ def _clip(text: str, limit: int) -> str:
         return text
     logger.warning("Telegram 消息超过 %s 字，已截断（原长 %s）", limit, len(text))
     return text[: limit - 3] + "..."
+
+
+# ----------------------------------------------------------------------
+# 表情（send_sticker）
+# ----------------------------------------------------------------------
+
+
+def _native_file_id(native: Any) -> str:
+    """平台原生引用 -> file_id；接受裸字符串或含 ``file_id`` 的结构。"""
+    if isinstance(native, str):
+        return native.strip()
+    if isinstance(native, Mapping):
+        value = native.get("file_id")
+        if not value and isinstance(native.get("data"), Mapping):
+            value = native["data"].get("file_id")
+        if value:
+            return str(value)
+    return ""
+
+
+def _sticker_payload(sticker: Any) -> Mapping[str, Any]:
+    """表情引用 -> 可直接读的映射（段 / 普通 dict 都行）。"""
+    if isinstance(sticker, Mapping):
+        return sticker
+    data = getattr(sticker, "data", None)
+    return data if isinstance(data, Mapping) else {}
+
+
+def _sticker_upload(sticker: Any) -> tuple[bytes, str] | None:
+    """表情引用的图片本体：本地文件或 base64 → ``(bytes, mime)``；没有返回 None。"""
+    data = _sticker_payload(sticker)
+    raw = data.get("base64")
+    if raw:
+        value = str(raw)
+        mime = str(data.get("mime_type") or "image/webp")
+        if value.startswith("data:"):
+            header, _, encoded = value.partition(",")
+            mime = header[5:].split(";")[0] or mime
+        else:
+            encoded = value
+        try:
+            return base64.b64decode(encoded, validate=False), mime
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"表情 base64 无效：{exc}") from exc
+    path = data.get("file")
+    if path:
+        file = Path(str(path))
+        try:
+            if file.is_file():
+                mime = str(data.get("mime_type") or mimetypes.guess_type(file.name)[0] or "image/webp")
+                return file.read_bytes(), mime
+        except OSError:  # pragma: no cover - 读不到按没有处理
+            return None
+    return None
+
+
+def _sticker_url(sticker: Any) -> str:
+    """表情引用里的 URL（Telegram 会自己下载）；没有返回空串。"""
+    value = _sticker_payload(sticker).get("url")
+    return str(value) if value else ""
+
+
+def _result_file_id(result: Any) -> str:
+    """Bot API 返回的 Message 里取表情的 file_id（可能没有）。"""
+    if not isinstance(result, Mapping):
+        return ""
+    sticker = result.get("sticker")
+    if isinstance(sticker, Mapping) and sticker.get("file_id"):
+        return str(sticker["file_id"])
+    return ""
+
+
+def _sticker_result(result: Any, file_id: str) -> dict[str, Any]:
+    """统一能力返回值：``{"message_id": ..., "file_id": ...}``（缺项就不放）。"""
+    payload: dict[str, Any] = {}
+    if isinstance(result, Mapping) and result.get("message_id") is not None:
+        payload["message_id"] = result["message_id"]
+    if file_id:
+        payload["file_id"] = file_id
+    return payload

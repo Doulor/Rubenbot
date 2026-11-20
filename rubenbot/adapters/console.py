@@ -16,7 +16,9 @@ import sys
 from typing import Any, TextIO
 
 from .base import (
+    SEND_STICKER,
     BaseAdapter,
+    CapabilityError,
     CapabilityNotSupported,
     EventCallback,
     MessageEvent,
@@ -33,6 +35,9 @@ class ConsoleAdapter(BaseAdapter):
     """从 stdin 读消息、往 stdout 写回复。"""
 
     name = "console"
+
+    # 本地调试也把「发表情」演一遍：没有富媒体，就打一行 [表情] 占位
+    capabilities: frozenset[str] = frozenset({SEND_STICKER})
 
     def __init__(
         self,
@@ -160,5 +165,14 @@ class ConsoleAdapter(BaseAdapter):
             self._task = None
 
     async def call_capability(self, name: str, **kwargs: Any) -> Any:
-        """Console 不提供任何平台能力；调用即优雅失败。"""
-        raise CapabilityNotSupported(self.name, name)
+        """Console 只演 send_sticker（文本占位）；其余能力优雅失败。"""
+        if name != SEND_STICKER:
+            raise CapabilityNotSupported(self.name, name)
+        chat_id = kwargs.get("chat_id")
+        if chat_id in (None, ""):
+            raise CapabilityError("send_sticker 需要 chat_id")
+        # 与普通出站一致：占位符走 render，消息进 sent 便于测试/调试
+        segment = Segment.sticker()
+        self.sent.append((str(chat_id), str(kwargs.get("chat_type") or "group"), [segment]))
+        self.write(f"{self.bot_name}: {segment.render()}")
+        return {"sent": True}

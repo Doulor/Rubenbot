@@ -17,10 +17,14 @@ import abc
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Iterable, Mapping
 
+# 平台能力名：发送一张表情（入参见 SPEC「表情包设计」）
+SEND_STICKER = "send_sticker"
+
 # 非文本消息段在纯文本投影里的占位符；text 直接取 data["text"]
 SEGMENT_PLACEHOLDERS: dict[str, str] = {
     "image": "[图片]",
     "face": "[表情]",
+    "sticker": "[表情]",
     "record": "[语音]",
     "video": "[视频]",
     "file": "[文件]",
@@ -82,6 +86,19 @@ class Segment(dict):
     @classmethod
     def face(cls, face_id: str | int) -> "Segment":
         return cls(type="face", data={"id": str(face_id)})
+
+    @classmethod
+    def sticker(cls, file: str = "", **data: Any) -> "Segment":
+        """表情段：``file`` 是图片本体的引用（路径 / URL / base64）。
+
+        平台原生引用（如 Telegram ``file_id``）放进 ``data["native_ref"]``，
+        由适配器自己解释；能力层调用时也按这个结构传表情引用。
+        """
+        payload: dict[str, Any] = {}
+        if file:
+            payload["file"] = str(file)
+        payload.update({key: value for key, value in data.items() if value is not None})
+        return cls(type="sticker", data=payload)
 
     @classmethod
     def reply(cls, message_id: str | int) -> "Segment":
@@ -196,3 +213,35 @@ class BaseAdapter(abc.ABC):
         （语音回复等核心直调场景同样只降级，不影响正常回复）。
         """
         raise CapabilityNotSupported(self.name, name)
+
+
+def sticker_native_ref(sticker: Any, platform: str) -> Any | None:
+    """从表情引用里取某平台的原生引用。
+
+    ``sticker`` 是能力调用时传的表情结构（通常来自表情库的 ``to_dict()``），
+    ``native_refs`` 形如 ``{平台名: 引用}``。插件不碰平台判断，取哪一项由
+    适配器用自己的 ``name`` 决定。
+    """
+    if not isinstance(sticker, Mapping):
+        return None
+    refs = sticker.get("native_refs")
+    if not isinstance(refs, Mapping):
+        return None
+    ref = refs.get(platform)
+    return ref if ref not in (None, "", {}) else None
+
+
+__all__ = [
+    "BaseAdapter",
+    "CapabilityError",
+    "CapabilityNotSupported",
+    "EventCallback",
+    "MessageEvent",
+    "SEND_STICKER",
+    "Segment",
+    "as_segment",
+    "render_segment",
+    "render_segments",
+    "sticker_native_ref",
+    "text_segments",
+]

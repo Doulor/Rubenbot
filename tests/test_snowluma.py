@@ -244,3 +244,160 @@ def test_start_reconnects_after_disconnect(monkeypatch):
     asyncio.run(scenario())
     assert len(attempts) >= 2
     assert adapter.reconnect_count >= 1
+
+
+# ----------------------------------------------------------------------
+# 能力：发表情（send_sticker）
+# ----------------------------------------------------------------------
+
+
+def test_sticker_segment_prefers_native_mface():
+    """有本平台原生 mface 引用时直接用，不读图片文件。"""
+    from rubenbot.adapters.snowluma import sticker_segment_for_onebot
+
+    sticker = {
+        "file": "/tmp/never-read.png",
+        "native_refs": {
+            "snowluma": {"kind": "mface", "data": {"emoji_id": "7", "summary": "[表情]"}}
+        },
+    }
+    assert sticker_segment_for_onebot(sticker) == {
+        "type": "mface",
+        "data": {"emoji_id": "7", "summary": "[表情]"},
+    }
+
+
+def test_sticker_segment_falls_back_to_image_file(tmp_path):
+    from rubenbot.adapters.snowluma import sticker_segment_for_onebot
+
+    path = tmp_path / "cat.png"
+    path.write_bytes(b"png")
+    assert sticker_segment_for_onebot({"file": str(path)}) == {
+        "type": "image",
+        "data": {"file": str(path)},
+    }
+
+
+def test_sticker_segment_without_source_is_none():
+    from rubenbot.adapters.snowluma import sticker_segment_for_onebot
+
+    assert sticker_segment_for_onebot({"id": "st_x"}) is None
+    assert sticker_segment_for_onebot("不是引用") is None
+
+
+def test_sticker_segment_accepts_bare_native_data():
+    """原生引用也接受直接给段 data 的写法（没有 kind，按 mface 处理）。"""
+    from rubenbot.adapters.snowluma import sticker_segment_for_onebot
+
+    assert sticker_segment_for_onebot(
+        {"native_refs": {"snowluma": {"emoji_id": "3"}}}
+    ) == {"type": "mface", "data": {"emoji_id": "3"}}
+
+
+def test_call_capability_send_sticker_uses_mface():
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json={"status": "ok", "data": {"message_id": 5}})
+
+    adapter = make_adapter(handler)
+
+    async def scenario():
+        result = await adapter.call_capability(
+            "send_sticker",
+            chat_id="55555",
+            sticker={
+                "native_refs": {"snowluma": {"kind": "mface", "data": {"emoji_id": "7"}}}
+            },
+        )
+        await adapter._client.aclose()
+        return result
+
+    result = asyncio.run(scenario())
+    assert calls == [
+        (
+            "/send_group_msg",
+            {
+                "group_id": 55555,
+                "message": [{"type": "mface", "data": {"emoji_id": "7"}}],
+            },
+        )
+    ]
+    assert result == {"message_id": 5}
+
+
+def test_call_capability_send_sticker_private_and_image_fallback(tmp_path):
+    path = tmp_path / "cat.png"
+    path.write_bytes(b"png")
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json={"status": "ok", "data": {}})
+
+    adapter = make_adapter(handler)
+
+    async def scenario():
+        await adapter.call_capability(
+            "send_sticker",
+            chat_id="12345",
+            chat_type="private",
+            sticker={"file": str(path)},
+        )
+        await adapter._client.aclose()
+
+    asyncio.run(scenario())
+    assert calls == [
+        (
+            "/send_private_msg",
+            {"user_id": 12345, "message": [{"type": "image", "data": {"file": str(path)}}]},
+        )
+    ]
+
+
+def test_call_capability_send_sticker_without_source_raises():
+    from rubenbot.adapters.base import CapabilityError
+
+    adapter = make_adapter(lambda request: httpx.Response(200, json={"status": "ok"}))
+
+    async def scenario():
+        with pytest.raises(CapabilityError, match="缺少可用的表情引用或图片文件"):
+            await adapter.call_capability("send_sticker", chat_id="1", sticker={"id": "st_x"})
+        with pytest.raises(CapabilityError, match="需要 chat_id"):
+            await adapter.call_capability("send_sticker", sticker={"file": "x"})
+        await adapter._client.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_call_capability_send_sticker_failure_wrapped():
+    from rubenbot.adapters.base import CapabilityError
+
+    adapter = make_adapter(
+        lambda request: httpx.Response(200, json={"status": "failed", "retcode": 100})
+    )
+
+    async def scenario():
+        with pytest.raises(CapabilityError, match="send_sticker 失败"):
+            await adapter.call_capability(
+                "send_sticker",
+                chat_id="1",
+                sticker={"native_refs": {"snowluma": {"kind": "mface", "data": {"emoji_id": "1"}}}},
+            )
+        await adapter._client.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_unsupported_capability_raises():
+    from rubenbot.adapters.base import CapabilityNotSupported
+
+    adapter = make_adapter(lambda request: httpx.Response(200, json={"status": "ok"}))
+
+    async def scenario():
+        with pytest.raises(CapabilityNotSupported):
+            await adapter.call_capability("message.teleport", target="月球")
+        await adapter._client.aclose()
+
+    asyncio.run(scenario())

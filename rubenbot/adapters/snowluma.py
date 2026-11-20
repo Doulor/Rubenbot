@@ -18,7 +18,7 @@ import os
 import re
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import httpx
 
@@ -28,6 +28,7 @@ except ImportError:  # pragma: no cover - 兼容旧版
     from websockets.client import connect as ws_connect  # type: ignore
 
 from .base import (
+    SEND_STICKER,
     BaseAdapter,
     CapabilityError,
     CapabilityNotSupported,
@@ -36,6 +37,7 @@ from .base import (
     Segment,
     as_segment,
     render_segments,
+    sticker_native_ref,
 )
 from .qzone import QzoneClient
 
@@ -57,6 +59,7 @@ class SnowLumaAdapter(BaseAdapter):
         {
             "message.emoji_like",
             "message.voice",
+            SEND_STICKER,
             "qzone.publish",
             "qzone.feeds",
             "qzone.like",
@@ -68,6 +71,7 @@ class SnowLumaAdapter(BaseAdapter):
     capability_config_keys = {
         "message.emoji_like": "emoji_like",
         "message.voice": "voice",
+        SEND_STICKER: "sticker",
         "qzone.publish": "qzone",
         # 空间只读能力共用一个开关；写操作各自独立，默认全关
         "qzone.feeds": "feeds",
@@ -261,6 +265,8 @@ class SnowLumaAdapter(BaseAdapter):
         """调用 SnowLuma 扩展动作；失败统一抛 :class:`CapabilityError`。"""
         if name == "message.voice":
             return await self._send_voice(kwargs)
+        if name == SEND_STICKER:
+            return await self._send_sticker(kwargs)
         if name == "message.emoji_like":
             message_id = kwargs.get("message_id")
             emoji_id = kwargs.get("emoji_id", kwargs.get("emoji"))
@@ -403,6 +409,73 @@ class SnowLumaAdapter(BaseAdapter):
                 pass
         return payload.get("data", payload) if isinstance(payload, dict) else payload
 
+    async def _send_sticker(self, kwargs: dict[str, Any]) -> Any:
+        """send_sticker：优先用本平台原生 mface 段，没有原生引用就退图片段。
+
+        OneBot v11 的 ``mface`` 段最常见的原生引用来自 QQ 商城表情：
+        ``{"type": "mface", "data": {"emoji_id": ..., "summary": ..., "url": ...}}``。
+        表情库回填的 ``native_refs["snowluma"]`` 就按这个结构存
+        （见 :func:`rubenbot.stickers.StickerStore.record_native_ref` 的调用方）。
+
+        退化顺序：原生 mface → 图片文件（本地路径 / URL / base64 都交给 OneBot
+        ``image`` 段）→ 什么都没有就报错，由上层照常处理。
+        """
+        chat_id = kwargs.get("chat_id")
+        if chat_id in (None, ""):
+            raise CapabilityError("send_sticker 需要 chat_id")
+        chat_type = str(kwargs.get("chat_type") or "group")
+        sticker = kwargs.get("sticker")
+        segment = sticker_segment_for_onebot(sticker)
+        if segment is None:
+            raise CapabilityError("send_sticker 缺少可用的表情引用或图片文件")
+        action = "send_private_msg" if chat_type == "private" else "send_group_msg"
+        key = "user_id" if chat_type == "private" else "group_id"
+        try:
+            # segment 已经是 OneBot 段（mface / image），别再走一遍翻译
+            payload = await self.call_api(
+                action,
+                {key: _to_id(str(chat_id)), "message": [segment]},
+            )
+        except CapabilityError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 能力失败不能打断调用方
+            raise CapabilityError(f"send_sticker 失败：{exc}") from exc
+        return payload.get("data", payload) if isinstance(payload, dict) else payload
+
+
+def sticker_segment_for_onebot(sticker: Any) -> dict[str, Any] | None:
+    """表情引用 -> OneBot 发送段（mface 优先，退 image）；没有可用来源返回 None。
+
+    原生引用约定为 ``{"kind": "mface"|"image", "data": {...}}``；也接受直接
+    给段 ``data`` 的旧写法（没有 ``kind`` 时按 mface 处理）。纯函数，便于单测。
+    """
+    native = sticker_native_ref(sticker, "snowluma")
+    if isinstance(native, Mapping):
+        kind = str(native.get("kind") or "mface")
+        if kind not in ("mface", "image"):
+            kind = "mface"
+        raw = native.get("data")
+        if not isinstance(raw, Mapping):
+            raw = {key: value for key, value in native.items() if key != "kind"}
+        data = {str(k): v for k, v in raw.items() if v not in (None, "")}
+        if data:
+            return {"type": kind, "data": data}
+    file = _sticker_file(sticker)
+    if file:
+        return {"type": "image", "data": {"file": file}}
+    return None
+
+
+def _sticker_file(sticker: Any) -> str:
+    """表情引用里的图片本体：绝对路径优先，其次 URL（占位段里可能有）。"""
+    if not isinstance(sticker, Mapping):
+        return ""
+    for key in ("file", "url"):
+        value = sticker.get(key)
+        if value:
+            return str(value)
+    return ""
+
 
 def _to_id(value: str | int) -> int | str:
     try:
@@ -450,6 +523,13 @@ def segment_to_onebot(segment: Segment | dict[str, Any]) -> dict[str, Any]:
         return {"type": "reply", "data": {"id": str(data.get("id", ""))}}
     if segment.type == "face":
         return {"type": "face", "data": {"id": str(data.get("id", ""))}}
+    if segment.type == "sticker":
+        # 表情段：与 send_sticker 能力同一套翻译（原生 mface 优先，退图片）
+        reference = {"native_refs": {"snowluma": data.get("native_ref")}, "file": data.get("file")}
+        translated = sticker_segment_for_onebot(reference)
+        if translated is not None:
+            return translated
+        return {"type": "text", "data": {"text": segment.render()}}
     if segment.type in ("record", "video", "file"):
         source = data.get("file") or data.get("url") or ""
         return {"type": segment.type, "data": {"file": source}}
