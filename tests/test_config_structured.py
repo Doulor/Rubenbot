@@ -20,6 +20,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from rubenbot.web.app import create_app  # noqa: E402
 from rubenbot.web.config_schema import (  # noqa: E402
+    SECRET_PATHS,
     ConfigValidationError,
     merge_config,
     structured_config,
@@ -319,6 +320,61 @@ def test_put_structured_secrets_blank_keeps_original(client, config_path):
     assert data["llm"]["api_key"] == "sk-original-key"
     # 没提交过 password 就不写进文件
     assert "password" not in (data.get("webui") or {})
+
+
+def test_search_section_structured_view_and_secret(config):
+    """搜索分组出现在表单视图里；key 按密码型处理（留空 + secrets 标记）。"""
+    config.search.api_key = "sk-search"
+    view = structured_config(config)
+    assert view["search"]["provider"] == "bocha"
+    assert view["search"]["timeout_seconds"] == 10.0
+    assert view["search"]["cooldown_seconds"] == 30.0
+    assert view["search"]["api_key"] == ""
+    assert view["secrets"]["search.api_key"] is True
+    assert "search.api_key" in SECRET_PATHS
+
+
+def test_put_structured_search_section(client, config_path, state):
+    response = client.put(
+        "/api/config",
+        json={
+            "config": {
+                "search": {
+                    "provider": "tavily",
+                    "api_key": "tvly-key",
+                    "timeout_seconds": "5",
+                    "cooldown_seconds": "0",
+                }
+            }
+        },
+    )
+    assert response.status_code == 200, response.text
+    data = read_yaml(config_path)
+    assert data["search"] == {
+        "provider": "tavily",
+        "api_key": "tvly-key",
+        "timeout_seconds": 5.0,
+        "cooldown_seconds": 0.0,
+    }
+    assert state.config.search.provider == "tavily"
+    assert state.config.search.api_key == "tvly-key"
+
+    # 空 key 表示保留原值，不会把文件里的 key 清掉
+    again = client.put(
+        "/api/config", json={"config": {"search": {"provider": "bocha", "api_key": ""}}}
+    )
+    assert again.status_code == 200, again.text
+    assert read_yaml(config_path)["search"]["api_key"] == "tvly-key"
+    assert read_yaml(config_path)["search"]["provider"] == "bocha"
+
+
+def test_validate_search_rejects_unknown_provider():
+    with pytest.raises(ConfigValidationError) as info:
+        validate_structured({"search": {"provider": "bing"}})
+    assert any(item["field"] == "search.provider" for item in info.value.fields)
+    with pytest.raises(ConfigValidationError) as info:
+        validate_structured({"search": {"cooldown_seconds": -1}})
+    assert any(item["field"] == "search.cooldown_seconds" for item in info.value.fields)
 
 
 def test_put_structured_masked_placeholder_not_written(client, config_path, config, state):
