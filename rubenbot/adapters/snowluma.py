@@ -13,7 +13,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import mimetypes
+import os
 import re
+import tempfile
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -52,6 +56,7 @@ class SnowLumaAdapter(BaseAdapter):
     capabilities = frozenset(
         {
             "message.emoji_like",
+            "message.voice",
             "qzone.publish",
             "qzone.feeds",
             "qzone.like",
@@ -62,6 +67,7 @@ class SnowLumaAdapter(BaseAdapter):
     )
     capability_config_keys = {
         "message.emoji_like": "emoji_like",
+        "message.voice": "voice",
         "qzone.publish": "qzone",
         # 空间只读能力共用一个开关；写操作各自独立，默认全关
         "qzone.feeds": "feeds",
@@ -253,6 +259,8 @@ class SnowLumaAdapter(BaseAdapter):
 
     async def call_capability(self, name: str, **kwargs: Any) -> Any:
         """调用 SnowLuma 扩展动作；失败统一抛 :class:`CapabilityError`。"""
+        if name == "message.voice":
+            return await self._send_voice(kwargs)
         if name == "message.emoji_like":
             message_id = kwargs.get("message_id")
             emoji_id = kwargs.get("emoji_id", kwargs.get("emoji"))
@@ -352,6 +360,48 @@ class SnowLumaAdapter(BaseAdapter):
         except Exception as exc:  # noqa: BLE001 - 能力失败不能打断调用方
             raise CapabilityError(f"{capability} 失败（{action}）：{exc}") from exc
         return payload.get("data", payload)
+
+    async def _send_voice(self, kwargs: dict[str, Any]) -> Any:
+        """message.voice：把音频字节落成临时文件，用 record 段发出去。
+
+        OneBot 的 record 段 ``file`` 接受本地路径；临时文件在发送完成后删除
+        （协议端可能异步读取，所以放到 finally 里删）。没有音频字节直接报错，
+        由上层降级为发文字。
+        """
+        data = kwargs.get("audio") or kwargs.get("data") or b""
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        if not data:
+            raise CapabilityError("message.voice 需要非空音频数据")
+        chat_id = kwargs.get("chat_id")
+        if chat_id in (None, ""):
+            raise CapabilityError("message.voice 需要 chat_id")
+        chat_type = str(kwargs.get("chat_type") or "group")
+        # 扩展名按 MIME 推断（TTS 默认是 mp3）；协议端按扩展名识别音频格式
+        mime = str(kwargs.get("mime") or kwargs.get("mime_type") or "")
+        suffix = str(kwargs.get("suffix") or kwargs.get("format") or "").lstrip(".")
+        if not suffix:
+            suffix = (mimetypes.guess_extension(mime.split(";")[0].strip()) or ".amr").lstrip(".")
+        fd, path = tempfile.mkstemp(prefix="rubenbot-voice-", suffix=f".{suffix}")
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+            action = "send_private_msg" if chat_type == "private" else "send_group_msg"
+            key = "user_id" if chat_type == "private" else "group_id"
+            payload = await self.call_api(
+                action,
+                {key: _to_id(str(chat_id)), "message": [{"type": "record", "data": {"file": path}}]},
+            )
+        except CapabilityError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 能力失败不能打断调用方
+            raise CapabilityError(f"message.voice 失败：{exc}") from exc
+        finally:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:  # pragma: no cover - 删不掉不致命
+                pass
+        return payload.get("data", payload) if isinstance(payload, dict) else payload
 
 
 def _to_id(value: str | int) -> int | str:

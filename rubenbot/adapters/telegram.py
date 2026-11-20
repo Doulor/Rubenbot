@@ -5,9 +5,11 @@
 - 用 **长轮询** ``getUpdates`` 收消息，部署时不需要公网回调地址
 - ``offset`` 落盘保存（默认 ``data/telegram_offset.json``），重启后不会重复处理旧消息
 - 入站统一转成 :class:`MessageEvent`：私聊 / 群组 / 超级群，``text``、``photo``
-  （取最大尺寸，``getFile`` 下载后转成带 base64 的 image 段）、``caption``
-- 出站 ``sendMessage`` / ``sendPhoto``，图片段支持 ``base64`` 与 ``url`` 两种来源
-- 本轮不声明平台特有能力（``capabilities`` 为空），发送仍走统一 segments 入口
+  （取最大尺寸，``getFile`` 下载后转成带 base64 的 image 段）、``voice``
+  （下载后转成带 base64 的 record 段，供转写）、``caption``
+- 出站 ``sendMessage`` / ``sendPhoto`` / ``sendVoice``，图片段支持 ``base64``
+  与 ``url`` 两种来源，语音段只支持 base64 上传
+- 声明 ``message.voice`` 能力：语音回复经它发 ``sendVoice``
 
 ``${ENV_VAR}`` 的展开由 :mod:`rubenbot.config` 统一处理，这里只接收展开后的 token。
 配置段 ``adapters.telegram`` 由 :meth:`rubenbot.config.Config.telegram_config`
@@ -38,6 +40,8 @@ import httpx
 
 from .base import (
     BaseAdapter,
+    CapabilityError,
+    CapabilityNotSupported,
     EventCallback,
     MessageEvent,
     Segment,
@@ -49,6 +53,9 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_API_BASE = "https://api.telegram.org"
 DEFAULT_OFFSET_FILE = "data/telegram_offset.json"
+
+# getFile 下载的单条语音上限（与 STT 的单条上限对齐；超大文件不下）
+MAX_VOICE_BYTES = 20 * 1024 * 1024
 
 # 轮询失败后的重试退避（秒）；测试会 monkeypatch 调小
 POLL_BACKOFF_MIN = 1.0
@@ -70,8 +77,9 @@ class TelegramAdapter(BaseAdapter):
 
     name = "telegram"
 
-    # 本轮不提供贴表情 / 发说说之类的特有能力
-    capabilities: frozenset[str] = frozenset()
+    # 语音回复：sendVoice；音频需要能够转成文字的另一侧
+    capabilities: frozenset[str] = frozenset({"message.voice"})
+    capability_config_keys = {"message.voice": "voice"}
 
     def __init__(
         self,
@@ -332,6 +340,11 @@ class TelegramAdapter(BaseAdapter):
             image = await self._photo_segment(_largest_photo(photo))
             if image is not None:
                 segments.append(image)
+        voice = message.get("voice")
+        if isinstance(voice, Mapping):
+            segment = await self._voice_segment(voice)
+            if segment is not None:
+                segments.append(segment)
         text = message.get("text")
         caption = message.get("caption")
         if isinstance(text, str) and text:
@@ -339,7 +352,7 @@ class TelegramAdapter(BaseAdapter):
         elif isinstance(caption, str) and caption:
             segments.append(Segment.text(caption))
         if not segments:
-            # 贴纸 / 语音 / 文件等本轮不支持的形态：跳过，避免空消息进上下文
+            # 贴纸 / 文件等本轮不支持的形态：跳过，避免空消息进上下文
             return None
 
         reply_to = message.get("reply_to_message")
@@ -423,6 +436,48 @@ class TelegramAdapter(BaseAdapter):
             raise ValueError(f"图片过大（{len(content)} 字节）")
         return content
 
+    async def _voice_segment(self, voice: Mapping[str, Any]) -> Segment | None:
+        """语音条 -> record 段；下载失败时只留 file_id/duration 占位。
+
+        下载后以 base64 放进段里：转写层不再需要第二次请求，也不会因为
+        Telegram 的临时文件地址过期而取不到音频。
+        """
+        file_id = voice.get("file_id")
+        data: dict[str, Any] = {}
+        if file_id:
+            data["file_id"] = str(file_id)
+        for key in ("duration", "mime_type", "file_size"):
+            if voice.get(key) is not None:
+                data[key] = voice[key]
+        if file_id:
+            try:
+                result = await self._call("getFile", {"file_id": str(file_id)})
+                file_path = result.get("file_path") if isinstance(result, Mapping) else None
+                if file_path:
+                    raw = await self._download_voice(str(file_path))
+                    data["base64"] = base64.b64encode(raw).decode("ascii")
+                    data["filename"] = str(file_path).rsplit("/", 1)[-1]
+                    data["mime_type"] = (
+                        str(data.get("mime_type") or "")
+                        or mimetypes.guess_type(str(file_path))[0]
+                        or "audio/ogg"
+                    )
+            except Exception as exc:  # noqa: BLE001 - 下载失败仍保留语音段占位
+                logger.warning("下载 Telegram 语音失败（file_id=%s）：%s", file_id, exc)
+        if not data:
+            return None
+        return Segment("record", data)
+
+    async def _download_voice(self, file_path: str) -> bytes:
+        client = await self._get_client()
+        url = f"{self.api_base}/file/bot{self.bot_token}/{file_path.lstrip('/')}"
+        resp = await client.get(url)
+        resp.raise_for_status()
+        content = resp.content
+        if len(content) > MAX_VOICE_BYTES:
+            raise ValueError(f"语音过大（{len(content)} 字节）")
+        return content
+
     # ------------------------------------------------------------------
     # 出站：统一 segments -> sendMessage / sendPhoto
     # ------------------------------------------------------------------
@@ -440,8 +495,12 @@ class TelegramAdapter(BaseAdapter):
             elif segment.type == "image":
                 actions.append(("image", segment, buffer))
                 buffer = ""
+            elif segment.type == "record":
+                # 语音单独成一条（sendVoice 只带 caption），前面的文本并入说明
+                actions.append(("record", segment, buffer))
+                buffer = ""
             else:
-                # Telegram 没有对应形态的段（表情、语音等）退化成占位文本
+                # Telegram 没有对应形态的段（表情等）退化成占位文本
                 buffer += segment.render()
         if buffer:
             actions.append(("text", buffer, ""))
@@ -458,6 +517,25 @@ class TelegramAdapter(BaseAdapter):
                     reply_to=reply_id if first else None,
                 )
                 first = False
+                continue
+            if kind == "record":
+                # 语音段：有音频就 sendVoice，没有可用来源时退化成占位文本
+                source = _voice_source(payload.data)
+                reply_to = reply_id if first else None
+                first = False
+                if source is None:
+                    text = caption + payload.render()
+                    await self._send_message(chat_id, _clip(text, MAX_TEXT_CHARS), reply_to=reply_to)
+                    continue
+                raw, mime = source
+                if caption and len(caption) > MAX_CAPTION_CHARS:
+                    # 说明太长：先发语音，再单独补一条文本
+                    await self._send_voice(chat_id, raw, mime, "", reply_to=reply_to)
+                    await self._send_message(
+                        chat_id, _clip(caption, MAX_TEXT_CHARS), reply_to=None
+                    )
+                else:
+                    await self._send_voice(chat_id, raw, mime, caption, reply_to=reply_to)
                 continue
             # 图片段：没有可用来源时退化成文本，保证内容不丢
             source = _image_source(payload.data)
@@ -509,6 +587,56 @@ class TelegramAdapter(BaseAdapter):
         else:
             payload["photo"] = str(value)
             await self._call("sendPhoto", payload)
+
+    async def _send_voice(
+        self,
+        chat_id: str,
+        raw: bytes,
+        mime: str,
+        caption: str,
+        *,
+        reply_to: str | None,
+    ) -> Any:
+        """发送语音：按平台规则 OGG/OPUS 用 sendVoice，其余用 sendAudio。
+
+        返回 Bot API 的 ``result``（里面带 message_id），便于调用方落流水。
+        """
+        payload: dict[str, Any] = {"chat_id": _to_id(chat_id)}
+        if caption:
+            payload["caption"] = caption
+        _attach_reply(payload, reply_to)
+        suffix = mimetypes.guess_extension(mime or "") or ".ogg"
+        is_voice = (mime or "").startswith("audio/ogg")
+        method = "sendVoice" if is_voice else "sendAudio"
+        # 两个方法的文件字段名不同：sendVoice 用 voice，sendAudio 用 audio
+        files = {("voice" if is_voice else "audio"): ("voice" + suffix, raw, mime or "audio/ogg")}
+        return await self._call(method, payload, files=files)
+
+    async def call_capability(self, name: str, **kwargs: Any) -> Any:
+        """平台能力：message.voice 直接把音频字节发成语音；其余不支持。"""
+        if name != "message.voice":
+            raise CapabilityNotSupported(self.name, name)
+        data = kwargs.get("audio") or kwargs.get("data") or b""
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        if not data:
+            raise CapabilityError("message.voice 需要非空音频数据")
+        chat_id = kwargs.get("chat_id")
+        if chat_id in (None, ""):
+            raise CapabilityError("message.voice 需要 chat_id")
+        mime = str(kwargs.get("mime") or kwargs.get("mime_type") or "audio/mpeg")
+        caption = str(kwargs.get("text") or kwargs.get("caption") or "")
+        try:
+            result = await self._send_voice(
+                str(chat_id),
+                data,
+                mime,
+                caption[:MAX_CAPTION_CHARS],
+                reply_to=None,
+            )
+        except Exception as exc:  # noqa: BLE001 - 能力失败收敛成统一异常
+            raise CapabilityError(f"message.voice 失败：{exc}") from exc
+        return result
 
 
 # ----------------------------------------------------------------------
@@ -575,6 +703,27 @@ def _image_source(data: Mapping[str, Any]) -> tuple[str, Any] | None:
     url = data.get("url")
     if url:
         return ("url", str(url))
+    return None
+
+
+def _voice_source(data: Mapping[str, Any]) -> tuple[bytes, str] | None:
+    """语音段的可用来源：base64 音频（``(bytes, mime)``）；没有就返回 None。
+
+    语音只支持上传：``sendVoice`` 不接受随意 URL，TTS 的产物也总是字节。
+    """
+    raw = data.get("base64")
+    if raw:
+        value = str(raw)
+        if value.startswith("data:"):
+            header, _, encoded = value.partition(",")
+            mime = header[5:].split(";")[0]
+        else:
+            encoded = value
+            mime = str(data.get("mime_type") or "audio/ogg")
+        try:
+            return base64.b64decode(encoded, validate=False), mime or "audio/ogg"
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"语音段 base64 无效：{exc}") from exc
     return None
 
 

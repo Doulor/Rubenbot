@@ -68,11 +68,21 @@ class MergedRound:
         return "\n".join(e.text for e in self.events if e.text and e.text.strip())
 
     def to_event(self) -> MessageEvent:
-        """合并后的合成事件，供决策、上下文与插件使用。"""
+        """合并后的合成事件，供决策、上下文与插件使用。
+
+        ``segments`` 按批次顺序拼起来，语音回复判断（对方这轮发过语音条）
+        与插件拿原始段都依赖它；``raw["has_voice"]`` 是同一信息的快速标记。
+        """
         last = self.events[-1]
         reply_to = next((e.reply_to_id for e in reversed(self.events) if e.reply_to_id), None)
         raw = dict(last.raw or {})
         raw["merged_count"] = len(self.events)
+        segments = [segment for event in self.events for segment in (event.segments or [])]
+        has_voice = any(e.raw.get("has_voice") for e in self.events) or any(
+            segment.type == "record" for segment in segments
+        )
+        if has_voice:
+            raw["has_voice"] = True
         return MessageEvent(
             platform=last.platform,
             chat_type=last.chat_type,
@@ -83,6 +93,7 @@ class MergedRound:
             reply_to_id=reply_to,
             mentions_bot=any(e.mentions_bot for e in self.events),
             raw=raw,
+            segments=segments,
         )
 
 

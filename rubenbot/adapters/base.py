@@ -192,6 +192,7 @@ class BaseAdapter(abc.ABC):
     async def call_capability(self, name: str, **kwargs: Any) -> Any:
         """调用平台特有能力；默认实现表示不支持。
 
-        子类声明了能力就应覆盖本方法。异常由核心入口捕获并转成失败原因。
+        子类声明了能力就应覆盖本方法。异常由核心入口捕获并转成失败原因
+        （语音回复等核心直调场景同样只降级，不影响正常回复）。
         """
         raise CapabilityNotSupported(self.name, name)
