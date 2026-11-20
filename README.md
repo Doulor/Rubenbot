@@ -414,7 +414,7 @@ def register(ctx):
 
 ### 插件市场
 
-WebUI 的「插件市场」页就是原来的插件页：已安装与可安装的插件在同一个列表里，按状态区分。
+WebUI 的「插件」分两页：「插件市场」在同一列表里发现、安装与启停插件；「插件配置」只列出已安装的插件。在左侧选择插件，右侧按 `config_schema` 编辑并保存，重启 bot 后生效。没有声明配置的插件会显示「无可配置项」。原来的 `#/plugins` 链接仍打开市场。
 
 - **数据来源**：配置 `market.index_url` 指向索引仓库的 `plugins.json`（raw 地址），条目字段为 `id / name / version / description / author / permissions / path`，可选 `download_url`（插件目录打包的 zip）与 `category` / `icon` / `min_core_version` / `hooks`。没配地址或 5 秒内拉不到，就回退到随框架发布的内置官方索引——页面顶部始终标注当前来源与失败原因，不会空白。
 - **状态机**：`未安装` → `已安装（未启用）` → `已启用`；附加「可更新」（索引版本更高）、「不合规」（manifest 有问题，详情里写原因）、「核心版本过低」、「仅展示」（索引没给 `download_url`）几个标记。

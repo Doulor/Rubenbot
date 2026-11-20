@@ -351,7 +351,7 @@ const PAGES = {
   memory: { title: "记忆", sub: "按人浏览、搜索与维护记忆库", render: renderMemory },
   people: { title: "人物", sub: "见过的每个人和他们的档案", render: renderPeople },
   groups: { title: "群组与意愿", sub: "每群活跃度、静默时段与决策记录", render: renderGroups },
-  plugins: { title: "插件市场", sub: "已装与可装同列表；安装后默认关闭，手动启用才加载", render: renderPlugins },
+  plugins: { title: "插件", sub: "发现与管理插件，或调整已安装插件的配置", render: renderPlugins },
   logs: { title: "日志", sub: "最近的运行日志", render: renderLogs },
   settings: { title: "设置", sub: "模型、搜索、主动触达、适配器与运行环境", render: renderSettings },
 };
@@ -2081,57 +2081,96 @@ function detailDrawer(item) {
   dialog.showModal();
 }
 
-/** 卡片的操作按钮组：按状态机切换安装 / 启用 / 停用 / 更新 / 卸载。 */
-async function pluginConfigDialog(item) {
-  const dialog = $("#dialog");
-  const close = () => dialog.close();
-  dialog.replaceChildren(h("div", { class: "dialog-body" }, h("p", {}, "正在读取配置…")));
-  dialog.showModal();
+/** 配置页只读本地清单，不必等市场索引；没有 schema 的插件同样列出。 */
+async function renderPluginConfigs(panel, selected) {
+  const { items } = await api.get("/api/plugins");
+  if (!items.length) {
+    panel.replaceChildren(card("", { body: emptyState("plugins", "还没有已安装的插件", "到插件市场安装后，即可在这里配置。") }));
+    return;
+  }
+  const idOf = item => encodeURIComponent(item.manifest?.id || item.name);
+  const nameOf = item => item.manifest?.name || item.name;
+  const current = items.find(item => idOf(item) === selected) || items[0];
+  const menu = h("nav", { class: "settings-menu", "aria-label": "已安装插件" },
+    h("div", { class: "settings-menu-group" }, "已安装插件"),
+    ...items.map(item => h("a", {
+      class: `settings-menu-item${item === current ? " active" : ""}`,
+      href: `#/plugins/config/${idOf(item)}`,
+      "aria-current": item === current ? "page" : null,
+    }, nameOf(item))));
+  const editor = h("div", { class: "settings-content" });
+  panel.replaceChildren(h("div", { class: "settings-layout" }, menu, editor));
+  const title = nameOf(current);
+  if (!current.valid || !current.manifest?.config_schema?.length) {
+    editor.replaceChildren(card(title, { body: emptyState("plugins", "无可配置项", current.invalid_reason || "该插件未声明配置项。") }));
+    return;
+  }
+  const path = `/api/plugins/${idOf(current)}/config`;
+  editor.replaceChildren(skeleton(3));
   try {
-    const data = await api.get(`/api/plugins/${encodeURIComponent(item.id)}/config`);
-    const draft = { ...(data.values || {}) };
-    const fields = h("div", { style: { display: "grid", gap: "14px" } });
-    for (const spec of data.schema || []) {
-      const key = String(spec.key || "");
-      const kind = String(spec.type || "string").toLowerCase();
-      const label = spec.description || key;
-      let control;
-      if (kind === "bool" || kind === "boolean") {
-        control = switchField(Boolean(draft[key]), (value) => { draft[key] = value; }, { label });
-      } else if (["int", "integer", "float", "number"].includes(kind)) {
-        control = numberField(draft[key], (value) => { draft[key] = value === "" ? "" : Number(value); });
-      } else if (["list", "string_list"].includes(kind)) {
-        control = listEditor(draft[key], (value) => { draft[key] = value; });
-      } else {
-        control = textField(draft[key], (value) => { draft[key] = value; });
-      }
-      fields.append(h("label", { class: "field" }, h("span", { class: "field-label" }, label), control));
-    }
-    const save = h("button", { class: "btn btn-primary", type: "button" }, "保存配置");
-    save.addEventListener("click", async () => {
-      save.disabled = true;
-      try {
-        const result = await api.put(`/api/plugins/${encodeURIComponent(item.id)}/config`, { values: draft });
-        toast(result.message || "插件配置已保存");
-        close();
-      } catch (err) {
-        if (!(err instanceof Unauthorized)) toast(err.message || "保存失败", "error");
-      } finally {
-        save.disabled = false;
-      }
-    });
-    dialog.replaceChildren(
-      h("div", { class: "dialog-head" }, h("h2", {}, `配置「${item.name}」`), h("button", { class: "icon-button", type: "button", onclick: close }, icon("close"))),
-      h("div", { class: "dialog-body" }, h("div", { class: "notice" }, icon("warning"), "保存后重启 bot 生效。"), fields),
-      h("div", { class: "dialog-foot" }, h("button", { class: "btn", type: "button", onclick: close }, "取消"), save)
-    );
+    const data = await api.get(path);
+    editor.replaceChildren(pluginConfigForm(title, path, data));
   } catch (err) {
-    if (!(err instanceof Unauthorized)) {
-      dialog.replaceChildren(h("div", { class: "dialog-body" }, h("p", {}, err.message || "读取配置失败"), h("button", { class: "btn", type: "button", onclick: close }, "关闭")));
-    }
+    if (!(err instanceof Unauthorized)) editor.replaceChildren(card(title, { body: [
+      emptyState("warning", "读取配置失败", err.message),
+      h("button", { class: "btn", type: "button", onclick: () => renderRoute() }, "重试"),
+    ] }));
   }
 }
 
+/** 表单与保存请求绑定在同一个插件上，后台响应只回写自己的表单。 */
+function pluginConfigForm(title, path, data) {
+  const draft = { ...data.values };
+  const secretInputs = new Map();
+  const fields = h("fieldset", { class: "plugin-config-fields", "aria-label": `${title}配置` });
+  for (const spec of data.schema) {
+    const key = String(spec?.key || "").trim();
+    if (!Object.hasOwn(draft, key)) continue;
+    const kind = String(spec.type || "string").trim().toLowerCase();
+    const label = spec.description || key;
+    const change = value => { draft[key] = value; };
+    let control;
+    if (kind === "bool" || kind === "boolean") {
+      control = switchField(Boolean(draft[key]), change, { label });
+    } else if (["int", "integer", "float", "number"].includes(kind)) {
+      control = numberField(draft[key], value => change(value === "" ? "" : Number(value)));
+    } else if (["list", "string_list"].includes(kind)) {
+      control = listEditor(draft[key], change, { placeholder: `添加${label}` });
+    } else if (Object.hasOwn(data.secrets || {}, key)) {
+      control = h("input", { class: "input", type: "password", autocomplete: "new-password",
+        placeholder: data.secrets[key] ? "已设置，留空保留原值" : "尚未设置", oninput: event => change(event.target.value) });
+      secretInputs.set(key, control);
+    } else {
+      control = textField(draft[key], change);
+    }
+    control.setAttribute("aria-label", label);
+    fields.append(h("div", { class: "field" }, h("span", { class: "field-label" }, label), control));
+  }
+  const save = h("button", { type: "submit", class: "btn btn-primary" }, icon("check"), "保存配置");
+  const resultBox = h("div", { role: "status", class: "field-hint" }, "保存后重启 bot 生效。");
+  const form = h("form", { class: "grid" }, fields, h("div", { class: "market-actions" }, save, resultBox));
+  form.addEventListener("submit", async event => {
+    event.preventDefault();
+    if (save.disabled) return;
+    save.disabled = fields.disabled = true;
+    try {
+      const result = await api.put(path, { values: draft });
+      resultBox.textContent = result.message || "插件配置已保存，重启 bot 后生效。";
+      // 服务端不会回显密钥；留在页面上时也不保留刚输入的密钥。
+      for (const [key, input] of secretInputs) {
+        input.value = draft[key] = "";
+        input.placeholder = result.secrets?.[key] ? "已设置，留空保留原值" : "尚未设置";
+      }
+    } catch (err) {
+      if (!(err instanceof Unauthorized)) resultBox.textContent = err.message || "保存失败，请重试。";
+    } finally {
+      save.disabled = fields.disabled = false;
+    }
+  });
+  return card(title, { body: form });
+}
+
+/** 卡片的操作按钮组：按状态机切换安装 / 启用 / 停用 / 更新 / 卸载。 */
 function marketActions(item, refresh) {
   const buttons = [];
   const run = (path, body, message) => async (event) => {
@@ -2175,9 +2214,6 @@ function marketActions(item, refresh) {
           "更新"
         )
       );
-    }
-    if (item.has_config) {
-      buttons.push(h("button", { class: "btn btn-sm btn-ghost", type: "button", onclick: () => pluginConfigDialog(item) }, "配置"));
     }
     if (item.state === "enabled") {
       buttons.push(
@@ -2284,7 +2320,28 @@ function marketCard(item, refresh) {
   );
 }
 
-async function renderPlugins(view) {
+async function renderPlugins(view, sub = "") {
+  const [tab, selected] = sub.split("/");
+  const config = tab === "config";
+  const tabs = h("nav", { class: "segmented plugin-tabs", "aria-label": "插件页面" },
+    ...[[false, "#/plugins", "插件市场"], [true, "#/plugins/config", "插件配置"]].map(([isConfig, href, label]) =>
+      h("a", { href, class: config === isConfig ? "active" : "", "aria-current": config === isConfig ? "page" : null }, label)
+    ));
+  // 请求只更新本次路由创建的面板，快速切页时旧响应不会覆盖当前插件。
+  const panel = h("div", {}, skeleton(3));
+  view.replaceChildren(h("div", { class: "grid" }, tabs, panel));
+  try {
+    if (config) await renderPluginConfigs(panel, selected);
+    else await renderPluginMarket(panel);
+  } catch (err) {
+    if (!(err instanceof Unauthorized)) panel.replaceChildren(card("", { body: [
+      emptyState("warning", "加载失败", err.message),
+      h("button", { class: "btn", type: "button", onclick: () => renderRoute() }, "重试"),
+    ] }));
+  }
+}
+
+async function renderPluginMarket(view) {
   const keyword = { value: "" };
   const category = { value: "" };
   let data = null;

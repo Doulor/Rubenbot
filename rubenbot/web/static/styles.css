@@ -1036,7 +1036,8 @@ button {
   gap: 2px;
 }
 
-.segmented button {
+.segmented button,
+.plugin-tabs a {
   height: 32px;
   padding: 0 15px;
   border: 0;
@@ -1049,11 +1050,13 @@ button {
   transition: background-color var(--surface-motion), color var(--surface-motion);
 }
 
-.segmented button:hover {
+.segmented button:hover,
+.plugin-tabs a:hover {
   color: var(--text);
 }
 
-.segmented button.active {
+.segmented button.active,
+.plugin-tabs a.active {
   background: var(--accent-container);
   color: var(--on-accent-container);
   box-shadow: none;
@@ -1544,7 +1547,18 @@ button {
   cursor: progress;
 }
 
-/* ---------------- 插件市场 ---------------- */
+/* ---------------- 插件市场与配置 ---------------- */
+
+.plugin-tabs { justify-self: start; }
+.plugin-tabs a { display: inline-flex; align-items: center; }
+.plugin-config-fields {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
 
 .market-toolbar {
   display: flex;
