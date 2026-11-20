@@ -168,7 +168,8 @@ def _add(store, text, *, sender="u1", name="阿花", msg_id=None, reply_to="", t
     )
 
 
-def test_render_history_format_and_bot_marker(config, store):
+def test_render_history_bot_content_is_plain(config, store):
+    """bot 自己的历史只有干净正文，不带转录前缀（否则模型会模仿前缀）。"""
     _add(store, "今天下雨了", sender="u1", name="阿花", msg_id="m1", ts=100.0)
     _add(store, "是啊", bot=True, msg_id="m2", ts=160.0)
     bot, _ = make_bot(config, store, ScriptedLLM())
@@ -178,7 +179,17 @@ def test_render_history_format_and_bot_marker(config, store):
     assert rendered[0]["role"] == "user"
     assert re.fullmatch(CLOCK_RE + r" \[阿花\] 今天下雨了", rendered[0]["content"])
     assert rendered[1]["role"] == "assistant"
-    assert re.fullmatch(CLOCK_RE + r" \[我\] 是啊", rendered[1]["content"])
+    assert rendered[1]["content"] == "是啊"
+
+
+def test_render_history_bot_keeps_quote_suffix(config, store):
+    """bot 历史不带前缀，但引用附注仍照旧追加在正文后。"""
+    _add(store, "今天下雨了", sender="u1", name="阿花", msg_id="m1", ts=100.0)
+    _add(store, "是啊", bot=True, msg_id="m2", reply_to="m1", ts=160.0)
+    bot, _ = make_bot(config, store, ScriptedLLM())
+    rendered = bot.render_history(store.recent_messages("g1", platform="recording"))
+
+    assert rendered[1]["content"] == "是啊（引用 [阿花]：今天下雨了）"
 
 
 def test_render_history_quote_resolved_in_batch(config, store):

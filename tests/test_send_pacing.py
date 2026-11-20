@@ -10,6 +10,7 @@ from rubenbot.core import (
     estimate_typing_seconds,
     split_sentences,
     strip_action_parens,
+    strip_transcript_prefix,
 )
 from rubenbot.decision import MessageMerger
 from rubenbot.persona import Persona
@@ -160,6 +161,46 @@ def test_short_reply_not_split_even_with_breaks(config, store):
     config.chat.split_part_chars = 30
     bot, _ = make_bot(config, store)
     assert bot.split_reply("好。走。") == ["好。走。"]
+
+
+# ----------------------------------------------------------------------
+# 转录行前缀清洗（模型模仿历史格式的兜底）
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        # 带时间戳和发言人前缀：剥掉
+        ("[10:00] [我] 刚才说到哪了", "刚才说到哪了"),
+        ("[9:05] [阿花] 在吗", "在吗"),
+        ("[10:00] [我]  两个空格也行", "两个空格也行"),
+        # 正常正文，没有前缀
+        ("我觉得挺好", "我觉得挺好"),
+        # 正文以时间开头但后面不是 [名字] 形式：不剥
+        ("[10:00] 开会了", "[10:00] 开会了"),
+        ("[10:00][我] 中间没空格？剥", "中间没空格？剥"),
+        # 只剥开头，正文中间同样样式不动
+        ("先说这个 [10:00] [我] 后面不动", "先说这个 [10:00] [我] 后面不动"),
+        ("", ""),
+    ],
+)
+def test_strip_transcript_prefix(text, expected):
+    assert strip_transcript_prefix(text) == expected
+
+
+def test_send_reply_strips_transcript_prefix(config, store):
+    bot, adapter = make_bot(config, store)
+    asyncio.run(bot.send_reply(group_event(), "[10:00] [我] 全局记忆这块你真搞出来了？"))
+    assert adapter.texts == ["全局记忆这块你真搞出来了？"]
+
+
+def test_send_reply_only_prefix_not_sent(config, store):
+    """剥完为空则整条不发，也不记流水。"""
+    bot, adapter = make_bot(config, store)
+    asyncio.run(bot.send_reply(group_event(), "[10:00] [我] "))
+    assert adapter.texts == []
+    assert store.recent_messages("g1", platform="recording") == []
 
 
 # ----------------------------------------------------------------------
