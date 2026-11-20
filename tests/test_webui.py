@@ -27,6 +27,8 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from rubenbot.web.app import create_app  # noqa: E402
 
+from conftest import write_manifest  # noqa: E402
+
 
 # ----------------------------------------------------------------------
 # 夹具
@@ -483,16 +485,25 @@ def test_decisions_list_and_filter(client, store):
 # ----------------------------------------------------------------------
 
 
-def test_plugins_toggle_runtime(client, store, config):
+def test_plugins_toggle_runtime(client, store, config, tmp_path):
     from rubenbot.plugins.loader import PluginManager
 
     plugins = PluginManager(config, store)
     state = client.app.state.web
     state.plugins = plugins
-    # 手工塞一个已加载的插件，不碰文件系统
+    # 手工塞一个已加载的插件，manifest 用临时目录里的一份（不合规的不能启用）
     from rubenbot.plugins.loader import Plugin
 
-    plugins.plugins["demo"] = Plugin(name="demo", path=Path("/tmp/demo"), enabled=True)
+    demo_dir = tmp_path / "demo"
+    write_manifest(demo_dir, "demo")
+    from rubenbot.plugins.manifest import load_manifest
+
+    plugins.plugins["demo"] = Plugin(
+        name="demo",
+        path=demo_dir,
+        enabled=True,
+        manifest=load_manifest(demo_dir),
+    )
 
     listing = client.get("/api/plugins").json()["items"]
     assert listing[0]["name"] == "demo"
@@ -608,8 +619,10 @@ def test_plugin_toggle_writes_config(client, store, config, config_path, tmp_pat
         "        return 'ok'\n",
         encoding="utf-8",
     )
+    write_manifest(root / "alpha", "alpha", hooks=["command"])
     (root / "beta").mkdir()
     (root / "beta" / "plugin.py").write_text("def register(ctx):\n    pass\n", encoding="utf-8")
+    write_manifest(root / "beta", "beta")
 
     config.plugins.dir = str(root)
     config.plugins.enabled = []

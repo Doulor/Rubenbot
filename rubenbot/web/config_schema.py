@@ -92,6 +92,7 @@ def structured_config(config: Config) -> dict[str, Any]:
             "enabled": list(config.plugins.enabled),
             "command_prefix": config.plugins.command_prefix,
         },
+        "market": {"index_url": config.market.index_url},
         "adapters": {
             "console": {"enabled": "console" in enabled},
             "snowluma": {
@@ -495,6 +496,21 @@ def _validate_plugins(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
     return out
 
 
+def _validate_market(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    if "index_url" in section:
+        # 留空就是「用内置官方索引」，所以允许空字符串
+        value = v.text(
+            section["index_url"], "market.index_url", allow_empty=True, max_len=500
+        )
+        if value is not None:
+            if value and not value.lower().startswith(("http://", "https://")):
+                v.fail("market.index_url", "索引地址必须是以 http:// 或 https:// 开头的 URL")
+            else:
+                out["index_url"] = value
+    return out
+
+
 def _validate_adapters(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for name in ADAPTER_NAMES:
@@ -591,6 +607,9 @@ def validate_structured(payload: dict[str, Any]) -> dict[str, Any]:
     plugins = _section(payload, "plugins", v)
     if plugins is not None:
         update["plugins"] = _validate_plugins(plugins, v)
+    market = _section(payload, "market", v)
+    if market is not None:
+        update["market"] = _validate_market(market, v)
     adapters = _section(payload, "adapters", v)
     if adapters is not None:
         update["adapters"] = _validate_adapters(adapters, v)

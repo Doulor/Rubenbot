@@ -311,6 +311,21 @@ class PluginsConfig:
 
 
 @dataclass
+class MarketConfig:
+    """插件市场数据源。
+
+    ``index_url`` 指向索引仓库的 ``plugins.json``（raw 地址）；留空或拉取
+    失败时回退到随框架发布的内置官方索引（即插件目录里的官方插件）。
+    改动在 WebUI 侧按请求读取，无需重启。
+    """
+
+    index_url: str = ""
+
+    def __post_init__(self) -> None:
+        self.index_url = str(self.index_url or "").strip()
+
+
+@dataclass
 class WebUIConfig:
     """WebUI 服务配置（第二阶段）。
 
@@ -420,6 +435,7 @@ class Config:
     chat: ChatConfig = field(default_factory=ChatConfig)
     decision: DecisionConfig = field(default_factory=DecisionConfig)
     plugins: PluginsConfig = field(default_factory=PluginsConfig)
+    market: MarketConfig = field(default_factory=MarketConfig)
     webui: WebUIConfig = field(default_factory=WebUIConfig)
     persona_path: str = "data/SOUL.md"
     database_path: str = "data/rubenbot.db"
@@ -494,6 +510,7 @@ class Config:
         chat = ChatConfig(**{k: v for k, v in (data.get("chat") or {}).items() if _has(ChatConfig, k)})
         decision = _load_decision(data.get("decision") or {})
         plugins = PluginsConfig(**{k: v for k, v in (data.get("plugins") or {}).items() if _has(PluginsConfig, k)})
+        market = MarketConfig(**{k: v for k, v in (data.get("market") or {}).items() if _has(MarketConfig, k)})
         webui = WebUIConfig(**{k: v for k, v in (data.get("webui") or {}).items() if _has(WebUIConfig, k)})
         persona = data.get("persona") or {}
         if isinstance(persona, str):
@@ -511,6 +528,7 @@ class Config:
             chat=chat,
             decision=decision,
             plugins=plugins,
+            market=market,
             webui=webui,
             **basics,
         )

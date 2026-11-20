@@ -24,6 +24,10 @@
 - ``GET  /api/decisions``       决策日志（可按 chat_id 过滤）
 - ``GET  /api/plugins``         插件列表（含目录里发现但未启用的）
 - ``POST /api/plugins/{name}``  启用/禁用：热生效并写回 plugins.enabled
+- ``GET  /api/market``          插件市场：数据来源 + 本地/索引合并后的卡片列表
+- ``POST /api/market/plugins/{id}/install``   从索引安装（默认不启用）
+- ``POST /api/market/plugins/{id}/update``    更新代码与 manifest（保留配置与启用状态）
+- ``POST /api/market/plugins/{id}/uninstall`` 卸载（启用中先停用再删目录）
 - ``GET  /api/logs``            运行日志尾部
 - ``GET  /api/config``          查看 config.yaml
 - ``PUT  /api/config``          编辑并校验后保存，返回需重启提示
@@ -60,12 +64,14 @@ from .config_schema import (
     validate_structured,
 )
 from .logbuffer import records as log_records
+from .market import MarketError, MarketService
 from .state import (
     WebState,
     describe_restart_fields,
     restart_fields,
     save_config_text,
     save_persona_text,
+    write_plugin_enabled,
 )
 
 logger = logging.getLogger(__name__)
@@ -256,31 +262,10 @@ def _write_plugin_enabled(state) -> None:
     """把当前启用的插件列表写回 config.yaml 的 ``plugins.enabled``。
 
     只动这一个键，保留其余内容与顺序；写盘沿用设置页的原子替换 + 备份。
+    真正的写入逻辑在 :func:`rubenbot.web.state.write_plugin_enabled`，市场页
+    的启停/卸载复用同一条路径。
     """
-    import yaml
-
-    path = Path(state.config_path)
-    data = _read_raw_config(path)
-    plugins = data.get("plugins")
-    if plugins is None:
-        plugins = {}
-        data["plugins"] = plugins
-    if not isinstance(plugins, dict):
-        raise ValueError("config.yaml 里的 plugins 段格式不正确")
-    manager = state.plugins
-    if manager is None:
-        # 独立 WebUI 模式：没有管理器，按 state.config 里刚更新的列表写回
-        names = list(state.config.plugins.enabled)
-    else:
-        names = state.enabled_plugin_names(manager)
-        # 让磁盘配置与内存里管理器的状态保持一致（管理器可能持有旧配置对象）
-        state.config.plugins.enabled = list(names)
-        manager.config.plugins.enabled = list(names)
-    plugins["enabled"] = list(names)
-    if "dir" not in plugins:
-        plugins["dir"] = state.config.plugins.dir
-    text = yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
-    save_config_text(path, text)
+    write_plugin_enabled(state)
 
 
 def _save_plugin_without_manager(state: WebState, name: str, enabled: bool) -> dict[str, Any]:
@@ -789,6 +774,12 @@ def create_app(state: WebState):
         if state.plugins is None:
             return _save_plugin_without_manager(state, name, enabled)
         if not state.set_plugin_enabled(name, enabled):
+            # manifest 不合规（含核心版本过低）时把原因带回去，别只说「不存在」
+            plugin = state.plugins.plugins.get(name)
+            if plugin is not None and not plugin.valid:
+                raise ApiError(
+                    409, f"插件 {name} 的 manifest 不合规，不能启用：{plugin.invalid_reason}"
+                )
             raise ApiError(404, f"插件不存在或启用失败：{name}")
         try:
             _write_plugin_enabled(state)
@@ -809,6 +800,57 @@ def create_app(state: WebState):
             "persisted": True,
             "message": f"插件已{'启用' if enabled else '停用'}，立即生效并已写回配置。",
         }
+
+    # ------------------------------------------------------------------
+    # 插件市场
+    # ------------------------------------------------------------------
+
+    # 一个进程一个市场服务；索引拉取按请求进行（页面刷新即重新拉），
+    # 安装类操作在服务内部串行。
+    # 这些路由用同步函数（不是 async def）：索引拉取最多会阻塞 5 秒、
+    # 下载与解压更久，交给 FastAPI 的线程池跑，别把整个 WebUI 的事件循环卡住。
+    market = MarketService(state)
+
+    @app.get("/api/market")
+    def market_snapshot(request: Request):
+        """市场页数据：来源标注 + 本地/索引合并后的卡片列表。"""
+        require_session(request)
+        return {"ok": True, **market.snapshot()}
+
+    def _market_action(func, plugin_id: str):
+        try:
+            result = func(plugin_id)
+        except MarketError as exc:
+            raise ApiError(exc.status, exc.message) from exc
+        return {"ok": True, **result, "market": market.snapshot()}
+
+    def _market_log(plugin_id: str, action: str):
+        """操作完成后记一行日志，方便事后对账。"""
+        logger.info("WebUI 从市场%s插件 %s", action, plugin_id)
+
+    @app.post("/api/market/plugins/{plugin_id}/install")
+    def market_install(plugin_id: str, request: Request):
+        """安装：下载 zip → 校验 manifest → 落盘；默认不启用。"""
+        require_session(request)
+        result = _market_action(market.install, plugin_id)
+        _market_log(plugin_id, "安装")
+        return result
+
+    @app.post("/api/market/plugins/{plugin_id}/update")
+    def market_update(plugin_id: str, request: Request):
+        """更新：换代码与 manifest，保留插件配置与启用状态。"""
+        require_session(request)
+        result = _market_action(market.update, plugin_id)
+        _market_log(plugin_id, "更新")
+        return result
+
+    @app.post("/api/market/plugins/{plugin_id}/uninstall")
+    def market_uninstall(plugin_id: str, request: Request):
+        """卸载：启用中先停用，再删目录。"""
+        require_session(request)
+        result = _market_action(market.uninstall, plugin_id)
+        _market_log(plugin_id, "卸载")
+        return result
 
     # ------------------------------------------------------------------
     # 日志

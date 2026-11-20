@@ -134,19 +134,27 @@ class WebState:
                 logger.warning("扫描插件目录失败：%s", exc)
             return self.plugins.list_plugins()
         from ..plugins.loader import discover_plugin_dirs
+        from ..plugins.manifest import read_manifest
 
         allow = set(self.config.plugins.enabled)
-        return [
-            {
-                "name": name,
-                "enabled": name in allow,
-                "loaded": False,
-                "commands": [],
-                "hooks": {"on_message": 0, "on_before_reply": 0, "on_after_reply": 0},
-                "path": str(path),
-            }
-            for name, path in discover_plugin_dirs(self.config.plugins.dir)
-        ]
+        items = []
+        for name, path in discover_plugin_dirs(self.config.plugins.dir):
+            manifest, reason, core_too_old = read_manifest(path)
+            items.append(
+                {
+                    "name": name,
+                    "enabled": name in allow,
+                    "loaded": False,
+                    "valid": manifest is not None,
+                    "invalid_reason": reason,
+                    "core_too_old": core_too_old,
+                    "manifest": manifest.as_dict() if manifest is not None else None,
+                    "commands": [],
+                    "hooks": {"on_message": 0, "on_before_reply": 0, "on_after_reply": 0},
+                    "path": str(path),
+                }
+            )
+        return items
 
     def set_plugin_enabled(self, name: str, enabled: bool) -> bool:
         """运行时启用/停用插件，并把启用列表同步到内存里的配置。
@@ -341,6 +349,41 @@ class WebState:
     def shutdown(self) -> None:
         """关闭 WebUI 时清理自己挂的东西（不关 store，store 归 bot 管）。"""
         self.extras.clear()
+
+
+def write_plugin_enabled(state: "WebState") -> Path | None:
+    """把当前启用列表写回 config.yaml 的 ``plugins.enabled``。
+
+    只动这一个键，保留其余内容与顺序；写盘沿用设置页的原子替换 + 备份。
+    市场页的启用/停用/卸载也走这里，保证和插件开关是同一条写盘路径。
+    """
+    import yaml
+
+    path = Path(state.config_path)
+    data: dict[str, Any] = {}
+    if path.exists():
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        if not isinstance(data, dict):
+            raise ValueError("config.yaml 顶层不是键值对，无法写入")
+    plugins = data.get("plugins")
+    if plugins is None:
+        plugins = {}
+        data["plugins"] = plugins
+    if not isinstance(plugins, dict):
+        raise ValueError("config.yaml 里的 plugins 段格式不正确")
+    manager = state.plugins
+    if manager is None:
+        names = list(state.config.plugins.enabled)
+    else:
+        names = state.enabled_plugin_names(manager)
+        # 磁盘配置与内存里的管理器状态保持一致（管理器可能持有旧配置对象）
+        state.config.plugins.enabled = list(names)
+        manager.config.plugins.enabled = list(names)
+    plugins["enabled"] = list(names)
+    if "dir" not in plugins:
+        plugins["dir"] = state.config.plugins.dir
+    text = yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
+    return save_config_text(path, text)
 
 
 def restart_fields(old: Config, new: Config) -> list[str]:

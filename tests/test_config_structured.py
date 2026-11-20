@@ -163,6 +163,7 @@ def test_structured_config_covers_every_field(config):
             "groups",
         ],
         "plugins": ["dir", "enabled", "command_prefix"],
+        "market": ["index_url"],
         "webui": ["enabled", "host", "port", "session_hours"],
     }.items():
         for key in keys:
@@ -249,6 +250,16 @@ def test_quiet_hours_validation():
     assert update["decision"]["groups"]["g1"]["quiet_hours"] == ["23:00-07:30"]
     with pytest.raises(ConfigValidationError):
         validate_structured({"decision": {"groups": {"g1": {"quiet_hours": ["25:00-30:00"]}}}})
+
+
+def test_validate_market_index_url():
+    # 留空表示「用内置官方索引」，允许；http(s) 地址原样保留
+    assert validate_structured({"market": {"index_url": ""}})["market"] == {"index_url": ""}
+    update = validate_structured({"market": {"index_url": " https://example.test/plugins.json "}})
+    assert update["market"]["index_url"] == "https://example.test/plugins.json"
+    with pytest.raises(ConfigValidationError) as info:
+        validate_structured({"market": {"index_url": "ftp://example.test/plugins.json"}})
+    assert any(item["field"] == "market.index_url" for item in info.value.fields)
 
 
 def test_merge_config_keeps_unknown_keys():
