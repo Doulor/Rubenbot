@@ -594,10 +594,114 @@ function confirmDialog({ title, message, confirmText = "确定", danger = false,
 /* 概览                                                               */
 /* ------------------------------------------------------------------ */
 
+/** 心情枚举（与后端 MOODS 一致，设置页的情绪下拉用）。 */
+const MOOD_NAMES = ["平静", "开心", "委屈", "无聊", "兴奋", "低落"];
+
+const MOOD_TONE = {
+  开心: "good",
+  兴奋: "accent",
+  委屈: "bad",
+  低落: "bad",
+  无聊: "warn",
+  平静: "outline",
+};
+
+const AFFINITY_TONE = {
+  亲近: "good",
+  友好: "accent",
+  普通: "outline",
+  冷淡: "warn",
+  疏远: "bad",
+};
+
+/** 好感档位色条：0–100 的横向进度，够直观又不抢注意力。 */
+function affinityBar(score) {
+  const fill = h("div", { class: "fill" });
+  fill.style.width = `${Math.max(0, Math.min(100, Number(score) || 0))}%`;
+  return h("div", { class: "scorebar", role: "img", "aria-label": `好感度 ${score}` }, h("div", { class: "track" }), fill);
+}
+
+function affinityRow(item) {
+  return h(
+    "div",
+    { class: "row emotion-person", tabindex: "0", role: "link",
+      onclick: () => navigate("people", encodeURIComponent(item.person_id)),
+      onkeydown: (event) => {
+        if (event.key === "Enter") navigate("people", encodeURIComponent(item.person_id));
+      } },
+    h("div", { class: "avatar" }, avatarText(item.display_name)),
+    h("div", { class: "row-main" },
+      h("div", { class: "row-title" }, item.display_name),
+      affinityBar(item.score)),
+    h("div", { class: "row-side" },
+      h("span", { class: "num" }, Number(item.score).toFixed(1)),
+      h("span", { class: `tag ${AFFINITY_TONE[item.band] || "outline"}` }, item.band))
+  );
+}
+
+/** 情绪状态卡：当前心情 + 好感 Top5/Bottom3 + 最近变化；数据来自 /api/emotion。 */
+function emotionCard(data) {
+  const mood = data.mood || {};
+  const moodNode = data.enabled
+    ? h(
+        "div",
+        { class: "emotion-mood" },
+        h("span", { class: `tag ${MOOD_TONE[mood.mood] || "outline"}` }, mood.mood || "平静"),
+        mood.phrase ? h("span", { class: "muted" }, mood.phrase) : null,
+        h("span", { class: "emotion-threshold" },
+          data.threshold_adjust
+            ? `开口阈值 ${data.threshold_adjust > 0 ? "+" : ""}${Number(data.threshold_adjust).toFixed(2)}`
+            : "开口阈值不受影响")
+      )
+    : h("div", { class: "muted" }, "情绪系统已关闭（emotion.enabled: false）");
+
+  const top = (data.affinity && data.affinity.top) || [];
+  const bottom = (data.affinity && data.affinity.bottom) || [];
+  const tracked = (data.affinity && data.affinity.tracked) || 0;
+
+  const ranking = h(
+    "div",
+    { class: "grid grid-2" },
+    h("div", {},
+      h("div", { class: "emotion-subhead" }, "好感 Top5"),
+      top.length ? h("div", { class: "emotion-list" }, ...top.map(affinityRow))
+        : emptyState("heartbeat", "还没有好感记录", "跟 bot 说上话就会开始攒")),
+    h("div", {},
+      h("div", { class: "emotion-subhead" }, "好感 Bottom3"),
+      bottom.length ? h("div", { class: "emotion-list" }, ...bottom.map(affinityRow))
+        : h("div", { class: "muted emotion-empty" }, tracked > 5 ? "人数还不够分出 Bottom3" : "暂时没有更低的人"))
+  );
+
+  const recent = data.recent_changes || [];
+  const changes = h(
+    "div",
+    { class: "emotion-changes" },
+    h("div", { class: "emotion-subhead" }, "最近变化"),
+    recent.length
+      ? h("div", { class: "emotion-list" },
+          ...recent.map((entry) =>
+            h("div", { class: "emotion-change" },
+              h("span", { class: entry.delta >= 0 ? "num pos" : "num neg" },
+                `${entry.delta >= 0 ? "+" : ""}${Number(entry.delta).toFixed(2)}`),
+              h("span", { class: "row-title" }, entry.display_name),
+              h("span", { class: "tag outline" }, entry.reason || "变化"),
+              h("span", { class: "muted" }, fmtRelative(entry.created_at)))))
+      : h("div", { class: "muted emotion-empty" }, "还没有好感度变化")
+  );
+
+  return card("情绪与好感", {
+    hint: tracked ? `已记录 ${tracked} 人` : "",
+    body: h("div", { class: "emotion-body" }, moodNode, ranking, changes),
+  });
+}
+
 async function renderOverview(view) {
   view.replaceChildren(skeleton(4));
   const load = async () => {
-    const data = await api.get("/api/overview");
+    const [data, emotion] = await Promise.all([
+      api.get("/api/overview"),
+      api.get("/api/emotion").catch(() => null),
+    ]);
     const counts = data.counts;
     const replyRate = counts.decisions ? counts.decision_replies / counts.decisions : 0;
 
@@ -693,11 +797,15 @@ async function renderOverview(view) {
       }
     );
 
+    // replaceChildren 会把 null 转成文本节点，用 filter 把缺省项剔掉
     view.replaceChildren(
-      overviewHero(data),
-      tiles,
-      h("div", { class: "grid grid-2" }, h("div", { class: "grid" }, runtime, adapters), h("div", { class: "grid" }, plugins, webui)),
-      decisions
+      ...[
+        overviewHero(data),
+        tiles,
+        emotion ? emotionCard(emotion) : null,
+        h("div", { class: "grid grid-2" }, h("div", { class: "grid" }, runtime, adapters), h("div", { class: "grid" }, plugins, webui)),
+        decisions,
+      ].filter(Boolean)
     );
     setSidebarStatus(data.bot.running ? "运行中" : "未运行", data.bot.running ? "ok" : "off");
   };
@@ -2450,6 +2558,8 @@ function groupName(key) {
     decision: "回复意愿",
     reminder: "提醒",
     proactive: "冷场开口",
+    generation: "生成",
+    emotion: "情绪与好感度",
     plugins: "插件",
     webui: "WebUI",
     persona: "人格",
@@ -2793,6 +2903,57 @@ async function renderSettings(view) {
             kind: "switch",
             hint: "先让快速模型想一段简短指导，再按指导写正文；第一段失败会自动回退单段直出",
           },
+        ],
+        draft
+      ),
+    }),
+    card("情绪与好感度", {
+      hint: "状态由规则计算，只做背景注入与阈值微调",
+      body: fieldGrid(
+        [
+          {
+            path: "emotion.enabled",
+            label: "启用情绪系统",
+            kind: "switch",
+            hint: "关掉后不记录好感度、不注入状态、不调整开口阈值",
+          },
+          { path: "emotion.chat_delta", label: "每轮对话加分", kind: "number", step: "0.1", min: 0, max: 10, hint: "与 bot 完成一轮对话的好感度增量" },
+          { path: "emotion.chat_daily_cap", label: "对话加分每日上限", kind: "number", step: "0.5", min: 0, hint: "每人每个自然日靠对话最多加多少" },
+          { path: "emotion.praise_delta", label: "被夸 / 感谢加分", kind: "number", step: "0.5", min: -50, max: 50, hint: "关键词命中且确认是对 bot 说的" },
+          { path: "emotion.insult_delta", label: "被骂减分", kind: "number", step: "0.5", min: -50, max: 50, hint: "同一套保守规则，宁可漏判" },
+          { path: "emotion.decay_weekly", label: "每周回归基线比例", kind: "number", step: "0.01", min: 0, max: 1, hint: "好感度每周向 50 靠拢的比例（惰性折算）" },
+          { path: "emotion.half_life_seconds", label: "情绪半衰期（秒）", kind: "number", step: "60", min: 1, hint: "情绪强度减半所需时间，默认一小时" },
+          { path: "emotion.boredom_after_seconds", label: "多久没人理算无聊（秒）", kind: "number", step: "60", min: 0, hint: "超过这么久没人说话、情绪也淡了才判无聊" },
+          {
+            path: "emotion.praise_mood",
+            label: "被夸时的情绪",
+            kind: "select",
+            options: MOOD_NAMES.map((name) => ({ value: name, label: name })),
+            hint: "情绪枚举之一；强度在下面几项里配",
+          },
+          { path: "emotion.praise_intensity", label: "被夸情绪强度", kind: "number", step: "0.05", min: 0, max: 1 },
+          {
+            path: "emotion.insult_mood",
+            label: "被骂时的情绪",
+            kind: "select",
+            options: MOOD_NAMES.map((name) => ({ value: name, label: name })),
+          },
+          { path: "emotion.insult_intensity", label: "被骂情绪强度", kind: "number", step: "0.05", min: 0, max: 1 },
+          {
+            path: "emotion.excitement_mood",
+            label: "热闹时的情绪",
+            kind: "select",
+            options: MOOD_NAMES.map((name) => ({ value: name, label: name })),
+          },
+          { path: "emotion.excitement_intensity", label: "兴奋强度", kind: "number", step: "0.05", min: 0, max: 1, hint: "群里热闹且 bot 参与多时" },
+          {
+            path: "emotion.boredom_mood",
+            label: "没人理时的情绪",
+            kind: "select",
+            options: MOOD_NAMES.map((name) => ({ value: name, label: name })),
+          },
+          { path: "emotion.boredom_intensity", label: "无聊强度", kind: "number", step: "0.05", min: 0, max: 1 },
+          { path: "emotion.min_intensity", label: "情绪有效期阈值", kind: "number", step: "0.01", min: 0, max: 1, hint: "强度低于它视为平静：不再注入、不调阈值" },
         ],
         draft
       ),

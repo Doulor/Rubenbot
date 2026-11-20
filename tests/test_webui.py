@@ -509,6 +509,55 @@ def test_reminders_list_is_read_only(client, store):
 
 
 # ----------------------------------------------------------------------
+# 情绪与好感度
+# ----------------------------------------------------------------------
+
+
+def test_emotion_status_card(client, store):
+    seed(store)
+    now = time.time()
+    store.set_affinity("snowluma:1001", 82.0, now=now)
+    store.set_affinity("snowluma:1002", 31.0, now=now)
+    store.add_affinity_log("snowluma:1001", 1.0, reason="被夸", place="snowluma:g1", now=now)
+    store.set_mood("开心", 0.6, now=now)
+
+    payload = client.get("/api/emotion").json()
+    assert payload["ok"] is True
+    assert payload["enabled"] is True
+    assert payload["mood"]["mood"] == "开心"
+    assert payload["threshold_adjust"] == -0.05
+    top = payload["affinity"]["top"]
+    assert [(item["display_name"], item["band"]) for item in top] == [("阿花", "亲近"), ("老周", "冷淡")]
+    assert payload["affinity"]["tracked"] == 2
+    assert payload["recent_changes"][0]["reason"] == "被夸"
+    assert payload["recent_changes"][0]["display_name"] == "阿花"
+
+
+def test_emotion_status_empty(client):
+    payload = client.get("/api/emotion").json()
+    assert payload["ok"] is True
+    assert payload["mood"]["mood"] == "平静"
+    assert payload["affinity"] == {"top": [], "bottom": [], "tracked": 0}
+    assert payload["recent_changes"] == []
+
+
+def test_emotion_status_uses_running_bot_engine(client, store, config):
+    from rubenbot.emotion import EmotionEngine
+
+    state = client.app.state.web
+    engine = EmotionEngine(store, config.emotion, now_fn=lambda: 1_000_000.0)
+    engine.react("委屈", 0.6, now=1_000_000.0)
+
+    class FakeBot:
+        emotion = engine
+
+    state.bot = FakeBot()
+    payload = client.get("/api/emotion").json()
+    assert payload["mood"]["mood"] == "委屈"
+    assert payload["threshold_adjust"] == 0.05
+
+
+# ----------------------------------------------------------------------
 # 插件
 # ----------------------------------------------------------------------
 

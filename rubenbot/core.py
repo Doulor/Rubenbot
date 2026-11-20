@@ -38,6 +38,7 @@ from .decision import (
     ReplyDecision,
     parse_generation_output,
 )
+from .emotion import EmotionEngine
 from .llm import LLMClient, LLMProtocol, ToolUnsupported, make_usage_recorder
 from .memory.consolidate import Consolidator
 from .memory.extract import MemoryExtractor, audience_for_chat
@@ -475,6 +476,8 @@ class RubenBot:
         self.searcher: WebSearcher | None = build_searcher(config.search)
         # 语音双向（STT/TTS）：转写与合成都没配时为 None，全部降级为文字
         self.voice: VoiceService | None = build_voice(config.voice)
+        # 情绪与好感度：确定性规则，状态落库，只做背景注入与阈值微调
+        self.emotion = EmotionEngine(store, config.emotion)
         self.adapters: dict[str, BaseAdapter] = {}
         self.plugins = plugins
         self.context = BotContext(
@@ -490,6 +493,7 @@ class RubenBot:
                 "bot": self,
                 "memory_reader": self.memory_reader,
                 "privacy_gate": self.gate,
+                "emotion": self.emotion,
             },
         )
         # 每个会话最近一次收到消息的时间，用于日志/调试
@@ -566,6 +570,8 @@ class RubenBot:
                     asyncio.get_running_loop().create_task(old_voice.close())
                 except RuntimeError:  # 没有事件循环（测试/同步调用）
                     pass
+        # 情绪规则：参数换新，已落库的好感度/心情不受影响
+        self.emotion.config = config.emotion
         # 读取侧与审查口：配置/模型一起热换，索引缓存保留（配置里 TTL 会立即生效）
         self.memory_reader.config = config.memory
         self.memory_reader.llm = self.llm
@@ -606,6 +612,11 @@ class RubenBot:
     async def run(self) -> None:
         """启动全部适配器与后台任务，直到 stop。"""
         self._stop.clear()
+        # 情绪系统冷启动：补一个「有人理」的基准时刻（只在从没记录时写）
+        try:
+            self.emotion.ensure_tracking()
+        except Exception as exc:  # noqa: BLE001 - 情绪状态失败不能拖住启动
+            logger.warning("初始化情绪状态失败：%s", exc)
         tasks = [asyncio.create_task(self._run_adapter(adapter)) for adapter in self.adapters.values()]
         self._bg_task = asyncio.create_task(self._background_loop())
         self._merge_task = asyncio.create_task(self._merge_loop())
@@ -957,6 +968,7 @@ class RubenBot:
 
     async def _process_round_locked(self, round_: MergedRound, event: MessageEvent) -> None:
         now = time.time()
+        self.observe_emotion(event, events=round_.events, now=now)
         decision = self.decide(event, now=now)
         self.last_decision[self.decision_engine.chat_key(event)] = decision
         self._log_decision(round_, event, decision, now)
@@ -1036,6 +1048,7 @@ class RubenBot:
                     "multiplier": factors.multiplier,
                     "noise": factors.noise,
                     "share": factors.share,
+                    "mood_adjust": factors.mood_adjust,
                 }
                 if factors is not None
                 else {},
@@ -1185,11 +1198,84 @@ class RubenBot:
             recent_messages=recent,
             relevance=relevance,
             hard_trigger=hard,
+            # 心情只微调普通群消息的开口阈值；硬触发本来就不看分数
+            mood_adjust=self.emotion.threshold_adjust(now=now),
         )
 
     def should_reply(self, event: MessageEvent, *, now: float | None = None) -> ReplyDecision:
         """兼容旧调用名，等价于 :meth:`decide`。"""
         return self.decide(event, now=now)
+
+    # ------------------------------------------------------------------
+    # 情绪与好感度
+    # ------------------------------------------------------------------
+
+    def observe_emotion(
+        self,
+        event: MessageEvent,
+        *,
+        events: list[MessageEvent] | None = None,
+        now: float | None = None,
+    ) -> None:
+        """这一轮消息对情绪的影响：记互动、识别被夸/被骂、算一轮对话。
+
+        - 只有**对着 bot 说**的消息才算（私聊、@、回复、叫名字）；
+        - 与 bot 对话一轮 +0.2（每人每日上限 +2），被夸 +1、被骂 −2；
+        - 合并轮逐条看夸/骂和是否对着 bot 说，但「对话轮」一轮只记一次；
+        - 任何异常都只记日志：情绪系统坏了也不能影响回复。
+        """
+        now = time.time() if now is None else now
+        if not self.config.emotion.enabled:
+            return
+        try:
+            raw_events = list(events or [event])
+            # 一轮里只要有任意一条对着 bot 说（私聊/@/回复/叫名字），整轮就算
+            # 对着 bot 的一口气：紧接着补一句「谢谢你」也属于这一轮。
+            addressed = any(
+                self.decision_engine.is_hard_trigger(item) is not None for item in raw_events
+            )
+            for item in raw_events:
+                self._observe_one_emotion(item, addressed=addressed, now=now)
+            if addressed:
+                person_id = make_person_id(event.platform, event.sender_id)
+                place = f"{event.platform}:{event.chat_id}"
+                self.emotion.record_chat_round(person_id, place=place, now=now)
+        except Exception as exc:  # noqa: BLE001 - 情绪状态失败不能影响回复
+            logger.warning("更新情绪状态失败：%s", exc)
+
+    def _observe_one_emotion(self, item: MessageEvent, *, addressed: bool, now: float) -> None:
+        """合并轮里的一条原始消息：识别被夸/被骂。"""
+        person_id = make_person_id(item.platform, item.sender_id)
+        place = f"{item.platform}:{item.chat_id}"
+        self.emotion.observe_message(
+            person_id=person_id,
+            text=item.text,
+            addressed=addressed,
+            place=place,
+            now=now,
+        )
+
+    def note_emotion_after_reply(self, event: MessageEvent, *, now: float | None = None) -> None:
+        """bot 发言后：记「有人理」，群里热闹且它参与多就兴奋一下。"""
+        now = time.time() if now is None else now
+        if not self.config.emotion.enabled:
+            return
+        try:
+            self.emotion.note_engaged(now=now)
+            if event.is_group:
+                self.emotion.maybe_excited(event.platform, event.chat_id, now=now)
+        except Exception as exc:  # noqa: BLE001 - 情绪状态失败不能影响回复
+            logger.warning("更新发言后情绪失败：%s", exc)
+
+    def emotion_text(self, event: MessageEvent, *, now: float | None = None) -> str:
+        """状态注入行（平静且普通档位时为空串）；失败退化为空。"""
+        now = time.time() if now is None else now
+        try:
+            person_id = make_person_id(event.platform, event.sender_id)
+            return self.emotion.injection_line(person_id, now=now)
+        except Exception as exc:  # noqa: BLE001 - 注入失败只少一行背景
+            logger.warning("组装情绪状态失败：%s", exc)
+            return ""
 
     # ------------------------------------------------------------------
     # 上下文拼装
@@ -1296,6 +1382,10 @@ class RubenBot:
         memory_text = await self.memory_text(event, now=now)
         if memory_text:
             sections.append(memory_text)
+        # 情绪与好感度：一行状态描述，放在记忆之后、场景之前；平静且普通时整行省掉
+        emotion_text = self.emotion_text(event, now=now)
+        if emotion_text:
+            sections.append(emotion_text)
         # 本会话的早期对话压缩：只补对话历史，不涉及跨会话记忆
         summary = self.summarizer.active_summary(event.platform, event.chat_id)
         covered_until = 0
@@ -1793,6 +1883,8 @@ class RubenBot:
             self._record_bot_message(event, text, message_id)
         # 发言时间交给决策引擎：动量加成与发言后冷却都依赖它
         self.decision_engine.note_reply(self.decision_engine.chat_key(event), time.time() if now is None else now)
+        # 情绪侧：刚说过话 = 有人理；群里热闹就兴奋一下
+        self.note_emotion_after_reply(event, now=now)
 
     def _record_bot_message(
         self, event: MessageEvent, text: str, message_id: str | None

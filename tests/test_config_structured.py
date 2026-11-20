@@ -165,6 +165,27 @@ def test_structured_config_covers_every_field(config):
         ],
         "plugins": ["dir", "enabled", "command_prefix"],
         "webui": ["enabled", "host", "port", "session_hours"],
+        "emotion": [
+            "enabled",
+            "affinity_baseline",
+            "chat_delta",
+            "chat_daily_cap",
+            "praise_delta",
+            "insult_delta",
+            "decay_weekly",
+            "praise_mood",
+            "praise_intensity",
+            "insult_mood",
+            "insult_intensity",
+            "excitement_mood",
+            "excitement_intensity",
+            "boredom_mood",
+            "boredom_intensity",
+            "boredom_after_seconds",
+            "half_life_seconds",
+            "min_intensity",
+            "threshold_adjust",
+        ],
     }.items():
         for key in keys:
             assert key in view[section], (section, key)
@@ -223,6 +244,59 @@ def test_validate_structured_accepts_string_numbers():
     assert update["decision"]["threshold"] == 0.7
     assert update["webui"]["port"] == 9000
     assert update["log_level"] == "DEBUG"
+
+
+def test_validate_emotion_section():
+    update = validate_structured(
+        {
+            "emotion": {
+                "enabled": True,
+                "chat_delta": "0.3",
+                "insult_delta": "-3",
+                "praise_mood": "开心",
+                "excitement_min_messages": "8",
+                "threshold_adjust": {"开心": "-0.08", "委屈": "0.1"},
+            }
+        }
+    )
+    emotion = update["emotion"]
+    assert emotion["enabled"] is True
+    assert emotion["chat_delta"] == 0.3
+    assert emotion["insult_delta"] == -3.0
+    assert emotion["praise_mood"] == "开心"
+    assert emotion["excitement_min_messages"] == 8
+    assert emotion["threshold_adjust"] == {"开心": -0.08, "委屈": 0.1}
+
+
+def test_validate_emotion_rejects_bad_values():
+    with pytest.raises(ConfigValidationError) as info:
+        validate_structured(
+            {
+                "emotion": {
+                    "chat_delta": -1,
+                    "decay_weekly": 2,
+                    "half_life_seconds": 0,
+                    "threshold_adjust": {"开心": 5},
+                }
+            }
+        )
+    fields = {item["field"] for item in info.value.fields}
+    assert {"emotion.chat_delta", "emotion.decay_weekly", "emotion.half_life_seconds",
+            "emotion.threshold_adjust.开心"} <= fields
+
+
+def test_put_structured_emotion_hot_applies(bot_state):
+    """情绪参数保存即生效：引擎换上新配置，已落库的好感度不受影响。"""
+    bot = bot_state.bot
+    client = TestClient(create_app(bot_state))
+    response = client.put(
+        "/api/config",
+        json={"config": {"emotion": {"chat_delta": 0.5, "decay_weekly": 0.1}}},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["applied"] == ["emotion"]
+    assert bot.emotion.config.chat_delta == pytest.approx(0.5)
+    assert bot.emotion.config.decay_weekly == pytest.approx(0.1)
 
 
 @pytest.mark.parametrize(

@@ -196,6 +196,38 @@ proactive:
   relevance_bonus: 0.10        # 群近期话题命中记忆时最多加多少分
   relevance_scale: 8.0         # 检索分数归一尺度
 
+# 情绪与好感度：状态全部由代码规则算，模型不参与打分；只做背景注入与阈值微调
+emotion:
+  enabled: true                 # 总开关：关掉后不记录、不注入、不调阈值
+  affinity_baseline: 50         # 好感度基线（也是衰减回归的目标）
+  chat_delta: 0.2               # 与 bot 对话一轮的加分
+  chat_daily_cap: 2.0           # 每人每个自然日靠对话最多加多少
+  praise_delta: 1.0             # 被夸/感谢（关键词规则，保守）
+  insult_delta: -2.0            # 被骂/恶语（同一套保守规则）
+  decay_weekly: 0.05            # 每周向基线回归的比例，惰性折算
+  # 情绪：事件 → 状态（强度 0–1）
+  praise_mood: "开心"
+  praise_intensity: 0.6
+  insult_mood: "委屈"
+  insult_intensity: 0.6
+  excitement_mood: "兴奋"
+  excitement_intensity: 0.4
+  excitement_window_seconds: 600     # 统计「群里热闹」的时间窗
+  excitement_min_messages: 6         # 窗口内至少这么多条真实消息
+  excitement_min_bot_messages: 2     # 且 bot 至少参与了这么多次
+  boredom_mood: "无聊"
+  boredom_intensity: 0.3
+  boredom_after_seconds: 10800       # 三小时没人理 bot 才判无聊
+  half_life_seconds: 3600            # 情绪强度减半所需时间
+  min_intensity: 0.05                # 低于它视为平静
+  # 意愿阈值微调（加到阈值上；负数更容易开口）
+  threshold_adjust:
+    开心: -0.05
+    兴奋: -0.05
+    无聊: -0.03
+    委屈: 0.05
+    低落: 0.05
+
 plugins:
   dir: "plugins"
   # 插件默认全部关闭（显式启用制）：只有列在这里的插件才会加载，

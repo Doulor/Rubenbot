@@ -111,6 +111,7 @@ def structured_config(config: Config) -> dict[str, Any]:
             **asdict(config.proactive),
             "quiet_hours": list(config.proactive.quiet_hours),
         },
+        "emotion": asdict(config.emotion),
         "plugins": {
             "dir": config.plugins.dir,
             "enabled": list(config.plugins.enabled),
@@ -543,6 +544,74 @@ def _validate_generation(section: dict[str, Any], v: _Validator) -> dict[str, An
     return out
 
 
+# emotion 段的数值字段 → (下限, 上限)；全都是可调的规则幅度
+_EMOTION_NUMBERS: dict[str, tuple[float | None, float | None]] = {
+    "affinity_baseline": (0, 100),
+    "affinity_min": (0, 100),
+    "affinity_max": (0, 100),
+    "chat_delta": (0, 10),
+    "chat_daily_cap": (0, 100),
+    "praise_delta": (-50, 50),
+    "insult_delta": (-50, 50),
+    "decay_weekly": (0, 1),
+    "praise_intensity": (0, 1),
+    "insult_intensity": (0, 1),
+    "excitement_intensity": (0, 1),
+    "excitement_window_seconds": (0, None),
+    "boredom_intensity": (0, 1),
+    "boredom_after_seconds": (0, None),
+    "half_life_seconds": (1, None),
+    "min_intensity": (0, 1),
+}
+
+
+def _validate_emotion(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
+    """情绪与好感度：开关、幅度、阈值微调表。
+
+    幅度写错只报字段错误，不挡启动；``threshold_adjust`` 只收「心情 → 数字」，
+    其它类型的值整项忽略。
+    """
+    out: dict[str, Any] = {}
+    if "enabled" in section:
+        flag = v.boolean(section["enabled"], "emotion.enabled")
+        if flag is not None:
+            out["enabled"] = flag
+    for key in ("praise_mood", "insult_mood", "excitement_mood", "boredom_mood"):
+        if key in section:
+            value = v.text(section[key], f"emotion.{key}", max_len=10)
+            if value is not None:
+                out[key] = value
+    for key, (minimum, maximum) in _EMOTION_NUMBERS.items():
+        if key not in section:
+            continue
+        number = v.number(section[key], f"emotion.{key}", minimum=minimum, maximum=maximum)
+        if number is not None:
+            out[key] = float(number)
+    for key, field in (
+        ("excitement_min_messages", "emotion.excitement_min_messages"),
+        ("excitement_min_bot_messages", "emotion.excitement_min_bot_messages"),
+    ):
+        if key in section:
+            number = v.number(section[key], field, minimum=0, integer=True)
+            if number is not None:
+                out[key] = int(number)
+    adjust = section.get("threshold_adjust")
+    if adjust is not None:
+        if not isinstance(adjust, dict):
+            v.fail("emotion.threshold_adjust", "应为「心情 → 数字」的对象")
+        else:
+            table: dict[str, float] = {}
+            for raw_mood, raw_value in adjust.items():
+                mood = str(raw_mood).strip()
+                if not mood:
+                    continue
+                number = v.number(raw_value, f"emotion.threshold_adjust.{mood}", minimum=-1, maximum=1)
+                if number is not None:
+                    table[mood] = float(number)
+            out["threshold_adjust"] = table
+    return out
+
+
 def _validate_decision(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
     out: dict[str, Any] = {}
     number_fields = {
@@ -822,6 +891,9 @@ def validate_structured(payload: dict[str, Any]) -> dict[str, Any]:
     proactive = _section(payload, "proactive", v)
     if proactive is not None:
         update["proactive"] = _validate_proactive(proactive, v)
+    emotion = _section(payload, "emotion", v)
+    if emotion is not None:
+        update["emotion"] = _validate_emotion(emotion, v)
     plugins = _section(payload, "plugins", v)
     if plugins is not None:
         update["plugins"] = _validate_plugins(plugins, v)
