@@ -62,7 +62,7 @@ def test_registered_mcp_tool_reaches_model_and_returns_result(config, store):
 
 
 def test_missing_server_does_not_interrupt_chat(config, store, tmp_path):
-    config.mcp.servers = [MCPServerConfig(name="absent", command=str(tmp_path / "absent"))]
+    config.mcp.servers = [MCPServerConfig(name="absent", command=str(tmp_path / "python"))]
     llm = ScriptedLLM({"chat": ["在呢"]})
     bot = RubenBot(config, store, llm, Persona("Ruben", "说人话"))
     adapter = RecordingAdapter()

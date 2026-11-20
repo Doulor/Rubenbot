@@ -896,12 +896,20 @@ class MCPConfig:
     connect_timeout: float = 10
     call_timeout: float = 30
     max_result_bytes: int = 32768
+    stdio_allowed_commands: list[str] = field(default_factory=lambda: ["python", "python3", "uv", "uvx", "npx", "node"])
 
 
 def _load_mcp(data: Any) -> MCPConfig:
     config = MCPConfig()
     if not isinstance(data, dict):
         return config
+    if "stdio_allowed_commands" in data:
+        commands = data["stdio_allowed_commands"]
+        if isinstance(commands, list) and all(isinstance(name, str) and name.strip() for name in commands):
+            config.stdio_allowed_commands = commands
+        else:
+            logger.warning("mcp.stdio_allowed_commands 应为启动器名称列表，已禁止所有 stdio 连接")
+            config.stdio_allowed_commands = []
     for key in ("connect_timeout", "call_timeout", "max_result_bytes"):
         try:
             raw = data[key]

@@ -30,6 +30,8 @@ for line in sys.stdin:
         text = req["params"]["arguments"]["text"]
         if text == "超时":
             continue
+        if text == "启动参数":
+            text = json.dumps(sys.argv[1:])
         if text == "环境":
             text = json.dumps(dict(os.environ))
         if text == "刷新":
