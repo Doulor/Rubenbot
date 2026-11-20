@@ -956,6 +956,7 @@ def test_index_serves_spa(client):
     assert response.status_code == 200
     assert "RubenBot" in response.text
     assert "/static/app.js" in response.text
+    assert response.headers["cache-control"] == "no-cache"
 
 
 def test_index_nav_has_bot_tab_instead_of_persona():
@@ -976,6 +977,7 @@ def test_static_assets_served(client):
     for asset in ("/static/app.js", "/static/styles.css", "/static/fonts.css", "/static/favicon.svg"):
         response = client.get(asset)
         assert response.status_code == 200, asset
+        assert response.headers["cache-control"] == "no-cache", asset
 
 
 def test_unauthorized_api_call_does_not_leak_html(locked_client):
