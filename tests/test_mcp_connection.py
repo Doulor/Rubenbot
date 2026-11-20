@@ -4,11 +4,13 @@ import asyncio
 import json
 from pathlib import Path
 import sys
+from unittest.mock import AsyncMock
 
 import httpx
+import pytest
 
 from rubenbot import mcp_client
-from rubenbot.config import MCPConfig, MCPServerConfig
+from rubenbot.config import Config, MCPConfig, MCPServerConfig
 from rubenbot.mcp_client import MCPManager
 
 FAKE = Path(__file__).with_name("fixtures") / "mcp_echo.py"
@@ -16,6 +18,57 @@ FAKE = Path(__file__).with_name("fixtures") / "mcp_echo.py"
 
 def stdio(name="demo", *args, **kwargs):
     return MCPServerConfig(name=name, command=sys.executable, args=[str(FAKE), *args], **kwargs)
+
+
+def test_default_stdio_launchers():
+    assert set(Config.from_dict({}).mcp.stdio_allowed_commands) == {"python", "python3", "uv", "uvx", "npx", "node"}
+
+
+@pytest.mark.parametrize(("policy", "command"), [
+    ({}, "/private/python/not-python"),
+    ({"stdio_allowed_commands": []}, "/private/python"),
+    ({"stdio_allowed_commands": ["local-runner"]}, "/private/node"),
+    ({"stdio_allowed_commands": "python"}, "/private/python"),
+    ({"stdio_allowed_commands": ["python", None]}, "/private/python"),
+])
+def test_denied_launcher_is_audited_without_opening_transport(policy, command, monkeypatch, caplog):
+    transport = AsyncMock()
+    monkeypatch.setattr(mcp_client, "_open_transport", transport)
+    server = {"name": "blocked", "command": command, "args": ["secret-arg"]}
+    manager = MCPManager(Config.from_dict({"mcp": {**policy, "servers": [server]}}).mcp)
+
+    async def run():
+        try:
+            await manager.start()
+            status, = manager.status()
+            assert status["state"] == "error" and status["tool_count"] == 0
+            assert "白名单" in status["last_error"]
+            assert "blocked" in caplog.text and status["last_error"] in caplog.text
+            assert all(value not in caplog.text + str(status) for value in (command, "secret-arg"))
+            transport.assert_not_called()
+        finally:
+            await manager.stop()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(("launcher", "policy"), [("python", {}), ("local-runner", {"stdio_allowed_commands": ["local-runner"]})])
+def test_stdio_matches_basename_and_passes_literal_argv(tmp_path, launcher, policy):
+    # 目录由机主信任；同名启动器即使位于临时目录也匹配，不按链接目标判定。
+    command = tmp_path / launcher
+    command.symlink_to(sys.executable)
+    args = ["with spaces", "semi;colon", "left&&right", "$(printf expanded)", ""]
+    server = {"name": "demo", "command": str(command), "args": [str(FAKE), *args]}
+    manager = MCPManager(Config.from_dict({"mcp": {**policy, "servers": [server]}}).mcp)
+
+    async def run():
+        try:
+            await manager.start()
+            assert manager.status()[0]["state"] == "connected"
+            result = await manager.call("mcp__demo__echo", {"text": "启动参数"})
+            assert json.loads(result) == args
+        finally:
+            await manager.stop()
+    asyncio.run(run())
 
 
 def test_stdio_discovery_and_isolated_connect_timeout():
@@ -111,7 +164,7 @@ def test_http_discovery_with_headers_and_pagination(monkeypatch):
     async def run():
         server = MCPServerConfig.parse({"name": "remote", "transport": "http", "url": "https://mcp.invalid/api",
                                         "headers": {"X-Test-Key": "explicit"}})
-        manager = MCPManager(MCPConfig(servers=[server], connect_timeout=2))
+        manager = MCPManager(MCPConfig(servers=[server], connect_timeout=2, stdio_allowed_commands=[]))
         try:
             start = asyncio.create_task(manager.start())
             await asyncio.wait_for(second_page.wait(), 5)
