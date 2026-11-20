@@ -577,6 +577,20 @@ class VoiceConfig:
 
 
 @dataclass
+class StickerConfig:
+    """表情库位置。
+
+    图片本体与 ``index.json`` 都放在这个目录（默认 ``data/stickers``）；
+    该目录是运行时数据，已在 ``.gitignore`` 里排除。
+    """
+
+    dir: str = "data/stickers"
+
+    def __post_init__(self) -> None:
+        self.dir = str(self.dir or "").strip() or "data/stickers"
+
+
+@dataclass
 class PluginsConfig:
     """插件目录与启停。
 
@@ -740,6 +754,7 @@ class Config:
     generation: GenerationConfig = field(default_factory=GenerationConfig)
     emotion: EmotionConfig = field(default_factory=EmotionConfig)
     plugins: PluginsConfig = field(default_factory=PluginsConfig)
+    stickers: StickerConfig = field(default_factory=StickerConfig)
     market: MarketConfig = field(default_factory=MarketConfig)
     webui: WebUIConfig = field(default_factory=WebUIConfig)
     reminder: ReminderConfig = field(default_factory=ReminderConfig)
@@ -823,6 +838,9 @@ class Config:
         generation = _load_generation(data.get("generation") or {})
         emotion = _load_emotion(data.get("emotion") or {})
         plugins = PluginsConfig(**{k: v for k, v in (data.get("plugins") or {}).items() if _has(PluginsConfig, k)})
+        stickers = StickerConfig(
+            **{k: v for k, v in (data.get("stickers") or {}).items() if _has(StickerConfig, k)}
+        )
         market = MarketConfig(**{k: v for k, v in (data.get("market") or {}).items() if _has(MarketConfig, k)})
         webui = WebUIConfig(**{k: v for k, v in (data.get("webui") or {}).items() if _has(WebUIConfig, k)})
         reminder = _load_reminder(data.get("reminder") or {})
@@ -847,6 +865,7 @@ class Config:
             generation=generation,
             emotion=emotion,
             plugins=plugins,
+            stickers=stickers,
             market=market,
             webui=webui,
             reminder=reminder,
