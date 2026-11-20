@@ -247,10 +247,12 @@ def test_settings_layout_pages_and_groups():
         "emotion",
         "voice",
         "emoji",
+        "tools",
     ]
     assert [page["id"] for page in groups["settings"]["pages"]] == [
         "model",
         "search",
+        "mcp",
         "reminder",
         "adapters",
         "system",
@@ -302,6 +304,68 @@ def test_structured_config_view_paths_unchanged(config):
     assert "memory.rolling_summary.enabled" in field_paths(view)
     # secrets 是密钥标记，不算配置字段
     assert "secrets" not in field_paths(view)
+
+
+def test_mcp_form_roundtrip_and_status(client, config_path, monkeypatch):
+    """表单不下发敏感连接参数；再次保存保留磁盘上的环境变量引用。"""
+    monkeypatch.setenv("DOCS_TOKEN", "expanded-private-token")
+    stdio = {"name": "local", "transport": "stdio", "command": "/path/to/local",
+             "env": {"DOCS_TOKEN": "${DOCS_TOKEN}"}, "args": ["", "private-argument"]}
+    http = {"name": "docs", "transport": "http", "url": "https://private-host.invalid/mcp",
+            "headers": {"X-Custom": "private-header"}}
+    update = {"servers": [stdio, http], "call_timeout": 1.5}
+    saved = client.put("/api/config", json={"config": {"mcp": update}})
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["requires_restart"] == ["mcp"]
+    loaded = Config.load(config_path).mcp
+    assert loaded.call_timeout == 1.5 and loaded.servers[1].headers == http["headers"]
+    assert loaded.servers[0].env == {"DOCS_TOKEN": "expanded-private-token"}
+    view = client.get("/api/config")
+    status = client.get("/api/mcp/status")
+    for secret in ("expanded-private-token", "private-argument", "private-host", "private-header", "/path/to/local"):
+        assert secret not in saved.text + view.text + status.text
+    assert view.json()["raw_hidden"] and not view.json()["text"]
+    assert status.json()["servers"] == [
+        {"name": row["name"], "transport": row["transport"], "state": "unavailable", "tool_count": 0, "last_error": ""}
+        for row in (stdio, http)
+    ]
+    form = view.json()["structured"]["mcp"]
+    form["servers"][1].update(enabled=False, headers={})
+    assert client.put("/api/config", json={"config": {"mcp": form}}).is_success
+    rows = read_yaml(config_path)["mcp"]["servers"]
+    assert rows[0] == {**stdio, "enabled": True}
+    assert rows[1] == {**http, "enabled": False, "headers": {}}
+    form["servers"] = [{"name": "local", "transport": "http", "url": "https://new.invalid/mcp"}]
+    assert client.put("/api/config", json={"config": {"mcp": form}}).is_success
+    assert read_yaml(config_path)["mcp"]["servers"] == form["servers"]
+
+
+@pytest.mark.parametrize("fields", [
+    {"servers": [{"name": "bad_", "command": "echo"}]},
+    {"servers": [{"name": "bad__name", "command": "echo"}]},
+    {"servers": [{"name": "no-command"}]},
+    {"servers": [{"name": "bad-url", "transport": "http", "url": "https://"}]},
+    {"servers": [{"name": "dup", "enabled": False}] * 2},
+    {"servers": [{"name": "broken", "args": "["}]},
+    {"connect_timeout": 0}, {"call_timeout": "NaN"}, {"max_result_bytes": 31},
+])
+def test_mcp_validation_does_not_overwrite(client, config_path, fields):
+    original = config_path.read_bytes()
+    rejected = client.put("/api/config", json={"config": {"mcp": fields}})
+    assert rejected.status_code == 422
+    assert rejected.json()["fields"][0]["field"].startswith("mcp.")
+    assert config_path.read_bytes() == original
+
+
+def test_mcp_live_status_is_read_only(client, state):
+    from types import SimpleNamespace
+
+    row = {"name": "docs", "transport": "http", "state": "connected", "tool_count": 2, "last_error": ""}
+    state.bot = SimpleNamespace(mcp=SimpleNamespace(status=lambda: [{**row, "headers": {"x": "private"}}]))
+    assert client.get("/api/mcp/status").json()["servers"] == [row]
+    assert client.post("/api/mcp/status").status_code == 405
+    row.update(state="disconnected", tool_count=0, last_error="连接超时")
+    assert client.get("/api/mcp/status").json()["servers"] == [row]
 
 
 def test_nonverbal_probability_round_trip():

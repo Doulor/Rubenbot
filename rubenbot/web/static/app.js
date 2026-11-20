@@ -2552,6 +2552,7 @@ const LOG_LEVELS = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"];
 /** 需要重启才能生效的字段 → 展示名。 */
 const RESTART_LABELS = {
   database_path: "数据库路径",
+  mcp: "MCP 外部工具",
   "persona.path": "人格文件路径",
   "plugins.dir": "插件目录",
   "webui.enabled": "WebUI 启用状态",
@@ -3094,6 +3095,83 @@ function adaptersEditor(draft, secrets) {
   );
 }
 
+/** 同名连接只提交变动的参数；数组/映射保留顺序、重复参数和空字符串。 */
+function mcpServerEditor(draft) {
+  const rows = h("div", { class: "group-list" });
+  const servers = draft.mcp.servers;
+  const field = (label, input) => h("label", { class: "settings-field" }, h("span", { class: "field-label" }, label), input);
+  function serverRow(row) {
+    const params = h("div", { class: "settings-fields" });
+    const connectionField = (key, label, example, structured = false) => {
+      const current = row[key];
+      const input = h("input", {
+        type: "text", class: "input mono", autocomplete: "off", placeholder: example,
+        value: current === undefined ? "" : (structured && typeof current !== "string" ? JSON.stringify(current) : current),
+        oninput: ({ target }) => {
+          if (!target.value) { delete row[key]; return; }
+          if (!structured) { row[key] = target.value; return; }
+          // 暂存无效文本：保存时后端返回字段错误，不能把拼错的 JSON 当作「保留原值」。
+          try { row[key] = JSON.parse(target.value); } catch { row[key] = target.value; }
+        },
+      });
+      return field(label, input);
+    };
+    function renderParams() {
+      params.replaceChildren(...(row.transport === "http" ? [
+        connectionField("url", "服务地址", "https://host/mcp"),
+        connectionField("headers", "请求头 · JSON 对象", '{"Authorization":"Bearer ${MCP_TOKEN}"}', true),
+      ] : [
+        connectionField("command", "命令", "/path/to/server"),
+        connectionField("args", "启动参数 · JSON 数组", '["--mode","stdio"]', true),
+        connectionField("env", "环境变量 · JSON 对象", '{"TOKEN":"${MCP_TOKEN}"}', true),
+      ]));
+    }
+    renderParams();
+    return h("div", { class: "group-item" },
+      h("div", { class: "group-item-head" },
+        field("名称", textField(row.name, value => { row.name = value; }, { placeholder: "例如 local-docs", mono: true })),
+        field("传输", selectField(row.transport, ["stdio", "http"].map(value => ({ value, label: value })), value => {
+          for (const key of ["command", "args", "env", "url", "headers"]) delete row[key];
+          row.transport = value; renderParams();
+        })),
+        field("启用", switchField(row.enabled, on => { row.enabled = on; }, { label: "启用此服务器" })),
+        h("button", { type: "button", class: "icon-btn-sm danger", "aria-label": "移除此服务器", onclick: () => {
+          servers.splice(servers.indexOf(row), 1); render();
+        } }, icon("trash"))), params);
+  }
+  function render() {
+    rows.replaceChildren(...(servers.length ? servers.map(serverRow) : [h("p", { class: "field-hint" }, "未配置服务器。模型只会使用内置工具。") ]));
+  }
+  render();
+  return h("div", { class: "settings-stack" }, rows,
+    h("div", {}, h("button", { class: "btn btn-sm", type: "button", onclick: () => {
+      servers.push({ name: "", transport: "stdio", enabled: true }); render();
+    } }, icon("plus"), "添加服务器")));
+}
+
+/** 工具卡只读；按需刷新，不因查看状态发起连接。 */
+function mcpStatusCard() {
+  const states = { disabled: "已停用", connecting: "连接中", connected: "已连接", disconnected: "已断开", unavailable: "未运行" };
+  const rows = h("div", { class: "rows", "aria-live": "polite" }, skeleton(2));
+  const refresh = h("button", { type: "button", class: "btn btn-sm", onclick: load }, icon("refresh"), "刷新");
+  async function load() {
+    refresh.disabled = true;
+    try {
+      const { servers } = await api.get("/api/mcp/status");
+      rows.replaceChildren(...(servers.length ? servers.map(s => h("div", { class: "plugin-row" },
+        h("div", { class: "row-main" }, h("div", { class: "row-title mono" }, s.name),
+          h("div", { class: "row-sub" }, `${s.transport} · ${s.tool_count} 项工具`),
+          s.last_error ? h("div", { class: "row-sub" }, `最近错误：${s.last_error}`) : null),
+        h("span", { class: `tag ${s.state === "connected" ? "good" : s.state === "disconnected" ? "warn" : ""}` }, states[s.state] || s.state))) :
+        [h("p", { class: "field-hint" }, "未配置外部服务器。") ]));
+    } catch (err) {
+      if (!(err instanceof Unauthorized)) rows.replaceChildren(h("p", { class: "field-hint" }, "暂时无法读取连接状态。"));
+    } finally { refresh.disabled = false; }
+  }
+  load();
+  return card("MCP 连接状态", { actions: [h("a", { class: "btn btn-sm", href: "#/settings/mcp" }, "配置服务器"), refresh], body: rows });
+}
+
 /** 插件开关：默认全关，逐个显式启用；保存后热生效并写回 plugins.enabled。 */
 function pluginEditor(draft, discovered = []) {
   const plugins = draft.plugins || (draft.plugins = {});
@@ -3460,6 +3538,20 @@ function settingsCardSpecs(draft, secrets, pluginsAvailable) {
           ],
           draft
         ),
+      }),
+    },
+    {
+      path: "mcp.servers",
+      node: card("MCP 服务器", {
+        hint: "重启后生效",
+        body: h("div", { class: "settings-stack" },
+          h("p", { class: "field-hint" }, "只连接可信服务；stdio 命令以 bot 身份运行。名称只用英文、数字、短横线与下划线；不可含双下划线，也不可以下划线结尾。同名、同传输的连接参数不回显，留空保留；改名或换传输须重填。用 [] 或 {} 清空参数、变量或请求头。"),
+          mcpServerEditor(draft),
+          fieldGrid([
+            { path: "mcp.connect_timeout", label: "连接超时（秒）", kind: "number", step: "any", min: 0.001 },
+            { path: "mcp.call_timeout", label: "调用超时（秒）", kind: "number", step: "any", min: 0.001 },
+            { path: "mcp.max_result_bytes", label: "调用结果上限（字节）", kind: "number", step: "1", min: 32 },
+          ], draft)),
       }),
     },
     {
@@ -3953,6 +4045,10 @@ function systemExtras(data) {
   });
   applyTheme(localStorage.getItem("rubenbot.theme") || "auto");
 
+  // 整份文件可能在命令、URL、参数或任意请求头中含凭据，不能安全回显。
+  if (data.raw_hidden) return [appearance, card("高级：原始 YAML", {
+    body: h("p", { class: "field-hint" }, "为避免暴露连接凭据，含 MCP 服务器或无法解析的配置不显示原文。请使用设置表单，或在本机直接编辑文件。"),
+  })];
   // 原始 YAML：折叠放在底部，保留旧编辑方式
   const textarea = h("textarea", {
     class: "textarea code",
@@ -4055,6 +4151,10 @@ async function renderSettingsGroup(view, groupId, sub) {
   menuHost.removeAttribute("aria-busy");
 
   // 人设页是 SOUL 编辑器，不走结构化表单；保存、备份与热重载保持原样
+  if (page.id === "tools" && group.id === "bot") {
+    content.replaceChildren(mcpStatusCard());
+    return;
+  }
   if (page.id === "persona" && group.id === "bot") {
     content.replaceChildren(...(await personaNodes()));
     return;

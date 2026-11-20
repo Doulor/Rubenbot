@@ -400,6 +400,8 @@ def write_plugin_enabled(state: "WebState") -> Path | None:
 def restart_fields(old: Config, new: Config) -> list[str]:
     """比较两份配置，列出本次只能重启生效的字段。"""
     fields: list[str] = []
+    if old.mcp != new.mcp:
+        fields.append("mcp")
     if old.database_path != new.database_path:
         fields.append("database_path")
     if old.persona_path != new.persona_path:
@@ -440,6 +442,7 @@ def describe_restart_fields(fields: list[str]) -> str:
         "persona.path": "人格文件路径",
         "plugins.dir": "插件目录",
         "plugins.enabled": "插件开关",
+        "mcp": "MCP 外部工具",
         "webui.enabled": "WebUI 启用状态",
         "webui.host": "WebUI 监听地址",
         "webui.port": "WebUI 端口",

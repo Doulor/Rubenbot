@@ -49,6 +49,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import yaml
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -65,6 +66,7 @@ from .config_schema import (
     ConfigValidationError,
     config_layout,
     merge_config,
+    mcp_form,
     structured_config,
     validate_structured,
 )
@@ -857,6 +859,22 @@ def create_app(state: WebState):
             raise ApiError(404, "表情不存在")
         return {"ok": True, "id": sticker_id}
 
+    @app.get("/api/mcp/status")
+    async def mcp_status(request: Request):
+        """读取当前连接快照；独立 WebUI 不建立连接，也不假装知道运行状态。"""
+        require_session(request)
+        manager = getattr(state.bot, "mcp", None)
+        if manager is None:
+            servers = [
+                {"name": item.name, "transport": item.transport,
+                 "state": "unavailable" if item.enabled else "disabled", "tool_count": 0, "last_error": ""}
+                for item in state.config.mcp.servers
+            ]
+        else:
+            fields = ("name", "transport", "state", "tool_count", "last_error")
+            servers = [{key: row[key] for key in fields} for row in manager.status()]
+        return {"ok": True, "servers": servers}
+
     @app.get("/api/emotion")
     async def get_emotion(request: Request, limit: int = 12):
         """情绪与好感度状态卡（只读）：心情 + 好感 Top5/Bottom3 + 最近变化。
@@ -1026,10 +1044,19 @@ def create_app(state: WebState):
         require_session(request)
         path = state.config_path
         text = path.read_text(encoding="utf-8") if path.exists() else ""
+        # 整个原文编辑器无法可靠遮盖命令行、URL、任意 env/header 里的密钥。
+        # 配了 MCP 时不下发原文，仍可用结构化表单编辑，或在本机编辑文件。
+        try:
+            raw = yaml.safe_load(text)
+            section = raw.get("mcp") if isinstance(raw, dict) else None
+            raw_hidden = bool(section.get("servers")) if isinstance(section, dict) else bool(section)
+        except yaml.YAMLError:
+            raw_hidden = True
         return {
             "ok": True,
             "path": str(path),
-            "text": text,
+            "text": "" if raw_hidden else text,
+            "raw_hidden": raw_hidden,
             "exists": path.exists(),
             "effective": _mask_config(_config_to_dict(state.config)),
             "structured": structured_config(state.config),
@@ -1170,14 +1197,12 @@ async def _save_structured_config(state: WebState, payload: Any) -> dict[str, An
     """结构化保存：校验 → 合并 → 写盘 → 热应用 → 返回生效方式。"""
     import yaml
 
+    path = state.config_path
     try:
         update = validate_structured(payload)
+        merged = merge_config(_read_raw_config(path), update)
     except ConfigValidationError as exc:
         raise ApiError(422, f"配置校验失败：{exc}", fields=exc.fields) from exc
-
-    path = state.config_path
-    base = _read_raw_config(path)
-    merged = merge_config(base, update)
     try:
         new_config = Config.from_raw(merged)
     except (TypeError, ValueError) as exc:
@@ -1349,6 +1374,7 @@ def _config_to_dict(config) -> dict[str, Any]:
     from dataclasses import asdict
 
     data = asdict(config)
+    data["mcp"] = mcp_form(config.mcp)
     data["llm"]["api_key"] = config.llm.api_key
     data["webui"]["password"] = ""
     return data

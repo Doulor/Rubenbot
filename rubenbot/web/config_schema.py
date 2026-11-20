@@ -23,7 +23,9 @@ import copy
 from dataclasses import asdict
 from typing import Any
 
-from ..config import SEARCH_PROVIDERS, STT_PROVIDERS, TTS_MODES, TTS_PROVIDERS, Config
+from ..config import (
+    SEARCH_PROVIDERS, STT_PROVIDERS, TTS_MODES, TTS_PROVIDERS, Config, MCPConfig, MCPServerConfig,
+)
 from ..decision import parse_quiet_hours
 
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
@@ -82,6 +84,7 @@ SETTINGS_GROUPS: tuple[dict[str, Any], ...] = (
                 "title": "表情",
                 "sub": "收集与回复后补发表情",
             },
+            {"id": "tools", "title": "外部工具", "sub": "查看正在运行的 MCP 连接与工具数"},
         ),
     },
     {
@@ -92,6 +95,7 @@ SETTINGS_GROUPS: tuple[dict[str, Any], ...] = (
         "pages": (
             {"id": "model", "title": "模型", "sub": "接口、密钥、模型角色与重试"},
             {"id": "search", "title": "搜索", "sub": "web_search 的渠道顺序与密钥"},
+            {"id": "mcp", "title": "MCP 工具", "sub": "外部服务器、连接超时与工具调用限制"},
             {"id": "reminder", "title": "提醒与主动", "sub": "提醒工具与冷场开口"},
             {"id": "adapters", "title": "适配器", "sub": "Console 与 OneBot 连接参数"},
             {"id": "system", "title": "系统", "sub": "WebUI、插件、路径与运行参数"},
@@ -127,6 +131,7 @@ _SETTINGS_PAGE_RULES: tuple[tuple[str, str], ...] = (
     # ---- 设置 ----
     ("llm", "model"),
     ("search", "search"),
+    ("mcp", "mcp"),
     ("reminder", "reminder"),
     ("proactive", "reminder"),
     ("adapters", "adapters"),
@@ -211,6 +216,16 @@ class ConfigValidationError(ValueError):
 # ----------------------------------------------------------------------
 
 
+def mcp_form(config: MCPConfig) -> dict[str, Any]:
+    """连接参数都可能藏有凭据，表单只回显身份；同名条目省略的参数留原值。"""
+    return {
+        "servers": [{"name": s.name, "transport": s.transport, "enabled": s.enabled} for s in config.servers],
+        "connect_timeout": config.connect_timeout,
+        "call_timeout": config.call_timeout,
+        "max_result_bytes": config.max_result_bytes,
+    }
+
+
 def structured_config(config: Config) -> dict[str, Any]:
     """当前生效配置的表单视图：完整字段、密钥置空、附带 ``secrets`` 标记。"""
     enabled = set(config.enabled_adapters)
@@ -248,6 +263,7 @@ def structured_config(config: Config) -> dict[str, Any]:
         "database_path": config.database_path,
         "memory": asdict(config.memory),
         "search": search,
+        "mcp": mcp_form(config.mcp),
         "voice": {**voice, "stt_api_key": "", "tts_api_key": ""},
         "chat": asdict(config.chat),
         "decision": decision,
@@ -565,6 +581,35 @@ def _validate_rolling_summary(section: dict[str, Any], v: _Validator) -> dict[st
             )
             if number is not None:
                 out[key] = int(number)
+    return out
+
+
+def _validate_mcp(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
+    out = {}
+    for key in ("connect_timeout", "call_timeout", "max_result_bytes"):
+        if key in section:
+            size = key == "max_result_bytes"
+            out[key] = v.number(section[key], f"mcp.{key}", integer=size, minimum=32 if size else 0)
+            if out[key] == 0:
+                v.fail(f"mcp.{key}", "必须大于零")
+    if "servers" in section:
+        servers = section["servers"]
+        if not isinstance(servers, list):
+            v.fail("mcp.servers", "应为服务器对象列表")
+            return out
+        names = set()
+        for index, row in enumerate(servers):
+            try:
+                # 仅校验提交的字段；缺省连接参数可能需要从磁盘保留，合并后再查必填项。
+                item = MCPServerConfig.parse(row, partial=True)
+                if set(row) - MCPServerConfig.__dataclass_fields__.keys():
+                    raise ValueError("服务器配置包含未知字段")
+                if item.name in names:
+                    raise ValueError("name 重复")
+                names.add(item.name)
+            except ValueError as exc:
+                v.fail(f"mcp.servers[{index}]", str(exc))
+        out["servers"] = servers
     return out
 
 
@@ -1115,6 +1160,9 @@ def validate_structured(payload: dict[str, Any]) -> dict[str, Any]:
     search = _section(payload, "search", v)
     if search is not None:
         update["search"] = _validate_search(search, v)
+    mcp = _section(payload, "mcp", v)
+    if mcp is not None:
+        update["mcp"] = _validate_mcp(mcp, v)
     voice = _section(payload, "voice", v)
     if voice is not None:
         update["voice"] = _validate_voice(voice, v)
@@ -1215,7 +1263,25 @@ def merge_config(raw: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
     if isinstance(base.get("persona"), str) and isinstance(update.get("persona"), dict):
         # 旧格式只写人格路径；仅修改示例设置时也不能丢掉它。
         base["persona"] = {"path": base["persona"]}
+    # 数组按本次提交增删，只对同名且同传输的条目保留未回显的连接参数。
+    # 从磁盘原文取值，绝不把展开的 ${ENV} 重新写成明文。
     _deep_merge(base, update, ())
+    if "servers" in update.get("mcp", {}):
+        previous = raw.get("mcp")
+        rows = previous.get("servers", []) if isinstance(previous, dict) else []
+        by_name = {
+            row["name"]: row for row in rows
+            if isinstance(row, dict) and isinstance(row.get("name"), str)
+        } if isinstance(rows, list) else {}
+        for index, row in enumerate(base["mcp"]["servers"]):
+            old = by_name.get(row["name"], {})
+            if old.get("transport", "stdio") == row.get("transport", "stdio"):
+                row = {**old, **row}
+            try:
+                MCPServerConfig.parse(row, expand_env=True)
+            except ValueError as exc:
+                raise ConfigValidationError([{"field": f"mcp.servers[{index}]", "message": str(exc)}]) from exc
+            base["mcp"]["servers"][index] = row
     return base
 
 
