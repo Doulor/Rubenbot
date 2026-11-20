@@ -7,7 +7,7 @@
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/static/fonts.css">
   <link rel="stylesheet" href="/static/styles.css">
-  <script>
+  <script data-cfasync="false">
     // 尽早定主题，避免首帧闪白/闪暗
     (function () {
       var saved = localStorage.getItem("rubenbot.theme") || "auto";
@@ -110,7 +110,7 @@
   <!-- 通用弹窗 -->
   <dialog class="dialog" id="dialog"></dialog>
 
-  <script src="/static/motion.js"></script>
-  <script src="/static/app.js"></script>
+  <script data-cfasync="false" src="/static/motion.js"></script>
+  <script data-cfasync="false" src="/static/app.js"></script>
 </body>
 </html>
