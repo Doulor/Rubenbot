@@ -9,6 +9,8 @@ from html.parser import HTMLParser
 
 import httpx
 
+from .http_body import read_compressed_body
+
 _MAX_REDIRECTS = 5
 _MAX_URL = 8192
 _IPV6_UNICAST = ipaddress.IPv6Network("2000::/3")
@@ -70,18 +72,19 @@ class _BodyText(HTMLParser):
 
 
 async def _body(response: httpx.Response, output_limit: int) -> str:
-    # 不信任 Content-Length；拒绝压缩，避免先解压再截断造成内存膨胀。
-    if response.headers.get("content-encoding", "identity").strip().lower() != "identity":
-        raise ValueError("不支持压缩响应")
+    encoding = response.headers.get("content-encoding", "identity").strip().lower()
     cap = min(256 * 1024, max(8192, output_limit * 4))
-    data = bytearray()
     clipped = False
-    async for chunk in response.aiter_raw():
-        left = cap - len(data)
-        data.extend(chunk[:left])
-        if len(chunk) > left:
-            clipped = True
-            break
+    if encoding == "identity":
+        data = bytearray()
+        async for chunk in response.aiter_raw():
+            left = cap - len(data)
+            data.extend(chunk[:left])
+            if len(chunk) > left:
+                clipped = True
+                break
+    else:
+        data = await read_compressed_body(response.aiter_raw(), encoding, cap)
     charset = (response.charset_encoding or "utf-8").lower()
     if charset not in {"utf-8", "us-ascii", "iso-8859-1", "windows-1252", "gbk",
                        "gb2312", "gb18030", "big5", "shift_jis"}:
@@ -127,7 +130,7 @@ async def fetch_url(url: str, *, sandbox: bool, output_limit: int, timeout: floa
                     destination = await _pinned_url(target) if sandbox else target
                     request = httpx.Request(
                         "GET", destination,
-                        headers={b"Host": target.netloc, b"Accept-Encoding": b"identity"},
+                        headers={b"Host": target.netloc, b"Accept-Encoding": b"gzip, deflate"},
                         extensions={"sni_hostname": target.raw_host.decode("ascii")},
                     )
                     response = await transport.handle_async_request(request)
