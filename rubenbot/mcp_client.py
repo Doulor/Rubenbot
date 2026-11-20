@@ -95,6 +95,15 @@ def _diagnostic(exc: Exception) -> str:
     return f"连接失败或已断开（{type(exc).__name__}）"
 
 
+def _bounded(text: str, limit: int) -> str:
+    # SDK 已经解码了应答；只编码有可能放进结果的前缀，不另做整份大字节串副本。
+    data = text[:limit + 1].encode("utf-8", errors="replace")
+    if len(data) <= limit:
+        return data.decode()
+    suffix = "\n[结果已截断]"
+    return data[:limit - len(suffix.encode())].decode(errors="ignore") + suffix
+
+
 class MCPManager:
     def __init__(self, config: MCPConfig):
         self.config = config
@@ -107,6 +116,57 @@ class MCPManager:
 
     def tools(self) -> list[dict]:
         return [schema for s in self._servers.values() for schema in s.schemas.values()]
+
+    async def call(self, name: str, arguments: Any) -> str:
+        """只执行在线目录里的工具；不重试调用（上次请求可能已产生副作用）。"""
+        _, _, suffix = name.partition("mcp__")
+        server, _, tool = suffix.partition("__")
+        s = self._servers.get(server)
+        started = monotonic()
+        ok = False
+        try:
+            if not s or not s.session or name not in s.schemas:
+                return _bounded("工具错误：服务器离线或工具不存在", self.config.max_result_bytes)
+            if not isinstance(arguments, dict):
+                return _bounded("工具错误：参数必须是 JSON 对象", self.config.max_result_bytes)
+            from jsonschema import ValidationError, validate
+            from referencing import Registry
+
+            schema = s.schemas[name]["function"]["parameters"]
+            try:
+                # 仅解析 schema 文档内的引用，不为外部 $ref 发起网络请求。
+                validate(arguments, schema, registry=Registry())
+            except ValidationError as exc:
+                return _bounded(f"工具错误：参数不符合 {exc.validator} 约束", self.config.max_result_bytes)
+            async with asyncio.timeout(self.config.call_timeout):
+                result = await s.session.call_tool(tool, arguments)
+            parts = []
+            for block in result.content:
+                if block.type == "text":
+                    parts.append(block.text)
+                elif block.type == "resource" and hasattr(block.resource, "text"):
+                    parts.append(block.resource.text)
+                else:
+                    parts.append(f"[{block.type}]")  # 文字工具通道不透传 base64
+            if not parts and result.structuredContent is not None:
+                parts.append(json.dumps(result.structuredContent, ensure_ascii=False))
+            text = "\n".join(parts)
+            ok = not result.isError
+            if not ok:
+                s.last_error = "远端工具返回错误"
+            return _bounded(text if ok else "工具错误：" + text, self.config.max_result_bytes)
+        except TimeoutError:
+            if s:
+                s.last_error = "工具调用超时"
+            return "工具错误：调用超时"
+        except Exception as exc:
+            if s:
+                s.last_error = f"工具调用失败（{type(exc).__name__}）"
+                s.refresh.set()  # 唤醒监视器复查目录；RPC 业务错误不应直接踢掉会话。
+            return _bounded(f"工具错误：调用失败（{type(exc).__name__}）", self.config.max_result_bytes)
+        finally:
+            logger.info("MCP 调用 server=%r tool=%r elapsed_ms=%.1f success=%s",
+                        server, tool, (monotonic() - started) * 1000, ok)
 
     async def start(self) -> None:
         if self._tasks:
@@ -176,6 +236,9 @@ class MCPManager:
                         s.refresh.clear()
                         async with asyncio.timeout(self.config.connect_timeout):
                             s.schemas = await _discover(session, s.config.name)
+            except Exception as exc:
+                s.last_error = _diagnostic(exc)
+                raise
             finally:
                 # 先撤销清单，再等待传输关闭，避免模型继续拿到失效工具。
                 s.schemas = {}
