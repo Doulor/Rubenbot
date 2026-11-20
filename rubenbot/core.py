@@ -368,6 +368,9 @@ def strip_action_parens(text: str) -> str:
 
 
 _TRANSCRIPT_PREFIX_RE = re.compile(r"^\[\d{1,2}:\d{2}\]\s*\[[^\]]*\]\s*")
+_MARKDOWN_HEADING_RE = re.compile(r"(?m)^\s*#{1,6}\s+")
+_MARKDOWN_LIST_RE = re.compile(r"(?m)^\s*\d+[.)、]\s*")
+_LEADING_NARRATION_RE = re.compile(r"^\s*（[^（）\n]{1,40}）\s*")
 
 
 def strip_transcript_prefix(text: str) -> str:
@@ -379,6 +382,40 @@ def strip_transcript_prefix(text: str) -> str:
     if not text:
         return text
     return _TRANSCRIPT_PREFIX_RE.sub("", text, count=1)
+
+
+def clean_reply_patterns(text: str) -> str:
+    """清理高置信的作文/旁白格式残留，不改正常正文标点。
+
+    这里只处理发送链能确定是格式而非语义的模式：加粗标记、行首标题/列表号，
+    以及整条开头的旁白括号。每条规则命中一次即记一条日志，便于线上回看误伤。
+    """
+    if not text:
+        return text
+    cleaned = text
+    hits: list[str] = []
+    if "**" in cleaned:
+        cleaned = cleaned.replace("**", "")
+        hits.append("markdown_bold")
+    if "__" in cleaned:
+        cleaned = cleaned.replace("__", "")
+        hits.append("markdown_underline")
+    cleaned, count = _MARKDOWN_HEADING_RE.subn("", cleaned)
+    if count:
+        hits.append("markdown_heading")
+    cleaned, count = _MARKDOWN_LIST_RE.subn("", cleaned)
+    if count:
+        hits.append("markdown_list")
+    cleaned, count = _LEADING_NARRATION_RE.subn("", cleaned, count=1)
+    if count:
+        hits.append("leading_narration")
+    # 单条消息中的空行是作文段落，不保留空行；普通单换行仍交给既有断句。
+    if "\n\n" in cleaned:
+        cleaned = re.sub(r"\n{2,}", "\n", cleaned)
+        hits.append("blank_line")
+    for rule in hits:
+        logger.info("出站清洗命中规则 %s", rule)
+    return cleaned.strip()
 
 
 def _strip_segments_actions(segments: list[Segment]) -> list[Segment]:
@@ -2170,7 +2207,7 @@ class RubenBot:
         短回复（不超过一条上限）不拆；切句时避开括号、引号、颜文字、URL
         与行内代码，不会从它们中间断开。贪心合并到接近 ``split_part_chars``。
         """
-        reply = reply.strip()
+        reply = clean_reply_patterns(strip_transcript_prefix(reply.strip()))
         if not reply:
             return []
         max_parts = max(1, self.config.chat.split_max_parts)
@@ -2227,8 +2264,6 @@ class RubenBot:
         voice_mime = "audio/mpeg"
         if isinstance(reply, str):
             text_reply = strip_action_parens(reply) if strip_actions else reply
-            # 模型可能模仿历史格式把转录行前缀一起生成出来，发送前剥掉兜底
-            text_reply = strip_transcript_prefix(text_reply)
             parts: list[list[Segment]] = [[Segment.text(part)] for part in self.split_reply(text_reply)]
             if len(parts) == 1:
                 voice_audio, voice_mime = await self.synthesize_reply(event, text_reply)
