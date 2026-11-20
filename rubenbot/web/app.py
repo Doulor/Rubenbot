@@ -458,7 +458,11 @@ def create_app(state: WebState):
                     {"ok": False, "error": "未登录或会话已过期", "auth_required": True},
                     status_code=401,
                 )
-        return await call_next(request)
+        response = await call_next(request)
+        # index 与无构建链静态资源必须重新校验，避免部署后旧 JS 与新页面混搭。
+        if path == "/" or path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-cache"
+        return response
 
     @app.get("/api/health")
     async def health():
