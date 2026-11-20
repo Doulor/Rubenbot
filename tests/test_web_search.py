@@ -1,4 +1,4 @@
-"""联网搜索：配置解析、两家后端解析、注入格式与截断、冷却、工具注册与退化。"""
+"""联网搜索：配置解析、渠道回退链、两家后端解析、注入格式与截断、冷却、工具注册。"""
 
 from __future__ import annotations
 
@@ -9,18 +9,20 @@ import logging
 import httpx
 
 from rubenbot.adapters.base import MessageEvent
-from rubenbot.config import Config, SearchConfig
+from rubenbot.config import Config, SearchChannelConfig, SearchConfig
 from rubenbot.core import RubenBot
 from rubenbot.memory.store import MemoryStore
 from rubenbot.persona import Persona
 from rubenbot.search import (
-    BOCHA_URL,
-    COOLDOWN_TEXT,
+    DEEPSEEK_QUERY_MAX,
+    DEEPSEEK_URL,
+    NO_RESULT_TEXT,
     RESULT_HEADER,
     SUMMARY_CHARS,
     TAVILY_URL,
     TOTAL_CHARS,
     UNAVAILABLE_TEXT,
+    COOLDOWN_TEXT,
     SearchResult,
     WebSearcher,
     build_searcher,
@@ -29,26 +31,6 @@ from rubenbot.search import (
 )
 
 from conftest import RecordingAdapter
-
-BOCHA_BODY = {
-    "code": 200,
-    "data": {
-        "webPages": {
-            "value": [
-                {
-                    "name": "今日要闻：某地发布暴雨预警",
-                    "snippet": "气象台今天上午发布暴雨橙色预警，" + "降雨" * 100,
-                    "url": "https://news.example.com/a/1",
-                },
-                {
-                    "name": "第二条",
-                    "snippet": "简短摘要",
-                    "url": "https://www.example.org/path?q=1",
-                },
-            ]
-        }
-    },
-}
 
 TAVILY_BODY = {
     "results": [
@@ -65,10 +47,44 @@ TAVILY_BODY = {
     ]
 }
 
+DEEPSEEK_BODY = {
+    "results": [
+        {
+            "title": "DeepSeek 搜索结果",
+            "url": "https://www.example.com/deep/1",
+            "snippet": "这是一段简短摘要",
+            "summary": "这是给模型读的长摘要 " + "细节" * 100,
+            "site_name": "Example",
+            "date": "2026-11-20",
+            "rerank_score": 0.9,
+        },
+        {
+            "title": "只有 snippet 的条目",
+            "url": "https://example.org/deep/2",
+            "snippet": "回退到 snippet 的正文",
+            "summary": "",
+        },
+    ]
+}
 
-def make_searcher(handler, *, provider="bocha", cooldown=30.0, now=1000.0, clock=None):
+
+def make_searcher(
+    handler,
+    *,
+    order=("tavily",),
+    tavily_key="k-tavily",
+    deepseek_key="k-deepseek",
+    cooldown=30.0,
+    now=1000.0,
+    clock=None,
+):
     """用 httpx.MockTransport 造搜索器；clock 是 [当前时间] 的可变引用。"""
-    config = SearchConfig(provider=provider, api_key="k-test", cooldown_seconds=cooldown)
+    config = SearchConfig(
+        order=list(order),
+        tavily=SearchChannelConfig(api_key=tavily_key),
+        deepseek=SearchChannelConfig(api_key=deepseek_key),
+        cooldown_seconds=cooldown,
+    )
     holder = {"now": now} if clock is None else clock
     return WebSearcher(
         config,
@@ -77,38 +93,182 @@ def make_searcher(handler, *, provider="bocha", cooldown=30.0, now=1000.0, clock
     ), holder
 
 
+def tavily_handler(seen=None, body=None, status=200):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if seen is not None:
+            seen.append((str(request.url), json.loads(request.content), request.headers))
+        return httpx.Response(status, json=body or TAVILY_BODY)
+
+    return handler
+
+
+def deepseek_handler(seen=None, body=None, status=200):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if seen is not None:
+            seen.append((str(request.url), json.loads(request.content), request.headers))
+        return httpx.Response(status, json=body or DEEPSEEK_BODY)
+
+    return handler
+
+
+def routing_handler(routes):
+    """按 URL 路由到不同 handler；记录调用顺序。"""
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        for prefix, route in routes.items():
+            if url == prefix:
+                calls.append(prefix)
+                return route(request)
+        raise AssertionError(f"未预期的请求：{url}")
+
+    return handler, calls
+
+
 # ----------------------------------------------------------------------
 # 配置
 # ----------------------------------------------------------------------
 
 
-def test_search_config_defaults_and_provider_fallback():
+def test_search_config_defaults():
     config = SearchConfig()
-    assert config.provider == "bocha"
+    # 缺省顺序：Tavily 主力、DeepSeek 备胎
+    assert config.order == ["tavily", "deepseek"]
     assert config.configured is False
     assert config.timeout_seconds == 10.0
     assert config.cooldown_seconds == 30.0
-    # 写错的后端回落 bocha，不报错
-    assert SearchConfig(provider="bing").provider == "bocha"
-    assert SearchConfig(provider="Tavily").provider == "tavily"
+    # 任一渠道配 key 就算可用
+    config.tavily = SearchChannelConfig(api_key="a")
+    assert config.configured is True
+    config.tavily = SearchChannelConfig()
+    config.deepseek = SearchChannelConfig(api_key="b")
+    assert config.configured is True
 
 
-def test_config_loads_search_section_and_env(tmp_path, monkeypatch):
-    monkeypatch.setenv("RUBEN_SEARCH_KEY", "sk-from-env")
+def test_search_config_order_ignores_unknown_channel(caplog):
+    with caplog.at_level(logging.WARNING, logger="rubenbot.config"):
+        config = SearchConfig(order=["tavily", "bing", "deepseek", "tavily"])
+    assert config.order == ["tavily", "deepseek"]
+    assert any("bing" in record.message for record in caplog.records)
+    # 全是未知渠道时回落到默认顺序，不崩
+    assert SearchConfig(order=["bing"]).order == ["tavily", "deepseek"]
+    # 逗号分隔字符串也认
+    assert SearchConfig(order="deepseek, tavily").order == ["deepseek", "tavily"]
+
+
+def test_config_loads_new_search_section_and_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("RUBEN_TAVILY_KEY", "tvly-from-env")
+    monkeypatch.setenv("RUBEN_DEEPSEEK_KEY", "ds-from-env")
     path = tmp_path / "config.yaml"
     path.write_text(
         "search:\n"
-        "  provider: tavily\n"
-        "  api_key: ${RUBEN_SEARCH_KEY}\n"
+        "  order: [deepseek, tavily]\n"
+        "  tavily:\n"
+        "    api_key: ${RUBEN_TAVILY_KEY}\n"
+        "  deepseek:\n"
+        "    api_key: ${RUBEN_DEEPSEEK_KEY}\n"
         "  timeout_seconds: 5\n"
         "  cooldown_seconds: 0\n",
         encoding="utf-8",
     )
-    config = Config.load(path)
-    assert config.search.provider == "tavily"
-    assert config.search.api_key == "sk-from-env"
-    assert config.search.timeout_seconds == 5.0
-    assert config.search.cooldown_seconds == 0.0
+    config = Config.load(path).search
+    assert config.order == ["deepseek", "tavily"]
+    assert config.tavily.api_key == "tvly-from-env"
+    assert config.deepseek.api_key == "ds-from-env"
+    assert config.timeout_seconds == 5.0
+    assert config.cooldown_seconds == 0.0
+
+
+def test_legacy_flat_config_maps_to_chain(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "search:\n"
+        "  provider: tavily\n"
+        "  api_key: legacy-key\n",
+        encoding="utf-8",
+    )
+    config = Config.load(path).search
+    assert config.order == ["tavily"]
+    assert config.tavily.api_key == "legacy-key"
+    assert config.deepseek.api_key == ""
+    assert config.configured is True
+
+
+def test_legacy_flat_config_bocha_ignored(caplog, tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "search:\n"
+        "  provider: bocha\n"
+        "  api_key: bocha-key\n",
+        encoding="utf-8",
+    )
+    with caplog.at_level(logging.INFO, logger="rubenbot.config"):
+        config = Config.load(path).search
+    # 博查渠道移除：key 不塞给别的渠道，一个 key 都没有 → 工具不注册
+    assert config.configured is False
+    assert config.tavily.api_key == ""
+    assert config.deepseek.api_key == ""
+    assert any("bocha" in record.message for record in caplog.records)
+    # 旧配置只写 api_key 不写 provider 时同样按 bocha 处理
+    path.write_text("search:\n  api_key: bocha-key\n", encoding="utf-8")
+    assert Config.load(path).search.configured is False
+    # 旧平铺写的是仍在支持的渠道时照常映射
+    path.write_text(
+        "search:\n  provider: deepseek\n  api_key: ds-key\n", encoding="utf-8"
+    )
+    config = Config.load(path).search
+    assert config.order == ["deepseek"]
+    assert config.deepseek.api_key == "ds-key"
+
+
+def test_legacy_flat_config_keeps_chain_with_other_keys(tmp_path):
+    """博查被忽略后，链中其余已配 key 的渠道照常工作。"""
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "search:\n"
+        "  provider: bocha\n"
+        "  api_key: bocha-key\n"
+        "  tavily:\n"
+        "    api_key: tvly-key\n",
+        encoding="utf-8",
+    )
+    config = Config.load(path).search
+    assert config.order == ["tavily", "deepseek"]
+    assert config.tavily.api_key == "tvly-key"
+    assert config.configured is True
+
+
+def test_new_structure_wins_over_legacy(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "search:\n"
+        "  order: [deepseek, tavily]\n"
+        "  provider: tavily\n"
+        "  api_key: legacy-key\n"
+        "  tavily:\n"
+        "    api_key: new-key\n",
+        encoding="utf-8",
+    )
+    config = Config.load(path).search
+    assert config.order == ["deepseek", "tavily"]
+    assert config.tavily.api_key == "new-key"
+
+
+def test_legacy_provider_without_key_does_not_shrink_chain(tmp_path):
+    """旧写法 provider 没 key、新结构另配了渠道 key：链保持默认顺序。"""
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "search:\n"
+        "  provider: tavily\n"
+        "  deepseek:\n"
+        "    api_key: ds-key\n",
+        encoding="utf-8",
+    )
+    config = Config.load(path).search
+    assert config.order == ["tavily", "deepseek"]
+    assert config.deepseek.api_key == "ds-key"
+    assert config.configured is True
 
 
 def test_unconfigured_search_skips_tool(caplog):
@@ -119,57 +279,56 @@ def test_unconfigured_search_skips_tool(caplog):
 
 
 # ----------------------------------------------------------------------
-# 后端解析与注入格式
+# 渠道解析与注入格式
 # ----------------------------------------------------------------------
 
 
-def test_bocha_parses_and_formats():
-    seen = {}
+def test_tavily_parses_and_formats():
+    seen = []
+    searcher, _ = make_searcher(tavily_handler(seen), order=["tavily"])
+    text = asyncio.run(searcher.search("python 新版本", 3, chat_key="c1"))
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen["url"] = str(request.url)
-        seen["auth"] = request.headers.get("authorization")
-        seen["body"] = json.loads(request.content)
-        return httpx.Response(200, json=BOCHA_BODY)
-
-    searcher, _ = make_searcher(handler)
-    text = asyncio.run(searcher.search("今天天气", 2, chat_key="c1"))
-
-    assert seen["url"] == BOCHA_URL
-    assert seen["auth"] == "Bearer k-test"
-    assert seen["body"] == {"query": "今天天气", "count": 2, "summary": True}
+    assert seen[0][0] == TAVILY_URL
+    assert seen[0][1] == {"api_key": "k-tavily", "query": "python 新版本", "max_results": 3}
     lines = text.splitlines()
     assert lines[0] == RESULT_HEADER
-    assert "今日要闻：某地发布暴雨预警" in lines[1]
-    assert "来源：news.example.com" in lines[1]
-    # 摘要截断到约 120 字 + 省略号
-    snippet = lines[1].split(" — ", 1)[1].rsplit(" — 来源：", 1)[0]
-    assert snippet.endswith("…")
-    assert len(snippet) == SUMMARY_CHARS + 1
-    assert "\n" not in snippet
-    # 去掉 www. 前缀
-    assert "来源：example.org" in lines[2]
-
-
-def test_tavily_parses_and_formats():
-    seen = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen["url"] = str(request.url)
-        seen["body"] = json.loads(request.content)
-        return httpx.Response(200, json=TAVILY_BODY)
-
-    searcher, _ = make_searcher(handler, provider="tavily")
-    asyncio.run(searcher.search("python 新版本", 3, chat_key="c1"))
-
-    assert seen["url"] == TAVILY_URL
-    assert seen["body"] == {"api_key": "k-test", "query": "python 新版本", "max_results": 3}
-    text = asyncio.run(searcher.search("python 新版本", 3, chat_key="c2"))
-    lines = text.splitlines()
     assert "Python 3.13 发布" in lines[1]
     assert "来源：blog.python.org" in lines[1]
     assert "无关条目" in lines[2]
     assert "来源：news.example.net" in lines[2]
+    assert searcher.last_provider == "tavily"
+
+
+def test_deepseek_parses_and_formats():
+    seen = []
+    searcher, _ = make_searcher(deepseek_handler(seen), order=["deepseek"])
+    text = asyncio.run(searcher.search("deepseek 发布", 2, chat_key="c1"))
+
+    assert seen[0][0] == DEEPSEEK_URL
+    assert seen[0][1] == {"query": "deepseek 发布", "count": 2, "need_content": False}
+    assert seen[0][2].get("authorization") == "Bearer k-deepseek"
+    assert seen[0][2].get("content-type") == "application/json"
+    lines = text.splitlines()
+    assert lines[0] == RESULT_HEADER
+    # 正文优先 summary；去掉 www.
+    assert "DeepSeek 搜索结果" in lines[1]
+    assert "这是给模型读的长摘要" in lines[1]
+    assert "来源：example.com" in lines[1]
+    # summary 缺失时退 snippet
+    assert "只有 snippet 的条目" in lines[2]
+    assert "回退到 snippet 的正文" in lines[2]
+    # summary 按注入格式截断
+    snippet = lines[1].split(" — ", 1)[1].rsplit(" — 来源：", 1)[0]
+    assert snippet.endswith("…")
+    assert len(snippet) == SUMMARY_CHARS + 1
+    assert searcher.last_provider == "deepseek"
+
+
+def test_deepseek_long_query_is_truncated():
+    seen = []
+    searcher, _ = make_searcher(deepseek_handler(seen), order=["deepseek"])
+    asyncio.run(searcher.search("长" * 300, 2, chat_key="c1"))
+    assert len(seen[0][1]["query"]) == DEEPSEEK_QUERY_MAX
 
 
 def test_count_is_clamped_to_max():
@@ -177,14 +336,14 @@ def test_count_is_clamped_to_max():
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(json.loads(request.content))
-        return httpx.Response(200, json=BOCHA_BODY)
+        return httpx.Response(200, json=TAVILY_BODY)
 
-    searcher, _ = make_searcher(handler)
+    searcher, _ = make_searcher(handler, order=["tavily"])
     asyncio.run(searcher.search("q", 99, chat_key="a"))
     asyncio.run(searcher.search("q", None, chat_key="b"))
     asyncio.run(searcher.search("q", "x", chat_key="c"))
     asyncio.run(searcher.search("q", 0, chat_key="d"))
-    assert [body["count"] for body in seen] == [8, 5, 5, 5]
+    assert [body["max_results"] for body in seen] == [8, 5, 5, 5]
     assert clamp_count(True) == 5
 
 
@@ -200,43 +359,153 @@ def test_total_length_capped():
     assert text.startswith("【联网搜索结果】")
 
 
-def test_http_failure_returns_unavailable():
+def test_all_channels_http_failure_returns_unavailable():
+    handler, calls = routing_handler(
+        {
+            TAVILY_URL: lambda request: httpx.Response(500, text="boom"),
+            DEEPSEEK_URL: lambda request: httpx.Response(503, text="busy"),
+        }
+    )
+    searcher, _ = make_searcher(handler, order=["tavily", "deepseek"])
+    assert asyncio.run(searcher.search("q", 3, chat_key="c1")) == UNAVAILABLE_TEXT
+    assert calls == [TAVILY_URL, DEEPSEEK_URL]
+
+
+def test_network_error_falls_back_to_next_channel():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == TAVILY_URL:
+            raise httpx.ConnectError("no route", request=request)
+        return httpx.Response(200, json=DEEPSEEK_BODY)
+
+    searcher, _ = make_searcher(handler, order=["tavily", "deepseek"])
+    text = asyncio.run(searcher.search("q", 3, chat_key="c1"))
+    assert "DeepSeek 搜索结果" in text
+    assert searcher.last_provider == "deepseek"
+
+
+def test_malformed_response_counts_as_empty_and_falls_back():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == TAVILY_URL:
+            return httpx.Response(200, json={"unexpected": True})
+        return httpx.Response(200, json=DEEPSEEK_BODY)
+
+    searcher, _ = make_searcher(handler, order=["tavily", "deepseek"])
+    text = asyncio.run(searcher.search("q", 3, chat_key="c1"))
+    assert "DeepSeek 搜索结果" in text
+
+
+def test_bad_json_counts_as_error_and_falls_back():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == TAVILY_URL:
+            return httpx.Response(200, text="<html>不是 json</html>")
+        return httpx.Response(200, json=DEEPSEEK_BODY)
+
+    searcher, _ = make_searcher(handler, order=["tavily", "deepseek"])
+    text = asyncio.run(searcher.search("q", 3, chat_key="c1"))
+    assert "DeepSeek 搜索结果" in text
+
+
+def test_all_channels_empty_returns_no_result():
+    handler, calls = routing_handler(
+        {
+            TAVILY_URL: lambda request: httpx.Response(200, json={"results": []}),
+            DEEPSEEK_URL: lambda request: httpx.Response(200, json={"results": []}),
+        }
+    )
+    searcher, _ = make_searcher(handler, order=["tavily", "deepseek"])
+    assert asyncio.run(searcher.search("没有的东西", 3, chat_key="c1")) == NO_RESULT_TEXT
+    assert calls == [TAVILY_URL, DEEPSEEK_URL]
+
+
+# ----------------------------------------------------------------------
+# 回退链语义
+# ----------------------------------------------------------------------
+
+
+def test_chain_follows_order():
+    handler, calls = routing_handler(
+        {
+            TAVILY_URL: lambda request: httpx.Response(200, json=TAVILY_BODY),
+            DEEPSEEK_URL: lambda request: httpx.Response(200, json=DEEPSEEK_BODY),
+        }
+    )
+    searcher, _ = make_searcher(handler, order=["deepseek", "tavily"])
+    text = asyncio.run(searcher.search("q", 3, chat_key="c1"))
+    # 首个渠道就有结果：不会再打第二个
+    assert calls == [DEEPSEEK_URL]
+    assert "DeepSeek 搜索结果" in text
+    assert searcher.last_provider == "deepseek"
+
+
+def test_chain_skips_channels_without_key():
+    handler, calls = routing_handler(
+        {
+            TAVILY_URL: lambda request: httpx.Response(200, json=TAVILY_BODY),
+            DEEPSEEK_URL: lambda request: httpx.Response(200, json=DEEPSEEK_BODY),
+        }
+    )
+    searcher, _ = make_searcher(handler, order=["deepseek", "tavily"], deepseek_key="")
+    text = asyncio.run(searcher.search("q", 3, chat_key="c1"))
+    assert calls == [TAVILY_URL]
+    assert "Python 3.13 发布" in text
+    assert searcher.last_provider == "tavily"
+
+
+def test_chain_falls_back_on_first_failure():
+    handler, calls = routing_handler(
+        {
+            TAVILY_URL: lambda request: httpx.Response(500, text="boom"),
+            DEEPSEEK_URL: lambda request: httpx.Response(200, json=DEEPSEEK_BODY),
+        }
+    )
+    searcher, _ = make_searcher(handler, order=["tavily", "deepseek"])
+    text = asyncio.run(searcher.search("q", 3, chat_key="c1"))
+    assert calls == [TAVILY_URL, DEEPSEEK_URL]
+    assert "DeepSeek 搜索结果" in text
+    assert searcher.last_provider == "deepseek"
+
+
+def test_chain_falls_back_on_empty_results():
+    handler, calls = routing_handler(
+        {
+            TAVILY_URL: lambda request: httpx.Response(200, json={"results": []}),
+            DEEPSEEK_URL: lambda request: httpx.Response(200, json=DEEPSEEK_BODY),
+        }
+    )
+    searcher, _ = make_searcher(handler, order=["tavily", "deepseek"])
+    text = asyncio.run(searcher.search("q", 3, chat_key="c1"))
+    assert calls == [TAVILY_URL, DEEPSEEK_URL]
+    assert "DeepSeek 搜索结果" in text
+
+
+def test_chain_second_channel_skipped_when_unconfigured():
+    """首渠道失败、次渠道没 key：不会发第二个请求，返回「暂时不可用」。"""
+    handler, calls = routing_handler(
+        {TAVILY_URL: lambda request: httpx.Response(500, text="boom")}
+    )
+    searcher, _ = make_searcher(handler, order=["tavily", "deepseek"], deepseek_key="")
+    assert asyncio.run(searcher.search("q", 3, chat_key="c1")) == UNAVAILABLE_TEXT
+    assert calls == [TAVILY_URL]
+
+
+def test_all_channels_fail_returns_unavailable_message():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500, text="boom")
 
-    searcher, _ = make_searcher(handler)
+    searcher, _ = make_searcher(handler, order=["tavily", "deepseek"])
     assert asyncio.run(searcher.search("q", 3, chat_key="c1")) == UNAVAILABLE_TEXT
 
 
-def test_network_error_returns_unavailable():
+def test_search_logs_winning_channel(caplog):
     def handler(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("no route", request=request)
+        if str(request.url) == TAVILY_URL:
+            return httpx.Response(500, text="boom")
+        return httpx.Response(200, json=DEEPSEEK_BODY)
 
-    searcher, _ = make_searcher(handler)
-    assert asyncio.run(searcher.search("q", 3, chat_key="c1")) == UNAVAILABLE_TEXT
-
-
-def test_malformed_response_returns_unavailable():
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"unexpected": True})
-
-    searcher, _ = make_searcher(handler)
-    # 结构不对但没有可用结果：当作没搜到，而不是崩掉
-    assert asyncio.run(searcher.search("q", 3, chat_key="c1")) == "没搜到相关结果。"
-
-    def bad_handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, text="<html>不是 json</html>")
-
-    searcher, _ = make_searcher(bad_handler)
-    assert asyncio.run(searcher.search("q", 3, chat_key="c2")) == UNAVAILABLE_TEXT
-
-
-def test_empty_results_message():
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"data": {"webPages": {"value": []}}})
-
-    searcher, _ = make_searcher(handler)
-    assert asyncio.run(searcher.search("没有的东西", 3, chat_key="c1")) == "没搜到相关结果。"
+    searcher, _ = make_searcher(handler, order=["tavily", "deepseek"])
+    with caplog.at_level(logging.INFO, logger="rubenbot.search"):
+        asyncio.run(searcher.search("q", 3, chat_key="c1"))
+    assert any("deepseek" in record.message and "命中" in record.message for record in caplog.records)
 
 
 # ----------------------------------------------------------------------
@@ -249,10 +518,10 @@ def test_cooldown_blocks_second_search_same_chat():
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(1)
-        return httpx.Response(200, json=BOCHA_BODY)
+        return httpx.Response(200, json=TAVILY_BODY)
 
     clock = {"now": 1000.0}
-    searcher, _ = make_searcher(handler, cooldown=30.0, clock=clock)
+    searcher, _ = make_searcher(handler, order=["tavily"], cooldown=30.0, clock=clock)
 
     first = asyncio.run(searcher.search("q", 3, chat_key="g1"))
     assert RESULT_HEADER in first
@@ -271,14 +540,35 @@ def test_cooldown_blocks_second_search_same_chat():
     assert len(calls) == 3
 
 
+def test_cooldown_gate_covers_whole_chain():
+    """整条链只过一次冷却闸：首渠道失败后换渠道也算同一次搜索。"""
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        if str(request.url) == TAVILY_URL:
+            return httpx.Response(500, text="boom")
+        return httpx.Response(200, json=DEEPSEEK_BODY)
+
+    clock = {"now": 1000.0}
+    searcher, _ = make_searcher(
+        handler, order=["tavily", "deepseek"], cooldown=30.0, clock=clock
+    )
+    asyncio.run(searcher.search("q", 3, chat_key="g1"))
+    assert calls == [TAVILY_URL, DEEPSEEK_URL]
+    clock["now"] += 5.0
+    assert COOLDOWN_TEXT in asyncio.run(searcher.search("q", 3, chat_key="g1"))
+    assert calls == [TAVILY_URL, DEEPSEEK_URL]
+
+
 def test_cooldown_zero_disables_limit():
     calls = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(1)
-        return httpx.Response(200, json=BOCHA_BODY)
+        return httpx.Response(200, json=TAVILY_BODY)
 
-    searcher, _ = make_searcher(handler, cooldown=0.0)
+    searcher, _ = make_searcher(handler, order=["tavily"], cooldown=0.0)
     asyncio.run(searcher.search("q", 3, chat_key="g1"))
     asyncio.run(searcher.search("q", 3, chat_key="g1"))
     assert len(calls) == 2
@@ -354,7 +644,7 @@ def test_web_search_tool_registered_when_configured():
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(1)
-        return httpx.Response(200, json=BOCHA_BODY)
+        return httpx.Response(200, json=TAVILY_BODY)
 
     llm = ToolLLM(
         [
@@ -362,8 +652,10 @@ def test_web_search_tool_registered_when_configured():
             {"content": "看新闻说今天有暴雨"},
         ]
     )
-    bot, adapter = make_bot(llm, search=SearchConfig(api_key="k-test"))
-    bot.searcher, _ = make_searcher(handler)
+    bot, adapter = make_bot(
+        llm, search=SearchConfig(tavily=SearchChannelConfig(api_key="k-test"))
+    )
+    bot.searcher, _ = make_searcher(handler, order=["tavily"])
 
     asyncio.run(bot.handle_event(event("今天有什么新闻")))
     assert adapter.texts == ["看新闻说今天有暴雨"]
@@ -371,8 +663,8 @@ def test_web_search_tool_registered_when_configured():
     assert names == {"recall", "web_search"}
     tool_message = next(m for m in llm.last_messages if m.get("role") == "tool")
     assert RESULT_HEADER in tool_message["content"]
-    assert "今日要闻" in tool_message["content"]
-    assert "来源：news.example.com" in tool_message["content"]
+    assert "Python 3.13 发布" in tool_message["content"]
+    assert "来源：blog.python.org" in tool_message["content"]
     assert calls == [1]
 
 
@@ -389,10 +681,21 @@ def test_web_search_not_registered_without_key():
     assert adapter.texts == ["在的"]
 
 
+def test_web_search_not_registered_when_chain_has_no_keys():
+    llm = ToolLLM([{"content": "在的"}])
+    bot, _ = make_bot(llm)
+    config = Config()
+    assert config.search.configured is False
+    assert bot.searcher is None
+    assert [tool["function"]["name"] for tool in bot.tool_definitions()] == ["recall"]
+
+
 def test_search_tool_works_when_recall_disabled():
     """recall 关掉但配了搜索：工具循环照常跑，只给 web_search。"""
     llm = ToolLLM([{"content": "好"}])
-    bot, _ = make_bot(llm, search=SearchConfig(api_key="k-test"))
+    bot, _ = make_bot(
+        llm, search=SearchConfig(deepseek=SearchChannelConfig(api_key="k-test"))
+    )
     bot.config.memory.recall_tool_enabled = False
     assert [tool["function"]["name"] for tool in bot.tool_definitions()] == ["web_search"]
     asyncio.run(bot.handle_event(event("在吗")))
@@ -401,7 +704,9 @@ def test_search_tool_works_when_recall_disabled():
 
 def test_system_prompt_has_search_guide_when_configured():
     llm = ToolLLM([{"content": "好"}])
-    bot, _ = make_bot(llm, search=SearchConfig(api_key="k-test"))
+    bot, _ = make_bot(
+        llm, search=SearchConfig(tavily=SearchChannelConfig(api_key="k-test"))
+    )
     asyncio.run(bot.handle_event(event("在吗")))
     system = llm.last_messages[0]["content"]
     assert "可以联网搜索" in system
@@ -419,8 +724,10 @@ def test_web_search_failure_does_not_break_reply():
             {"content": "搜不到，不过先聊"},
         ]
     )
-    bot, adapter = make_bot(llm, search=SearchConfig(api_key="k-test"))
-    bot.searcher, _ = make_searcher(handler)
+    bot, adapter = make_bot(
+        llm, search=SearchConfig(tavily=SearchChannelConfig(api_key="k-test"))
+    )
+    bot.searcher, _ = make_searcher(handler, order=["tavily"])
     asyncio.run(bot.handle_event(event("今天有什么新闻")))
     assert adapter.texts == ["搜不到，不过先聊"]
     tool_message = next(m for m in llm.last_messages if m.get("role") == "tool")
@@ -429,11 +736,13 @@ def test_web_search_failure_does_not_break_reply():
 
 def test_cooldown_message_reaches_model():
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json=BOCHA_BODY)
+        return httpx.Response(200, json=TAVILY_BODY)
 
     clock = {"now": 1000.0}
-    config = SearchConfig(api_key="k-test", cooldown_seconds=30)
-    searcher, _ = make_searcher(handler, cooldown=30.0, clock=clock)
+    config = SearchConfig(
+        tavily=SearchChannelConfig(api_key="k-test"), cooldown_seconds=30
+    )
+    searcher, _ = make_searcher(handler, order=["tavily"], cooldown=30.0, clock=clock)
     searcher.config = config
 
     llm = ToolLLM(

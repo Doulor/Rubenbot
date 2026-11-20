@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import ipaddress
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -13,6 +14,8 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
@@ -290,35 +293,90 @@ class GenerationConfig:
     two_stage: TwoStageConfig = field(default_factory=TwoStageConfig)
 
 
+# 联网搜索支持的渠道；顺序只影响默认尝试顺序，不代表优先级
+SEARCH_PROVIDERS: tuple[str, ...] = ("tavily", "deepseek")
+# 用户拍板：Tavily 当主力、DeepSeek 当备胎
+DEFAULT_SEARCH_ORDER: tuple[str, ...] = ("tavily", "deepseek")
+
+
+@dataclass
+class SearchChannelConfig:
+    """单个搜索渠道的配置；目前只有密钥。"""
+
+    api_key: str = ""
+
+    def __post_init__(self) -> None:
+        self.api_key = str(self.api_key or "").strip()
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.api_key)
+
+
+def _normalize_order(raw: object) -> list[str]:
+    """把 ``order`` 归一化成已知渠道名的列表。
+
+    接受列表或逗号分隔字符串；未知渠道名忽略并打一行日志，重复项去重。
+    一个都不剩时回落到默认顺序（缺省语义），不让配置写错就搜不了。
+    """
+    if isinstance(raw, str):
+        items: list[object] = raw.split(",")
+    elif isinstance(raw, (list, tuple, set)):
+        items = list(raw)
+    else:
+        items = []
+    order: list[str] = []
+    for item in items:
+        name = str(item or "").strip().lower()
+        if not name:
+            continue
+        if name not in SEARCH_PROVIDERS:
+            logger.warning("未知的搜索渠道 %r，已忽略", name)
+            continue
+        if name not in order:
+            order.append(name)
+    return order or list(DEFAULT_SEARCH_ORDER)
+
+
 @dataclass
 class SearchConfig:
     """联网搜索（LLM 工具 ``web_search``）的配置。
 
-    ``provider`` 目前支持 ``bocha``（博查）与 ``tavily``，写错回落 ``bocha``；
-    ``api_key`` 与 ``llm.api_key`` 一样支持 ``${ENV_VAR}``（加载时已统一展开）。
-    没配 ``api_key`` 时工具不注册，模型看不见它。
+    搜索渠道改成**有序回退链**：``order`` 里的渠道按顺序尝试，没配 key 的
+    自动跳过，抛错/超时/空结果就顺延下一个，第一个有结果的胜出。渠道目前
+    有 ``tavily`` 与 ``deepseek``，各自在 ``tavily.api_key`` /
+    ``deepseek.api_key`` 配密钥；支持 ``${ENV_VAR}``（加载时已统一展开）。
+    整条链一个 key 都没有时工具不注册，模型看不见它。
     """
 
-    provider: str = "bocha"
-    api_key: str = ""
+    order: list[str] = field(default_factory=lambda: list(DEFAULT_SEARCH_ORDER))
+    tavily: SearchChannelConfig = field(default_factory=SearchChannelConfig)
+    deepseek: SearchChannelConfig = field(default_factory=SearchChannelConfig)
     timeout_seconds: float = 10.0
-    # 每个会话两次真实搜索之间的冷却；冷却内直接返回提示文本，不发请求
+    # 每个会话两次真实搜索之间的冷却；整条链共用，冷却内不发任何请求
     cooldown_seconds: float = 30.0
 
     def __post_init__(self) -> None:
-        provider = str(self.provider or "").strip().lower()
-        self.provider = provider if provider in SEARCH_PROVIDERS else "bocha"
-        self.api_key = str(self.api_key or "").strip()
+        self.order = _normalize_order(self.order)
+        for name in SEARCH_PROVIDERS:
+            value = getattr(self, name)
+            if isinstance(value, dict):
+                value = SearchChannelConfig(**{k: v for k, v in value.items() if _has(SearchChannelConfig, k)})
+            elif not isinstance(value, SearchChannelConfig):
+                value = SearchChannelConfig()
+            setattr(self, name, value)
         self.timeout_seconds = max(0.1, _as_float(self.timeout_seconds, 10.0))
         self.cooldown_seconds = max(0.0, _as_float(self.cooldown_seconds, 30.0))
 
+    def channel(self, name: str) -> SearchChannelConfig:
+        """按渠道名取配置；未知渠道返回空配置（调用方应先过滤）。"""
+        value = getattr(self, name, None)
+        return value if isinstance(value, SearchChannelConfig) else SearchChannelConfig()
+
     @property
     def configured(self) -> bool:
-        """填了 api_key 才算可用（provider 不需要额外校验）。"""
-        return bool(self.api_key)
-
-
-SEARCH_PROVIDERS: tuple[str, ...] = ("bocha", "tavily")
+        """链上至少有一个渠道配了 key 才算可用。"""
+        return any(self.channel(name).configured for name in self.order)
 
 
 @dataclass
@@ -539,9 +597,7 @@ class Config:
     def from_dict(cls, data: dict[str, Any]) -> "Config":
         llm = LLMConfig(**{k: v for k, v in (data.get("llm") or {}).items() if _has(LLMConfig, k)})
         memory = _load_memory(data.get("memory") or {})
-        search = SearchConfig(
-            **{k: v for k, v in (data.get("search") or {}).items() if _has(SearchConfig, k)}
-        )
+        search = _load_search(data.get("search") or {})
         chat = ChatConfig(**{k: v for k, v in (data.get("chat") or {}).items() if _has(ChatConfig, k)})
         decision = _load_decision(data.get("decision") or {})
         generation = _load_generation(data.get("generation") or {})
@@ -589,6 +645,47 @@ def _load_memory(data: dict[str, Any]) -> MemoryConfig:
             keep_recent=_as_int(raw.get("keep_recent"), default.keep_recent, minimum=0),
             max_chars=_as_int(raw.get("max_chars"), default.max_chars, minimum=100),
         )
+    return config
+
+
+def _load_search(data: dict[str, Any]) -> SearchConfig:
+    """解析 search 段；兼容旧的平铺写法。
+
+    新结构：``order`` + ``tavily.api_key`` / ``deepseek.api_key``。
+    旧结构（``provider`` + ``api_key`` 平铺）自动映射成 ``order: [provider]``
+    并把 key 填给对应渠道；新结构优先，两者都写时旧字段只作兜底。
+    旧配置里的 ``provider: bocha`` 已移除：忽略该渠道并打一行日志，按链中
+    其余已配 key 的渠道走。
+    """
+    if not isinstance(data, dict):
+        return SearchConfig()
+    plain = {k: v for k, v in data.items() if _has(SearchConfig, k)}
+    for name in SEARCH_PROVIDERS:
+        if isinstance(plain.get(name), dict):
+            plain[name] = SearchChannelConfig(
+                **{k: v for k, v in plain[name].items() if _has(SearchChannelConfig, k)}
+            )
+    config = SearchConfig(**plain)
+
+    legacy_provider = str(data.get("provider") or "").strip().lower()
+    legacy_key = str(data.get("api_key") or "").strip()
+    if not legacy_provider and not legacy_key:
+        return config
+    if not legacy_provider:
+        # 旧默认渠道就是 bocha：只写了 api_key 的旧配置同样按已移除处理，
+        # 别把旧 key 悄悄塞给别的渠道
+        logger.info("搜索渠道 bocha 已移除，旧配置中的该渠道被忽略")
+        return config
+    if legacy_provider not in SEARCH_PROVIDERS:
+        logger.warning("搜索渠道 %r 已移除或未知，旧配置中的该渠道被忽略", legacy_provider)
+        return config
+    channel = config.channel(legacy_provider)
+    # 新结构里显式写了渠道 key 时优先；只有渠道 key 为空才用旧平铺 key
+    if not channel.api_key and legacy_key:
+        channel.api_key = legacy_key
+    # 旧写法的 provider 就是唯一渠道；但它没 key 时不必把别的渠道挤出链外
+    if "order" not in data and channel.configured:
+        config.order = [legacy_provider]
     return config
 
 

@@ -109,8 +109,8 @@ RECALL_TOOL = {
     },
 }
 
-# 联网搜索工具的定义。只在配置了 search.api_key 时随 recall 一起开放；
-# 未配置时模型完全看不见它（不会调用后才报错）。
+# 联网搜索工具的定义。只在 search 回退链上至少一个渠道配了 key 时随 recall
+# 一起开放；一个都没有时模型完全看不见它（不会调用后才报错）。
 WEB_SEARCH_TOOL = {
     "type": "function",
     "function": {
