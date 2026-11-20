@@ -237,6 +237,12 @@ plugins:
   # enabled: ["hello"]
   command_prefix: "/"
 
+market:
+  # 插件市场索引地址：索引仓库 plugins.json 的 raw 地址。
+  # 留空或拉取失败（5 秒超时）时回退到内置官方索引（随框架发布的 4 个官方插件）。
+  # index_url: "https://raw.githubusercontent.com/Doulor/Rubenbot-plugins/main/plugins.json"
+  index_url: ""
+
 adapters:
   console: {}                 # 本地调试：stdin/stdout
   snowluma:                   # OneBot v11

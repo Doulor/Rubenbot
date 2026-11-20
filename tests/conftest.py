@@ -83,3 +83,32 @@ def config() -> Config:
 
 def json_array(*items) -> str:
     return json.dumps(items, ensure_ascii=False)
+
+
+def write_manifest(directory, plugin_id: str | None = None, **overrides) -> Path:
+    """在插件目录里写一份合规的最小 manifest（测试用）。
+
+    loader 现在要求每个插件目录根部有 manifest.json，测试里临时造的插件
+    目录统一用这个函数补上一份；不用关心的字段给默认值。
+    """
+    import json
+    from pathlib import Path
+
+    path = Path(directory)
+    path.mkdir(parents=True, exist_ok=True)
+    name = plugin_id or path.name
+    data = {
+        "id": name,
+        "name": overrides.pop("display_name", name),
+        "version": overrides.pop("version", "1.0.0"),
+        "description": overrides.pop("description", f"测试插件 {name}"),
+        "author": overrides.pop("author", "test"),
+        "min_core_version": overrides.pop("min_core_version", "0.0.0"),
+        "permissions": overrides.pop("permissions", ["read_messages"]),
+        "hooks": overrides.pop("hooks", []),
+    }
+    data.update(overrides)
+    (path / "manifest.json").write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return path / "manifest.json"

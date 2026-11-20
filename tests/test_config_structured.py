@@ -164,6 +164,7 @@ def test_structured_config_covers_every_field(config):
             "groups",
         ],
         "plugins": ["dir", "enabled", "command_prefix"],
+        "market": ["index_url"],
         "webui": ["enabled", "host", "port", "session_hours"],
         "emotion": [
             "enabled",
@@ -403,6 +404,21 @@ def test_proactive_config_written_and_hot_applied(client, config_path, state):
     assert raw["reminder"]["max_pending_per_chat"] == 2
     assert state.config.proactive.enabled is True
     assert state.config.reminder.max_pending_per_chat == 2
+
+
+# ----------------------------------------------------------------------
+# 插件市场
+# ----------------------------------------------------------------------
+
+
+def test_validate_market_index_url():
+    # 留空表示「用内置官方索引」，允许；http(s) 地址原样保留
+    assert validate_structured({"market": {"index_url": ""}})["market"] == {"index_url": ""}
+    update = validate_structured({"market": {"index_url": " https://example.test/plugins.json "}})
+    assert update["market"]["index_url"] == "https://example.test/plugins.json"
+    with pytest.raises(ConfigValidationError) as info:
+        validate_structured({"market": {"index_url": "ftp://example.test/plugins.json"}})
+    assert any(item["field"] == "market.index_url" for item in info.value.fields)
 
 
 def test_merge_config_keeps_unknown_keys():

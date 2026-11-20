@@ -350,7 +350,7 @@ const PAGES = {
   memory: { title: "记忆", sub: "按人浏览、搜索与维护记忆库", render: renderMemory },
   people: { title: "人物", sub: "见过的每个人和他们的档案", render: renderPeople },
   groups: { title: "群组与意愿", sub: "每群活跃度、静默时段与决策记录", render: renderGroups },
-  plugins: { title: "插件", sub: "已发现的插件与启停状态", render: renderPlugins },
+  plugins: { title: "插件市场", sub: "已装与可装同列表；安装后默认关闭，手动启用才加载", render: renderPlugins },
   logs: { title: "日志", sub: "最近的运行日志", render: renderLogs },
   settings: { title: "设置", sub: "模型、记忆、意愿与运行参数，保存即生效", render: renderSettings },
 };
@@ -1857,80 +1857,454 @@ async function fillDetail(container, chat) {
 }
 
 /* ------------------------------------------------------------------ */
-/* 插件                                                               */
+/* 插件市场（与插件页合并：已装与可装同列表，靠状态区分）              */
 /* ------------------------------------------------------------------ */
 
-async function renderPlugins(view) {
-  const load = async () => {
-    const data = await api.get("/api/plugins");
-    if (!data.items.length) {
-      view.replaceChildren(
-        h("section", { class: "card" }, emptyState("plugins", "没有发现插件", "在 plugins/ 目录下放 <名称>/plugin.py 即可"))
+const MARKET_STATE_TEXT = {
+  not_installed: "未安装",
+  installed: "已安装",
+  enabled: "已启用",
+};
+
+/** 权限徽标：manifest 的 permissions 映射成中文短标签。 */
+function permissionBadges(permissions, meta = []) {
+  const byId = new Map((meta || []).map((item) => [item.id, item]));
+  return h(
+    "div",
+    { class: "market-perms" },
+    ...(permissions || []).map((name) => {
+      const info = byId.get(name) || { label: name, high_risk: false };
+      return h(
+        "span",
+        { class: `tag ${info.high_risk ? "bad" : "outline"}`, title: info.description || name },
+        info.label || name
       );
-      return;
-    }
-    const list = h("div", { class: "rows" });
-    for (const plugin of data.items) {
-      const toggle = h("button", {
-        class: "switch",
-        type: "button",
-        role: "switch",
-        "aria-checked": plugin.enabled ? "true" : "false",
-        "aria-label": `${plugin.enabled ? "禁用" : "启用"}插件 ${plugin.name}`,
-      });
-      toggle.addEventListener("click", async () => {
-        const next = toggle.getAttribute("aria-checked") !== "true";
-        toggle.disabled = true;
-        try {
-          const result = await api.post(`/api/plugins/${encodeURIComponent(plugin.name)}`, { enabled: next });
-          toast(result.message || `插件 ${plugin.name} 已${next ? "启用" : "禁用"}`);
-          load();
-        } catch (err) {
-          if (!(err instanceof Unauthorized)) toast(err.message || "操作失败", "error");
-          toggle.disabled = false;
-        }
-      });
-      const stateText = plugin.enabled ? (plugin.loaded ? "启用中" : "加载失败") : "已禁用";
-      const tagClass = plugin.enabled && plugin.loaded ? "tag good" : "tag";
-      const hooks = plugin.hooks || {};
-      const hookText = [
-        hooks.on_message ? `on_message ${hooks.on_message}` : "",
-        hooks.on_before_reply ? `on_before_reply ${hooks.on_before_reply}` : "",
-        hooks.on_after_reply ? `on_after_reply ${hooks.on_after_reply}` : "",
-      ].filter(Boolean);
-      list.append(
-        h(
-          "div",
-          { class: "plugin-row" },
-          h("div", { class: "plugin-icon" }, icon("plugins")),
+    })
+  );
+}
+
+/** 市场卡片的状态标签（含可更新 / 不合规 / 核心版本过低 / 仅展示）。 */
+function marketTags(item) {
+  const tags = [];
+  if (item.invalid) tags.push(h("span", { class: "tag bad" }, "不合规"));
+  if (item.core_too_old) tags.push(h("span", { class: "tag bad" }, "核心版本过低"));
+  if (item.updatable) tags.push(h("span", { class: "tag warn" }, "可更新"));
+  if (item.state === "enabled") tags.push(h("span", { class: "tag good" }, "已启用"));
+  else if (item.state === "installed") tags.push(h("span", { class: "tag" }, "已安装"));
+  else if (!item.download_available) tags.push(h("span", { class: "tag outline" }, "仅展示"));
+  return tags;
+}
+
+/** 安装确认框：逐项列出权限；高权限（空间写入 / 定时任务）额外红色提示。 */
+function installDialog(item) {
+  const dialog = $("#dialog");
+  const close = () => dialog.close();
+  const meta = item.permission_meta || [];
+  const highRisk = meta.filter((info) => info.high_risk);
+
+  const rows = meta.length
+    ? h(
+        "ul",
+        { class: "perm-list" },
+        ...meta.map((info) =>
           h(
+            "li",
+            { class: info.high_risk ? "high-risk" : "" },
+            h("strong", {}, info.label || info.id),
+            h("span", {}, info.description || "")
+          )
+        )
+      )
+    : h("p", { class: "field-hint" }, "该插件没有声明任何权限。");
+
+  const confirm = h(
+    "button",
+    { class: "btn btn-primary", type: "button" },
+    "确认安装"
+  );
+  confirm.addEventListener("click", async () => {
+    confirm.disabled = true;
+    try {
+      const result = await api.post(`/api/market/plugins/${encodeURIComponent(item.id)}/install`);
+      toast(result.message || "已安装");
+      close();
+      await renderRoute();
+    } catch (err) {
+      if (!(err instanceof Unauthorized)) toast(err.message || "安装失败", "error");
+    } finally {
+      confirm.disabled = false;
+    }
+  });
+
+  dialog.replaceChildren(
+    h(
+      "div",
+      { class: "dialog-head" },
+      h("h2", {}, `安装「${item.name}」`),
+      h("button", { class: "icon-button", type: "button", "aria-label": "关闭", onclick: close }, icon("close"))
+    ),
+    h(
+      "div",
+      { class: "dialog-body" },
+      h(
+        "p",
+        { class: "soft", style: { marginTop: 0 } },
+        `版本 ${item.version || "未知"} · ${item.author || "未知作者"}。插件是任意 Python 代码，安装即完全信任；` +
+          "安装后默认不启用，需要你在卡片上手动开启。"
+      ),
+      h("div", { class: "field-label" }, "它需要这些权限"),
+      rows,
+      highRisk.length
+        ? h(
             "div",
-            { class: "row-main" },
-            h("div", { class: "row-title" }, plugin.name),
+            { class: "notice bad" },
+            icon("warning"),
             h(
-              "div",
-              { class: "row-sub", title: plugin.path },
-              plugin.commands.length ? `命令 ${plugin.commands.map((c) => "/" + c).join(" ")}` : "无命令",
-              hookText.length ? ` · ${hookText.join("，")}` : " · 无钩子"
+              "span",
+              {},
+              `注意：该插件声明了高权限（${highRisk.map((info) => info.label).join("、")}），` +
+                "会读写你的 QQ 空间或运行后台定时任务，请确认来源可信。"
             )
-          ),
-          h("div", { class: "row-side" },
-            h("span", { class: tagClass }, stateText),
-            toggle)
+          )
+        : null
+    ),
+    h(
+      "div",
+      { class: "dialog-foot" },
+      h("button", { class: "btn btn-ghost", type: "button", onclick: close }, "取消"),
+      confirm
+    )
+  );
+  dialog.showModal();
+}
+
+/** 详情抽屉：完整说明、版本、作者、权限、钩子与不合规原因。 */
+function detailDrawer(item) {
+  const dialog = $("#dialog");
+  const close = () => dialog.close();
+  const kv = (label, value) =>
+    h(
+      "div",
+      { class: "market-kv" },
+      h("span", { class: "field-label" }, label),
+      h("span", {}, value || "—")
+    );
+  const meta = item.permission_meta || [];
+  dialog.replaceChildren(
+    h(
+      "div",
+      { class: "dialog-head" },
+      h("h2", {}, `${item.name}${item.version ? ` · v${item.version}` : ""}`),
+      h("button", { class: "icon-button", type: "button", "aria-label": "关闭", onclick: close }, icon("close"))
+    ),
+    h(
+      "div",
+      { class: "dialog-body" },
+      h("p", { class: "soft", style: { marginTop: 0 } }, item.description || "这个插件没有写说明。"),
+      item.invalid_reason
+        ? h("div", { class: "notice bad" }, icon("warning"), h("span", {}, `不合规：${item.invalid_reason}`))
+        : null,
+      h(
+        "div",
+        { class: "market-kv-grid" },
+        kv("版本", item.version),
+        kv("作者", item.author),
+        kv("分类", item.category || "工具"),
+        kv("状态", MARKET_STATE_TEXT[item.state] || item.state),
+        item.latest_version && item.latest_version !== item.version
+          ? kv("最新版本", item.latest_version)
+          : null,
+        item.local_path ? kv("本地目录", item.local_path) : null
+      ),
+      h("div", { class: "field-label" }, "权限"),
+      meta.length
+        ? h(
+            "ul",
+            { class: "perm-list" },
+            ...meta.map((info) =>
+              h(
+                "li",
+                { class: info.high_risk ? "high-risk" : "" },
+                h("strong", {}, info.label || info.id),
+                h("span", {}, info.description || "")
+              )
+            )
+          )
+        : h("p", { class: "field-hint" }, "没有声明权限。"),
+      h("div", { class: "field-label" }, "钩子"),
+      h(
+        "p",
+        { class: "field-hint", style: { margin: 0 } },
+        item.hooks && item.hooks.length ? item.hooks.join("、") : "未声明（以 plugin.py 实际注册为准）"
+      )
+    ),
+    h(
+      "div",
+      { class: "dialog-foot" },
+      h("button", { class: "btn", type: "button", onclick: close }, "关闭")
+    )
+  );
+  dialog.showModal();
+}
+
+/** 卡片的操作按钮组：按状态机切换安装 / 启用 / 停用 / 更新 / 卸载。 */
+function marketActions(item, refresh) {
+  const buttons = [];
+  const run = (path, body, message) => async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    try {
+      const result = await api.post(path, body);
+      toast(result.message || message);
+      await refresh();
+    } catch (err) {
+      if (!(err instanceof Unauthorized)) toast(err.message || "操作失败", "error");
+      button.disabled = false;
+    }
+  };
+
+  if (item.state === "not_installed") {
+    buttons.push(
+      h(
+        "button",
+        {
+          class: "btn btn-sm btn-primary",
+          type: "button",
+          disabled: !item.download_available,
+          title: item.download_available ? "" : "该插件没有下载地址，仅作展示",
+          onclick: () => installDialog(item),
+        },
+        "安装"
+      )
+    );
+  } else {
+    if (item.updatable && item.download_available) {
+      buttons.push(
+        h(
+          "button",
+          {
+            class: "btn btn-sm",
+            type: "button",
+            onclick: run(`/api/market/plugins/${encodeURIComponent(item.id)}/update`, {}, "已更新"),
+          },
+          icon("refresh"),
+          "更新"
         )
       );
     }
-    const headHint = data.hot_reload === false
-      ? "插件默认全部关闭；当前 WebUI 没有运行中的 bot，开关会写入配置，重启 RubenBot 后生效"
-      : "插件默认全部关闭；开关立即生效，并写回 config.yaml 的 plugins.enabled";
-    view.replaceChildren(
-      h("section", { class: "card" },
-        h("div", { class: "card-head" },
-          h("h2", {}, "插件"),
-          h("span", { class: "hint" }, headHint)),
-        list)
+    if (item.state === "enabled") {
+      buttons.push(
+        h(
+          "button",
+          {
+            class: "btn btn-sm btn-ghost",
+            type: "button",
+            disabled: item.invalid || item.core_too_old,
+            onclick: run(
+              `/api/plugins/${encodeURIComponent(item.plugin_name)}`,
+              { enabled: false },
+              "已停用"
+            ),
+          },
+          "停用"
+        )
+      );
+    } else {
+      buttons.push(
+        h(
+          "button",
+          {
+            class: "btn btn-sm btn-primary",
+            type: "button",
+            disabled: item.invalid || item.core_too_old,
+            title: item.invalid_reason || (item.core_too_old ? "当前框架版本过低" : ""),
+            onclick: run(
+              `/api/plugins/${encodeURIComponent(item.plugin_name)}`,
+              { enabled: true },
+              "已启用"
+            ),
+          },
+          "启用"
+        )
+      );
+    }
+    buttons.push(
+      h(
+        "button",
+        {
+          class: "btn btn-sm btn-ghost",
+          type: "button",
+          title: "卸载会删除插件目录（插件自带的配置文件一并删除，config.yaml 的配置段保留）",
+          onclick: () =>
+            confirmDialog({
+              title: `卸载「${item.name}」？`,
+              message:
+                "会先停用再删除插件目录，目录里自带的文件（含插件自己的 config.yaml）会一起删掉；" +
+                "框架 config.yaml 里该插件的配置段保留不动，只从 plugins.enabled 摘除。",
+              confirmText: "卸载",
+              danger: true,
+              onConfirm: async () => {
+                const result = await api.post(
+                  `/api/market/plugins/${encodeURIComponent(item.id)}/uninstall`
+                );
+                toast(result.message || "已卸载");
+                await refresh();
+              },
+            }),
+        },
+        "卸载"
+      )
+    );
+  }
+  return h("div", { class: "market-actions" }, ...buttons);
+}
+
+function marketCard(item, refresh) {
+  const iconText = (item.icon || "").trim() || avatarText(item.name);
+  return h(
+    "article",
+    { class: `market-card ${item.state === "enabled" ? "is-enabled" : ""}` },
+    h(
+      "div",
+      { class: "market-card-head" },
+      h("div", { class: "market-icon", "aria-hidden": "true" }, iconText),
+      h(
+        "div",
+        { class: "market-title" },
+        h("div", { class: "row-title" }, item.name),
+        h("div", { class: "row-sub" }, [item.author || "未知作者", item.version ? `v${item.version}` : ""].filter(Boolean).join(" · "))
+      ),
+      h(
+        "button",
+        {
+          class: "icon-button",
+          type: "button",
+          "aria-label": `查看 ${item.name} 详情`,
+          title: "详情",
+          onclick: () => detailDrawer(item),
+        },
+        icon("caret")
+      )
+    ),
+    h("p", { class: "market-desc" }, item.description || "这个插件没有写说明。"),
+    permissionBadges(item.permissions, item.permission_meta),
+    h(
+      "div",
+      { class: "market-foot" },
+      h("div", { class: "market-tags" }, ...marketTags(item)),
+      marketActions(item, refresh)
+    )
+  );
+}
+
+async function renderPlugins(view) {
+  const keyword = { value: "" };
+  const category = { value: "" };
+  let data = null;
+
+  const gridBox = h("div", {});
+  const tabsBox = h("div", { class: "market-tabs", role: "tablist" });
+  const sourceBox = h("div", {});
+
+  const searchInput = h("input", {
+    class: "input",
+    type: "search",
+    placeholder: "搜索插件名称、说明或作者",
+    "aria-label": "搜索插件",
+  });
+  searchInput.addEventListener(
+    "input",
+    debounce(() => {
+      keyword.value = searchInput.value;
+      drawBody();
+    }, 200)
+  );
+
+  const drawBody = () => {
+    if (!data) return;
+    const q = keyword.value.trim().toLowerCase();
+    const items = (data.items || []).filter((item) => {
+      if (category.value && item.category !== category.value) return false;
+      if (!q) return true;
+      return [item.name, item.id, item.description, item.author]
+        .filter(Boolean)
+        .some((text) => String(text).toLowerCase().includes(q));
+    });
+
+    tabsBox.replaceChildren(
+      ...[["", "全部"], ...(data.categories || [])].map((item) => {
+        const value = Array.isArray(item) ? item[0] : item;
+        const label = Array.isArray(item) ? item[1] : item;
+        return h(
+          "button",
+          {
+            class: `market-tab ${category.value === value ? "active" : ""}`,
+            type: "button",
+            role: "tab",
+            "aria-selected": category.value === value ? "true" : "false",
+            onclick: () => {
+              category.value = value;
+              drawBody();
+            },
+          },
+          label
+        );
+      })
+    );
+    gridBox.replaceChildren(
+      items.length
+        ? h("div", { class: "market-grid" }, ...items.map((item) => marketCard(item, load)))
+        : emptyState("plugins", "没有匹配的插件", "换个关键词或分类试试")
     );
   };
+
+  const drawSource = () => {
+    const source = (data && data.index) || {};
+    const available = source.available !== false;
+    sourceBox.replaceChildren(
+      h(
+        "div",
+        { class: `notice ${available ? "good" : ""}` },
+        icon(available ? "plugins" : "warning"),
+        h(
+          "div",
+          { style: { display: "grid", gap: "4px", flex: "1" } },
+          h(
+            "span",
+            {},
+            h("strong", {}, `数据来源：${source.label || "内置官方索引"}`),
+            source.url ? `（${source.url}）` : ""
+          ),
+          source.error
+            ? h("span", { class: "field-hint" }, `${source.note || "索引不可用"}：${source.error}`)
+            : source.note
+            ? h("span", { class: "field-hint" }, source.note)
+            : null
+        )
+      )
+    );
+  };
+
+  const load = async () => {
+    data = await api.get("/api/market");
+    drawSource();
+    drawBody();
+  };
+
+  view.replaceChildren(
+    h(
+      "div",
+      { class: "grid", style: { gridTemplateColumns: "minmax(0, 1fr)", gap: "14px" } },
+      sourceBox,
+      h("div", { class: "market-toolbar" }, searchInput, tabsBox),
+      gridBox,
+      h(
+        "p",
+        { class: "field-hint" },
+        "插件默认全部关闭：安装后状态是「已安装」，在卡片上点「启用」才会加载。"
+      )
+    )
+  );
   await load();
 }
 
@@ -2561,6 +2935,7 @@ function groupName(key) {
     generation: "生成",
     emotion: "情绪与好感度",
     plugins: "插件",
+    market: "插件市场",
     webui: "WebUI",
     persona: "人格",
     adapters: "适配器",
@@ -3019,9 +3394,25 @@ async function renderSettings(view) {
         draft
       ),
     }),
-    card("插件", {
-      hint: "默认全关，逐个启用",
-      body: pluginEditor(draft, data.plugins_available || []),
+    card("插件市场", {
+      hint: "索引地址与远程来源；装卸启停在插件市场页",
+      body: h(
+        "div",
+        { style: { display: "grid", gap: "16px" } },
+        fieldGrid(
+          [
+            {
+              path: "market.index_url",
+              label: "索引地址",
+              hint: "索引仓库 plugins.json 的 raw 地址；留空或拉取失败时回退内置官方索引",
+              wide: true,
+              mono: true,
+            },
+          ],
+          draft
+        ),
+        pluginEditor(draft, data.plugins_available || [])
+      ),
     }),
     card("适配器", {
       hint: "连接参数改动需重启",

@@ -612,6 +612,21 @@ class PluginsConfig:
 
 
 @dataclass
+class MarketConfig:
+    """插件市场数据源。
+
+    ``index_url`` 指向索引仓库的 ``plugins.json``（raw 地址）；留空或拉取
+    失败时回退到随框架发布的内置官方索引（即插件目录里的官方插件）。
+    改动在 WebUI 侧按请求读取，无需重启。
+    """
+
+    index_url: str = ""
+
+    def __post_init__(self) -> None:
+        self.index_url = str(self.index_url or "").strip()
+
+
+@dataclass
 class WebUIConfig:
     """WebUI 服务配置（第二阶段）。
 
@@ -725,6 +740,7 @@ class Config:
     generation: GenerationConfig = field(default_factory=GenerationConfig)
     emotion: EmotionConfig = field(default_factory=EmotionConfig)
     plugins: PluginsConfig = field(default_factory=PluginsConfig)
+    market: MarketConfig = field(default_factory=MarketConfig)
     webui: WebUIConfig = field(default_factory=WebUIConfig)
     reminder: ReminderConfig = field(default_factory=ReminderConfig)
     proactive: ProactiveConfig = field(default_factory=ProactiveConfig)
@@ -807,6 +823,7 @@ class Config:
         generation = _load_generation(data.get("generation") or {})
         emotion = _load_emotion(data.get("emotion") or {})
         plugins = PluginsConfig(**{k: v for k, v in (data.get("plugins") or {}).items() if _has(PluginsConfig, k)})
+        market = MarketConfig(**{k: v for k, v in (data.get("market") or {}).items() if _has(MarketConfig, k)})
         webui = WebUIConfig(**{k: v for k, v in (data.get("webui") or {}).items() if _has(WebUIConfig, k)})
         reminder = _load_reminder(data.get("reminder") or {})
         proactive = _load_proactive(data.get("proactive") or {})
@@ -830,6 +847,7 @@ class Config:
             generation=generation,
             emotion=emotion,
             plugins=plugins,
+            market=market,
             webui=webui,
             reminder=reminder,
             proactive=proactive,

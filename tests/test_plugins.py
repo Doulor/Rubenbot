@@ -12,7 +12,7 @@ from rubenbot.memory.store import MemoryStore
 from rubenbot.persona import Persona
 from rubenbot.plugins.loader import PluginManager
 
-from conftest import RecordingAdapter, ScriptedLLM
+from conftest import RecordingAdapter, ScriptedLLM, write_manifest
 
 PLUGIN_SOURCE = '''
 def register(ctx):
@@ -47,9 +47,11 @@ def plugin_dir(tmp_path: Path) -> Path:
     demo = root / "demo"
     demo.mkdir(parents=True)
     (demo / "plugin.py").write_text(PLUGIN_SOURCE, encoding="utf-8")
+    write_manifest(demo, "demo")
     bad = root / "broken"
     bad.mkdir()
     (bad / "plugin.py").write_text("raise RuntimeError('import 就炸')", encoding="utf-8")
+    write_manifest(bad, "broken")
     return root
 
 
@@ -300,6 +302,7 @@ def lifecycle_dir(tmp_path: Path) -> Path:
     demo = root / "life"
     demo.mkdir(parents=True)
     (demo / "plugin.py").write_text(LIFECYCLE_SOURCE, encoding="utf-8")
+    write_manifest(demo, "life", hooks=["command", "on_start", "on_stop"])
     return root
 
 

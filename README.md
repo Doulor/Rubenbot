@@ -168,7 +168,9 @@ bot 对每个人的好感度、以及自己当下的心情，都由确定性规�
 | `rubenbot/adapters/base.py` | `BaseAdapter`、`MessageEvent`、`Segment` |
 | `rubenbot/adapters/console.py` | stdin/stdout 调试适配器 |
 | `rubenbot/adapters/snowluma.py` | OneBot v11 正向 WS 收事件 + HTTP API 发送 |
-| `rubenbot/plugins/loader.py` | 插件发现、钩子与命令分发；显式启用制与热启停 |
+| `rubenbot/plugins/loader.py` | 插件发现、钩子与命令分发；加载前校验 manifest；显式启用制与热启停 |
+| `rubenbot/plugins/manifest.py` | 插件 manifest 规范：字段 / 权限枚举 / 版本比较与校验 |
+| `rubenbot/web/market.py` | 插件市场：索引拉取与内置回退、本地插件合并、安装 / 更新 / 卸载（zip 安全解压） |
 | `rubenbot/__main__.py` | 命令行入口 `rubenbot` / `python -m rubenbot` |
 | `plugins/hello/` | 示例插件：`/hello` 命令 + `on_message` 钩子（默认关闭，需显式启用） |
 | `plugins/privacy/` | 内置插件：`/隐私` 命令（档位 / 自查 / 清空）与灰区询问投递（默认关闭，需显式启用） |
@@ -240,7 +242,7 @@ ConsoleAdapter 的输入格式：
 | `[摸鱼群\|阿花] 今天好累` | 指定群名与昵称 |
 | `/hello` | 触发示例插件命令（需先在 `plugins.enabled` 或 WebUI 里启用 `hello`） |
 
-群聊里普通消息默认只拿 `decision.base`（0.10）的基础意愿，单靠它过不了阈值；被 @ / 被回复 / 叫到名字（`Ruben`）时必回。想调试时可以在配置里临时调高 `decision.base` / `decision.threshold`。插件默认全部关闭，想试 `/hello` 请在 WebUI 的「插件」页打开 `hello`，或在配置里写 `plugins.enabled: ["hello"]`。
+群聊里普通消息默认只拿 `decision.base`（0.10）的基础意愿，单靠它过不了阈值；被 @ / 被回复 / 叫到名字（`Ruben`）时必回。想调试时可以在配置里临时调高 `decision.base` / `decision.threshold`。插件默认全部关闭，想试 `/hello` 请在 WebUI 的「插件市场」页启用 `hello`，或在配置里写 `plugins.enabled: ["hello"]`。
 
 ### 4. 测试
 
@@ -248,7 +250,7 @@ ConsoleAdapter 的输入格式：
 pytest
 ```
 
-当前共 974 个测试，覆盖存储 CRUD / 变更日志与撤销、检索打分、抽取去重、归纳校验（不许新词、20% 上限、user 来源不可删）、画像提炼与时间线压缩、记忆读取侧（索引 / 预拉取 / 预算裁剪 / 跨会话 / 分寸审查 / 隐私命令）、会话滚动摘要（触发 / 水位 / 增量折叠 / 上下文组装 / 开关与容错）、回复决策（合并窗口、动量衰减、占比抑制、冷却、硬触发、生成否决）、情绪与好感度（关键词保守识别、增减幅度与每日上限、惰性衰减、档位边界、注入行省略、阈值微调、WebUI 只读端点）、两段式生成（指导注入 / 失败回退 / 用量打标）、联网搜索（渠道回退链 / 跳过无 key / DeepSeek 归一 / 旧配置兼容 / 冷却）、定时任务（到期执行 / 重启恢复 / 迟到标记 / 取消 / 执行中续命）、提醒工具（注册条件 / 会话上限 / 到点走正常发送通道 / 迟到说明）、冷场开口条件矩阵与内容过滤、语音双向（转写/合成后端解析、模式矩阵、超限跳过、平台降级）、主循环、插件（显式启用制与 WebUI 开关写回）、SnowLuma 事件解析，以及 Console + 假 LLM 的端到端流程。
+当前共 1002 个测试，覆盖存储 CRUD / 变更日志与撤销、检索打分、抽取去重、归纳校验（不许新词、20% 上限、user 来源不可删）、画像提炼与时间线压缩、记忆读取侧（索引 / 预拉取 / 预算裁剪 / 跨会话 / 分寸审查 / 隐私命令）、会话滚动摘要（触发 / 水位 / 增量折叠 / 上下文组装 / 开关与容错）、回复决策（合并窗口、动量衰减、占比抑制、冷却、硬触发、生成否决）、情绪与好感度（关键词保守识别、增减幅度与每日上限、惰性衰减、档位边界、注入行省略、阈值微调、WebUI 只读端点）、两段式生成（指导注入 / 失败回退 / 用量打标）、联网搜索（渠道回退链 / 跳过无 key / DeepSeek 归一 / 旧配置兼容 / 冷却）、定时任务（到期执行 / 重启恢复 / 迟到标记 / 取消 / 执行中续命）、提醒工具（注册条件 / 会话上限 / 到点走正常发送通道 / 迟到说明）、冷场开口条件矩阵与内容过滤、语音双向（转写/合成后端解析、模式矩阵、超限跳过、平台降级）、主循环、插件（manifest 校验、显式启用制与 WebUI 开关写回）、插件市场（索引拉取与内置回退、状态合并、安装 / 更新 / 卸载与路径穿越拒绝）、SnowLuma 事件解析，以及 Console + 假 LLM 的端到端流程。
 
 ---
 
@@ -313,6 +315,7 @@ pytest
 | | `boredom_after_seconds` | 多久没人理 bot 判无聊（默认 10800 秒） |
 | | `threshold_adjust` | 心情 → 意愿阈值微调量表（开心/兴奋 −0.05、无聊 −0.03、委屈/低落 +0.05） |
 | `plugins` | `dir` `enabled` `command_prefix` | 插件显式启用：`enabled` 里没列的插件不加载，留空表示全部关闭 |
+| | manifest | 每个插件目录下的 `manifest.json` 声明名称 / 版本 / 说明等元信息，加载时校验 `name` 与目录名一致 |
 | `search` | `order` `tavily.api_key` `deepseek.api_key` | 联网搜索渠道与尝试顺序（可选 `tavily` / `deepseek`，默认 `[tavily, deepseek]`）；key 支持 `${ENV_VAR}`，整条链一个 key 都没有则 `web_search` 工具不注册。旧的 `provider` + `api_key` 平铺写法自动映射成 `order: [provider]`，已下线的旧渠道会被忽略并打日志 |
 | | `timeout_seconds` `cooldown_seconds` | 单次搜索超时（默认 10 秒）与每会话冷却（默认 30 秒，整条链只过一次闸，冷却内只返回提示不发请求） |
 | `voice` | `stt_provider` `stt_api_key` `stt_base_url` `stt_model` | 语音转写后端（`siliconflow` / `openai_compatible`）；密钥支持 `${ENV_VAR}`，不填则语音消息只记 `[语音]` 占位。兼容模式靠 `stt_base_url` 判定可用 |
@@ -321,18 +324,60 @@ pytest
 | | `tts_api_key` `tts_model` `tts_siliconflow_voice` | 硅基流动合成的密钥（留空复用 `stt_api_key`）、模型与音色 |
 | | `edge_tts_command` `tts_voice` | edge-tts 命令行（默认 `edge-tts`）与音色（默认 `zh-CN-XiaoxiaoNeural`）；找不到命令自动降级发文字 |
 | | `tts_max_chars` `tts_timeout_seconds` | 语音回复字数上限（默认 60，超过发文字）与合成超时（默认 30 秒） |
+| `market` | `index_url` | 插件市场索引地址（索引仓库 plugins.json 的 raw 地址）；留空或拉取失败时回退内置官方索引 |
 | `background_check_minutes` | — | 抽取/归纳检查间隔 |
 
 ---
 
 ## 插件开发
 
-插件默认**全部关闭**（显式启用制）：只有在 `config.yaml` 的 `plugins.enabled` 列表里出现的插件才会加载，不写或留空表示一个都不启用。最省事的开启方式是启动后打开 WebUI 的「插件」页，逐个打开开关——保存后立即热生效（现场 `register` / 触发 `on_stop`），并写回 `plugins.enabled`；也可以直接改配置：
+插件默认**全部关闭**（显式启用制）：只有在 `config.yaml` 的 `plugins.enabled` 列表里出现的插件才会加载，不写或留空表示一个都不启用。最省事的开启方式是启动后打开 WebUI 的「插件市场」页，在卡片上点「启用」——立即热生效（现场 `register` / 触发 `on_stop`），并写回 `plugins.enabled`；也可以直接改配置：
 
 ```yaml
 plugins:
   enabled: ["hello"]   # 只启用 hello 插件
 ```
+
+每个插件目录根部必须有 `manifest.json`，loader 加载前会校验：文件缺失、必填字段不全、`permissions` 含枚举外的值、或 `min_core_version` 高于当前框架版本，都会拒绝加载（插件仍出现在市场页的「本地插件」里，带 `invalid_reason` 或「核心版本过低」标记）。字段如下：
+
+```json
+{
+  "id": "hello",
+  "name": "打招呼",
+  "version": "1.0.0",
+  "description": "示例插件：/hello 命令回一句问候",
+  "author": "RubenBot",
+  "min_core_version": "0.1.0",
+  "permissions": ["read_messages", "send_messages"],
+  "hooks": ["command", "on_message"],
+  "category": "互动",
+  "icon": "👋"
+}
+```
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `id` | 是 | 全局唯一，英文小写 / 数字 / `-` / `_`；市场按它和索引条目合并 |
+| `name` / `description` / `author` | 是 | 展示用；`description` 是一句话说明 |
+| `version` | 是 | 形如 `1.0.0`；市场用它判断「可更新」 |
+| `min_core_version` | 是 | 要求的框架最低版本，高于当前版本时禁止安装 / 启用 |
+| `permissions` | 是 | 能力声明，只能取下列枚举值；市场安装前逐项展示中文说明 |
+| `config_schema` / `hooks` | 否 | 配置项声明（二期做自动表单）/ 用到的钩子名 |
+| `category` / `icon` | 否 | 市场分类（互动 / 空间 / 工具 / 系统，缺省「工具」）/ 卡片图标 |
+
+`permissions` 枚举固定为 7 项：
+
+| 权限 | 含义 | 高风险 |
+| --- | --- | --- |
+| `read_messages` | 读取聊天消息、历史与记忆 | |
+| `send_messages` | 以 bot 的身份发送消息 | |
+| `capabilities` | 调用平台能力层（如贴表情） | |
+| `qzone_write` | 在 QQ 空间发布说说、点赞、评论（对外写操作） | 是 |
+| `scheduler` | 注册并运行后台定时任务 | 是 |
+| `llm` | 调用核心的大模型接口（会产生费用） | |
+| `network` | 向外部网络发起请求 | |
+
+带高风险权限的插件，安装确认框里会额外标红提示。框架自带的 4 个官方插件（hello / privacy / emoji_react / qzone_post）都已声明真实 manifest，可作参考。
 
 在插件目录下新建 `plugins/<name>/plugin.py`，暴露 `register(ctx)`：
 
@@ -356,6 +401,18 @@ def register(ctx):
 - `command(name, handler)`：`handler(ctx, event, args)`，返回字符串作为回复；可直接调用也可作装饰器
 
 钩子和命令都同时支持同步/异步函数，异常会被捕获并记录，不会拖垮主循环。`ctx` 上还能拿到 `store`、`config`，以及 `runtime` 中的 `persona`、`adapters`、`retriever`、`extractor`、`consolidator`；记忆读取侧与分寸审查口经 `ctx.extras["memory_reader"]` / `ctx.extras["privacy_gate"]`（或 `runtime.memory` / `runtime.gate`）取用。
+
+### 插件市场
+
+WebUI 的「插件市场」页就是原来的插件页：已安装与可安装的插件在同一个列表里，按状态区分。
+
+- **数据来源**：配置 `market.index_url` 指向索引仓库的 `plugins.json`（raw 地址），条目字段为 `id / name / version / description / author / permissions / path`，可选 `download_url`（插件目录打包的 zip）与 `category` / `icon` / `min_core_version` / `hooks`。没配地址或 5 秒内拉不到，就回退到随框架发布的内置官方索引——页面顶部始终标注当前来源与失败原因，不会空白。
+- **状态机**：`未安装` → `已安装（未启用）` → `已启用`；附加「可更新」（索引版本更高）、「不合规」（manifest 有问题，详情里写原因）、「核心版本过低」、「仅展示」（索引没给 `download_url`）几个标记。
+- **安装**：先弹确认框逐项列出权限（含 `qzone_write` / `scheduler` 时额外标红），确认后下载 zip、校验每个条目的解压路径都在目标目录内（防路径穿越，不合规整包拒绝）、校验 manifest 与 `min_core_version`，落盘到 `plugins/<id>`。**装好默认不启用**，仍走 `plugins.enabled`。
+- **更新**：索引版本更高时卡片挂「可更新」，一键替换代码与 manifest，插件目录里的 `config.yaml` 与启用状态保持不变。
+- **卸载**：启用中先停用，再删插件目录；目录里自带的文件（含插件自己的 `config.yaml`）随目录删除，框架 `config.yaml` 里该插件的配置段保留不动，只从 `plugins.enabled` 摘除。
+
+索引仓库 `Doulor/Rubenbot-plugins` 需要你自己搭（根目录 `plugins.json` + 每个插件一个目录）；代码只依赖「可配置 URL + 拉不到就回退内置」。
 
 ---
 

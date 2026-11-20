@@ -1,0 +1,13 @@
+{
+  "id": "qzone_post",
+  "name": "QQ 空间说说",
+  "version": "1.0.0",
+  "description": "按命令、定时或概率发说说，并可巡检好友空间点赞评论",
+  "author": "RubenBot",
+  "min_core_version": "0.1.0",
+  "permissions": ["read_messages", "send_messages", "qzone_write", "scheduler", "llm"],
+  "config_schema": [],
+  "hooks": ["command", "on_message", "on_after_reply", "on_start", "on_stop"],
+  "category": "空间",
+  "icon": "🌌"
+}

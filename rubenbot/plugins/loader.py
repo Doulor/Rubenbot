@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from ..adapters.base import MessageEvent, Segment
+from .manifest import Manifest, ManifestError, load_manifest
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,17 @@ class Plugin:
     enabled: bool = False
     # 是否真的执行过 register；加载时被禁用的插件是 False
     loaded: bool = False
+    # 校验通过的 manifest；插件目录没有或不合规时为 None
+    manifest: Manifest | None = None
+    # manifest 不合规的原因（缺文件/缺字段/权限越界/核心版本过低）
+    invalid_reason: str | None = None
+    # 不合规是否因为框架版本低于 min_core_version
+    core_too_old: bool = False
+
+    @property
+    def valid(self) -> bool:
+        """manifest 是否合规（合规的插件才能加载）。"""
+        return self.manifest is not None and self.invalid_reason is None
 
 
 class PluginContext:
@@ -235,7 +247,8 @@ class PluginManager:
         已经登记过的插件沿用原对象（保留已注册的钩子、启停状态与生命周期
         回调），这里只更新路径；新发现的插件一律先记为未启用，由
         :meth:`load_all` / :meth:`apply_enabled` / :meth:`set_enabled` 决定
-        是否真正加载。
+        是否真正加载。每次扫描都重新校验 manifest：装好/换过 manifest 的
+        插件不用重启就能拿到最新状态。
         """
         root = Path(directory or self.config.plugins.dir)
         if not root.exists():
@@ -254,8 +267,30 @@ class PluginManager:
                 self.plugins[entry.name] = plugin
             else:
                 plugin.path = entry
+            self._refresh_manifest(plugin)
             found.append(plugin)
         return found
+
+    @staticmethod
+    def _refresh_manifest(plugin: Plugin) -> None:
+        """读取并校验 manifest，把结果记到插件对象上（不合规只记原因）。"""
+        try:
+            manifest = load_manifest(plugin.path)
+        except ManifestError as exc:
+            plugin.manifest = None
+            plugin.invalid_reason = exc.reason
+            plugin.core_too_old = exc.core_too_old
+            return
+        plugin.manifest = manifest
+        plugin.invalid_reason = None
+        plugin.core_too_old = False
+
+    def _reject(self, plugin: Plugin, reason: str) -> None:
+        """记录拒绝原因并解除启用状态（发现列表里保留它，供 WebUI 展示）。"""
+        plugin.invalid_reason = reason
+        plugin.enabled = False
+        plugin.loaded = False
+        logger.warning("拒绝加载插件 %s：%s", plugin.name, reason)
 
     def discover(self) -> list[Plugin]:
         """重新扫描插件目录（发现新目录），返回当前登记的插件。
@@ -281,6 +316,10 @@ class PluginManager:
                     self.set_enabled(plugin.name, False)
                 logger.debug("插件 %s 未在启用列表中，跳过", plugin.name)
                 continue
+            if not plugin.valid:
+                # manifest 不合规（含核心版本过低）：拒绝加载，但保留在发现列表里
+                self._reject(plugin, plugin.invalid_reason or "manifest 不合规")
+                continue
             if plugin.loaded:
                 # 重复调用 load_all 不重复 register（避免钩子翻倍），
                 # 但运行中被停用的要补一次 on_start
@@ -294,6 +333,9 @@ class PluginManager:
                 self._load_plugin(plugin)
                 loaded.append(plugin)
                 logger.info("插件 %s 已加载", plugin.name)
+            except ManifestError as exc:
+                # manifest 在扫描后又被改坏：拒绝加载，但不从列表里移除
+                self._reject(plugin, exc.reason)
             except Exception as exc:  # noqa: BLE001 - 插件失败不能拖垮宿主
                 plugin.enabled = False
                 logger.warning("加载插件 %s 失败：%s", plugin.name, exc)
@@ -327,9 +369,17 @@ class PluginManager:
                 continue
             if plugin.enabled and plugin.loaded:
                 continue
+            if not plugin.valid:
+                # 不合规的插件不能启用：如实报失败，但保留在列表里让 WebUI 显示原因
+                self._reject(plugin, plugin.invalid_reason or "manifest 不合规")
+                failures.append(name)
+                continue
             if not self.set_enabled(name, True):
                 plugin.enabled = False
                 failures.append(name)
+                if plugin.invalid_reason:
+                    # manifest 校验失败：保留插件对象，不当作导入失败移除
+                    continue
                 # 与 load_all 一致：加载失败的插件从列表移除，下次扫描再发现
                 self.plugins.pop(name, None)
         for name, plugin in list(self.plugins.items()):
@@ -340,6 +390,13 @@ class PluginManager:
         return failures
 
     def _load_plugin(self, plugin: Plugin) -> None:
+        # 加载前再校验一次 manifest：目录可能在上一次扫描后被改过
+        self._refresh_manifest(plugin)
+        if not plugin.valid:
+            raise ManifestError(
+                plugin.invalid_reason or "manifest 不合规",
+                core_too_old=plugin.core_too_old,
+            )
         module_name = f"rubenbot_plugin_{plugin.name}"
         spec = importlib.util.spec_from_file_location(
             module_name,
@@ -442,6 +499,10 @@ class PluginManager:
                 "name": p.name,
                 "enabled": p.enabled,
                 "loaded": p.loaded,
+                "valid": p.valid,
+                "invalid_reason": p.invalid_reason,
+                "core_too_old": p.core_too_old,
+                "manifest": p.manifest.as_dict() if p.manifest is not None else None,
                 "commands": sorted(p.commands),
                 "hooks": {
                     "on_message": len(p.message_hooks),
@@ -459,7 +520,7 @@ class PluginManager:
         禁用只是让分发时跳过它（已注册的钩子留着，再次启用立即生效）；
         启用一个加载时被跳过的插件时，会现场执行它的 ``register``。
         禁用/启用时会同步调用插件的 ``on_stop`` / ``on_start`` 回调，
-        后台任务据此启动和干净退出。
+        后台任务据此启动和干净退出。manifest 不合规的插件不能启用。
 
         这个开关会同步更新内存里 ``config.plugins.enabled``；WebUI 调用它
         之后负责把列表写回 config.yaml。
@@ -467,6 +528,12 @@ class PluginManager:
         plugin = self.plugins.get(name)
         if plugin is None:
             return False
+        if enabled and not plugin.valid:
+            # 目录里的 manifest 可能刚被改好/改坏：再校验一次
+            self._refresh_manifest(plugin)
+            if not plugin.valid:
+                self._reject(plugin, plugin.invalid_reason or "manifest 不合规")
+                return False
         was_enabled = plugin.enabled
         if enabled and not plugin.loaded:
             plugin.enabled = True  # _load_plugin 按启用状态决定是否跑 on_start

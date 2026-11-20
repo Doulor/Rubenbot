@@ -1,0 +1,13 @@
+{
+  "id": "hello",
+  "name": "打招呼",
+  "version": "1.0.0",
+  "description": "示例插件：/hello 命令回一句问候，并演示消息钩子与回复后钩子",
+  "author": "RubenBot",
+  "min_core_version": "0.1.0",
+  "permissions": ["read_messages", "send_messages"],
+  "config_schema": [],
+  "hooks": ["command", "on_message", "on_after_reply"],
+  "category": "互动",
+  "icon": "👋"
+}
