@@ -106,12 +106,16 @@ def test_inbound_string_cq_codes():
     assert [segment["type"] for segment in event.segments] == ["at", "text"]
 
 
-def test_inbound_unknown_segment_kept():
+def test_inbound_mface_is_normalized_to_sticker():
     message = [{"type": "mface", "data": {"summary": "[动画表情]"}}]
     segments = onebot_message_segments(message)
-    assert segments == [Segment("mface", {"summary": "[动画表情]"})]
-    # 未知类型在文本投影里退化为 [type]
-    assert onebot_to_segments(message) == "[mface]"
+    assert segments == [
+        Segment(
+            "sticker",
+            {"native_ref": {"kind": "mface", "data": {"summary": "[动画表情]"}}},
+        )
+    ]
+    assert onebot_to_segments(message) == "[表情]"
 
 
 def test_inbound_without_message_field():

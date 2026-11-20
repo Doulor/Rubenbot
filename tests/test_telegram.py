@@ -204,6 +204,45 @@ def test_parse_group_and_supergroup_are_group():
     assert supergroup.is_group
 
 
+def test_parse_native_sticker_as_unified_segment():
+    adapter = make_adapter(FakeTelegram())
+
+    async def scenario():
+        result = await adapter.parse_update(
+            make_update(make_message(sticker={"file_id": "STICKER_1", "emoji": "😀"}))
+        )
+        await close(adapter)
+        return result
+
+    event = asyncio.run(scenario())
+    assert event is not None
+    assert event.segments == [
+        {
+            "type": "sticker",
+            "data": {"native_ref": {"kind": "sticker", "file_id": "STICKER_1"}, "emoji": "😀"},
+        }
+    ]
+
+
+def test_parse_sticker_does_not_download_or_transform_native_ref():
+    adapter = make_adapter(FakeTelegram())
+
+    async def scenario():
+        result = await adapter.parse_update(
+            make_update(make_message(sticker={"file_id": "STICKER_2", "width": 64, "height": 64}))
+        )
+        await close(adapter)
+        return result
+
+    event = asyncio.run(scenario())
+    assert event is not None
+    assert event.text == "[表情]"
+    assert event.segments[0].data["native_ref"] == {
+        "kind": "sticker",
+        "file_id": "STICKER_2",
+    }
+
+
 def test_parse_channel_and_unhandled_kinds_are_ignored():
     adapter = make_adapter(FakeTelegram())
 
@@ -229,7 +268,9 @@ def test_parse_channel_and_unhandled_kinds_are_ignored():
         await close(adapter)
         return channel, sticker, edited, from_bot
 
-    assert asyncio.run(scenario()) == (None, None, None, None)
+    channel, sticker, edited, from_bot = asyncio.run(scenario())
+    assert channel is None and edited is None and from_bot is None
+    assert sticker is not None and sticker.segments[0].type == "sticker"
 
 
 def test_parse_mentions_via_entity():

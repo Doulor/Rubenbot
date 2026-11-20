@@ -337,6 +337,11 @@ class TelegramAdapter(BaseAdapter):
             return None
 
         segments: list[Segment] = []
+        sticker = message.get("sticker")
+        if isinstance(sticker, Mapping):
+            segment = await self._sticker_segment(sticker)
+            if segment is not None:
+                segments.append(segment)
         photo = message.get("photo")
         if isinstance(photo, list) and photo:
             image = await self._photo_segment(_largest_photo(photo))
@@ -404,6 +409,19 @@ class TelegramAdapter(BaseAdapter):
                 if fragment and fragment.lstrip("@").lower() == self.bot_username.lower():
                     return True
         return False
+
+    async def _sticker_segment(self, sticker: Mapping[str, Any]) -> Segment | None:
+        """Telegram 原生 sticker -> 统一 sticker 段，并保留平台引用。"""
+        file_id = sticker.get("file_id")
+        if not file_id:
+            return None
+        data: dict[str, Any] = {
+            "native_ref": {"kind": "sticker", "file_id": str(file_id)},
+        }
+        for key in ("emoji", "set_name", "width", "height", "file_size"):
+            if sticker.get(key) is not None:
+                data[key] = sticker[key]
+        return Segment("sticker", data)
 
     async def _photo_segment(self, photo: Mapping[str, Any]) -> Segment | None:
         """最大尺寸的 PhotoSize -> image 段（下载后以 base64 保存）。"""

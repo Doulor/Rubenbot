@@ -264,8 +264,10 @@ loader 加载时校验 manifest：缺失或字段不全的插件拒绝加载并�
 
 ## 表情包设计（2026-11-20 多萝确认）
 
-- 能力层新增 `send_sticker` 原语：给一个表情引用，当前会话能发就发。适配器各自翻译——SnowLuma/QQ 走 mface 或图片段，Telegram 走原生 sendSticker（file_id），QQ 官方走图片兜底，Console 走文本占位。不支持的平台抛 `CapabilityNotSupported`，按既有能力降级惯例处理。
-- 表情库：一份本体（图片文件 + 标签 + 平台原生引用）。发送时优先用目标平台的原生引用（如 Telegram file_id），没有才退到图片文件发送；发送成功后把平台回给的原生引用回填进库，下次直达。
+- 跨平台消息约定：适配器在入站边界把平台原生表情段统一为 `sticker`，平台原始段数据放入该段的 `data.native_ref`；core 只识别统一类型，不感知 `mface` 等协议名。发送侧由适配器从 `native_ref` 还原平台原生段，行为不变。
+- 存储层平台无关：图片本体按内容哈希去重；同一条表情记录的 `native_refs` 按平台分别挂载，互不覆盖。没有图片本体时也允许只保存原生引用。
+- 能力层新增 `send_sticker` 原语：发送只经这一能力完成——目标平台有原生引用则直发，没有则用图片字节上传；发送成功后把平台返回的原生引用回填该平台的 `native_refs`。适配器各自翻译——SnowLuma/QQ 走 mface 或图片段，Telegram 走原生 sendSticker（file_id），QQ 官方走图片兜底，Console 走文本占位。不支持的平台抛 `CapabilityNotSupported`，按既有能力降级惯例处理。
+- 新平台接入只需两点：①入站表情段归一化为 `sticker` 并按约定保存 `native_ref`；②实现 `send_sticker`。core 无需修改。
 - core 表情行为（本节的交付主体）：负责收集（群里出现的表情自动入库、去重）、打标签、决定何时发哪张。只经能力层行事，不感知平台差异；行为默认关闭，配置位于主 config 的 stickers 段。
 - 同批顺带修适配器装配线缺口：`build_adapters` 目前只装配 console 与 snowluma，Telegram 与 QQ 官方适配器类已存在但从未接线——补齐装配分支、配置示例与装配测试（生产只用 SnowLuma，此缺口不影响线上，但框架完整性要补）。
 

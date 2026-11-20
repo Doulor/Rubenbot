@@ -14,7 +14,7 @@ from .memory.retrieve import tokenize
 
 logger = logging.getLogger(__name__)
 
-COLLECTABLE_SEGMENTS = frozenset({"sticker", "image", "mface"})
+COLLECTABLE_SEGMENTS = frozenset({"sticker", "image"})
 MAX_TAGS = 8
 
 
@@ -74,7 +74,13 @@ class StickerBehavior:
         if not payload:
             return
         raw = _decode_base64(payload.get("base64"))
-        refs = {platform: {"kind": kind, "data": payload}} if platform else None
+        if kind == "sticker" and isinstance(payload.get("native_ref"), Mapping):
+            # 适配器已经把平台原生段放进 native_ref；存储层直接保留这份
+            # 约定结构，发送侧才能按平台还原原生段。
+            native_ref = payload["native_ref"]
+        else:
+            native_ref = {"kind": kind, "data": payload}
+        refs = {platform: native_ref} if platform else None
         if raw is None and not refs:
             return
         store.add(raw, tags=tags, native_refs=refs, file_name=payload.get("filename") or payload.get("name") or None, mime_type=payload.get("mime_type") or payload.get("content_type") or None)

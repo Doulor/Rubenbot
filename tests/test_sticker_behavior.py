@@ -95,6 +95,33 @@ def test_collect_image_and_topic_tags(tmp_path):
     assert item.native_refs["snowluma"]["kind"] == "image"
 
 
+def test_collect_snowluma_mface_after_adapter_normalization(tmp_path):
+    from rubenbot.adapters.snowluma import parse_onebot_event
+
+    store = StickerStore(tmp_path / "stickers")
+    behavior = make_behavior(store)
+    inbound = parse_onebot_event(
+        {
+            "post_type": "message",
+            "message_type": "group",
+            "self_id": 10000,
+            "group_id": 55555,
+            "user_id": 12345,
+            "message_id": 9001,
+            "sender": {"nickname": "阿花"},
+            "message": [{"type": "mface", "data": {"emoji_id": "商城-1"}}],
+        }
+    )
+    assert inbound is not None
+    asyncio.run(behavior.on_message(runtime(Bot(store)), inbound))
+    item = store.find_by_tags(None)[0]
+    assert item.file == ""
+    assert item.native_refs["snowluma"] == {
+        "kind": "mface",
+        "data": {"emoji_id": "商城-1"},
+    }
+
+
 def test_collect_deduplicates_and_merges_tags(tmp_path):
     store = StickerStore(tmp_path / "stickers")
     behavior = make_behavior(store)
