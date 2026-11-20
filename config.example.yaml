@@ -135,6 +135,21 @@ reminder:
   max_delay_minutes: 43200     # 单条提醒最远提前多久（分钟，默认 30 天）
   max_text_chars: 200          # 提醒正文截断长度
 
+# 冷场开口（主动触达）：默认关闭，宁可漏、不可扰
+proactive:
+  enabled: false               # 只在群聊里生效，私聊不主动开口
+  idle_hours: 6                # 距上一条消息超过这么久才考虑
+  quiet_hours: ["23:00-08:00"] # 这段时间内不开口，格式同 decision.groups
+  daily_limit: 1               # 每个群每日最多主动开口几次
+  cooldown_minutes: 60         # 一次评估没开口后，隔多久再评估
+  # 主动开口场景的意愿评分：基础分给得低，阈值附近有随机扰动
+  base: 0.08
+  threshold: 0.15
+  threshold_noise: 0.10
+  threshold_noise_band: 0.12
+  relevance_bonus: 0.10        # 群近期话题命中记忆时最多加多少分
+  relevance_scale: 8.0         # 检索分数归一尺度
+
 plugins:
   dir: "plugins"
   # 插件默认全部关闭（显式启用制）：只有列在这里的插件才会加载，

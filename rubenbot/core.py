@@ -46,6 +46,7 @@ from .memory.store import MemoryStore, make_person_id
 from .memory.summary import RollingSummarizer, format_summary_block
 from .persona import Persona
 from .plugins.loader import PluginContext, PluginManager
+from .proactive import ProactiveOpener, is_acceptable_opener
 from .reminder import REMINDER_TOOL, build_reminder_prompt, describe_fire_at, resolve_fire_at
 from .scheduler import Scheduler
 
@@ -430,9 +431,11 @@ class RubenBot:
         self._chat_locks: dict[str, asyncio.Lock] = {}
         self._bg_task: asyncio.Task | None = None
         self._merge_task: asyncio.Task | None = None
-        # 定时任务：跟随主程序生命周期启停
+        # 定时任务与冷场开口：跟随主程序生命周期启停
         self.scheduler = Scheduler(store, self.handle_scheduled_job)
+        self.opener = ProactiveOpener(config.proactive, rng=self.rng)
         self._scheduler_task: asyncio.Task | None = None
+        self._proactive_task: asyncio.Task | None = None
         self._stop = asyncio.Event()
 
     # ------------------------------------------------------------------
@@ -474,6 +477,8 @@ class RubenBot:
         self.decision_engine.config = config.decision
         aliases = config.decision.aliases or [config.chat.bot_name]
         self.decision_engine.set_aliases(aliases)
+        # 提醒与冷场开口：配置对象替换即可生效；冷却/当日计数保留
+        self.opener.config = config.proactive
         # 合并窗口：新值对之后到达的消息生效
         self.merger.window = max(0.0, float(config.decision.merge_window_seconds))
         self.merger.hard_window = max(0.0, float(config.decision.hard_merge_window_seconds))
@@ -504,6 +509,7 @@ class RubenBot:
         self._bg_task = asyncio.create_task(self._background_loop())
         self._merge_task = asyncio.create_task(self._merge_loop())
         self._scheduler_task = asyncio.create_task(self.scheduler.run(self._stop))
+        self._proactive_task = asyncio.create_task(self._proactive_loop())
         try:
             if tasks:
                 await asyncio.gather(*tasks)
@@ -515,12 +521,13 @@ class RubenBot:
                 await self.flush_merger(all_rounds=True)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("退出前处理待合并消息失败：%s", exc)
-            for task in (self._bg_task, self._merge_task, self._scheduler_task):
+            for task in (self._bg_task, self._merge_task, self._scheduler_task, self._proactive_task):
                 if task is not None:
                     task.cancel()
             self._bg_task = None
             self._merge_task = None
             self._scheduler_task = None
+            self._proactive_task = None
             for task in tasks:
                 task.cancel()
 
@@ -597,7 +604,7 @@ class RubenBot:
             await self.process_round(round_)
 
     # ------------------------------------------------------------------
-    # 定时任务
+    # 定时任务与冷场开口
     # ------------------------------------------------------------------
 
     async def handle_scheduled_job(self, job, *, late: bool = False) -> None:
@@ -638,6 +645,104 @@ class RubenBot:
         )
         await self.send_reply(event, reply)
         logger.info("提醒 #%s 已发送%s：%s", job.id, "（迟到）" if late else "", text[:40])
+
+    async def _proactive_loop(self) -> None:
+        """冷场开口的后台循环：默认关，开着时每轮只在「可能该开口」的群里花一次生成。"""
+        while not self._stop.is_set():
+            try:
+                await self._proactive_check()
+            except Exception as exc:  # noqa: BLE001 - 主动开口失败不能带死循环
+                logger.warning("冷场开口检查异常：%s", exc)
+            # 评估冷却的 1/10 作为轮询间隔（至少 60 秒）；每轮现算，改配置后不必重启
+            interval = max(60.0, self.config.proactive.cooldown_minutes * 6.0)
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
+
+    async def _proactive_check(self, *, now: float | None = None) -> bool:
+        """扫一遍群会话，找出满足全部条件的群；返回是否开口了。"""
+        now = time.time() if now is None else now
+        cfg = self.config.proactive
+        if not cfg.enabled:
+            return False
+        for chat in self.store.list_chats(limit=100):
+            if chat.get("chat_type") != "group":
+                continue
+            platform, chat_id = str(chat["platform"]), str(chat["chat_id"])
+            # 每轮对每个群只评估一次；评估口径（含冷却）由 opener 统一控制。
+            # 相关性检索是惰性的：条件矩阵没过就根本不花这次计算。
+            decision = self.opener.evaluate(
+                self.store,
+                platform,
+                chat_id,
+                now=now,
+                relevance_fn=lambda platform=platform, chat_id=chat_id: self._proactive_relevance(
+                    chat_id, platform
+                ),
+            )
+            if decision.decision is not None:
+                logger.debug(
+                    "冷场开口评估 %s/%s：%s", platform, chat_id, decision.decision.log_text()
+                )
+            if not decision.should_open:
+                continue
+            if await self._proactive_open(platform, chat_id, now=now):
+                return True
+        return False
+
+    def _proactive_relevance(self, chat_id: str, platform: str) -> float:
+        """本群近期话题与记忆的最高检索分；失败当 0（没积累就不容易开口）。"""
+        try:
+            recent = self.store.recent_messages(chat_id, limit=8, platform=platform, real_only=True)
+            text = " ".join(msg.text for msg in recent if msg.sender_id != BOT_SENDER_ID)
+            if not text.strip():
+                return 0.0
+            scored = self.retriever.score(text)
+            return max((item.score for item in scored), default=0.0)
+        except Exception as exc:  # noqa: BLE001 - 相关性算不出来就当 0
+            logger.debug("计算主动开口相关性失败：%s", exc)
+            return 0.0
+
+    async def _proactive_open(self, platform: str, chat_id: str, *, now: float) -> bool:
+        """让模型现写一句并发送；写不出就放弃。返回是否真的开口。"""
+        if platform not in self.adapters:
+            return False
+        recent = self.store.recent_messages(chat_id, limit=12, platform=platform, real_only=True)
+        summary = self.summarizer.active_summary(platform, chat_id)
+        block = format_summary_block(summary.summary) if summary is not None else ""
+        messages = self.opener.build_prompt(
+            persona=self.persona.system_prompt(),
+            bot_name=self.config.chat.bot_name,
+            recent=recent,
+            summary_block=block,
+        )
+        # 不传 event：主动开口不需要工具循环（也不该在没触发消息时调 recall）
+        reply = await self.generate(messages)
+        if not is_acceptable_opener(reply):
+            logger.info("冷场开口尝试放弃：%s/%s（%s）", platform, chat_id, (reply or "")[:30])
+            return False
+        self.opener.note_opened(platform, chat_id, now)
+        await self.send_proactive(platform, chat_id, reply, now=now)
+        try:
+            self.store.add_decision_log(
+                platform=platform,
+                chat_id=chat_id,
+                chat_type="group",
+                sender_id=BOT_SENDER_ID,
+                sender_name=self.config.chat.bot_name,
+                text=reply,
+                should_reply=True,
+                reason="proactive",
+                score=0.0,
+                threshold=self.config.proactive.threshold,
+                factors={"proactive": True},
+                now=now,
+            )
+        except Exception as exc:  # noqa: BLE001 - 观测数据写不进去不影响发送
+            logger.debug("写主动开口决策日志失败：%s", exc)
+        logger.info("冷场开口 %s/%s：%s", platform, chat_id, reply[:40])
+        return True
 
     async def run_maintenance(self, *, now: float | None = None, force_extract: bool = False) -> None:
         """抽取 + 归纳的一次检查；两个环节互不影响。"""
@@ -1102,6 +1207,25 @@ class RubenBot:
     # ------------------------------------------------------------------
     # 生成与发送
     # ------------------------------------------------------------------
+
+    async def send_proactive(
+        self,
+        platform: str,
+        chat_id: str,
+        reply: str,
+        *,
+        now: float | None = None,
+    ) -> None:
+        """主动开口走正常发送通道：拆条、清洗、落流水与自我时间线都一视同仁。"""
+        event = MessageEvent(
+            platform=platform,
+            chat_type="group",
+            chat_id=chat_id,
+            sender_id=BOT_SENDER_ID,
+            sender_name=self.config.chat.bot_name,
+            text=reply,
+        )
+        await self.send_reply(event, reply, now=now)
 
     async def generate(self, messages: list[dict[str, str]], *, event: MessageEvent | None = None) -> str:
         """生成回复；模型支持工具调用时先给最多两轮工具循环（recall / 提醒）。
