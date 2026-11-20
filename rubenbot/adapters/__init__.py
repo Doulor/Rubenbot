@@ -2,6 +2,7 @@
 
 from .base import (
     ActionNotSupported,
+    SEND_STICKER,
     BaseAdapter,
     CapabilityError,
     CapabilityNotSupported,
@@ -12,6 +13,7 @@ from .base import (
     as_segment,
     render_segment,
     render_segments,
+    sticker_native_ref,
     text_segments,
 )
 from .console import ConsoleAdapter
@@ -30,10 +32,12 @@ __all__ = [
     "PlatformEventCallback",
     "QzoneClient",
     "SEGMENT_PLACEHOLDERS",
+    "SEND_STICKER",
     "Segment",
     "SnowLumaAdapter",
     "as_segment",
     "render_segment",
     "render_segments",
+    "sticker_native_ref",
     "text_segments",
 ]

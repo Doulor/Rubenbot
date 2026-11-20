@@ -4,6 +4,7 @@ import asyncio
 import json
 
 import httpx
+import pytest
 
 from rubenbot.adapters.base import (
     CapabilityNotSupported,
@@ -171,6 +172,11 @@ def test_segment_to_onebot_media_and_unknown():
         "type": "file",
         "data": {"file": "http://x/c.pdf"},
     }
+    # 表情段（sticker）直接交给 OneBot 的 mface（QQ 原生表情）
+    assert segment_to_onebot(Segment("sticker", {"native_ref": {"emoji_id": "1"}})) == {
+        "type": "mface",
+        "data": {"emoji_id": "1"},
+    }
     # 未知类型退化为文本占位，不丢消息
     assert segment_to_onebot(Segment("mface", {"summary": "x"})) == {
         "type": "text",
@@ -286,8 +292,9 @@ class Recorder:
 
 
 def test_capabilities_declared():
-    assert {"message.emoji_like", "qzone.publish"} <= SnowLumaAdapter.capabilities
-    assert ConsoleAdapter.capabilities == frozenset()
+    assert {"message.emoji_like", "qzone.publish", "send_sticker"} <= SnowLumaAdapter.capabilities
+    # Console 只多一个「发表情」的文本占位能力，别的平台能力仍然没有
+    assert ConsoleAdapter.capabilities == frozenset({"send_sticker"})
 
 
 def test_capability_disabled_returns_false_without_request(config, store):
@@ -553,3 +560,183 @@ def test_text_reply_still_split(config, store):
     asyncio.run(bot.send_reply(event, "第一句话。第二句话。第三句话。"))
     assert len(adapter.batches) >= 2
     assert all(len(batch) == 1 and batch[0]["type"] == "text" for batch in adapter.batches)
+
+
+# ----------------------------------------------------------------------
+# 能力：发表情（send_sticker）
+# ----------------------------------------------------------------------
+
+
+class StickerRecorder:
+    """假适配器：声明 send_sticker，可指定返回值 / 抛错。"""
+
+    def __init__(self, *, result=None, raises=None):
+        self.name = "sticker_rec"
+        self.capabilities = frozenset({"send_sticker"})
+        self.capability_config_keys = {"send_sticker": "sticker"}
+        self.capability_defaults = {}
+        self.result = result if result is not None else {"sent": True}
+        self.raises = raises
+        self.calls: list[dict] = []
+
+    async def call_capability(self, name, **kwargs):
+        self.calls.append({"name": name, **kwargs})
+        if self.raises is not None:
+            raise self.raises
+        return self.result
+
+    def set_platform_event_callback(self, callback) -> None:
+        """网关会往适配器注入事件回调；这个假适配器不解析平台事件，忽略。"""
+        pass
+
+
+class NoStickerAdapter:
+    name = "plain"
+    capabilities = frozenset()
+    capability_config_keys = {}
+    capability_defaults = {}
+
+    async def call_capability(self, name, **kwargs):  # pragma: no cover - 不会被调用
+        raise AssertionError("不支持的能力不应被调用")
+
+    def set_platform_event_callback(self, callback) -> None:  # pragma: no cover - 无事件
+        pass
+
+
+def test_console_send_sticker_writes_placeholder():
+    import io
+
+    out = io.StringIO()
+    adapter = ConsoleAdapter(stdout=out)
+
+    async def scenario():
+        return await adapter.call_capability(
+            "send_sticker", chat_id="摸鱼群", sticker={"id": "st_1"}
+        )
+
+    result = asyncio.run(scenario())
+    assert result == {"sent": True}
+    assert "Ruben: [表情]" in out.getvalue()
+    assert adapter.sent[-1][0] == "摸鱼群"
+    assert adapter.sent[-1][2][0]["type"] == "sticker"
+
+
+def test_console_unrelated_capability_still_unsupported():
+    adapter = ConsoleAdapter()
+
+    async def scenario():
+        with pytest.raises(CapabilityNotSupported):
+            await adapter.call_capability("message.emoji_like", message_id=1, emoji_id=2)
+
+    asyncio.run(scenario())
+
+
+def test_send_sticker_through_core_reaches_adapter(config, store):
+    recorder = StickerRecorder()
+    bot = RubenBot(config, store, ScriptedLLM(), Persona("Ruben", "你是 Ruben"))
+    bot.register_adapter(recorder)
+
+    async def scenario():
+        return await bot.call_capability(
+            "sticker_rec",
+            "send_sticker",
+            sticker={"id": "st_1", "native_refs": {}},
+            chat_id="g1",
+        )
+
+    ok, reason = asyncio.run(scenario())
+    assert ok is True
+    assert recorder.calls[0]["sticker"]["id"] == "st_1"
+    assert reason == "ok"
+
+
+def test_send_sticker_unsupported_platform_degrades(config, store):
+    bot = RubenBot(config, store, ScriptedLLM(), Persona("Ruben", "你是 Ruben"))
+    bot.register_adapter(NoStickerAdapter())
+
+    async def scenario():
+        return await bot.call_capability(
+            "plain", "send_sticker", sticker={"id": "st_1"}, chat_id="g1"
+        )
+
+    ok, reason = asyncio.run(scenario())
+    assert ok is False
+    assert "不支持" in reason
+
+
+def test_send_sticker_capability_disabled(config, store):
+    recorder = StickerRecorder()
+    config.adapters["sticker_rec"] = {"capabilities": {"sticker": False}}
+    bot = RubenBot(config, store, ScriptedLLM(), Persona("Ruben", "你是 Ruben"))
+    bot.register_adapter(recorder)
+
+    async def scenario():
+        return await bot.call_capability(
+            "sticker_rec", "send_sticker", sticker={"id": "st_1"}, chat_id="g1"
+        )
+
+    ok, reason = asyncio.run(scenario())
+    assert ok is False
+    assert "关闭" in reason
+    assert recorder.calls == []
+
+
+def test_send_sticker_backfills_native_ref(config, store, tmp_path):
+    """Telegram 返回 file_id 时，核心回填表情库，下次发送可直达。"""
+    from rubenbot.stickers import StickerStore
+
+    stickers = StickerStore(tmp_path / "stickers")
+    registered = stickers.add(b"sticker-bytes", tags=["猫"])
+    recorder = StickerRecorder(result={"message_id": 1, "file_id": "FILE_9"})
+    bot = RubenBot(
+        config, store, ScriptedLLM(), Persona("Ruben", "你是 Ruben"), stickers=stickers
+    )
+    bot.register_adapter(recorder)
+
+    async def scenario():
+        return await bot.call_capability(
+            recorder.name,
+            "send_sticker",
+            sticker=stickers.reference(registered),
+            chat_id="g1",
+        )
+
+    ok, _ = asyncio.run(scenario())
+    assert ok is True
+    refilled = stickers.get(registered.id)
+    assert refilled is not None
+    assert refilled.native_refs["sticker_rec"] == {"file_id": "FILE_9"}
+
+
+def test_send_sticker_without_file_id_does_not_backfill(config, store, tmp_path):
+    from rubenbot.stickers import StickerStore
+
+    stickers = StickerStore(tmp_path / "stickers")
+    registered = stickers.add(b"sticker-bytes")
+    recorder = StickerRecorder(result={"sent": True})
+    bot = RubenBot(
+        config, store, ScriptedLLM(), Persona("Ruben", "你是 Ruben"), stickers=stickers
+    )
+    bot.register_adapter(recorder)
+
+    asyncio.run(
+        bot.call_capability(
+            recorder.name, "send_sticker", sticker=stickers.reference(registered), chat_id="g1"
+        )
+    )
+    assert stickers.get(registered.id).native_refs == {}
+
+
+def test_send_sticker_exception_is_contained(config, store):
+    recorder = StickerRecorder(raises=RuntimeError("平台炸了"))
+    bot = RubenBot(config, store, ScriptedLLM(), Persona("Ruben", "你是 Ruben"))
+    bot.register_adapter(recorder)
+
+    async def scenario():
+        return await bot.call_capability(
+            recorder.name, "send_sticker", sticker={"id": "st_1"}, chat_id="g1"
+        )
+
+    ok, reason = asyncio.run(scenario())
+    assert ok is False
+    assert "平台炸了" in reason

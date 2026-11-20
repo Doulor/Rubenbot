@@ -9,7 +9,7 @@ import json
 import httpx
 import pytest
 
-from rubenbot.adapters.base import Segment
+from rubenbot.adapters.base import CapabilityError, Segment
 from rubenbot.adapters.telegram import (
     TelegramAdapter,
     _entity_text,
@@ -779,8 +779,8 @@ def test_start_without_token_returns_cleanly(caplog):
 
 
 def test_capabilities_voice_and_unsupported_raise():
-    """Telegram 只声明语音回复；其他能力仍按「不支持」优雅失败。"""
-    assert TelegramAdapter.capabilities == frozenset({"message.voice"})
+    """Telegram 声明语音回复与发表情；其他能力仍按「不支持」优雅失败。"""
+    assert TelegramAdapter.capabilities == frozenset({"message.voice", "send_sticker"})
 
     async def scenario():
         adapter = make_adapter(FakeTelegram())
@@ -844,3 +844,155 @@ adapters:
     cfg = Config.load(path)
     assert cfg.telegram_config().bot_token == "123:env-token"
     assert cfg.telegram_config().poll_timeout == 20.0
+
+# ----------------------------------------------------------------------
+# 能力：发表情（send_sticker）
+# ----------------------------------------------------------------------
+
+
+def _client_with(handler) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        base_url="https://api.telegram.org", transport=httpx.MockTransport(handler)
+    )
+
+
+def test_send_sticker_uses_native_file_id():
+    """有 file_id 时直接走原生 sendSticker，不读本地文件。"""
+    fake = FakeTelegram()
+
+    async def scenario():
+        adapter = make_adapter(fake)
+        result = await adapter.call_capability(
+            "send_sticker",
+            chat_id=111,
+            sticker={"id": "st_1", "native_refs": {"telegram": {"file_id": "FILE_1"}}},
+        )
+        await close(adapter)
+        return result
+
+    result = asyncio.run(scenario())
+    assert fake.methods() == ["sendSticker"]
+    assert fake.payload_for("sendSticker") == {"chat_id": 111, "sticker": "FILE_1"}
+    assert result["file_id"] == "FILE_1"
+
+
+def test_send_sticker_prefers_platform_returned_file_id():
+    """平台返回了新 file_id 就回传它，能力层据此回填表情库。"""
+    payloads: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        method = request.url.path.rsplit("/", 1)[-1]
+        payloads.append(_request_payload(request))
+        assert method == "sendSticker"
+        return _ok({"message_id": 9, "sticker": {"file_id": "NEW_ID"}})
+
+    adapter = TelegramAdapter(bot_token=TOKEN, offset_file=None, http_client=_client_with(handler))
+
+    async def scenario():
+        result = await adapter.call_capability(
+            "send_sticker",
+            chat_id=-100123,
+            sticker={"native_refs": {"telegram": {"file_id": "OLD_ID"}}},
+        )
+        await close(adapter)
+        return result
+
+    result = asyncio.run(scenario())
+    assert payloads[0] == {"chat_id": -100123, "sticker": "OLD_ID"}
+    assert result == {"message_id": 9, "file_id": "NEW_ID"}
+
+
+def test_send_sticker_uploads_local_file(tmp_path):
+    """没有原生引用时把表情库里的图片文件上传成表情。"""
+    sticker_file = tmp_path / "cat.png"
+    sticker_file.write_bytes(b"\x89PNG-fake-sticker")
+    payloads: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payloads.append(_request_payload(request))
+        return _ok({"message_id": 7, "sticker": {"file_id": "UP_ID"}})
+
+    adapter = TelegramAdapter(bot_token=TOKEN, offset_file=None, http_client=_client_with(handler))
+
+    async def scenario():
+        result = await adapter.call_capability(
+            "send_sticker", chat_id="111", sticker={"file": str(sticker_file)}
+        )
+        await close(adapter)
+        return result
+
+    result = asyncio.run(scenario())
+    # multipart：文件按 sticker 字段上传，扩展名沿用本地文件
+    assert payloads[0]["chat_id"] == "111"
+    assert payloads[0]["sticker"] == ("sticker.png", b"\x89PNG-fake-sticker")
+    assert result["file_id"] == "UP_ID"
+
+
+def test_send_sticker_uploads_base64():
+    payloads: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payloads.append(_request_payload(request))
+        return _ok({"message_id": 8, "sticker": {"file_id": "B64_ID"}})
+
+    adapter = TelegramAdapter(bot_token=TOKEN, offset_file=None, http_client=_client_with(handler))
+
+    async def scenario():
+        result = await adapter.call_capability(
+            "send_sticker",
+            chat_id=1,
+            sticker={
+                "base64": base64.b64encode(b"webp-bytes").decode("ascii"),
+                "mime_type": "image/webp",
+            },
+        )
+        await close(adapter)
+        return result
+
+    result = asyncio.run(scenario())
+    assert payloads[0]["sticker"] == ("sticker.webp", b"webp-bytes")
+    assert result["file_id"] == "B64_ID"
+
+
+def test_send_sticker_without_source_raises():
+    adapter = make_adapter(FakeTelegram())
+
+    async def scenario():
+        with pytest.raises(CapabilityError, match="缺少可用的表情引用或图片文件"):
+            await adapter.call_capability("send_sticker", chat_id=1, sticker={"id": "st_x"})
+        await close(adapter)
+
+    asyncio.run(scenario())
+
+
+def test_send_sticker_requires_chat_id():
+    adapter = make_adapter(FakeTelegram())
+
+    async def scenario():
+        with pytest.raises(CapabilityError, match="需要 chat_id"):
+            await adapter.call_capability(
+                "send_sticker", sticker={"native_refs": {"telegram": {"file_id": "x"}}}
+            )
+        await close(adapter)
+
+    asyncio.run(scenario())
+
+
+def test_send_sticker_api_error_is_capability_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400, json={"ok": False, "description": "Bad Request: wrong file identifier"}
+        )
+
+    adapter = TelegramAdapter(bot_token=TOKEN, offset_file=None, http_client=_client_with(handler))
+
+    async def scenario():
+        with pytest.raises(CapabilityError, match="send_sticker 失败"):
+            await adapter.call_capability(
+                "send_sticker",
+                chat_id=1,
+                sticker={"native_refs": {"telegram": {"file_id": "bad"}}},
+            )
+        await close(adapter)
+
+    asyncio.run(scenario())

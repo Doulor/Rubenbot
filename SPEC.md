@@ -235,12 +235,12 @@ SnowLuma 适配器（OneBot v11）：
 - `config_schema`：配置项声明（key/类型/默认/说明），供设置界面自动渲染表单（二期落地，一期先解析存下）
 - `hooks`：用到的钩子名列表（on_message / on_command / scheduled 等，与 loader 的 register(ctx) 对应）
 
-loader 加载时校验 manifest：缺失或字段不全的插件拒绝加载并在 WebUI 标「不合规」；现有 6 个官方插件（hello / privacy / qzone_post / music / image_gen / group_insights）都声明了 manifest；emoji_react 已于 2026-11-20 删除——贴表情改由适配器网关在模型思考中判断，不再用规则+概率插件；新增插件（音乐 / 画图 / 群聊总结）沿用同一规范，默认不启用。画图走**自定义生图端点（OpenAI 兼容）**：`base_url` / `api_key` / `model` 三件套齐全才注册触发，硅基流动退为预设示例、不再写死。
+loader 加载时校验 manifest：缺失或字段不全的插件拒绝加载并在 WebUI 标「不合规」；现有 7 个官方插件（hello / privacy / qzone_post / music / image_gen / group_insights / sticker）都声明了 manifest；emoji_react 已于 2026-11-20 删除——贴表情改由适配器网关在模型思考中判断，不再用规则+概率插件；新增插件（音乐 / 画图 / 群聊总结）沿用同一规范，默认不启用。画图走**自定义生图端点（OpenAI 兼容）**：`base_url` / `api_key` / `model` 三件套齐全才注册触发，硅基流动退为预设示例、不再写死。
 
 ### 分发：GitHub 索引仓库
 
 - 索引仓库 `Doulor/Rubenbot-plugins`：根目录 `plugins.json`（条目：id / name / version / description / author / permissions / path），每个插件一个目录（代码 + manifest.json）。
-- bot 侧索引地址可配置（`market.index_url`），拉取失败或未配置时回退到框架内置的官方索引（随框架发布的 6 个官方插件），市场页明确标注当前索引来源与「索引不可用」状态，不许静默空白。
+- bot 侧索引地址可配置（`market.index_url`），拉取失败或未配置时回退到框架内置的官方索引（随框架发布的 7 个官方插件），市场页明确标注当前索引来源与「索引不可用」状态，不许静默空白。
 - 安装 = 拉索引仓库对应插件目录落盘到 `plugins/` → 校验 manifest 与 min_core_version → 默认不启用，用户在卡片上手动启用（与「插件默认关」一致）。
 - 更新：索引 version 高于已装 manifest version 时卡片挂「可更新」角标，一键更新（保留该插件的配置段，只换代码与 manifest）。
 

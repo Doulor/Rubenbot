@@ -932,3 +932,127 @@ def test_sandbox_base_url_is_used_for_rest(monkeypatch):
     gateway = next(r for r in fake.requests if r.url.path == "/gateway")
     assert gateway.url.host == "sandbox.api.sgroup.qq.com"
     assert gateway.headers["Authorization"] == "QQBot TOKEN"
+
+
+# ----------------------------------------------------------------------
+# 能力：发表情（send_sticker，图片兜底）
+# ----------------------------------------------------------------------
+
+
+def _sticker_adapter(fake: FakeHTTP) -> QQOfficialAdapter:
+    fake.routes[("POST", "/v2/groups/GROUP_A/files")] = httpx.Response(
+        200, json={"file_uuid": "uuid-1", "file_info": "FILE_INFO", "ttl": 3600}
+    )
+    fake.routes[("POST", "/v2/groups/GROUP_A/messages")] = httpx.Response(200, json={"id": "OUT"})
+    adapter = make_adapter(fake)
+    _remember(adapter, "group", "GROUP_A", "MSG_GROUP_1")
+    return adapter
+
+
+def test_send_sticker_uploads_image_and_replies_passively():
+    fake = FakeHTTP()
+    adapter = _sticker_adapter(fake)
+    sticker = {"id": "st_1", "url": "https://cdn.example/sticker.webp"}
+
+    async def scenario():
+        result = await adapter.call_capability(
+            "send_sticker", chat_id="GROUP_A", sticker=sticker
+        )
+        await adapter._client.aclose()
+        return result
+
+    result = run(scenario())
+    upload = next(r for r in fake.requests if r.url.path == "/v2/groups/GROUP_A/files")
+    assert json.loads(upload.content) == {
+        "file_type": 1,
+        "srv_send_msg": False,
+        "url": "https://cdn.example/sticker.webp",
+    }
+    post = next(r for r in fake.requests if r.url.path == "/v2/groups/GROUP_A/messages")
+    assert json.loads(post.content) == {
+        "msg_type": 7,
+        "media": {"file_info": "FILE_INFO"},
+        "msg_id": "MSG_GROUP_1",
+        "msg_seq": 1,
+    }
+    # QQ 官方没有原生表情引用可回填
+    assert result == {"sent": True}
+
+
+def test_send_sticker_reads_local_file_and_sends_base64(tmp_path):
+    fake = FakeHTTP()
+    adapter = _sticker_adapter(fake)
+    path = tmp_path / "cat.png"
+    path.write_bytes(b"png-bytes")
+
+    async def scenario():
+        await adapter.call_capability(
+            "send_sticker", chat_id="GROUP_A", sticker={"file": str(path)}
+        )
+        await adapter._client.aclose()
+
+    run(scenario())
+    upload = next(r for r in fake.requests if r.url.path == "/v2/groups/GROUP_A/files")
+    body = json.loads(upload.content)
+    assert body["file_name"] == "cat.png"
+    assert base64.b64decode(body["file_data"]) == b"png-bytes"
+
+
+def test_send_sticker_without_source_raises():
+    fake = FakeHTTP()
+    adapter = make_adapter(fake)
+
+    async def scenario():
+        with pytest.raises(module.CapabilityError, match="缺少可用的图片文件或 URL"):
+            await adapter.call_capability(
+                "send_sticker", chat_id="GROUP_A", sticker={"id": "st_x"}
+            )
+        await adapter._client.aclose()
+
+    run(scenario())
+
+
+def test_send_sticker_requires_chat_id():
+    fake = FakeHTTP()
+    adapter = make_adapter(fake)
+
+    async def scenario():
+        with pytest.raises(module.CapabilityError, match="需要 chat_id"):
+            await adapter.call_capability(
+                "send_sticker", sticker={"url": "https://cdn.example/x.webp"}
+            )
+        await adapter._client.aclose()
+
+    run(scenario())
+
+
+def test_send_sticker_without_inbound_message_is_capability_error():
+    """QQ 官方只支持被动回复：没收到过消息时能力失败要收敛成 CapabilityError。"""
+    fake = FakeHTTP()
+    fake.routes[("POST", "/v2/groups/GROUP_B/files")] = httpx.Response(
+        200, json={"file_uuid": "u", "file_info": "FILE_INFO"}
+    )
+    adapter = make_adapter(fake)
+
+    async def scenario():
+        with pytest.raises(module.CapabilityError, match="send_sticker 失败"):
+            await adapter.call_capability(
+                "send_sticker",
+                chat_id="GROUP_B",
+                sticker={"url": "https://cdn.example/x.webp"},
+            )
+        await adapter._client.aclose()
+
+    run(scenario())
+
+
+def test_unsupported_capability_raises():
+    fake = FakeHTTP()
+    adapter = make_adapter(fake)
+
+    async def scenario():
+        with pytest.raises(module.CapabilityNotSupported):
+            await adapter.call_capability("message.emoji_like", message_id=1, emoji_id=2)
+        await adapter._client.aclose()
+
+    run(scenario())

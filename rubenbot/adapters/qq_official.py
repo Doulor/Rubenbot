@@ -74,7 +74,17 @@ try:  # websockets 13+ 的新版客户端 API
 except ImportError:  # pragma: no cover - 兼容旧版
     from websockets.client import connect as ws_connect  # type: ignore
 
-from .base import BaseAdapter, EventCallback, MessageEvent, Segment, as_segment, render_segments
+from .base import (
+    SEND_STICKER,
+    BaseAdapter,
+    CapabilityError,
+    CapabilityNotSupported,
+    EventCallback,
+    MessageEvent,
+    Segment,
+    as_segment,
+    render_segments,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +170,10 @@ class QQOfficialAdapter(BaseAdapter):
     """QQ 官方机器人：REST + WebSocket 网关。"""
 
     name = "qq_official"
+
+    # QQ 官方通道没有原生表情接口：send_sticker 按图片兜底（msg_type=7）
+    capabilities = frozenset({SEND_STICKER})
+    capability_config_keys = {SEND_STICKER: "sticker"}
 
     def __init__(
         self,
@@ -624,6 +638,32 @@ class QQOfficialAdapter(BaseAdapter):
         return str(file_info)
 
     # ------------------------------------------------------------------
+    # 平台能力
+    # ------------------------------------------------------------------
+
+    async def call_capability(self, name: str, **kwargs: Any) -> Any:
+        """QQ 官方通道只额外提供 send_sticker（图片兜底）；其余能力不支持。"""
+        if name != SEND_STICKER:
+            raise CapabilityNotSupported(self.name, name)
+        sticker = kwargs.get("sticker")
+        data = sticker_image_data(sticker)
+        if data is None:
+            raise CapabilityError("send_sticker 缺少可用的图片文件或 URL")
+        chat_id = kwargs.get("chat_id")
+        if chat_id in (None, ""):
+            raise CapabilityError("send_sticker 需要 chat_id")
+        chat_type = str(kwargs.get("chat_type") or "group")
+        try:
+            # 走与普通图片相同的发送路径：先上传拿 file_info，再被动回复
+            await self.send(str(chat_id), [Segment("image", data)], chat_type=chat_type)
+        except CapabilityError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 能力失败收敛成统一异常
+            raise CapabilityError(f"send_sticker 失败：{exc}") from exc
+        # QQ 官方不回原生表情引用，返回值只表示「已发出」
+        return {"sent": True}
+
+    # ------------------------------------------------------------------
     # HTTP
     # ------------------------------------------------------------------
 
@@ -841,3 +881,24 @@ def media_upload_payload(data: Mapping[str, Any]) -> dict[str, Any] | None:
             "file_name": name,
         }
     return None
+
+
+def sticker_image_data(sticker: Any) -> dict[str, Any] | None:
+    """表情引用 -> image 段数据（``url`` / ``base64`` / ``file`` 之一）。
+
+    QQ 官方没有原生表情接口，只能当图片发；表情库的 ``file`` 是本地绝对
+    路径，正好能交给 ``media_upload_payload`` 读成 base64 上传。
+    """
+    if not isinstance(sticker, Mapping):
+        return None
+    data: dict[str, Any] = {}
+    for key in ("file", "url", "base64"):
+        value = sticker.get(key)
+        if value:
+            data[key] = str(value)
+    if not data:
+        return None
+    if data.get("url"):
+        # url 优先，省一次本地读盘；media_upload_payload 也认
+        return {"url": data["url"]}
+    return data

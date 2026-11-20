@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .adapters.base import (
+    SEND_STICKER,
     BaseAdapter,
     CapabilityError,
     MessageEvent,
@@ -56,6 +57,7 @@ from .search import WebSearcher, build_searcher, clamp_count
 from .proactive import ProactiveOpener, is_acceptable_opener
 from .reminder import REMINDER_TOOL, build_reminder_prompt, describe_fire_at, resolve_fire_at
 from .scheduler import Scheduler
+from .stickers import StickerStore
 from .voice import VOICE_PLACEHOLDER, VOICE_PREFIX, VoiceService, build_voice
 
 logger = logging.getLogger(__name__)
@@ -461,6 +463,7 @@ class RubenBot:
         *,
         plugins: PluginManager | None = None,
         rng: random.Random | None = None,
+        stickers: StickerStore | None = None,
     ):
         self.config = config
         self.store = store
@@ -491,6 +494,8 @@ class RubenBot:
             profile_fn=self._person_has_profile,
         )
         self.event_judge = EventJudge(llm, store, persona.text)
+        # 表情库：图片本体 + JSON 索引；首次使用时按配置目录惰性创建
+        self._stickers: StickerStore | None = stickers
         self.adapters: dict[str, BaseAdapter] = {}
         self.plugins = plugins
         self.context = BotContext(
@@ -507,6 +512,8 @@ class RubenBot:
                 "memory_reader": self.memory_reader,
                 "privacy_gate": self.gate,
                 "emotion": self.emotion,
+                # 可能为 None：插件用 bot.stickers 属性拿（会按需创建）
+                "stickers": self._stickers,
             },
         )
         # 每个会话最近一次收到消息的时间，用于日志/调试
@@ -543,6 +550,14 @@ class RubenBot:
         self.adapters[adapter.name] = adapter
         # 事件通道：能解析 notice/request 的适配器把事件交给核心入口
         adapter.set_platform_event_callback(self.handle_platform_event)
+
+    @property
+    def stickers(self) -> StickerStore:
+        """表情库（惰性创建：测试里不碰磁盘，真正用到时才建目录）。"""
+        if self._stickers is None:
+            self._stickers = StickerStore(self.config.stickers.dir)
+            self.context.extras["stickers"] = self._stickers
+        return self._stickers
 
     def apply_config(self, config: Config, *, rebuild_llm: bool = True) -> None:
         """热应用新配置：后续消息立即使用新的 LLM、意愿、记忆与聊天参数。
@@ -2399,6 +2414,8 @@ class RubenBot:
                 logger.warning("适配器 %s 调用能力 %s 异常：%s", adapter.name, name, exc)
                 return False, str(exc) or exc.__class__.__name__
             logger.info("适配器 %s 调用能力 %s 成功", adapter.name, name)
+            if name == SEND_STICKER:
+                self._record_sticker_ref(adapter, kwargs.get("sticker"), result)
             return True, self._capability_success_text(result)
 
         reason = "；".join(dict.fromkeys(reasons)) or f"没有适配器支持能力 {name}"
@@ -2416,6 +2433,27 @@ class RubenBot:
             if not self.config.adapter_capability_enabled(adapter.name, config_key, default=default):
                 return f"适配器 {adapter.name} 的能力 {name} 已在配置中关闭（adapters.{adapter.name}.capabilities.{config_key}）"
         return None
+
+    def _record_sticker_ref(self, adapter: BaseAdapter, sticker: Any, result: Any) -> None:
+        """send_sticker 成功后回填平台原生引用（如 Telegram 的 file_id）。
+
+        表情引用里带 ``id``（即表情库的记录 id）时才回填；平台没返回原生
+        引用就跳过。回填失败只记日志，绝不影响这次成功的发送。
+        """
+        if not isinstance(result, Mapping) or not isinstance(sticker, Mapping):
+            return
+        sticker_id = sticker.get("id")
+        if sticker_id in (None, ""):
+            return
+        sent = result.get("file_id")
+        if sent in (None, ""):
+            return
+        platform = str(getattr(adapter, "name", "") or "")
+        ref = {"file_id": str(sent)}
+        try:
+            self.stickers.record_native_ref(str(sticker_id), platform, ref)
+        except Exception as exc:  # noqa: BLE001 - 回填失败不影响发送
+            logger.warning("回填表情原生引用失败（%s/%s）：%s", platform, sticker_id, exc)
 
     @staticmethod
     def _capability_success_text(result: Any) -> str:
