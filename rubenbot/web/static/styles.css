@@ -1,8 +1,8 @@
 /* RubenBot 控制台
  *
  * 设计语言：FlClash v0.9 桌面版的 Material You（M3）动态色，种子色为橙色。
- * - 明色是暖奶油底，暗色是暖深棕底；卡片靠 tonal（色调深浅）分层，不靠描边。
- * - 大圆角卡片（28px），内嵌子卡 20px，输入框 16px，交互元素一律药丸形。
+ * - 明色是暖奶油底，暗色是暖深棕底；卡片靠 tonal（色调深浅）与分层投影区分，不靠描边。
+ * - 大圆角卡片（30px），内嵌子卡 20px，输入框 16px，交互元素一律药丸形。
  * - 强调色、发光阴影、圆角全部走变量；换种子色只改 --seed 一处。
  * - 侧栏选中态是药丸形色调填充；移动端侧栏收成底部悬浮 dock。
  *
@@ -24,17 +24,28 @@
   --seed: #f2790c;
 
   /* 圆角档位：卡片 / 内嵌子卡 / 输入框 / 药丸 */
-  --r-card: 28px;
+  --r-card: 30px;
   --r-inner: 20px;
   --r-field: 16px;
   --r-pill: 999px;
 
+  /* 仪表盘的四层表面复用原调色板：暗色内嵌层逐级提亮，不加边框。 */
+  --page-fill: var(--bg);
+  --card-fill: var(--surface);
+  --block-fill: var(--surface-soft);
+  --inset-fill: var(--surface-sunk);
+
   --sidebar-w: 252px;
   --content-max: 1240px;
 
-  /* M3 emphasized 曲线 */
-  --ease: cubic-bezier(0.2, 0, 0, 1);
-  --ease-soft: cubic-bezier(0.05, 0.7, 0.1, 1);
+  /* FlClash 的 easeOutCubic / easeOutBack；只有回弹的几何属性使用后者。 */
+  --ease: cubic-bezier(.215, .61, .355, 1);
+  --ease-back: cubic-bezier(.175, .885, .32, 1.275);
+  --press-in: 120ms;
+  --release: 250ms;
+  --presence: 200ms;
+  --select: 240ms;
+  --surface-motion: var(--presence) var(--ease);
 }
 
 /* ---------------- 明色：暖奶油 ---------------- */
@@ -81,8 +92,8 @@ html[data-theme="light"] {
   --bad: #9c3b2f;
   --bad-soft: #ffe2db;
 
-  --shadow-card: 0 1px 2px rgba(90, 50, 20, 0.03);
-  --shadow-pop: 0 26px 64px -20px rgba(70, 35, 10, 0.35);
+  --shadow-card: 0 .5px 1px #0000000d, 0 2px 6px #0000000a, 0 12px 32px -6px #00000017;
+  --shadow-pop: 0 1px 3px #0000000f, 0 10px 24px #00000014, 0 32px 64px -12px #00000038;
   --scrim: rgba(38, 22, 10, 0.38);
   --grid-line: rgba(90, 55, 30, 0.06);
 }
@@ -129,8 +140,8 @@ html[data-theme="dark"] {
   --bad: #ffb4a4;
   --bad-soft: #3d1e18;
 
-  --shadow-card: 0 1px 0 rgba(255, 220, 190, 0.02);
-  --shadow-pop: 0 28px 70px -20px rgba(0, 0, 0, 0.65);
+  --shadow-card: 0 1px 2px #00000080, 0 10px 28px -6px #0000008c;
+  --shadow-pop: 0 2px 6px #00000080, 0 32px 64px -12px #000000b3;
   --scrim: rgba(8, 4, 2, 0.55);
   --grid-line: rgba(255, 220, 190, 0.05);
 }
@@ -258,9 +269,28 @@ button {
 }
 
 .nav {
+  position: relative;
+  isolation: isolate;
+  --nav-gap: 4px;
+  --nav-height: 44px;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: var(--nav-gap);
+}
+
+/* 同一块药丸跟随选中项，横竖布局共用索引；首帧不从概览滑入。 */
+.nav:has(.active)::before {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  inset: 0 auto auto 0;
+  width: 100%;
+  height: var(--nav-height);
+  border-radius: var(--r-pill);
+  background: var(--accent-container);
+  pointer-events: none;
+  transform: translateY(calc(var(--nav-index) * (100% + var(--nav-gap))));
+  transition: transform 400ms var(--ease);
 }
 
 .nav-item {
@@ -274,7 +304,7 @@ button {
   font-size: 13.5px;
   font-weight: 500;
   letter-spacing: 0.01em;
-  transition: background 0.2s var(--ease), color 0.2s var(--ease);
+  transition: background-color var(--surface-motion), color var(--surface-motion);
 }
 
 .nav-item .icon {
@@ -293,6 +323,8 @@ button {
   color: var(--on-accent-container);
   font-weight: 600;
 }
+
+.nav:has(.active) .nav-item.active { background: transparent; }
 
 .nav-item.active .icon {
   opacity: 1;
@@ -376,16 +408,12 @@ button {
   background: transparent;
   color: var(--text-soft);
   cursor: pointer;
-  transition: background 0.18s var(--ease), color 0.18s var(--ease);
+  transition: background-color var(--surface-motion), color var(--surface-motion);
 }
 
 .icon-button:hover {
   background: var(--surface-soft);
   color: var(--text);
-}
-
-.icon-button:active {
-  transform: scale(0.94);
 }
 
 /* ---------------- 主区 ---------------- */
@@ -433,31 +461,15 @@ button {
   gap: 18px;
 }
 
-/* 页面进入的轻微上浮；尊重 reduce-motion */
-.view > * {
-  animation: rise 0.38s var(--ease) both;
-}
-
-.view > *:nth-child(2) {
-  animation-delay: 36ms;
-}
-
-.view > *:nth-child(3) {
-  animation-delay: 72ms;
-}
-
-.view > *:nth-child(4) {
-  animation-delay: 108ms;
-}
-
-@keyframes rise {
-  from {
-    opacity: 0;
-    transform: translateY(8px);
+/* 仅实际换页完成时淡入；常驻容器不随轮询重新入场。 */
+@media (prefers-reduced-motion: no-preference) {
+  .route-arriving { animation: route-arrive 220ms cubic-bezier(.42, 0, .58, 1); }
+  @keyframes route-arrive { from { opacity: .55; } to { opacity: 1; } }
+  @starting-style {
+    .subpage-motion .settings-content { opacity: 0; translate: 0 4px; }
   }
-  to {
-    opacity: 1;
-    transform: none;
+  .subpage-motion .settings-content {
+    transition: opacity var(--select) var(--ease), translate var(--select) var(--ease);
   }
 }
 
@@ -465,16 +477,16 @@ button {
   *,
   *::before,
   *::after {
-    animation-duration: 0.001ms !important;
-    animation-iteration-count: 1 !important;
-    transition-duration: 0.001ms !important;
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
   }
 }
 
 /* ---------------- 卡片（tonal，无描边） ---------------- */
 
 .card {
-  background: var(--surface);
+  background: var(--card-fill);
   border: 0;
   border-radius: var(--r-card);
   box-shadow: var(--shadow-card);
@@ -606,7 +618,7 @@ button {
   height: 26px;
   padding: 0 11px;
   border-radius: var(--r-pill);
-  background: var(--surface-sunk);
+  background: var(--inset-fill);
   color: var(--text-soft);
   font-size: 12px;
   font-weight: 500;
@@ -694,7 +706,7 @@ button {
   padding: 13px 24px;
   border-top: 1px solid var(--hairline);
   min-width: 0;
-  transition: background 0.15s var(--ease);
+  transition: background-color var(--surface-motion);
 }
 
 .rows > .row:first-child {
@@ -818,8 +830,8 @@ button {
   font-weight: 500;
   cursor: pointer;
   white-space: nowrap;
-  transition: background 0.18s var(--ease), color 0.18s var(--ease),
-    transform 0.12s var(--ease), box-shadow 0.18s var(--ease);
+  transition: background-color var(--surface-motion), color var(--surface-motion),
+    box-shadow var(--surface-motion);
 }
 
 .btn .icon {
@@ -829,10 +841,6 @@ button {
 
 .btn:hover {
   background: var(--surface-high);
-}
-
-.btn:active {
-  transform: scale(0.98);
 }
 
 .btn:disabled {
@@ -891,7 +899,7 @@ button {
   background: transparent;
   color: var(--muted);
   cursor: pointer;
-  transition: background 0.15s var(--ease), color 0.15s var(--ease);
+  transition: background-color var(--surface-motion), color var(--surface-motion);
 }
 
 .icon-btn-sm:hover {
@@ -936,7 +944,7 @@ button {
   color: var(--text);
   font: inherit;
   font-size: 13.5px;
-  transition: background 0.18s var(--ease), box-shadow 0.18s var(--ease);
+  transition: background-color var(--surface-motion), box-shadow var(--surface-motion);
 }
 
 .select {
@@ -1038,7 +1046,7 @@ button {
   font-size: 12.5px;
   font-weight: 500;
   cursor: pointer;
-  transition: background 0.18s var(--ease), color 0.18s var(--ease);
+  transition: background-color var(--surface-motion), color var(--surface-motion);
 }
 
 .segmented button:hover {
@@ -1223,7 +1231,7 @@ button {
   padding: 14px 24px;
   border-top: 1px solid var(--hairline);
   align-items: flex-start;
-  transition: background 0.15s var(--ease);
+  transition: background-color var(--surface-motion);
 }
 
 .memory:first-child {
@@ -1259,7 +1267,7 @@ button {
   gap: 2px;
   flex: none;
   opacity: 0;
-  transition: opacity 0.15s var(--ease);
+  transition: opacity var(--surface-motion);
 }
 
 .memory:hover .memory-actions,
@@ -1422,7 +1430,7 @@ button {
   height: 28px;
   padding: 0 4px 0 11px;
   border-radius: var(--r-pill);
-  background: var(--surface-sunk);
+  background: var(--inset-fill);
   border: 0;
   font-family: var(--font-mono);
   font-size: 11.5px;
@@ -1460,7 +1468,7 @@ button {
   gap: 14px;
   padding: 16px 24px;
   border-top: 1px solid var(--hairline);
-  transition: background 0.15s var(--ease);
+  transition: background-color var(--surface-motion);
 }
 
 .plugin-row:first-child {
@@ -1496,7 +1504,7 @@ button {
   border: 0;
   background: var(--surface-highest);
   cursor: pointer;
-  transition: background 0.2s var(--ease);
+  transition: background-color var(--surface-motion);
   padding: 0;
 }
 
@@ -1509,8 +1517,13 @@ button {
   height: 20px;
   border-radius: 50%;
   background: var(--surface);
-  transition: transform 0.22s var(--ease), background 0.22s var(--ease);
+  transition: transform 300ms var(--ease-back), scale 150ms var(--ease),
+    background-color 300ms var(--ease);
   box-shadow: 0 1px 3px rgba(50, 25, 5, 0.22);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .switch:active:not(:disabled)::after { scale: 1.08; }
 }
 
 .switch:hover::after {
@@ -1559,7 +1572,7 @@ button {
   font: inherit;
   font-size: 12.5px;
   cursor: pointer;
-  transition: background 0.16s var(--ease), color 0.16s var(--ease);
+  transition: background-color var(--surface-motion), color var(--surface-motion);
 }
 
 .market-tab:hover {
@@ -1584,13 +1597,13 @@ button {
   gap: 12px;
   padding: 18px 20px 16px;
   border-radius: var(--r-inner);
-  background: var(--surface);
+  background: var(--card-fill);
   box-shadow: var(--shadow-card);
   min-width: 0;
 }
 
 .market-card.is-enabled {
-  background: var(--surface-soft);
+  background: var(--block-fill);
 }
 
 .market-card-head {
@@ -1840,7 +1853,7 @@ button {
   flex-direction: column;
   gap: 2px;
   padding: 10px;
-  background: var(--surface);
+  background: var(--card-fill);
   border-radius: var(--r-inner);
 }
 
@@ -1865,7 +1878,7 @@ button {
   font-weight: 500;
   text-align: left;
   cursor: pointer;
-  transition: background 0.18s var(--ease), color 0.18s var(--ease);
+  transition: background-color var(--surface-motion), color var(--surface-motion);
 }
 
 .settings-menu-item:hover {
@@ -2024,7 +2037,7 @@ button {
   border: 0;
   border-radius: var(--r-inner);
   padding: 14px 16px;
-  background: var(--surface-soft);
+  background: var(--block-fill);
 }
 
 .group-item-head {
@@ -2093,7 +2106,7 @@ button {
   padding: 24px;
   background: var(--scrim);
   backdrop-filter: blur(3px);
-  animation: toast-in 0.25s var(--ease) both;
+  transition: opacity var(--surface-motion);
 }
 
 .restart-card {
@@ -2391,7 +2404,7 @@ button {
   border: 0;
   box-shadow: var(--shadow-pop);
   font-size: 13px;
-  animation: toast-in 0.28s var(--ease) both;
+  transition: opacity var(--surface-motion), translate var(--surface-motion);
   pointer-events: auto;
 }
 
@@ -2405,15 +2418,39 @@ button {
   color: var(--bad);
 }
 
-@keyframes toast-in {
-  from {
+/* 原生 dialog 仍立即 close；只延迟顶层绘制的撤销，不延迟焦点归还。 */
+@media (prefers-reduced-motion: no-preference) {
+  .dialog, .dialog::backdrop {
     opacity: 0;
-    transform: translateY(6px) scale(0.98);
+    transition: opacity 404ms var(--ease), scale 404ms var(--ease),
+      overlay 404ms allow-discrete, display 404ms allow-discrete;
   }
-  to {
-    opacity: 1;
-    transform: none;
+  .dialog[open], .dialog[open]::backdrop { opacity: 1; }
+  .dialog:not([open]), .dialog:not([open])::backdrop { pointer-events: none; }
+
+  .settings-savebar, .item-arriving {
+    transition: opacity var(--surface-motion), translate var(--surface-motion);
   }
+  .toast.is-leaving { opacity: 0; translate: 0 4px; }
+  @starting-style {
+    .dialog[open] { opacity: 0; scale: 1.025; }
+    .dialog[open]::backdrop, .restart-overlay { opacity: 0; }
+    .toast, .settings-savebar, .item-arriving { opacity: 0; translate: 0 4px; }
+  }
+}
+
+/* 离场快照只绘制，不占位置、不接收焦点或点击。 */
+.motion-copy {
+  position: absolute !important;
+  z-index: 6;
+  margin: 0 !important;
+  pointer-events: none !important;
+  overflow: hidden;
+  transition: opacity var(--surface-motion), translate var(--surface-motion);
+}
+.motion-copy.is-leaving { opacity: 0; translate: 0 -4px; }
+@starting-style {
+  .motion-copy.is-leaving { opacity: 1; translate: none; }
 }
 
 /* ---------------- 窄屏：侧栏变底部悬浮 dock ---------------- */
@@ -2468,6 +2505,11 @@ button {
     justify-content: center;
     min-height: 44px;
     white-space: nowrap;
+  }
+
+  .nav:has(.active)::before {
+    width: calc(100% / var(--nav-count));
+    transform: translateX(calc(var(--nav-index) * 100%));
   }
 
   .nav-item span {
@@ -2678,4 +2720,31 @@ button {
 
 *::-webkit-scrollbar-track {
   background: transparent;
+}
+
+/* ElasticPress 向外轻涨而非按扁。只动操作面，表单、只读数据卡与文字仍在原位。 */
+@media (prefers-reduced-motion: no-preference) {
+  :is(.btn, .icon-button, .icon-btn-sm, .row[role="button"], .emotion-person, .chat-open) {
+    transition: scale var(--release) var(--ease-back), background-color var(--surface-motion),
+      color var(--surface-motion), box-shadow var(--surface-motion);
+  }
+
+  :is(.btn, .icon-button, .icon-btn-sm, .emotion-person, .chat-open, .row[role="button"]):active:not(:disabled) {
+    scale: 1.025;
+    transition-duration: var(--press-in), var(--presence), var(--presence), var(--presence);
+    transition-timing-function: var(--ease);
+  }
+
+  /* 市场卡仅在其真实操作按钮受压时响应，不把空白伪装成点击区。 */
+  .market-card {
+    transition: scale var(--release) var(--ease-back), translate 260ms var(--ease);
+  }
+  .market-card:has(button:enabled:active) {
+    scale: 1.008;
+    transition: scale var(--press-in) var(--ease), translate 260ms var(--ease);
+  }
+}
+
+@media (hover: hover) and (pointer: fine) and (prefers-reduced-motion: no-preference) {
+  .market-card:hover { translate: 0 -2px; }
 }

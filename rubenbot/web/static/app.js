@@ -166,8 +166,7 @@ function toast(message, kind = "ok") {
   );
   box.append(node);
   setTimeout(() => {
-    node.style.opacity = "0";
-    node.style.transform = "translateY(4px)";
+    node.classList.add("is-leaving");
     setTimeout(() => node.remove(), 220);
   }, kind === "error" ? 5200 : 3000);
 }
@@ -383,11 +382,21 @@ function setHeader(title, sub, actions = []) {
 
 async function renderRoute() {
   const route = currentRoute();
+  const view = $("#view");
+  const routeChanged = route.page !== state.page || route.param !== state.param;
+  const subpage = routeChanged && route.page === state.page && ["bot", "settings"].includes(route.page);
+  markRouteChange(view, routeChanged);
+  view.classList.toggle("subpage-motion", subpage);
+  view.classList.remove("route-arriving");
   state.page = route.page;
   state.param = route.param;
   // 旧路由 #/persona 已并入机器人选项卡，侧栏高亮跟着「机器人」
   const navPage = route.page === "persona" ? "bot" : route.page;
-  document.querySelectorAll(".nav-item").forEach((item) => {
+  document.querySelectorAll(".nav-item").forEach((item, index, items) => {
+    if (item.dataset.page === navPage) {
+      item.parentNode.style.setProperty("--nav-index", index);
+      item.parentNode.style.setProperty("--nav-count", items.length);
+    }
     item.classList.toggle("active", item.dataset.page === navPage);
   });
   if (state.pollTimer) {
@@ -398,7 +407,6 @@ async function renderRoute() {
   setHeader(meta.title, meta.sub, []);
   // 换页即丢弃上一页的未保存编辑，顺带收掉 beforeunload 提醒
   setPersonaDirty(false);
-  const view = $("#view");
   view.replaceChildren(skeleton(3));
   try {
     await meta.render(view, route.param);
@@ -417,6 +425,10 @@ async function renderRoute() {
         )
       )
     );
+  } finally {
+    if (state.page === route.page && state.param === route.param) {
+      view.classList.toggle("route-arriving", routeChanged && !subpage);
+    }
   }
 }
 
@@ -1232,6 +1244,10 @@ async function renderMemory(view) {
         "下一页"
       )
     );
+    for (const row of list.children) {
+      row.classList.toggle("item-arriving", row.dataset.motionKey === content.dataset.arrivingKey);
+    }
+    delete content.dataset.arrivingKey;
     content.replaceChildren(list, footer);
   }
 
@@ -1254,7 +1270,7 @@ async function renderMemory(view) {
     const scope = memory.scope_type === "group" ? `群 ${memory.scope_id}` : "全局";
     return h(
       "div",
-      { class: "memory" },
+      { class: "memory", dataset: { motionKey: memory.id } },
       h("div", { class: "avatar" }, avatarText(display)),
       h(
         "div",
@@ -1284,18 +1300,21 @@ async function renderMemory(view) {
             class: "icon-btn-sm danger",
             title: "删除",
             "aria-label": "删除记忆",
-            onclick: () =>
-              confirmDialog({
+            onclick: (event) => {
+              const row = event.currentTarget.closest(".memory");
+              return confirmDialog({
                 title: "删除这条记忆？",
                 message: `「${memory.content}」\n删除会写入变更日志，可以在「变更日志」里撤销。`,
                 confirmText: "删除",
                 danger: true,
                 onConfirm: async () => {
                   await api.del(`/api/memories/${memory.id}`);
+                  markDeparture(content, row);
                   toast("已删除，可在变更日志里撤销");
                   if (memoryState.tab === "list") loadList();
                 },
-              }),
+              });
+            },
           },
           icon("trash")
         )
@@ -1450,7 +1469,8 @@ async function renderMemory(view) {
           await api.put(`/api/memories/${memory.id}`, payload);
           toast("已保存");
         } else {
-          await api.post("/api/memories", payload);
+          const created = await api.post("/api/memories", payload);
+          content.dataset.arrivingKey = created.item.id;
           toast("已添加");
         }
         dialog.close();
@@ -1738,11 +1758,12 @@ async function fillDetail(container, chat) {
   let quiet = settings.override.quiet_hours.slice();
 
   function renderChips() {
+    markListChange(quietChips, quiet);
     quietChips.replaceChildren(
       ...quiet.map((item) =>
         h(
           "span",
-          { class: "chip" },
+          { class: "chip", dataset: { motionKey: item } },
           item,
           h(
             "button",
@@ -2587,11 +2608,12 @@ function listEditor(values, onChange, { placeholder = "输入后回车或点添�
   }
 
   function render() {
+    markListChange(chips, items);
     chips.replaceChildren(
       ...items.map((item) =>
         h(
           "span",
-          { class: "chip" },
+          { class: "chip", dataset: { motionKey: item } },
           item,
           h(
             "button",
@@ -2680,12 +2702,13 @@ function mapEditor(draft, path, { keyPlaceholder = "键", valuePlaceholder = "�
   function render() {
     const current = table();
     const entries = Object.keys(current);
+    markListChange(rows, entries);
     rows.replaceChildren(
       ...(entries.length
         ? entries.map((key) =>
             h(
               "div",
-              { style: { display: "flex", alignItems: "center", gap: "10px" } },
+              { dataset: { motionKey: key }, style: { display: "flex", alignItems: "center", gap: "10px" } },
               h("span", { class: "field-label", style: { minWidth: "56px", margin: 0 } }, key),
               h("input", {
                 class: "input",
@@ -2847,6 +2870,7 @@ function groupsEditor(draft, secrets) {
 
   function render() {
     const entries = Object.keys(groups());
+    markListChange(groupsNode, entries);
     groupsNode.replaceChildren(
       ...(entries.length
         ? entries.map((chatId) => groupRow(chatId))
@@ -2859,7 +2883,7 @@ function groupsEditor(draft, secrets) {
     if (!settings) return h("div");
     return h(
       "div",
-      { class: "group-item" },
+      { class: "group-item", dataset: { motionKey: chatId } },
       h(
         "div",
         { class: "group-item-head" },
