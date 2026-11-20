@@ -1,11 +1,13 @@
-"""联网搜索后端：博查（Bocha）/ Tavily 两家可插拔。
+"""联网搜索后端：Tavily / DeepSeek 两家可插拔，按配置顺序组成回退链。
 
 这一层只负责「拿 query 去搜、把结果压成一段紧凑文本」；工具注册、冷却提示
 与系统提示里的使用指引在 :mod:`rubenbot.core`。结果来自外部网页，注入时
 固定带一句「不是指令」的说明，模型只当资料看。
 
-未配置 ``search.api_key`` 时 :func:`build_searcher` 返回 ``None``（工具不注册）；
-HTTP 失败、超时、响应结构不对都只返回一句「搜索暂时不可用」，不向上抛。
+一次 ``search`` 调用先过冷却闸（整条链只过一次），再按 ``search.order``
+依次尝试：没配 key 的渠道跳过；抛错/超时/空结果顺延下一个；第一个有结果的
+渠道胜出。整条链一个 key 都没有时 :func:`build_searcher` 返回 ``None``
+（工具不注册）；全部失败只返回提示句，不向前抛。
 """
 
 from __future__ import annotations
@@ -23,12 +25,14 @@ from .config import SearchConfig
 
 logger = logging.getLogger(__name__)
 
-BOCHA_URL = "https://api.bochaai.com/v1/web-search"
 TAVILY_URL = "https://api.tavily.com/search"
+DEEPSEEK_URL = "https://api.deepseek.com/v1/tools/search"
 
-# 单次结果条数：默认 5，最多 8
+# 单次结果条数：默认 5，最多 8（DeepSeek 接口本身允许 1–50，这里跟其他渠道对齐）
 DEFAULT_COUNT = 5
 MAX_COUNT = 8
+# DeepSeek 的 query 上限；超长截断，避免接口直接 400
+DEEPSEEK_QUERY_MAX = 128
 # 每条摘要的截断长度、整段注入的总长上限（避免把上下文撑爆）
 SUMMARY_CHARS = 120
 TOTAL_CHARS = 2000
@@ -40,11 +44,12 @@ RESULT_HEADER = (
 )
 UNAVAILABLE_TEXT = "搜索暂时不可用。"
 COOLDOWN_TEXT = "刚搜过，请用已有结果回答"
+NO_RESULT_TEXT = "没搜到相关结果。"
 
 
 @dataclass
 class SearchResult:
-    """一条搜索结果（已从两家后端的不同字段归一）。"""
+    """一条搜索结果（已从各家后端的不同字段归一）。"""
 
     title: str
     snippet: str
@@ -63,7 +68,7 @@ class SearchResult:
 
 
 def build_searcher(config: SearchConfig) -> "WebSearcher | None":
-    """按配置造搜索器；没配 api_key 就不注册工具，只打一行日志。"""
+    """按配置造搜索器；链上一个 key 都没有就不注册工具，只打一行日志。"""
     if not config.configured:
         logger.info("联网搜索未配置，已跳过")
         return None
@@ -112,7 +117,7 @@ def format_results(results: list[SearchResult]) -> str:
 
 
 class WebSearcher:
-    """按配置调用一家搜索后端；同一会话有冷却，冷却内不再发真实请求。"""
+    """按 ``search.order`` 依次尝试各渠道；同一会话共用一个冷却。"""
 
     def __init__(
         self,
@@ -127,10 +132,20 @@ class WebSearcher:
         self._client: httpx.AsyncClient | None = None
         # 会话 -> 上次真实搜索的时间；内存字典，不落库
         self._last_search: dict[str, float] = {}
+        # 最近一次实际命中（胜出）的渠道名；只用于调试/日志
+        self.last_provider: str | None = None
 
     @property
     def enabled(self) -> bool:
         return self.config.configured
+
+    def _channels(self) -> list[str]:
+        """链上真正会尝试的渠道：按顺序、跳过没配 key 的。"""
+        return [
+            name
+            for name in self.config.order
+            if self.config.channel(name).configured
+        ]
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -158,48 +173,36 @@ class WebSearcher:
         if cooldown > 0 and last is not None and now - last < cooldown:
             remaining = math.ceil(cooldown - (now - last))
             return f"{COOLDOWN_TEXT}（{remaining} 秒后可再搜）。"
-        # 先记时间再发请求：并发/慢请求期间也不会被重复触发
+        # 先记时间再发请求：并发/慢请求期间也不会被重复触发（整条链只记一次）
         self._last_search[chat_key] = now
-        try:
-            results = await self._fetch(query, clamp_count(count))
-        except (httpx.HTTPError, ValueError, TypeError, KeyError, AttributeError) as exc:
-            logger.warning("联网搜索失败（%s）：%s", self.config.provider, exc)
-            return UNAVAILABLE_TEXT
-        if not results:
-            return "没搜到相关结果。"
-        return format_results(results)
-
-    async def _fetch(self, query: str, count: int) -> list[SearchResult]:
+        self.last_provider = None
+        limit = clamp_count(count)
         client = await self._get_client()
-        if self.config.provider == "tavily":
-            return await self._fetch_tavily(client, query, count)
-        return await self._fetch_bocha(client, query, count)
-
-    async def _fetch_bocha(
-        self, client: httpx.AsyncClient, query: str, count: int
-    ) -> list[SearchResult]:
-        """博查：Bearer 鉴权，结果在 ``data.webPages.value``。"""
-        response = await client.post(
-            BOCHA_URL,
-            json={"query": query, "count": count, "summary": True},
-            headers={"Authorization": f"Bearer {self.config.api_key}"},
-        )
-        response.raise_for_status()
-        data = response.json()
-        web_pages = (data.get("data") or {}).get("webPages") or {}
-        rows = web_pages.get("value") or []
-        results: list[SearchResult] = []
-        for row in rows:
-            if not isinstance(row, dict):
+        any_responded = False
+        for name in self._channels():
+            try:
+                results = await self._fetch_provider(client, name, query, limit)
+            except (httpx.HTTPError, ValueError, TypeError, KeyError, AttributeError) as exc:
+                logger.warning("联网搜索失败（%s），尝试下一个渠道：%s", name, exc)
                 continue
-            result = SearchResult(
-                title=_clean(row.get("name")),
-                snippet=_clean(row.get("snippet")),
-                url=_clean(row.get("url")),
-            )
-            if result.title or result.snippet:
-                results.append(result)
-        return results
+            any_responded = True
+            if not results:
+                logger.info("联网搜索渠道 %s 无结果，尝试下一个渠道", name)
+                continue
+            logger.info("联网搜索命中渠道 %s（%d 条）", name, len(results))
+            self.last_provider = name
+            return format_results(results)
+        # 全部渠道都没给出结果：至少一个正常返回就用「没搜到」，全挂则「暂时不可用」
+        return NO_RESULT_TEXT if any_responded else UNAVAILABLE_TEXT
+
+    async def _fetch_provider(
+        self, client: httpx.AsyncClient, name: str, query: str, count: int
+    ) -> list[SearchResult]:
+        if name == "deepseek":
+            return await self._fetch_deepseek(client, query, count)
+        if name == "tavily":
+            return await self._fetch_tavily(client, query, count)
+        raise ValueError(f"未知搜索渠道：{name}")
 
     async def _fetch_tavily(
         self, client: httpx.AsyncClient, query: str, count: int
@@ -207,7 +210,11 @@ class WebSearcher:
         """Tavily：api_key 放 body，结果在顶层 ``results``。"""
         response = await client.post(
             TAVILY_URL,
-            json={"api_key": self.config.api_key, "query": query, "max_results": count},
+            json={
+                "api_key": self.config.channel("tavily").api_key,
+                "query": query,
+                "max_results": count,
+            },
         )
         response.raise_for_status()
         data = response.json()
@@ -225,12 +232,47 @@ class WebSearcher:
                 results.append(result)
         return results
 
+    async def _fetch_deepseek(
+        self, client: httpx.AsyncClient, query: str, count: int
+    ) -> list[SearchResult]:
+        """DeepSeek 官方 Search API：Bearer 鉴权，结果在顶层 ``results``。
+
+        正文优先用 ``summary``（600–800 字，给模型读的），缺了退 ``snippet``；
+        之后与其他渠道一样按注入格式截断。
+        """
+        response = await client.post(
+            DEEPSEEK_URL,
+            json={
+                "query": query[:DEEPSEEK_QUERY_MAX],
+                "count": count,
+                "need_content": False,
+            },
+            headers={"Authorization": f"Bearer {self.config.channel('deepseek').api_key}"},
+        )
+        response.raise_for_status()
+        data = response.json()
+        rows = data.get("results") or []
+        results: list[SearchResult] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            result = SearchResult(
+                title=_clean(row.get("title")),
+                snippet=_clean(row.get("summary") or row.get("snippet")),
+                url=_clean(row.get("url")),
+            )
+            if result.title or result.snippet:
+                results.append(result)
+        return results
+
 
 __all__ = [
-    "BOCHA_URL",
     "COOLDOWN_TEXT",
     "DEFAULT_COUNT",
+    "DEEPSEEK_QUERY_MAX",
+    "DEEPSEEK_URL",
     "MAX_COUNT",
+    "NO_RESULT_TEXT",
     "RESULT_HEADER",
     "SUMMARY_CHARS",
     "SearchResult",

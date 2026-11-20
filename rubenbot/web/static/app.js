@@ -2629,25 +2629,30 @@ async function renderSettings(view) {
       ),
     }),
     card("联网搜索", {
-      hint: "给 bot 一个 web_search 工具：实时信息先搜再答；未填 Key 时工具不开放",
+      hint: "给 bot 一个 web_search 工具：按顺序尝试各渠道，未配任何 Key 时工具不开放",
       body: fieldGrid(
         [
           {
-            path: "search.provider",
-            label: "搜索后端",
-            kind: "select",
-            hint: "博查（api.bochaai.com）或 Tavily（api.tavily.com）",
-            options: [
-              { value: "bocha", label: "博查 Bocha" },
-              { value: "tavily", label: "Tavily" },
-            ],
+            path: "search.order",
+            label: "渠道顺序",
+            kind: "list",
+            wide: true,
+            placeholder: "例如 tavily",
+            hint: "按顺序尝试；没配 Key 的渠道自动跳过，失败或没结果就换下一个。可选：tavily / deepseek",
           },
           {
-            path: "search.api_key",
-            label: "搜索 API Key",
+            path: "search.tavily.api_key",
+            label: "Tavily API Key",
             kind: "password",
-            hint: "留空表示保留原值；不填则 bot 不具备联网搜索能力",
-            secretSet: Boolean(secrets["search.api_key"]),
+            hint: "留空表示保留原值；api.tavily.com",
+            secretSet: Boolean(secrets["search.tavily.api_key"]),
+          },
+          {
+            path: "search.deepseek.api_key",
+            label: "DeepSeek API Key",
+            kind: "password",
+            hint: "留空表示保留原值；与 DeepSeek 模型用同一把 Key",
+            secretSet: Boolean(secrets["search.deepseek.api_key"]),
           },
           { path: "search.timeout_seconds", label: "超时（秒）", kind: "number", step: "1", min: 0.1, hint: "单次搜索请求的超时" },
           { path: "search.cooldown_seconds", label: "每会话冷却（秒）", kind: "number", step: "5", min: 0, hint: "冷却内重复搜索直接返回已有结果提示，不发请求" },

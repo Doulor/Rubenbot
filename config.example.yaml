@@ -72,12 +72,20 @@ memory:
     max_chars: 800               # 摘要总长上限（五段合计），更新时模型需在此取舍
 
 # 联网搜索：给模型一个 web_search 工具（仿 recall 的工具接法）
-# 不填 api_key 时工具不注册，模型看不见它；日志会打一行「联网搜索未配置，已跳过」
+# 渠道按 order 依次尝试：没配 key 的自动跳过，抛错/超时/空结果就换下一个，
+# 第一个有结果的胜出。整条链一个 key 都没有时工具不注册，模型看不见它；
+# 日志会打一行「联网搜索未配置，已跳过」。
+# 旧写法（provider + api_key 平铺）仍可加载，会自动映射成 order: [provider]；
+# 已下线的旧渠道在配置里出现时会被忽略并打一行日志。
 search:
-  provider: "bocha"        # bocha（博查）或 tavily
-  api_key: "${RUBENBOT_SEARCH_KEY}"
-  timeout_seconds: 10      # 单次搜索请求超时（秒）
-  cooldown_seconds: 30     # 每会话两次真实搜索之间的冷却，冷却内只返回提示不发请求
+  order: [tavily, deepseek]  # 尝试顺序；可选 tavily / deepseek，未知名字忽略并打日志
+  tavily:
+    api_key: "${RUBENBOT_TAVILY_KEY}"
+  deepseek:
+    # 与 DeepSeek 模型同一把 key；按成功请求计费 $0.75/千次（失败/空结果不计费）
+    api_key: "${RUBENBOT_DEEPSEEK_KEY}"
+  timeout_seconds: 10      # 单次搜索请求超时（秒），整条链共用
+  cooldown_seconds: 30     # 每会话两次真实搜索之间的冷却，整条链只过一次闸；冷却内只返回提示
 
 chat:
   bot_name: "Ruben"
