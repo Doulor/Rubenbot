@@ -118,6 +118,8 @@ def test_structured_config_covers_every_field(config):
             "consolidate_model",
             "models",
             "temperature",
+            "chat_temperature",
+            "chat_frequency_penalty",
             "timeout",
             "max_retries",
         ],

@@ -186,8 +186,14 @@ class LLMClient:
         payload: dict[str, Any] = {
             "model": model,
             "messages": messages,
-            "temperature": self.config.temperature if temperature is None else temperature,
+            "temperature": (
+                self.config.chat_temperature
+                if role == "chat" and temperature is None and self.config.chat_temperature is not None
+                else self.config.temperature if temperature is None else temperature
+            ),
         }
+        if role == "chat" and self.config.chat_frequency_penalty:
+            payload["frequency_penalty"] = self.config.chat_frequency_penalty
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
 

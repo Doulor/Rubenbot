@@ -469,6 +469,18 @@ def _validate_llm(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
         number = v.number(section["temperature"], "llm.temperature", minimum=0, maximum=2)
         if number is not None:
             out["temperature"] = float(number)
+    if "chat_temperature" in section:
+        value = section["chat_temperature"]
+        if value in (None, ""):
+            out["chat_temperature"] = None
+        else:
+            number = v.number(value, "llm.chat_temperature", minimum=0, maximum=2)
+            if number is not None:
+                out["chat_temperature"] = float(number)
+    if "chat_frequency_penalty" in section:
+        number = v.number(section["chat_frequency_penalty"], "llm.chat_frequency_penalty", minimum=-2, maximum=2)
+        if number is not None:
+            out["chat_frequency_penalty"] = float(number)
     if "timeout" in section:
         number = v.number(section["timeout"], "llm.timeout", minimum=0.1)
         if number is not None:

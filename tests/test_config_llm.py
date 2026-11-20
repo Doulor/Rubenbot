@@ -234,6 +234,28 @@ def test_llm_task_defaults_to_role_and_can_be_customized():
     assert {u.model for u in rec} == {"m-fast"}
 
 
+def test_chat_payload_uses_chat_specific_sampling_defaults():
+    captured = {}
+
+    def handler(request):
+        captured.update(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = LLMClient(
+        LLMConfig(api_key="k", chat_model="m", temperature=0.8, chat_temperature=0.8),
+        transport=httpx.MockTransport(handler),
+    )
+
+    async def scenario():
+        await client.complete([{"role": "user", "content": "hi"}], role="chat")
+        await client.close()
+
+    asyncio.run(scenario())
+    assert captured["temperature"] == 0.8
+    assert captured["frequency_penalty"] == 0.3
+    assert "min_p" not in captured
+
+
 def test_llm_complete_payload_and_model():
     captured = {}
 

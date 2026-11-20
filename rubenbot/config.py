@@ -71,7 +71,11 @@ class LLMConfig:
     consolidate_model: str | None = None
     # 分寸审查（gate）用的模型；留空跟随 chat
     gate_model: str | None = None
+    # 全局温度供 summary/fast 等非聊天角色使用；chat 温度留空时沿用它。
     temperature: float = 0.8
+    chat_temperature: float | None = None
+    # 聊天单独的轻度重复惩罚；其它角色不默认带此参数。
+    chat_frequency_penalty: float = 0.3
     timeout: float = 60.0
     max_retries: int = 2
     # 角色 → 模型名。预置角色见 MODEL_ROLES，也可写自定义角色。
