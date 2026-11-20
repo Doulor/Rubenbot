@@ -176,6 +176,7 @@ bot 对每个人的好感度、以及自己当下的心情，都由确定性规�
 | `plugins/privacy/` | 内置插件：`/隐私` 命令（档位 / 自查 / 清空）与灰区询问投递（默认关闭，需显式启用） |
 | `plugins/qzone_post/` | 说说发布插件（命令 / 定时 / 概率触发）；自动互动开关默认关闭（默认不启用，需显式开启） |
 | `plugins/emoji_react/` | 贴表情反应插件：跟随回复 / 关键词触发（默认关闭，需显式启用） |
+| `plugins/music/` | 点歌插件：「点歌 / 我想听 <歌名>」搜网易云，音乐段发送，失败降级文字 + 封面（默认关闭，无需 key） |
 | `data/SOUL.md` | 默认人格示例 |
 
 ---
@@ -377,7 +378,7 @@ plugins:
 | `llm` | 调用核心的大模型接口（会产生费用） | |
 | `network` | 向外部网络发起请求 | |
 
-带高风险权限的插件，安装确认框里会额外标红提示。框架自带的 4 个官方插件（hello / privacy / emoji_react / qzone_post）都已声明真实 manifest，可作参考。
+带高风险权限的插件，安装确认框里会额外标红提示。框架自带的 5 个官方插件（hello / privacy / emoji_react / qzone_post / music）都已声明真实 manifest，可作参考。
 
 在插件目录下新建 `plugins/<name>/plugin.py`，暴露 `register(ctx)`：
 
@@ -413,6 +414,12 @@ WebUI 的「插件市场」页就是原来的插件页：已安装与可安装�
 - **卸载**：启用中先停用，再删插件目录；目录里自带的文件（含插件自己的 `config.yaml`）随目录删除，框架 `config.yaml` 里该插件的配置段保留不动，只从 `plugins.enabled` 摘除。
 
 索引仓库 `Doulor/Rubenbot-plugins` 需要你自己搭（根目录 `plugins.json` + 每个插件一个目录）；代码只依赖「可配置 URL + 拉不到就回退内置」。
+
+### 点歌插件（music）
+
+默认不启用（进 `plugins.enabled` 才生效），配置在插件目录的 `config.example.yaml` 里说明。
+
+- **`music`（点歌）**：群里/私聊发「点歌 <歌名>」或「我想听 <歌名>」。搜网易云公开搜索接口（免 key，带浏览器 UA 与 Referer），取第一首用 OneBot `music` 段（`type: netease` + 歌曲 id）发送；协议端不支持音乐段（或非 SnowLuma 平台）时降级成「歌名 — 歌手 + 链接」文字，有封面再附一张封面图。单人冷却默认 60 秒；搜不到就明说没找到，接口挂了回「搜不到，换个关键词试试」并记日志，绝不随便塞一首不相关的。
 
 ---
 

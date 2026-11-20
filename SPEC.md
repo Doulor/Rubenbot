@@ -235,12 +235,12 @@ SnowLuma 适配器（OneBot v11）：
 - `config_schema`：配置项声明（key/类型/默认/说明），供设置界面自动渲染表单（二期落地，一期先解析存下）
 - `hooks`：用到的钩子名列表（on_message / on_command / scheduled 等，与 loader 的 register(ctx) 对应）
 
-loader 加载时校验 manifest：缺失或字段不全的插件拒绝加载并在 WebUI 标「不合规」；现有 4 个插件（hello / privacy / emoji_react / qzone_post）一期全部补 manifest 迁移。
+loader 加载时校验 manifest：缺失或字段不全的插件拒绝加载并在 WebUI 标「不合规」；现有 4 个插件（hello / privacy / emoji_react / qzone_post）一期全部补 manifest 迁移，点歌（music）沿用同一规范，默认不启用。
 
 ### 分发：GitHub 索引仓库
 
 - 索引仓库 `Doulor/Rubenbot-plugins`：根目录 `plugins.json`（条目：id / name / version / description / author / permissions / path），每个插件一个目录（代码 + manifest.json）。
-- bot 侧索引地址可配置（`market.index_url`），拉取失败或未配置时回退到框架内置的官方索引（随框架发布的 4 个官方插件），市场页明确标注当前索引来源与「索引不可用」状态，不许静默空白。
+- bot 侧索引地址可配置（`market.index_url`），拉取失败或未配置时回退到框架内置的官方索引（随框架发布的官方插件），市场页明确标注当前索引来源与「索引不可用」状态，不许静默空白。
 - 安装 = 拉索引仓库对应插件目录落盘到 `plugins/` → 校验 manifest 与 min_core_version → 默认不启用，用户在卡片上手动启用（与「插件默认关」一致）。
 - 更新：索引 version 高于已装 manifest version 时卡片挂「可更新」角标，一键更新（保留该插件的配置段，只换代码与 manifest）。
 

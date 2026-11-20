@@ -24,6 +24,7 @@ SEGMENT_PLACEHOLDERS: dict[str, str] = {
     "record": "[语音]",
     "video": "[视频]",
     "file": "[文件]",
+    "music": "[音乐]",
 }
 
 

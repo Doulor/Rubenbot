@@ -453,6 +453,17 @@ def segment_to_onebot(segment: Segment | dict[str, Any]) -> dict[str, Any]:
     if segment.type in ("record", "video", "file"):
         source = data.get("file") or data.get("url") or ""
         return {"type": segment.type, "data": {"file": source}}
+    if segment.type == "music":
+        # OneBot v11 音乐分享：type 为 netease / qq / kugou 等音源名
+        music_type = str(data.get("type") or "netease")
+        payload: dict[str, Any] = {"type": music_type}
+        if data.get("id") not in (None, ""):
+            payload["id"] = str(data.get("id"))
+        for key in ("url", "audio", "title", "content", "image"):
+            value = data.get(key)
+            if value not in (None, ""):
+                payload[key] = str(value)
+        return {"type": "music", "data": payload}
     # 未知类型退化为文本，保证消息不会凭空丢失
     return {"type": "text", "data": {"text": segment.render()}}
 
