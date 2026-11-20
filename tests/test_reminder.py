@@ -30,6 +30,8 @@ class ToolLLM:
         self.chat_calls = 0
 
     async def complete(self, messages, *, role="chat", task=None, temperature=None, json_mode=False):
+        if role == "fast":
+            return json.dumps({"intent": "补充新信息", "increment": "根据工具结果回复"})
         self.chat_calls += 1
         return self.chat_reply
 

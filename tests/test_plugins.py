@@ -217,7 +217,7 @@ def test_hooks_before_and_after(plugin_dir):
     bot, adapter, manager, llm = make_bot(plugin_dir, replies=["好的呀"])
     asyncio.run(bot.handle_event(private("你好")))
     messages = llm.chat_messages[0]
-    assert messages[-1] == {"role": "system", "content": "插件提示"}
+    assert messages[-2] == {"role": "system", "content": "插件提示"}
     assert bot.context.extras["last_reply"] == "好的呀"
     assert bot.context.extras["seen"] == ["你好"]
 

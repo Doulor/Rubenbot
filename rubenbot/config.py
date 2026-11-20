@@ -402,7 +402,7 @@ class EmotionConfig:
 class TwoStageConfig:
     """两段式生成：先「想」再「说」。"""
 
-    # 默认关闭；关时保持原来的单段直出，行为完全不变
+    # 默认允许闲聊碎片省一次 fast 请求；开启则所有档位都走完整两段。
     enabled: bool = False
 
 

@@ -3614,7 +3614,7 @@ function settingsCardSpecs(draft, secrets, pluginsAvailable) {
               path: "generation.two_stage.enabled",
               label: "两段式生成",
               kind: "switch",
-              hint: "先让快速模型想一段简短指导，再按指导写正文；第一段失败会自动回退单段直出",
+              hint: "所有回复都有表达决策书；开启后，闲聊碎片也由快速模型决定，不走本地快速通道",
             },
           ],
           draft

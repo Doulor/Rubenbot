@@ -40,6 +40,7 @@ from .decision import (
     ReplyDecision,
     parse_generation_output,
 )
+from .expression import ExpressionDecision, choose_length_band, is_question, parse_plan, repetition_list
 from .emotion import EmotionEngine
 from .gateway.events import EventBatch, EventMerger, EventRouter, RouteDecision
 from .gateway.judge import EventJudge, EventVerdict, persona_line
@@ -67,30 +68,20 @@ logger = logging.getLogger(__name__)
 ADAPTER_RESTART_MIN = 1.0
 ADAPTER_RESTART_MAX = 30.0
 
-# ---- 两段式生成（默认关闭）----
+# ---- 表达决策书 ----
 # 第一段用快速模型；没配 fast 时由 LLMConfig.model_for 沿回退链落到 chat
 GUIDANCE_ROLE = "fast"
-# 第一段只产出「怎么回」的简短指导，不做正文草稿；远超约定长度就截断
-GUIDANCE_MAX_CHARS = 200
-# 第一段最多等这么久（秒）；再长就直接回退单段，不让指导拖住回复
 GUIDANCE_TIMEOUT_CAP = 15.0
-# 第一段的任务说明：附在正文上下文末尾，只让模型想、不让它说
 GUIDANCE_TASK_PROMPT = (
-    "这条消息已经确定要回了，不用再判断该不该接话。"
-    "现在先不要写回复正文，只替自己想清楚该怎么接：\n"
-    "- 回应什么：这句话真正在说什么、需要接住哪一点\n"
-    "- 态度语气：这轮该用什么样的情绪和分寸\n"
-    "- 要提到的点：必须带上的信息；没有就写「无」\n"
-    "- 要避开的：容易说错、说重或显得敷衍的地方\n"
-    "只写几行要点，总长不超过 150 字；不要写成正文草稿，不要复述聊天记录。"
+    "你是回复前的表达决策器，不写正文。只输出一个 JSON 对象，不要 Markdown。"
+    "字段必须是 intent、length_band、increment、avoid_repetition。\n"
+    "intent 只能从：接梗、补充新信息、反驳、提问、短附和、沉默 中选；"
+    "length_band 只能从：碎片、短句、展开 中选。"
+    "碎片最多10字，短句11-25字，展开26-60字。"
+    "increment 必须用一句话写明这条比上文多什么；写不出就把 intent 改为沉默且 increment 置空。"
+    "avoid_repetition 是数组，列出最近三条 bot 已用观点或措辞，当前回复不要复述。"
+    "严格限长：JSON 总长不超过 500 字。"
 )
-# 第二段末尾的生成指令：指导是内部材料，不能被说出来
-GENERATION_INSTRUCTION = (
-    "现在按上面的内部指导，直接写出这一轮要发出的回复正文；"
-    "如果仍然判断不该接话，照前面的规则处理。"
-    "不要输出思考过程，不要复述或提及这段指导。"
-)
-
 # recall 工具的定义（T2）。没配置搜索时只开放这一个工具，模型不用/失败就退化为单次生成。
 RECALL_TOOL = {
     "type": "function",
@@ -1288,7 +1279,6 @@ class RubenBot:
         self.observe_emotion(event, events=round_.events, now=now)
         decision = self.decide(event, now=now)
         self.last_decision[self.decision_engine.chat_key(event)] = decision
-        self._log_decision(round_, event, decision, now)
         logger.info(
             "决策 %s/%s %s：%s %s",
             event.platform,
@@ -1298,6 +1288,7 @@ class RubenBot:
             decision.log_text(),
         )
         if not decision.should_reply:
+            self._log_decision(event, decision, now)
             return
 
         messages = await self.build_context(event, now=now)
@@ -1313,15 +1304,16 @@ class RubenBot:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("插件 on_before_reply 异常：%s", exc)
 
-        two_stage = bool(self.config.generation.two_stage.enabled)
-        task = "gen_stage2" if two_stage else "chat"
-        guidance = ""
-        if two_stage:
-            # 第一段只「想」：失败/空/超时都退化为单段直出，绝不影响回复
-            guidance = await self.guide_reply(messages)
-            if guidance:
-                messages = self.with_guidance(messages, guidance)
+        expression = await self.plan_expression(messages, event, decision)
+        if expression.intent == "沉默":
+            decision.should_reply = False
+            decision.reason = "expression_silence"
+        self._log_decision(event, decision, now, expression)
+        if not decision.should_reply:
+            return
 
+        messages = [*messages, {"role": "system", "content": expression.prompt_block()}]
+        task = "chat" if expression.source == "fragment" else "gen_stage2"
         raw_reply = await self.generate(messages, event=event, task=task)
         parsed = parse_generation_output(raw_reply, marker)
         if parsed.vetoed:
@@ -1346,9 +1338,28 @@ class RubenBot:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("插件 on_after_reply 异常：%s", exc)
 
-    def _log_decision(self, round_: MergedRound, event: MessageEvent, decision: ReplyDecision, now: float) -> None:
-        """把决策写入 decision_log，供 WebUI 展示；写库失败不影响主流程。"""
+    def _log_decision(
+        self,
+        event: MessageEvent,
+        decision: ReplyDecision,
+        now: float,
+        expression: ExpressionDecision | None = None,
+    ) -> None:
+        """把意愿与表达决策合并写入同一条 decision_log。"""
         factors = decision.factors
+        factor_data = {
+            "base": factors.base,
+            "momentum": factors.momentum,
+            "relevance": factors.relevance,
+            "ratio_penalty": factors.ratio_penalty,
+            "cooldown_penalty": factors.cooldown_penalty,
+            "multiplier": factors.multiplier,
+            "noise": factors.noise,
+            "share": factors.share,
+            "mood_adjust": factors.mood_adjust,
+        } if factors is not None else {}
+        if expression is not None:
+            factor_data["expression_decision"] = expression.to_dict()
         try:
             self.store.add_decision_log(
                 platform=event.platform,
@@ -1362,19 +1373,7 @@ class RubenBot:
                 hard_trigger=decision.hard_trigger or "",
                 score=decision.score,
                 threshold=decision.threshold,
-                factors={
-                    "base": factors.base,
-                    "momentum": factors.momentum,
-                    "relevance": factors.relevance,
-                    "ratio_penalty": factors.ratio_penalty,
-                    "cooldown_penalty": factors.cooldown_penalty,
-                    "multiplier": factors.multiplier,
-                    "noise": factors.noise,
-                    "share": factors.share,
-                    "mood_adjust": factors.mood_adjust,
-                }
-                if factors is not None
-                else {},
+                factors=factor_data,
                 now=now,
             )
         except Exception as exc:  # noqa: BLE001 - 观测数据写不进去也不能影响回复
@@ -1910,38 +1909,37 @@ class RubenBot:
     # 生成与发送
     # ------------------------------------------------------------------
 
-    async def guide_reply(self, messages: list[dict[str, str]]) -> str:
-        """两段式的第一段：按与正文相同的上下文，产出一段简短回复指导。
-
-        任何失败（调用异常、超时、空内容）都返回空串，由调用方回退单段直出；
-        这里只记日志，绝不向上抛。用量经由 LLM 客户端记 ``gen_stage1``。
-        """
-        request = list(messages) + [{"role": "user", "content": GUIDANCE_TASK_PROMPT}]
+    async def plan_expression(
+        self, messages: list[dict[str, str]], event: MessageEvent, willingness: ReplyDecision
+    ) -> ExpressionDecision:
+        casual = event.is_group and willingness.hard_trigger is None
+        question = is_question(event.text)
+        band = choose_length_band(
+            self.rng.random(), mentioned_question=event.mentions_bot and question, casual_group=casual,
+        )
+        recent = [item.text for item in self.store.recent_messages(
+            event.chat_id, platform=event.platform, chat_type=event.chat_type,
+            sender_id=BOT_SENDER_ID, limit=3,
+        )]
+        if casual and not question and band == "碎片" and not self.config.generation.two_stage.enabled:
+            return ExpressionDecision("短附和", band, "", repetition_list(recent), "fragment")
+        prompt = (GUIDANCE_TASK_PROMPT + f"\n本轮已掷档：{band}，不要改档。"
+                  + "最近三条自己的发言：" + json.dumps([t[:160] for t in recent], ensure_ascii=False))
+        request = [*messages, {"role": "user", "content": prompt}]
         try:
-            text = await asyncio.wait_for(
-                self.llm.complete(request, role=GUIDANCE_ROLE, task="gen_stage1"),
+            raw = await asyncio.wait_for(
+                self.llm.complete(
+                    request, role=GUIDANCE_ROLE, task="gen_stage1", json_mode=True,
+                    **({"max_tokens": 256} if self._accepts_kwarg(self.llm.complete, "max_tokens") else {}),
+                ),
                 timeout=self.guidance_timeout(),
             )
-        except asyncio.TimeoutError:
-            logger.warning("两段式第一段超时（%.1fs），回退单段直出", self.guidance_timeout())
-            return ""
-        except Exception as exc:  # noqa: BLE001 - 指导失败不能拖垮回复
-            logger.warning("两段式第一段失败，回退单段直出：%s", exc)
-            return ""
-        guidance = (text or "").strip()
-        if not guidance:
-            logger.info("两段式第一段返回空内容，回退单段直出")
-            return ""
-        marker = self.config.decision.veto_marker
-        if marker and marker in guidance:
-            # 第一段顺着上下文里的「可以不接话」出口回了否决标记：这不是指导
-            logger.info("两段式第一段只返回了否决标记，回退单段直出")
-            return ""
-        if len(guidance) > GUIDANCE_MAX_CHARS:
-            # 明显跑偏成了草稿：宁可截断也不要让第二段照抄
-            guidance = guidance[:GUIDANCE_MAX_CHARS].rstrip()
-        logger.debug("两段式第一段指导：%s", guidance)
-        return guidance
+        except Exception as exc:  # 决策服务故障只允许短呼应，不放开到无约束正文
+            logger.warning("表达决策书不可用，降级碎片：%s", exc)
+            raw = ""
+        if raw and raw.strip() and parse_generation_output(raw, self.config.decision.veto_marker).vetoed:
+            return ExpressionDecision("沉默", band, "", repetition_list(recent))
+        return parse_plan(raw or "", band, recent)
 
     def guidance_timeout(self) -> float:
         """第一段的等待上限：不超过客户端超时，也不超过固定上限。"""
@@ -1949,18 +1947,6 @@ class RubenBot:
         if configured <= 0:
             return GUIDANCE_TIMEOUT_CAP
         return max(0.1, min(configured, GUIDANCE_TIMEOUT_CAP))
-
-    @staticmethod
-    def with_guidance(
-        messages: list[dict[str, str]], guidance: str
-    ) -> list[dict[str, str]]:
-        """把指导插到历史之后、生成指令之前，标注为内部材料、不要复述。"""
-        block = (
-            "下面是给你自己的内部回复指导，只用来决定怎么说，不要复述、不要提及：\n"
-            f"{guidance}\n\n"
-            f"{GENERATION_INSTRUCTION}"
-        )
-        return list(messages) + [{"role": "system", "content": block}]
 
     async def send_proactive(
         self,

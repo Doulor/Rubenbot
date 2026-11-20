@@ -67,15 +67,15 @@ def test_disabled_by_default():
     assert Config().generation.two_stage.enabled is False
 
 
-def test_disabled_flow_is_single_stage(config, store):
+def test_default_flow_still_plans_private_reply(config, store):
     config.generation.two_stage.enabled = False
     llm = ScriptedLLM({"chat": ["在的"]})
     bot, adapter = make_bot(config, store, llm)
     asyncio.run(bot.handle_event(private_event()))
     assert adapter.texts == ["在的"]
-    # 只有一次正文调用，且没有第一段
-    assert [c["task"] for c in llm.calls] == ["chat"]
-    assert all(c["role"] == "chat" for c in llm.calls)
+    # 旧开关关闭也不绕过表达决策。
+    assert [c["task"] for c in llm.calls] == ["gen_stage1", "gen_stage2"]
+    assert [c["role"] for c in llm.calls] == ["fast", "chat"]
 
 
 def test_config_parses_switch_and_defaults_to_off():
@@ -95,7 +95,7 @@ def test_guidance_generated_and_injected(config, store):
     config.generation.two_stage.enabled = True
     llm = ScriptedLLM(
         {
-            "fast": ["- 回应什么：接住「今天好累」\n- 语气：关心但不夸张\n- 必提：无\n- 避开：说教"],
+            "fast": [json.dumps({"intent": "提问", "increment": "问问是哪件事累着了"})],
             "chat": ["辛苦啦，早点歇着"],
         }
     )
@@ -117,7 +117,7 @@ def test_guidance_generated_and_injected(config, store):
     last = stage2["messages"][-1]
     assert last["role"] == "system"
     assert "内部回复指导" in last["content"]
-    assert "关心但不夸张" in last["content"]
+    assert "问问是哪件事累着了" in last["content"]
     assert "不要复述" in last["content"]
     # 指导在历史之后：前面仍是原来的上下文
     assert stage2["messages"][: len(stage1["messages"]) - 1] == stage1["messages"][:-1]
@@ -169,7 +169,7 @@ def test_stage1_failure_falls_back_to_single_pass(config, store):
     assert adapter.texts == ["还好吗"]
     # 正文照常生成；第二段 prompt 里没有指导块
     assert llm.calls[-1]["role"] == "chat"
-    assert not any("内部回复指导" in m["content"] for m in llm.calls[-1]["messages"])
+    assert "短附和；长度档：碎片" in llm.calls[-1]["messages"][-1]["content"]
 
 
 def test_stage1_empty_guidance_falls_back(config, store):
@@ -178,7 +178,7 @@ def test_stage1_empty_guidance_falls_back(config, store):
     bot, adapter = make_bot(config, store, llm)
     asyncio.run(bot.handle_event(private_event()))
     assert adapter.texts == ["在的"]
-    assert not any("内部回复指导" in m["content"] for m in llm.calls[-1]["messages"])
+    assert "短附和；长度档：碎片" in llm.calls[-1]["messages"][-1]["content"]
 
 
 def test_stage1_veto_marker_is_not_guidance(config, store):
@@ -188,7 +188,8 @@ def test_stage1_veto_marker_is_not_guidance(config, store):
     llm = ScriptedLLM({"fast": [marker], "chat": ["在的"]})
     bot, adapter = make_bot(config, store, llm)
     asyncio.run(bot.handle_event(private_event()))
-    assert adapter.texts == ["在的"]
+    assert not adapter.sent
+    assert not llm.chat_messages
 
 
 def test_stage1_timeout_falls_back(config, store):
@@ -242,9 +243,7 @@ def test_usage_records_both_stages(config, store):
     def handler(request):
         body = json.loads(request.content)
         text = " ".join(m["content"] for m in body["messages"])
-        content = "[]" if "JSON" in text else (
-            "- 语气：轻松" if "先不要写回复正文" in text else "好呀"
-        )
+        content = json.dumps({"intent": "提问", "increment": "问具体累在哪里"}) if body.get("response_format") else "好呀"
         return httpx.Response(
             200,
             json={
@@ -273,7 +272,7 @@ def test_usage_records_both_stages(config, store):
     assert all(row["ok"] == 1 for row in rows)
 
 
-def test_usage_single_task_when_disabled(config, store):
+def test_usage_includes_default_planner(config, store):
     def handler(request):
         return httpx.Response(
             200,
@@ -292,7 +291,7 @@ def test_usage_single_task_when_disabled(config, store):
     bot, _ = make_bot(config, store, client)
     asyncio.run(bot.handle_event(private_event()))
     asyncio.run(client.close())
-    assert [row["task"] for row in usage_rows(store)] == ["chat"]
+    assert [row["task"] for row in usage_rows(store)] == ["gen_stage1", "gen_stage2"]
 
 
 def test_stage1_failed_call_still_counted_as_failure(config, store):
