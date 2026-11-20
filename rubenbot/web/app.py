@@ -859,6 +859,19 @@ def create_app(state: WebState):
             raise ApiError(404, "表情不存在")
         return {"ok": True, "id": sticker_id}
 
+    @app.get("/api/computer/audit")
+    async def computer_audit(request: Request, limit: int = 30):
+        """只读审计：即使工具已关闭，仍可查历史操作；不返回原始参数或输出。"""
+        require_session(request)
+        rows = state.store.recent_computer_actions(limit=max(1, min(limit, 200)))
+        fields = ("who", "context", "tool", "success", "duration_ms", "created_at")
+        items = [
+            {**{key: row[key] for key in fields}, "args_summary": {
+                key: row["args_summary"][key] for key in ("arg_count", "input_bytes")
+            }} for row in rows
+        ]
+        return {"ok": True, "items": items}
+
     @app.get("/api/mcp/status")
     async def mcp_status(request: Request):
         """读取当前连接快照；独立 WebUI 不建立连接，也不假装知道运行状态。"""
@@ -1349,6 +1362,7 @@ def _save_message(applied: list[str], requires_restart: list[str]) -> str:
         "memory": "记忆",
         "chat": "聊天与回复",
         "decision": "回复意愿",
+        "computer": "操作电脑",
         "generation": "生成",
         "emotion": "情绪与好感度",
         "plugins": "插件",

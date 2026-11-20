@@ -219,6 +219,10 @@ class BaseAdapter(abc.ABC):
         以便后续解析「这条消息引用了谁」和拼 bot 自己的时间线。
         """
 
+    async def send_file(self, chat_id: str, filename: str, content: bytes, *, chat_type: str) -> None:
+        """上传已在执行上下文中读出的快照，不接受由协议端再解析的用户路径。"""
+        raise CapabilityNotSupported(self.name, "send_file")
+
     @abc.abstractmethod
     async def stop(self) -> None:
         """停止适配器，释放资源。"""

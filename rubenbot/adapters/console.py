@@ -151,6 +151,10 @@ class ConsoleAdapter(BaseAdapter):
         self.write(f"{self.bot_name}: {text}")
         return self._local_id()
 
+    async def send_file(self, chat_id: str, filename: str, content: bytes, *, chat_type: str) -> None:
+        # 调试适配器保留附件段供本地消费者读取，终端本身只打印占位符。
+        await self.send(chat_id, [Segment("file", {"name": filename, "content": content})], chat_type=chat_type)
+
     def write(self, text: str) -> None:
         try:
             self.stdout.write(text + "\n")

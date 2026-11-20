@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ..config import Config
+from ..config import ComputerConfig, Config
 from ..memory.store import MemoryStore
 from ..persona import Persona, load_persona
 from ..plugins.loader import PluginManager
@@ -470,6 +470,8 @@ def save_config_text(path: str | Path, text: str, *, backup: bool = True) -> Pat
         raise ValueError(f"YAML 语法错误：{exc}") from exc
     if data is not None and not isinstance(data, dict):
         raise ValueError("配置的顶层必须是键值对（YAML mapping）")
+    if data and "computer" in data:
+        ComputerConfig.parse(data["computer"])
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     backup_path: Path | None = None

@@ -24,7 +24,8 @@ from dataclasses import asdict
 from typing import Any
 
 from ..config import (
-    SEARCH_PROVIDERS, STT_PROVIDERS, TTS_MODES, TTS_PROVIDERS, Config, MCPConfig, MCPServerConfig,
+    COMPUTER_LIMITS, SEARCH_PROVIDERS, STT_PROVIDERS, TTS_MODES, TTS_PROVIDERS,
+    ComputerConfig, Config, MCPConfig, MCPServerConfig,
 )
 from ..decision import parse_quiet_hours
 
@@ -95,6 +96,7 @@ SETTINGS_GROUPS: tuple[dict[str, Any], ...] = (
         "pages": (
             {"id": "model", "title": "模型", "sub": "接口、密钥、模型角色与重试"},
             {"id": "search", "title": "搜索", "sub": "web_search 的渠道顺序与密钥"},
+            {"id": "computer", "title": "操作电脑", "sub": "真机授权、访客限额与最近操作记录"},
             {"id": "mcp", "title": "MCP 工具", "sub": "外部服务器、连接超时与工具调用限制"},
             {"id": "reminder", "title": "提醒与主动", "sub": "提醒工具与冷场开口"},
             {"id": "adapters", "title": "适配器", "sub": "Console 与 OneBot 连接参数"},
@@ -132,6 +134,7 @@ _SETTINGS_PAGE_RULES: tuple[tuple[str, str], ...] = (
     ("llm", "model"),
     ("search", "search"),
     ("mcp", "mcp"),
+    ("computer", "computer"),
     ("reminder", "reminder"),
     ("proactive", "reminder"),
     ("adapters", "adapters"),
@@ -264,6 +267,7 @@ def structured_config(config: Config) -> dict[str, Any]:
         "memory": asdict(config.memory),
         "search": search,
         "mcp": mcp_form(config.mcp),
+        "computer": asdict(config.computer),
         "voice": {**voice, "stt_api_key": "", "tts_api_key": ""},
         "chat": asdict(config.chat),
         "decision": decision,
@@ -1160,6 +1164,23 @@ def validate_structured(payload: dict[str, Any]) -> dict[str, Any]:
     search = _section(payload, "search", v)
     if search is not None:
         update["search"] = _validate_search(search, v)
+    if "computer" in payload:
+        section = copy.copy(payload["computer"])
+        # 表单的数字输入是文本；只有数值字段可作此转换，授权字段仍严格校验。
+        if isinstance(section, dict):
+            for key in COMPUTER_LIMITS:
+                if isinstance(section.get(key), str):
+                    try:
+                        section[key] = int(section[key])
+                    except ValueError:
+                        pass  # 由下方统一报字段错误
+        try:
+            ComputerConfig.parse(section)
+        except ValueError as exc:
+            field, _, message = str(exc).partition(": ")
+            v.fail(field, message)
+        else:
+            update["computer"] = section
     mcp = _section(payload, "mcp", v)
     if mcp is not None:
         update["mcp"] = _validate_mcp(mcp, v)

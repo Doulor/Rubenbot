@@ -285,6 +285,18 @@ class SnowLumaAdapter(BaseAdapter):
             self._bot_message_ids = set(list(self._bot_message_ids)[-250:])
         return message_id
 
+    async def send_file(self, chat_id: str, filename: str, content: bytes, *, chat_type: str) -> None:
+        # 与语音上传相同，OneBot 实现须能读取 bot 的临时目录。只暴露快照，
+        # 不传执行上下文的原路径，避免校验后协议端重新打开另一份文件。
+        with tempfile.NamedTemporaryFile(prefix="rubenbot-upload-") as snapshot:
+            snapshot.write(content)
+            snapshot.flush()
+            private = chat_type == "private"
+            await self.call_api("upload_private_file" if private else "upload_group_file", {
+                "user_id" if private else "group_id": _to_id(chat_id),
+                "name": filename, "file": snapshot.name,
+            })
+
     async def heartbeat(self) -> bool:
         """可选 HTTP 心跳探测：get_status 是否可用。"""
         try:

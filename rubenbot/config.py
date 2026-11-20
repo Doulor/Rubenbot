@@ -933,6 +933,45 @@ def _load_mcp(data: Any) -> MCPConfig:
     return config
 
 
+COMPUTER_LIMITS = {
+    "sandbox_quota_mb": (1, 10240),
+    "command_timeout_seconds": (1, 600),
+    "output_limit_bytes": (32, 1048576),
+}
+
+
+@dataclass
+class ComputerConfig:
+    """操作电脑的授权与限额；只有本地 Console 账号默认拥有真机权限。"""
+
+    enabled: bool = False
+    whitelist: list[str] = field(default_factory=lambda: ["console:console:me"])
+    sandbox_quota_mb: int = 100
+    command_timeout_seconds: int = 60
+    output_limit_bytes: int = 32768
+
+    @classmethod
+    def parse(cls, raw: Any) -> "ComputerConfig":
+        """安全配置严格校验；报错只写字段和约束，不带入原值。"""
+        if not isinstance(raw, dict):
+            raise ValueError("computer: 应为对象")
+        if raw.keys() - {"enabled", "whitelist", *COMPUTER_LIMITS}:
+            raise ValueError("computer: 存在未知配置项")
+        if "enabled" in raw and type(raw["enabled"]) is not bool:
+            raise ValueError("computer.enabled: 应为布尔值")
+        if "whitelist" in raw:
+            ids = raw["whitelist"]
+            if not isinstance(ids, list) or not all(
+                isinstance(item, str) and re.fullmatch(r"[A-Za-z0-9_-]+:[A-Za-z0-9_:.@-]+", item)
+                for item in ids
+            ):
+                raise ValueError("computer.whitelist: 应为精确的 platform:sender_id 字符串列表，不支持变量或通配符")
+        for key, (minimum, maximum) in COMPUTER_LIMITS.items():
+            if key in raw and (type(raw[key]) is not int or not minimum <= raw[key] <= maximum):
+                raise ValueError(f"computer.{key}: 应为 {minimum} 至 {maximum} 的整数")
+        return cls(**raw)
+
+
 @dataclass
 class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
@@ -951,6 +990,7 @@ class Config:
     proactive: ProactiveConfig = field(default_factory=ProactiveConfig)
     gateway: GatewayConfig = field(default_factory=GatewayConfig)
     mcp: MCPConfig = field(default_factory=MCPConfig)
+    computer: ComputerConfig = field(default_factory=ComputerConfig)
     persona_path: str = "data/SOUL.md"
     persona_examples_path: str = "data/reply_examples.json"
     persona_examples_enabled: bool = True
@@ -1028,7 +1068,9 @@ class Config:
         """
         if not isinstance(data, dict):
             raise ValueError("配置的顶层必须是键值对（YAML mapping）")
-        return cls.from_dict(_expand_env(data))
+        # 授权标识必须是字面值；不能把环境里的密钥展开到白名单并由设置页回显。
+        expanded = {key: value if key == "computer" else _expand_env(value) for key, value in data.items()}
+        return cls.from_dict(expanded)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Config":
@@ -1084,6 +1126,7 @@ class Config:
             proactive=proactive,
             gateway=gateway,
             mcp=_load_mcp(data.get("mcp")),
+            computer=ComputerConfig.parse(data.get("computer", {})),
             **basics,
         )
 

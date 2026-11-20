@@ -115,6 +115,20 @@ def _parse_multipart(request: httpx.Request) -> dict:
     return fields
 
 
+def test_send_file_uses_document_bytes_and_current_chat():
+    fake = FakeTelegram()
+    adapter = make_adapter(fake)
+
+    async def send():
+        try:
+            await adapter.send_file('123', 'report.txt', b'report', chat_type='private')
+        finally:
+            await close(adapter)
+
+    asyncio.run(send())
+    assert fake.payload_for('sendDocument') == {'chat_id': '123', 'document': ('report.txt', b'report')}
+
+
 def make_adapter(fake: FakeTelegram, **kwargs) -> TelegramAdapter:
     client = httpx.AsyncClient(
         base_url="https://api.telegram.org", transport=httpx.MockTransport(fake.handler)
