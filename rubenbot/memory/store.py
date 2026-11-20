@@ -1543,6 +1543,8 @@ class MemoryStore:
         *,
         real_only: bool = False,
         after_id: int = 0,
+        sender_id: str | None = None,
+        chat_type: str | None = None,
     ) -> list[RawMessage]:
         """按时间正序返回某会话最近的消息。
 
@@ -1555,6 +1557,12 @@ class MemoryStore:
         if platform is not None:
             sql += " AND platform = ?"
             params.append(platform)
+        if sender_id is not None:
+            sql += " AND sender_id = ?"
+            params.append(sender_id)
+        if chat_type is not None:
+            sql += " AND chat_type = ?"
+            params.append(chat_type)
         if since is not None:
             sql += " AND ts >= ?"
             params.append(since)

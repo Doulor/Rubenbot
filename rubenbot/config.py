@@ -20,6 +20,15 @@ logger = logging.getLogger(__name__)
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
+def _safe_nonnegative_int(value: Any, default: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return default
+    try:
+        return max(0, int(value))
+    except ValueError:
+        return default
+
+
 def _expand_env(value: Any) -> Any:
     """递归展开字符串里的 ${VAR}；未定义时替换为空串。"""
     if isinstance(value, str):
@@ -71,7 +80,11 @@ class LLMConfig:
     consolidate_model: str | None = None
     # 分寸审查（gate）用的模型；留空跟随 chat
     gate_model: str | None = None
+    # 全局温度供 summary/fast 等非聊天角色使用；chat 温度留空时沿用它。
     temperature: float = 0.8
+    chat_temperature: float | None = None
+    # 聊天单独的轻度重复惩罚；其它角色不默认带此参数。
+    chat_frequency_penalty: float = 0.3
     timeout: float = 60.0
     max_retries: int = 2
     # 角色 → 模型名。预置角色见 MODEL_ROLES，也可写自定义角色。
@@ -313,9 +326,16 @@ class DecisionConfig:
     ratio_threshold: float = 0.20
     ratio_silence: float = 0.60
     ratio_penalty: float = 1.50
-    # 发言后冷却
+    # 发言后冷却（软抑制）
     cooldown_seconds: float = 30.0
     cooldown_penalty: float = 0.60
+    # 活人感节奏闸门：普通消息在不应期内直接不触发；窗口内主动发言封顶
+    exclude_bot_momentum: bool = True
+    refractory_enabled: bool = True
+    refractory_seconds: float = 45.0
+    proactive_window_enabled: bool = True
+    proactive_window_seconds: float = 300.0
+    proactive_window_limit: int = 3
     # 模型输出该标记时静默丢弃
     veto_marker: str = "[不回复]"
     # 每群覆盖：群 id -> 配置
@@ -391,7 +411,7 @@ class EmotionConfig:
 class TwoStageConfig:
     """两段式生成：先「想」再「说」。"""
 
-    # 默认关闭；关时保持原来的单段直出，行为完全不变
+    # 默认允许闲聊碎片省一次 fast 请求；开启则所有档位都走完整两段。
     enabled: bool = False
 
 
@@ -615,6 +635,8 @@ class StickerConfig:
     collect: bool = False
     send_probability: float = 0.15
     cooldown_seconds: float = 300.0
+    # 接梗/短附和时，只发一张表情包的概率；不满足条件时回落文字。
+    nonverbal_probability: float = 0.30
     dir: str = "data/stickers"
 
     def __post_init__(self) -> None:
@@ -623,6 +645,9 @@ class StickerConfig:
         if isinstance(self.send_probability, bool) or not isinstance(self.send_probability, (int, float)):
             self.send_probability = 0.15
         self.send_probability = min(1.0, max(0.0, float(self.send_probability)))
+        if isinstance(self.nonverbal_probability, bool) or not isinstance(self.nonverbal_probability, (int, float)):
+            self.nonverbal_probability = 0.30
+        self.nonverbal_probability = min(1.0, max(0.0, float(self.nonverbal_probability)))
         if isinstance(self.cooldown_seconds, bool) or not isinstance(self.cooldown_seconds, (int, float)):
             self.cooldown_seconds = 300.0
         self.cooldown_seconds = max(0.0, float(self.cooldown_seconds))
@@ -834,6 +859,10 @@ class Config:
     proactive: ProactiveConfig = field(default_factory=ProactiveConfig)
     gateway: GatewayConfig = field(default_factory=GatewayConfig)
     persona_path: str = "data/SOUL.md"
+    persona_examples_path: str = "data/reply_examples.json"
+    persona_examples_enabled: bool = True
+    persona_examples_count: int = 5
+    persona_examples_position: str = "after"
     database_path: str = "data/rubenbot.db"
     adapters: dict[str, Any] = field(default_factory=dict)
     # 后台归纳检查间隔（分钟）
@@ -846,6 +875,15 @@ class Config:
     def enabled_adapters(self) -> list[str]:
         """返回配置中启用（值不为 null/false）的适配器名；``{}`` 也算启用。"""
         return [name for name, opts in self.adapters.items() if opts is not None and opts is not False]
+
+    def persona_example_options(self) -> dict[str, Any]:
+        """启动、热加载和只读预览共用的示例选项。"""
+        return {
+            "examples_path": self.persona_examples_path,
+            "examples_enabled": self.persona_examples_enabled,
+            "examples_count": self.persona_examples_count,
+            "examples_position": self.persona_examples_position,
+        }
 
     def adapter_options(self, name: str) -> dict[str, Any]:
         """某个适配器的配置段；未配置或不是 dict 时返回空 dict。"""
@@ -923,8 +961,14 @@ class Config:
         persona = data.get("persona") or {}
         if isinstance(persona, str):
             persona = {"path": persona}
+        elif not isinstance(persona, dict):
+            persona = {}
         basics = {
             "persona_path": persona.get("path", "data/SOUL.md"),
+            "persona_examples_path": persona.get("examples_path", "data/reply_examples.json"),
+            "persona_examples_enabled": persona.get("examples_enabled", True) is not False,
+            "persona_examples_count": _safe_nonnegative_int(persona.get("examples_count", 5), 5),
+            "persona_examples_position": "before" if persona.get("examples_position") == "before" else "after",
             "database_path": data.get("database_path", "data/rubenbot.db"),
             "adapters": data.get("adapters") or {},
             "background_check_minutes": data.get("background_check_minutes", 5.0),

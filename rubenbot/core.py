@@ -31,6 +31,7 @@ from .adapters.base import (
     render_segments,
 )
 from .adapters.platform import KIND_REQUEST, PlatformEvent
+from .agreement import is_repetitive_agreement
 from .config import Config
 from .decision import (
     BOT_SENDER_ID,
@@ -40,6 +41,7 @@ from .decision import (
     ReplyDecision,
     parse_generation_output,
 )
+from .expression import ExpressionDecision, choose_length_band, is_question, parse_plan, repetition_list
 from .emotion import EmotionEngine
 from .gateway.events import EventBatch, EventMerger, EventRouter, RouteDecision
 from .gateway.judge import EventJudge, EventVerdict, persona_line
@@ -67,30 +69,20 @@ logger = logging.getLogger(__name__)
 ADAPTER_RESTART_MIN = 1.0
 ADAPTER_RESTART_MAX = 30.0
 
-# ---- 两段式生成（默认关闭）----
+# ---- 表达决策书 ----
 # 第一段用快速模型；没配 fast 时由 LLMConfig.model_for 沿回退链落到 chat
 GUIDANCE_ROLE = "fast"
-# 第一段只产出「怎么回」的简短指导，不做正文草稿；远超约定长度就截断
-GUIDANCE_MAX_CHARS = 200
-# 第一段最多等这么久（秒）；再长就直接回退单段，不让指导拖住回复
 GUIDANCE_TIMEOUT_CAP = 15.0
-# 第一段的任务说明：附在正文上下文末尾，只让模型想、不让它说
 GUIDANCE_TASK_PROMPT = (
-    "这条消息已经确定要回了，不用再判断该不该接话。"
-    "现在先不要写回复正文，只替自己想清楚该怎么接：\n"
-    "- 回应什么：这句话真正在说什么、需要接住哪一点\n"
-    "- 态度语气：这轮该用什么样的情绪和分寸\n"
-    "- 要提到的点：必须带上的信息；没有就写「无」\n"
-    "- 要避开的：容易说错、说重或显得敷衍的地方\n"
-    "只写几行要点，总长不超过 150 字；不要写成正文草稿，不要复述聊天记录。"
+    "你是回复前的表达决策器，不写正文。只输出一个 JSON 对象，不要 Markdown。"
+    "字段必须是 intent、length_band、increment、avoid_repetition。\n"
+    "intent 只能从：接梗、补充新信息、反驳、提问、短附和、沉默 中选；"
+    "length_band 只能从：碎片、短句、展开 中选。"
+    "碎片最多10字，短句11-25字，展开26-60字。"
+    "increment 必须用一句话写明这条比上文多什么；写不出就把 intent 改为沉默且 increment 置空。"
+    "avoid_repetition 是数组，列出最近三条 bot 已用观点或措辞，当前回复不要复述。"
+    "严格限长：JSON 总长不超过 500 字。"
 )
-# 第二段末尾的生成指令：指导是内部材料，不能被说出来
-GENERATION_INSTRUCTION = (
-    "现在按上面的内部指导，直接写出这一轮要发出的回复正文；"
-    "如果仍然判断不该接话，照前面的规则处理。"
-    "不要输出思考过程，不要复述或提及这段指导。"
-)
-
 # recall 工具的定义（T2）。没配置搜索时只开放这一个工具，模型不用/失败就退化为单次生成。
 RECALL_TOOL = {
     "type": "function",
@@ -368,6 +360,9 @@ def strip_action_parens(text: str) -> str:
 
 
 _TRANSCRIPT_PREFIX_RE = re.compile(r"^\[\d{1,2}:\d{2}\]\s*\[[^\]]*\]\s*")
+_MARKDOWN_HEADING_RE = re.compile(r"(?m)^\s*#{1,6}\s+")
+_MARKDOWN_LIST_RE = re.compile(r"(?m)^\s*\d+[.)、]\s*")
+_LEADING_NARRATION_RE = re.compile(r"^\s*（[^（）\n]{1,40}）\s*")
 
 
 def strip_transcript_prefix(text: str) -> str:
@@ -379,6 +374,40 @@ def strip_transcript_prefix(text: str) -> str:
     if not text:
         return text
     return _TRANSCRIPT_PREFIX_RE.sub("", text, count=1)
+
+
+def clean_reply_patterns(text: str) -> str:
+    """清理高置信的作文/旁白格式残留，不改正常正文标点。
+
+    这里只处理发送链能确定是格式而非语义的模式：加粗标记、行首标题/列表号，
+    以及整条开头的旁白括号。每条规则命中一次即记一条日志，便于线上回看误伤。
+    """
+    if not text:
+        return text
+    cleaned = text
+    hits: list[str] = []
+    if "**" in cleaned:
+        cleaned = cleaned.replace("**", "")
+        hits.append("markdown_bold")
+    if "__" in cleaned:
+        cleaned = cleaned.replace("__", "")
+        hits.append("markdown_underline")
+    cleaned, count = _MARKDOWN_HEADING_RE.subn("", cleaned)
+    if count:
+        hits.append("markdown_heading")
+    cleaned, count = _MARKDOWN_LIST_RE.subn("", cleaned)
+    if count:
+        hits.append("markdown_list")
+    cleaned, count = _LEADING_NARRATION_RE.subn("", cleaned, count=1)
+    if count:
+        hits.append("leading_narration")
+    # 单条消息中的空行是作文段落，不保留空行；普通单换行仍交给既有断句。
+    if "\n\n" in cleaned:
+        cleaned = re.sub(r"\n{2,}", "\n", cleaned)
+        hits.append("blank_line")
+    for rule in hits:
+        logger.info("出站清洗命中规则 %s", rule)
+    return cleaned.strip()
 
 
 def _strip_segments_actions(segments: list[Segment]) -> list[Segment]:
@@ -1123,6 +1152,7 @@ class RubenBot:
             return False
         self.opener.note_opened(platform, chat_id, now)
         await self.send_proactive(platform, chat_id, reply, now=now)
+        self.decision_engine.note_bot_reply(f"{platform}:{chat_id}", now, proactive=True)
         try:
             self.store.add_decision_log(
                 platform=platform,
@@ -1250,7 +1280,6 @@ class RubenBot:
         self.observe_emotion(event, events=round_.events, now=now)
         decision = self.decide(event, now=now)
         self.last_decision[self.decision_engine.chat_key(event)] = decision
-        self._log_decision(round_, event, decision, now)
         logger.info(
             "决策 %s/%s %s：%s %s",
             event.platform,
@@ -1260,6 +1289,7 @@ class RubenBot:
             decision.log_text(),
         )
         if not decision.should_reply:
+            self._log_decision(event, decision, now)
             return
 
         messages = await self.build_context(event, now=now)
@@ -1275,27 +1305,52 @@ class RubenBot:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("插件 on_before_reply 异常：%s", exc)
 
-        two_stage = bool(self.config.generation.two_stage.enabled)
-        task = "gen_stage2" if two_stage else "chat"
-        guidance = ""
-        if two_stage:
-            # 第一段只「想」：失败/空/超时都退化为单段直出，绝不影响回复
-            guidance = await self.guide_reply(messages)
-            if guidance:
-                messages = self.with_guidance(messages, guidance)
+        expression = await self.plan_expression(messages, event, decision)
+        if expression.intent == "沉默":
+            decision.should_reply = False
+            decision.reason = "expression_silence"
+            self._log_decision(event, decision, now, expression)
+            return
 
-        raw_reply = await self.generate(messages, event=event, task=task)
-        parsed = parse_generation_output(raw_reply, marker)
-        if parsed.vetoed:
-            logger.info(
-                "生成后否决(%s)：%s %s", parsed.reason, event.sender_name, event.text[:40]
-            )
+        proactive = event.is_group and decision.hard_trigger is None
+        if await self.try_sticker_reply(event, expression, proactive=proactive, now=now):
+            self._log_decision(event, decision, now, expression)
+            return
+        messages = [*messages, {"role": "system", "content": expression.prompt_block()}]
+        task = "chat" if expression.source == "fragment" else "gen_stage2"
+        for attempt in range(2):
+            # 重写只改文字，不能再给工具，否则可能重复设提醒或执行平台动作。
+            raw = await self.generate(messages, event=None if attempt else event,
+                                      task="gen_agreement_retry" if attempt else task)
+            body = clean_reply_patterns(strip_transcript_prefix(raw))
+            if self.config.chat.strip_action_parens:
+                body = strip_action_parens(body)
+            parsed = parse_generation_output(body, marker)
+            if parsed.vetoed:
+                decision.should_reply, decision.reason = False, parsed.reason
+                logger.info("生成后否决(%s)：%s/%s", parsed.reason, event.platform, event.chat_id)
+                break
+            if not is_repetitive_agreement(event.text, parsed.text):
+                break
+            logger.info("附和闸门命中：%s/%s，%s", event.platform, event.chat_id,
+                        "重写仍是复述，本轮沉默" if attempt else "尝试一次重写")
+            if attempt:
+                decision.should_reply, decision.reason = False, "agreement_veto"
+            else:
+                messages = [*messages, {"role": "assistant", "content": parsed.text}, {
+                    "role": "system", "content": "刚才的草稿复述了对方。换一个新角度，或只回三个字以内。",
+                }]
+        self._log_decision(event, decision, now, expression)
+        if not decision.should_reply:
             return
         reply = parsed.text
-        if not reply:
-            return
 
-        await self.send_reply(event, reply, now=now)
+        await self.send_reply(
+            event,
+            reply,
+            now=now,
+            proactive=proactive,
+        )
         await self.sticker_behavior.on_after_reply(self.context, event, reply)
         if self.plugins is not None:
             try:
@@ -1303,9 +1358,28 @@ class RubenBot:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("插件 on_after_reply 异常：%s", exc)
 
-    def _log_decision(self, round_: MergedRound, event: MessageEvent, decision: ReplyDecision, now: float) -> None:
-        """把决策写入 decision_log，供 WebUI 展示；写库失败不影响主流程。"""
+    def _log_decision(
+        self,
+        event: MessageEvent,
+        decision: ReplyDecision,
+        now: float,
+        expression: ExpressionDecision | None = None,
+    ) -> None:
+        """把意愿与表达决策合并写入同一条 decision_log。"""
         factors = decision.factors
+        factor_data = {
+            "base": factors.base,
+            "momentum": factors.momentum,
+            "relevance": factors.relevance,
+            "ratio_penalty": factors.ratio_penalty,
+            "cooldown_penalty": factors.cooldown_penalty,
+            "multiplier": factors.multiplier,
+            "noise": factors.noise,
+            "share": factors.share,
+            "mood_adjust": factors.mood_adjust,
+        } if factors is not None else {}
+        if expression is not None:
+            factor_data["expression_decision"] = expression.to_dict()
         try:
             self.store.add_decision_log(
                 platform=event.platform,
@@ -1319,19 +1393,7 @@ class RubenBot:
                 hard_trigger=decision.hard_trigger or "",
                 score=decision.score,
                 threshold=decision.threshold,
-                factors={
-                    "base": factors.base,
-                    "momentum": factors.momentum,
-                    "relevance": factors.relevance,
-                    "ratio_penalty": factors.ratio_penalty,
-                    "cooldown_penalty": factors.cooldown_penalty,
-                    "multiplier": factors.multiplier,
-                    "noise": factors.noise,
-                    "share": factors.share,
-                    "mood_adjust": factors.mood_adjust,
-                }
-                if factors is not None
-                else {},
+                factors=factor_data,
                 now=now,
             )
         except Exception as exc:  # noqa: BLE001 - 观测数据写不进去也不能影响回复
@@ -1867,38 +1929,37 @@ class RubenBot:
     # 生成与发送
     # ------------------------------------------------------------------
 
-    async def guide_reply(self, messages: list[dict[str, str]]) -> str:
-        """两段式的第一段：按与正文相同的上下文，产出一段简短回复指导。
-
-        任何失败（调用异常、超时、空内容）都返回空串，由调用方回退单段直出；
-        这里只记日志，绝不向上抛。用量经由 LLM 客户端记 ``gen_stage1``。
-        """
-        request = list(messages) + [{"role": "user", "content": GUIDANCE_TASK_PROMPT}]
+    async def plan_expression(
+        self, messages: list[dict[str, str]], event: MessageEvent, willingness: ReplyDecision
+    ) -> ExpressionDecision:
+        casual = event.is_group and willingness.hard_trigger is None
+        question = is_question(event.text)
+        band = choose_length_band(
+            self.rng.random(), mentioned_question=event.mentions_bot and question, casual_group=casual,
+        )
+        recent = [item.text for item in self.store.recent_messages(
+            event.chat_id, platform=event.platform, chat_type=event.chat_type,
+            sender_id=BOT_SENDER_ID, limit=3,
+        )]
+        if casual and not question and band == "碎片" and not self.config.generation.two_stage.enabled:
+            return ExpressionDecision("短附和", band, "", repetition_list(recent), "fragment")
+        prompt = (GUIDANCE_TASK_PROMPT + f"\n本轮已掷档：{band}，不要改档。"
+                  + "最近三条自己的发言：" + json.dumps([t[:160] for t in recent], ensure_ascii=False))
+        request = [*messages, {"role": "user", "content": prompt}]
         try:
-            text = await asyncio.wait_for(
-                self.llm.complete(request, role=GUIDANCE_ROLE, task="gen_stage1"),
+            raw = await asyncio.wait_for(
+                self.llm.complete(
+                    request, role=GUIDANCE_ROLE, task="gen_stage1", json_mode=True,
+                    **({"max_tokens": 256} if self._accepts_kwarg(self.llm.complete, "max_tokens") else {}),
+                ),
                 timeout=self.guidance_timeout(),
             )
-        except asyncio.TimeoutError:
-            logger.warning("两段式第一段超时（%.1fs），回退单段直出", self.guidance_timeout())
-            return ""
-        except Exception as exc:  # noqa: BLE001 - 指导失败不能拖垮回复
-            logger.warning("两段式第一段失败，回退单段直出：%s", exc)
-            return ""
-        guidance = (text or "").strip()
-        if not guidance:
-            logger.info("两段式第一段返回空内容，回退单段直出")
-            return ""
-        marker = self.config.decision.veto_marker
-        if marker and marker in guidance:
-            # 第一段顺着上下文里的「可以不接话」出口回了否决标记：这不是指导
-            logger.info("两段式第一段只返回了否决标记，回退单段直出")
-            return ""
-        if len(guidance) > GUIDANCE_MAX_CHARS:
-            # 明显跑偏成了草稿：宁可截断也不要让第二段照抄
-            guidance = guidance[:GUIDANCE_MAX_CHARS].rstrip()
-        logger.debug("两段式第一段指导：%s", guidance)
-        return guidance
+        except Exception as exc:  # 决策服务故障只允许短呼应，不放开到无约束正文
+            logger.warning("表达决策书不可用，降级碎片：%s", exc)
+            raw = ""
+        if raw and raw.strip() and parse_generation_output(raw, self.config.decision.veto_marker).vetoed:
+            return ExpressionDecision("沉默", band, "", repetition_list(recent))
+        return parse_plan(raw or "", band, recent)
 
     def guidance_timeout(self) -> float:
         """第一段的等待上限：不超过客户端超时，也不超过固定上限。"""
@@ -1906,18 +1967,6 @@ class RubenBot:
         if configured <= 0:
             return GUIDANCE_TIMEOUT_CAP
         return max(0.1, min(configured, GUIDANCE_TIMEOUT_CAP))
-
-    @staticmethod
-    def with_guidance(
-        messages: list[dict[str, str]], guidance: str
-    ) -> list[dict[str, str]]:
-        """把指导插到历史之后、生成指令之前，标注为内部材料、不要复述。"""
-        block = (
-            "下面是给你自己的内部回复指导，只用来决定怎么说，不要复述、不要提及：\n"
-            f"{guidance}\n\n"
-            f"{GENERATION_INSTRUCTION}"
-        )
-        return list(messages) + [{"role": "system", "content": block}]
 
     async def send_proactive(
         self,
@@ -2170,7 +2219,7 @@ class RubenBot:
         短回复（不超过一条上限）不拆；切句时避开括号、引号、颜文字、URL
         与行内代码，不会从它们中间断开。贪心合并到接近 ``split_part_chars``。
         """
-        reply = reply.strip()
+        reply = clean_reply_patterns(strip_transcript_prefix(reply.strip()))
         if not reply:
             return []
         max_parts = max(1, self.config.chat.split_max_parts)
@@ -2204,12 +2253,34 @@ class RubenBot:
         cap = max(0.0, float(self.config.chat.type_delay_max_seconds))
         return min(raw * speed, cap) if speed > 0 else 0.0
 
+    async def try_sticker_reply(
+        self, event: MessageEvent, expression: ExpressionDecision | None, *, proactive: bool, now: float,
+    ) -> bool:
+        """接梗或短附和时尝试只发表情；未发出就交还文字生成路径。"""
+        if expression is None or expression.intent not in ("接梗", "短附和"):
+            return False
+        if not await self.sticker_behavior.try_send(
+            self.context, event, probability=self.config.stickers.nonverbal_probability,
+        ):
+            return False
+        reply = "[表情]"
+        self._record_bot_message(event, reply, None)
+        self.decision_engine.note_bot_reply(self.decision_engine.chat_key(event), now, proactive=proactive)
+        self.note_emotion_after_reply(event, now=now)
+        if self.plugins is not None:
+            try:
+                await self.plugins.run_after_reply(self.context, event, reply)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("插件 on_after_reply 异常：%s", exc)
+        return True
+
     async def send_reply(
         self,
         event: MessageEvent,
         reply: str | list[Segment] | list[dict[str, Any]],
         *,
         now: float | None = None,
+        proactive: bool = False,
     ) -> None:
         """拆条发送，并把 bot 自己的话写进流水（``processed=True``，不参与记忆抽取）。
 
@@ -2227,8 +2298,6 @@ class RubenBot:
         voice_mime = "audio/mpeg"
         if isinstance(reply, str):
             text_reply = strip_action_parens(reply) if strip_actions else reply
-            # 模型可能模仿历史格式把转录行前缀一起生成出来，发送前剥掉兜底
-            text_reply = strip_transcript_prefix(text_reply)
             parts: list[list[Segment]] = [[Segment.text(part)] for part in self.split_reply(text_reply)]
             if len(parts) == 1:
                 voice_audio, voice_mime = await self.synthesize_reply(event, text_reply)
@@ -2246,8 +2315,9 @@ class RubenBot:
             ok, sent_id = await self._send_voice(adapter, event, text, voice_audio, voice_mime)
             if ok:
                 self._record_bot_message(event, text, sent_id)
-                self.decision_engine.note_reply(
-                    self.decision_engine.chat_key(event), time.time() if now is None else now
+                self.decision_engine.note_bot_reply(
+                    self.decision_engine.chat_key(event), time.time() if now is None else now,
+                    proactive=proactive,
                 )
                 return
         for index, segments in enumerate(parts):
@@ -2263,7 +2333,10 @@ class RubenBot:
                 continue
             self._record_bot_message(event, text, message_id)
         # 发言时间交给决策引擎：动量加成与发言后冷却都依赖它
-        self.decision_engine.note_reply(self.decision_engine.chat_key(event), time.time() if now is None else now)
+        self.decision_engine.note_bot_reply(
+            self.decision_engine.chat_key(event), time.time() if now is None else now,
+            proactive=proactive,
+        )
         # 情绪侧：刚说过话 = 有人理；群里热闹就兴奋一下
         self.note_emotion_after_reply(event, now=now)
 

@@ -92,7 +92,7 @@ def build_adapters(config: Config):
 def build_bot(config: Config) -> tuple[RubenBot, LLMClient, MemoryStore]:
     store = MemoryStore(config.database_path)
     llm = LLMClient(config.llm, usage_recorder=make_usage_recorder(store))
-    persona = load_persona(config.persona_path)
+    persona = load_persona(config.persona_path, **config.persona_example_options())
     plugins = PluginManager(config, store)
     try:
         loaded = plugins.load_all()

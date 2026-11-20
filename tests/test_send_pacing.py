@@ -11,6 +11,7 @@ from rubenbot.core import (
     split_sentences,
     strip_action_parens,
     strip_transcript_prefix,
+    clean_reply_patterns,
 )
 from rubenbot.decision import MessageMerger
 from rubenbot.persona import Persona
@@ -193,6 +194,28 @@ def test_send_reply_strips_transcript_prefix(config, store):
     bot, adapter = make_bot(config, store)
     asyncio.run(bot.send_reply(group_event(), "[10:00] [我] 全局记忆这块你真搞出来了？"))
     assert adapter.texts == ["全局记忆这块你真搞出来了？"]
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("**重点**内容", "重点内容"),
+        ("# 标题\n正文", "标题\n正文"),
+        ("1. 第一条\n2、第二条", "第一条\n第二条"),
+        ("（小声）先说。\n\n再说。", "先说。\n再说。"),
+        ("正常（补充）标点", "正常（补充）标点"),
+    ],
+)
+def test_clean_reply_patterns_only_removes_high_confidence_formats(text, expected):
+    assert clean_reply_patterns(text) == expected
+
+
+def test_send_reply_cleans_patterns_before_splitting(config, store):
+    config.chat.split_part_chars = 10
+    bot, adapter = make_bot(config, store)
+    asyncio.run(bot.send_reply(group_event(), "**第一句。**\n\n第二句。"))
+    assert "**" not in "".join(adapter.texts)
+    assert "\n\n" not in "".join(adapter.texts)
 
 
 def test_send_reply_only_prefix_not_sent(config, store):

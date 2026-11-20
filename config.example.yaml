@@ -21,6 +21,10 @@ llm:
 
 persona:
   path: "data/SOUL.md"
+  examples_enabled: true                    # 注入「我说话的样子」，不改人格文件
+  examples_path: "data/reply_examples.json" # 可编辑 JSON 数组，每项是短回复字符串或带 text 的对象
+  examples_count: 5                         # 按文件顺序最多取几条（不足就全取，0 不注入）
+  examples_position: "after"                # before 在人格正文前，after 在正文后
 
 database_path: "data/rubenbot.db"
 
@@ -175,8 +179,8 @@ decision:
 
 # 回复生成策略：决定要回之后，正文怎么写
 generation:
-  # 两段式生成：先让 fast 角色（没配则跟随 chat）写一段简短指导，再按指导写正文。
-  # 默认关闭；第一段失败/超时/空内容都会自动回退单段直出。
+  # 默认先掷长度档并生成表达决策书；闲聊碎片可省一次 fast 调用。
+  # true 表示即使闲聊碎片也调用 fast；不是表达决策的总开关。
   two_stage:
     enabled: false
 # 提醒工具（模型工具 set_reminder）：只回应用户明确说「提醒我」的请求
@@ -255,11 +259,13 @@ plugins:
   command_prefix: "/"
 
 stickers:
-  # 核心表情包行为默认关闭；打开 enabled 后才会收集/补发表情。
+  # 核心表情包行为默认关闭；打开 enabled 后以下设置才生效。
   enabled: false
   collect: false
-  send_probability: 0.15
-  cooldown_seconds: 300
+  send_probability: 0.15  # 文字回复后补发的概率
+  # 接梗或短附和时只发一张表情的概率；库空、冷却中、发送失败时照常回文字。
+  nonverbal_probability: 0.30
+  cooldown_seconds: 300  # 两种发表情方式共用的会话冷却
   # 表情库目录：图片本体放 files/，索引是 index.json（运行时数据，已在 .gitignore 里排除）。
   dir: "data/stickers"
 

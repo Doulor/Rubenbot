@@ -118,6 +118,8 @@ def test_structured_config_covers_every_field(config):
             "consolidate_model",
             "models",
             "temperature",
+            "chat_temperature",
+            "chat_frequency_penalty",
             "timeout",
             "max_retries",
         ],
@@ -165,6 +167,12 @@ def test_structured_config_covers_every_field(config):
             "ratio_penalty",
             "cooldown_seconds",
             "cooldown_penalty",
+            "exclude_bot_momentum",
+            "refractory_enabled",
+            "refractory_seconds",
+            "proactive_window_enabled",
+            "proactive_window_seconds",
+            "proactive_window_limit",
             "veto_marker",
             "groups",
         ],
@@ -250,7 +258,7 @@ def test_settings_layout_pages_and_groups():
     emoji = next(page for page in groups["bot"]["pages"] if page["id"] == "emoji")
     assert "empty" not in emoji
     assigned = assign_pages(structured_config(Config()))
-    assert {"stickers.enabled", "stickers.collect", "stickers.send_probability", "stickers.cooldown_seconds"} <= set(assigned["emoji"])
+    assert {"stickers.enabled", "stickers.collect", "stickers.send_probability", "stickers.nonverbal_probability", "stickers.cooldown_seconds"} <= set(assigned["emoji"])
     # 人设页是 SOUL 编辑器，没有结构化字段
     assert "persona" not in assign_pages(structured_config(Config()))
 
@@ -294,6 +302,14 @@ def test_structured_config_view_paths_unchanged(config):
     assert "memory.rolling_summary.enabled" in field_paths(view)
     # secrets 是密钥标记，不算配置字段
     assert "secrets" not in field_paths(view)
+
+
+def test_nonverbal_probability_round_trip():
+    update = validate_structured({"stickers": {"nonverbal_probability": 0.72}})
+    assert structured_config(Config.from_dict(update))["stickers"]["nonverbal_probability"] == 0.72
+    for invalid in (-0.1, 1.1):
+        with pytest.raises(ConfigValidationError):
+            validate_structured({"stickers": {"nonverbal_probability": invalid}})
 
 
 def test_validate_structured_models_map():

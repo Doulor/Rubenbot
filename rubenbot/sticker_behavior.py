@@ -1,4 +1,4 @@
-"""核心表情包行为：收集消息里的表情，并在回复后按规则补发表情。"""
+"""核心表情包行为：收集群聊表情，按话题选图用于独立回复或文字后补发。"""
 
 from __future__ import annotations
 
@@ -87,36 +87,38 @@ class StickerBehavior:
 
     async def on_after_reply(self, runtime: Any, event: Any, reply: str) -> None:
         """在 core 发送完回复后按概率/冷却补一张表情。"""
+        await self.try_send(runtime, event, probability=self.config.send_probability)
+
+    async def try_send(self, runtime: Any, event: Any, *, probability: float) -> bool:
+        """独立回复与文字后补发共用选图、冷却和发送；只有能力调用成功才算已发。"""
         try:
-            if not self.enabled:
-                return
-            probability = getattr(self.config, "send_probability", 0.15)
-            if self.rng.random() >= probability:
-                return
+            if not self.enabled or self.rng.random() >= probability:
+                return False
             now = self.clock()
             if self._in_cooldown(event, now):
-                return
+                return False
+            bot = _resolve_bot(runtime)
+            platform = event.platform
+            if bot is None or not _can_send(bot, platform):
+                return False
             store = self.store
             if store is None:
-                return
-            sticker = self._pick(store, getattr(event, "text", "") or "")
+                return False
+            sticker = self._pick(store, event.text or "")
             if sticker is None:
-                return
-            bot = _resolve_bot(runtime)
-            if bot is None:
-                return
-            adapter_name = _select_adapter(bot, str(getattr(event, "platform", "") or ""), SEND_STICKER)
-            if adapter_name is None:
-                return
+                return False
+            # 冷却按尝试计，避免平台故障时每轮重试；它不是发言额度。
             self._last_sent_at[_chat_key(event)] = now
             ok, reason = await bot.call_capability(
-                adapter_name, SEND_STICKER, sticker=store.reference(sticker),
-                chat_id=getattr(event, "chat_id", ""), chat_type=getattr(event, "chat_type", "group"),
+                platform, SEND_STICKER, sticker=store.reference(sticker),
+                chat_id=event.chat_id, chat_type=event.chat_type,
             )
             if not ok:
                 logger.debug("发表情失败（忽略）：%s", reason)
+            return ok
         except Exception as exc:  # noqa: BLE001
             logger.debug("表情包发送异常：%s", exc)
+            return False
 
     def _in_cooldown(self, event: Any, now: float) -> bool:
         last = self._last_sent_at.get(_chat_key(event))
@@ -171,25 +173,16 @@ def _resolve_bot(runtime: Any) -> Any:
     return runtime if hasattr(runtime, "call_capability") else None
 
 
-def _select_adapter(bot: Any, platform: str, capability: str) -> str | None:
-    adapters = getattr(bot, "adapters", None)
-    if not isinstance(adapters, dict) or not adapters:
-        return None
-    candidates = [adapters[platform]] if platform in adapters else list(adapters.values())
-    config = getattr(bot, "config", None)
-    for adapter in candidates:
-        if capability not in (getattr(adapter, "capabilities", frozenset()) or ()):
-            continue
-        config_key = (getattr(adapter, "capability_config_keys", None) or {}).get(capability)
-        if config_key and config is not None:
-            default = (getattr(adapter, "capability_defaults", None) or {}).get(capability, True)
-            try:
-                if not config.adapter_capability_enabled(adapter.name, config_key, default=default):
-                    continue
-            except Exception:  # noqa: BLE001
-                continue
-        return adapter.name
-    return None
+def _can_send(bot: Any, platform: str) -> bool:
+    # chat_id 只在来源平台上有意义，不能让能力层改走别的在线适配器。
+    adapter = bot.adapters.get(platform)
+    if adapter is None or SEND_STICKER not in adapter.capabilities:
+        return False
+    key = adapter.capability_config_keys.get(SEND_STICKER)
+    if not key:
+        return True
+    default = adapter.capability_defaults.get(SEND_STICKER, True)
+    return bot.config.adapter_capability_enabled(platform, key, default=default)
 
 
 def _chat_key(event: Any) -> tuple[str, str]:

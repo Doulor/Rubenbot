@@ -386,6 +386,10 @@ class DecisionEngine:
         self.aliases = cleaned
         self._alias_patterns = [(_compile_alias(a), a) for a in cleaned]
         self._last_reply_at: dict[str, float] = {}
+        self._last_momentum_at: dict[str, float] = {}
+        self._last_bot_reply_at: dict[str, float] = {}
+        self._last_refractory_at: dict[str, float] = {}
+        self._active_replies: dict[str, list[float]] = {}
 
     def set_aliases(self, aliases: Iterable[str]) -> None:
         """替换硬触发的名字/别名（配置热更新用，不改评分逻辑）。"""
@@ -426,9 +430,36 @@ class DecisionEngine:
     def chat_key(event: MessageEvent) -> str:
         return f"{event.platform}:{event.chat_id}"
 
-    def note_reply(self, chat_key: str, now: float) -> None:
-        """记录 bot 在某个会话发言的时间（动量与冷却都用它）。"""
+    def note_reply(
+        self,
+        chat_key: str,
+        now: float,
+        *,
+        proactive: bool = False,
+        momentum: bool = True,
+    ) -> None:
+        """记录 bot 发言；主动发言才入窗口，``momentum`` 可排除 bot 自己的动量。"""
         self._last_reply_at[chat_key] = now
+        self._last_bot_reply_at[chat_key] = now
+        if momentum:
+            self._last_momentum_at[chat_key] = now
+        if proactive:
+            self._active_replies.setdefault(chat_key, []).append(now)
+
+    def note_bot_reply(self, chat_key: str, now: float, *, proactive: bool = False) -> None:
+        """记录真实出站 bot 消息，并启用活人感节奏闸门。"""
+        self.note_reply(chat_key, now, proactive=proactive, momentum=False)
+        self._last_refractory_at[chat_key] = now
+
+    def active_reply_count(self, chat_key: str, now: float) -> int:
+        """返回滚动窗口内的主动发言次数，并顺手淘汰过期时间戳。"""
+        window = max(0.0, float(self.config.proactive_window_seconds))
+        values = self._active_replies.get(chat_key, [])
+        if window <= 0:
+            return 0
+        values = [value for value in values if now - value < window]
+        self._active_replies[chat_key] = values
+        return len(values)
 
     def last_reply_at(self, chat_key: str) -> float | None:
         return self._last_reply_at.get(chat_key)
@@ -527,12 +558,28 @@ class DecisionEngine:
                 False, "quiet_hours", 0.0, threshold, None, factors
             )
 
-        # 对话动量：刚参与过这个会话，对方还在继续说，加分随时间指数衰减
+        # 对话动量：刚参与过这个会话，对方还在继续说，加分随时间指数衰减。
+        # bot 自己的流水不会调用 evaluate，因此这里的状态只由真实 bot 回复写入；
+        # 配置开关保留为显式语义，方便关闭这项修正做 A/B。
         last_reply = self._last_reply_at.get(chat_key)
         elapsed = None if last_reply is None else max(0.0, now - last_reply)
-        if elapsed is not None and cfg.momentum_bonus > 0:
+        momentum_at = self._last_momentum_at.get(chat_key)
+        momentum_elapsed = None if momentum_at is None else max(0.0, now - momentum_at)
+        if momentum_elapsed is not None and cfg.momentum_bonus > 0:
             half_life = max(1.0, cfg.momentum_half_life_seconds)
-            factors.momentum = cfg.momentum_bonus * (0.5 ** (elapsed / half_life))
+            factors.momentum = cfg.momentum_bonus * (0.5 ** (momentum_elapsed / half_life))
+
+        refractory_at = self._last_refractory_at.get(chat_key)
+        refractory_elapsed = None if refractory_at is None else max(0.0, now - refractory_at)
+        if cfg.refractory_enabled and cfg.refractory_seconds > 0 and refractory_elapsed is not None:
+            if refractory_elapsed < cfg.refractory_seconds:
+                factors.score = 0.0
+                return ReplyDecision(False, "refractory", 0.0, threshold, None, factors)
+
+        if cfg.proactive_window_enabled and cfg.proactive_window_limit >= 0:
+            if self.active_reply_count(chat_key, now) >= cfg.proactive_window_limit:
+                factors.score = 0.0
+                return ReplyDecision(False, "proactive_window", 0.0, threshold, None, factors)
 
         # 话题相关性：记忆检索最高分归一化后加分
         if cfg.relevance_bonus > 0 and cfg.relevance_scale > 0 and relevance > 0:

@@ -5,9 +5,17 @@ from __future__ import annotations
 import asyncio
 import base64
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
-from rubenbot.adapters.base import MessageEvent, Segment
+import pytest
+
+from conftest import RecordingAdapter, ScriptedLLM
+from rubenbot.adapters.base import SEND_STICKER, MessageEvent, Segment
 from rubenbot.config import Config
+from rubenbot.core import RubenBot
+from rubenbot.decision import BOT_SENDER_ID
+from rubenbot.expression import ExpressionDecision
+from rubenbot.persona import Persona
 from rubenbot.sticker_behavior import StickerBehavior
 from rubenbot.stickers import StickerStore
 
@@ -270,3 +278,113 @@ def test_probability_config_is_clamped():
     cfg = Config.from_dict({"stickers": {"enabled": True, "collect": True, "send_probability": 4, "cooldown_seconds": -1}})
     assert cfg.stickers.enabled and cfg.stickers.collect
     assert cfg.stickers.send_probability == 1.0 and cfg.stickers.cooldown_seconds == 0.0
+
+
+@pytest.mark.parametrize("value, expected", [(-1, 0.0), (4, 1.0), (0.25, 0.25), (True, 0.30)])
+def test_nonverbal_probability_config(value, expected):
+    assert Config().stickers.nonverbal_probability == 0.30
+    assert Config.from_dict({"stickers": {"nonverbal_probability": value}}).stickers.nonverbal_probability == expected
+
+
+def test_unknown_platform_never_uses_another_adapter(tmp_path):
+    store = StickerStore(tmp_path / "stickers")
+    store.add(b"one")
+    bot = Bot(store, [Adapter(name="another")])
+    asyncio.run(make_behavior(store).on_after_reply(runtime(bot), event(), "嗯"))
+    assert not bot.calls
+
+
+class StickerAdapter(RecordingAdapter):
+    name = "snowluma"
+    capabilities = frozenset({SEND_STICKER})
+
+
+def sticker_bot(config, store, tmp_path, *, intent="接梗"):
+    config.stickers.enabled = True
+    config.stickers.dir = str(tmp_path / "stickers")
+    config.stickers.nonverbal_probability = 1.0
+    config.stickers.send_probability = 0.0
+    config.generation.two_stage.enabled = True
+    llm = ScriptedLLM({"fast": ['{"intent":"%s","increment":"接住猫猫梗"}' % intent], "chat": ["路过一只"]})
+    bot = RubenBot(config, store, llm, Persona("Ruben", "你是 Ruben。"))
+    adapter = StickerAdapter()
+    adapter.call_capability = AsyncMock(return_value={})
+    bot.register_adapter(adapter)
+    return bot, adapter
+
+
+def bot_messages(store):
+    return [row for row in store.recent_messages("g1", platform="snowluma") if row.sender_id == BOT_SENDER_ID]
+
+
+@pytest.mark.parametrize("intent,proactive", [("接梗", True), ("短附和", False)])
+def test_sticker_reply_records_success_once(config, store, tmp_path, intent, proactive):
+    bot, adapter = sticker_bot(config, store, tmp_path)
+    bot.stickers.add(b"dog", tags=["狗狗"])
+    tagged = bot.stickers.add(b"cat", tags=["猫猫"])
+    bot.plugins = SimpleNamespace(run_after_reply=AsyncMock(side_effect=RuntimeError("插件故障")))
+    incoming = event("猫猫")
+    decision = ExpressionDecision(intent, "碎片", "接梗", ())
+    assert asyncio.run(bot.try_sticker_reply(incoming, decision, proactive=proactive, now=100.0))
+    # 即使文字补发概率不为零，冷却也必须和纯表情回复共用。
+    config.stickers.send_probability = 1.0
+    asyncio.run(bot.sticker_behavior.on_after_reply(bot.context, incoming, "嗯"))
+    adapter.call_capability.assert_awaited_once()
+    args, kwargs = adapter.call_capability.await_args
+    assert args == (SEND_STICKER,) and kwargs["sticker"]["id"] == tagged.id
+    assert (kwargs["chat_id"], kwargs["chat_type"]) == ("g1", "group")
+    assert [msg.text for msg in bot_messages(store)] == ["[表情]"]
+    assert not store.pending_senders()
+    assert bot.decision_engine.last_reply_at("snowluma:g1") == 100.0
+    assert bot.decision_engine.active_reply_count("snowluma:g1", 100.0) == int(proactive)
+    assert bot.decide(incoming, now=101.0).reason == "refractory"
+    bot.plugins.run_after_reply.assert_awaited_once_with(bot.context, incoming, "[表情]")
+    assert not adapter.sent
+
+
+@pytest.mark.parametrize("scenario", ["disabled", "empty", "miss", "ineligible", "absent", "unsupported", "failed"])
+def test_sticker_reply_fallback_does_not_count_as_speech(config, store, tmp_path, scenario):
+    bot, adapter = sticker_bot(config, store, tmp_path)
+    if scenario not in ("disabled", "empty"):
+        bot.stickers.add(b"cat")
+    if scenario == "disabled":
+        config.stickers.enabled = False
+    elif scenario == "miss":
+        config.stickers.nonverbal_probability = 0.0
+    elif scenario == "unsupported":
+        adapter.capabilities = frozenset()
+    elif scenario == "failed":
+        adapter.call_capability.side_effect = RuntimeError("未发出")
+    intent = "提问" if scenario == "ineligible" else "短附和"
+    decision = None if scenario == "absent" else ExpressionDecision(intent, "短句", "接住话题", ())
+    bot.plugins = SimpleNamespace(run_after_reply=AsyncMock())
+    assert not asyncio.run(bot.try_sticker_reply(event(), decision, proactive=True, now=100.0))
+    assert adapter.call_capability.await_count == int(scenario == "failed")
+    assert not bot_messages(store)
+    assert bot.decision_engine.last_reply_at("snowluma:g1") is None
+    assert bot.decision_engine.active_reply_count("snowluma:g1", 100.0) == 0
+    bot.plugins.run_after_reply.assert_not_awaited()
+    if scenario == "disabled":
+        assert not (tmp_path / "stickers").exists()
+
+
+@pytest.mark.parametrize("scenario", ["success", "empty", "disabled", "failed", "other_intent"])
+def test_nonverbal_reply_through_handle_event(config, store, tmp_path, scenario):
+    bot, adapter = sticker_bot(config, store, tmp_path, intent="提问" if scenario == "other_intent" else "接梗")
+    if scenario != "empty":
+        bot.stickers.add(b"cat", tags=["猫猫"])
+    if scenario == "disabled":
+        config.stickers.enabled = False
+    if scenario == "failed":
+        adapter.call_capability.side_effect = RuntimeError("未发出")
+    # 普通群消息确定性地通过意愿评分，验证接线也传递了主动插话标记。
+    config.decision.base = 1.0
+    config.decision.threshold = 0.1
+    asyncio.run(bot.handle_event(event("猫猫")))
+    key = "snowluma:g1"
+    assert bot.decision_engine.active_reply_count(key, bot.decision_engine.last_reply_at(key)) == 1
+    assert adapter.call_capability.await_count == int(scenario in ("success", "failed"))
+    expected_text = [] if scenario == "success" else ["路过一只"]
+    assert adapter.texts == expected_text
+    assert len(bot.llm.chat_messages) == len(expected_text)
+    assert [msg.text for msg in bot_messages(store)] == (expected_text or ["[表情]"])

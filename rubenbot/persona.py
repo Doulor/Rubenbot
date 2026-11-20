@@ -6,8 +6,10 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 DEFAULT_PERSONA = """# SOUL
 
@@ -38,19 +40,59 @@ DEFAULT_PERSONA = """# SOUL
 """
 
 
+DEFAULT_EXAMPLES_PATH = "data/reply_examples.json"
+
+
 @dataclass
 class Persona:
     """已加载的人格。"""
 
     name: str
     text: str
+    examples_path: str | Path | None = DEFAULT_EXAMPLES_PATH
+    examples_enabled: bool = True
+    examples_count: int = 5
+    examples_position: str = "after"
 
     def system_prompt(self) -> str:
-        """渲染为系统提示词。"""
-        return self.text.strip() + "\n"
+        """渲染人格，并按配置注入可编辑的说话示例。"""
+        prompt = self.text.strip()
+        if self.examples_enabled:
+            examples = load_reply_examples(self.examples_path, limit=self.examples_count)
+            if examples:
+                section = "## 我说话的样子\n" + "\n".join(f"- {item}" for item in examples)
+                parts = (section, prompt) if self.examples_position == "before" else (prompt, section)
+                prompt = "\n\n".join(parts)
+        return prompt + "\n"
 
 
-def load_persona(path: str | Path) -> Persona:
+def load_reply_examples(path: str | Path | None = DEFAULT_EXAMPLES_PATH, *, limit: int = 5) -> list[str]:
+    """读取示例文件；坏文件或空文件只返回空列表。"""
+    if not path or limit <= 0:
+        return []
+    try:
+        data: Any = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    result: list[str] = []
+    for item in data:
+        value = item.get("text") if isinstance(item, dict) else item
+        if not isinstance(value, str):
+            continue
+        text = " ".join(value.split())
+        if text and text not in result:
+            result.append(text)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def load_persona(
+    path: str | Path, *, examples_path: str | Path | None = DEFAULT_EXAMPLES_PATH,
+    examples_enabled: bool = True, examples_count: int = 5, examples_position: str = "after",
+) -> Persona:
     """读取人格文件；不存在时写入默认人格并返回。"""
     file = Path(path)
     if not file.exists():
@@ -59,7 +101,14 @@ def load_persona(path: str | Path) -> Persona:
         text = DEFAULT_PERSONA
     else:
         text = file.read_text(encoding="utf-8")
-    return Persona(name=_extract_name(text), text=text)
+    return Persona(
+        name=_extract_name(text),
+        text=text,
+        examples_path=examples_path,
+        examples_enabled=examples_enabled is not False,
+        examples_count=examples_count,
+        examples_position=examples_position,
+    )
 
 
 def _extract_name(text: str) -> str:

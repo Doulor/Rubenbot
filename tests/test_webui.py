@@ -888,6 +888,53 @@ def test_persona_preview_includes_scene(config, store):
     assert preview["source"] == "file"
 
 
+def test_persona_example_preview_without_bot(client, config, tmp_path):
+    examples = tmp_path / "examples.json"
+    examples.write_text('["只读预览"]', encoding="utf-8")
+    config.persona_examples_path = str(examples)
+    config.persona_examples_position = "before"
+    prompt = client.get("/api/persona/preview").json()["prompt"]
+    assert prompt.index("只读预览") < prompt.index("# SOUL")
+    assert not Path(config.persona_path).exists()
+    config.persona_examples_enabled = False
+    assert "我说话的样子" not in client.get("/api/persona/preview").json()["prompt"]
+
+
+def test_persona_examples_startup_and_hot_reload(tmp_path):
+    import asyncio
+
+    from rubenbot.__main__ import build_bot
+
+    config_path = tmp_path / "config.yaml"
+    soul = tmp_path / "SOUL.md"
+    soul.write_text("# 旧人格", encoding="utf-8")
+    config_path.write_text(f"persona: {soul}\ndatabase_path: ':memory:'\n", encoding="utf-8")
+    bot, llm, store = build_bot(Config.load(config_path))
+    try:
+        assert bot.persona.system_prompt().startswith("# 旧人格\n\n## 我说话的样子")
+        examples = tmp_path / "examples.json"
+        examples.write_text('["新示例", "第二条"]', encoding="utf-8")
+        options = {"examples_path": str(examples), "examples_count": 1, "examples_position": "before"}
+        with TestClient(create_app(WebState.from_bot(bot, config_path))) as c:
+            result = c.put("/api/config", json={"config": {"persona": options}}).json()
+            assert result["requires_restart"] == []
+            assert result["applied"] == ["persona"]
+            assert result["resolution"] == {f"persona.{key}": "hot" for key in options}
+            assert result["structured"]["persona"] == {"path": str(soul), "examples_enabled": True, **options}
+            assert bot.context.persona.system_prompt() == "## 我说话的样子\n- 新示例\n\n# 旧人格\n"
+            assert c.put("/api/persona", json={"text": "# 新人格"}).json()["applied"]
+            prompt = bot.persona.system_prompt()
+            assert prompt == "## 我说话的样子\n- 新示例\n\n# 新人格\n"
+            assert c.get("/api/persona/preview").json()["prompt"].startswith(prompt)
+            invalid = c.put("/api/config", json={"config": {"persona": {"examples_position": "middle"}}})
+            assert invalid.status_code == 422
+            c.put("/api/config", json={"config": {"persona": {"examples_enabled": False}}}).raise_for_status()
+            assert bot.persona.system_prompt() == "# 新人格\n"
+    finally:
+        asyncio.run(llm.close())
+        store.close()
+
+
 def test_persona_hot_reload_into_running_bot(config, store):
     """运行中的 bot PUT 新人设后，build_context 拼出的系统提示词立即包含新文本。"""
     import asyncio

@@ -176,7 +176,7 @@ def test_history_and_memory_in_context(config, store):
     assert "阿花" in system["content"]  # 说话人信息
     # 历史消息按「[HH:MM] [昵称] 正文」渲染
     assert any(re.match(r"\[\d{2}:\d{2}\] \[阿草\] 今天听歌吗$", m["content"]) for m in messages)
-    assert re.match(r"\[\d{2}:\d{2}\] \[阿花\] 最近在听坂本龙一$", messages[-1]["content"])
+    assert re.match(r"\[\d{2}:\d{2}\] \[阿花\] 最近在听坂本龙一$", messages[-2]["content"])
 
 
 def test_llm_failure_does_not_crash(config, store):
@@ -485,8 +485,8 @@ def test_llm_client_records_usage_with_task_labels(config, store):
     asyncio.run(client.close())
 
     by_task = {item["task"]: item for item in store.usage_by_task()}
-    assert "chat" in by_task
+    assert "gen_stage1" in by_task and "gen_stage2" in by_task
     assert "extract" in by_task
-    assert by_task["chat"]["total_tokens"] == 7
+    assert by_task["gen_stage2"]["total_tokens"] == 7
     assert by_task["extract"]["total_tokens"] == 7
-    assert store.usage_totals()["calls"] == 2
+    assert store.usage_totals()["calls"] == 3

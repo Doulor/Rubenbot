@@ -136,6 +136,10 @@ _SETTINGS_PAGE_RULES: tuple[tuple[str, str], ...] = (
     ("webui", "system"),
     ("plugins", "system"),
     ("market", "system"),
+    ("persona.examples_enabled", "expression"),
+    ("persona.examples_path", "expression"),
+    ("persona.examples_count", "expression"),
+    ("persona.examples_position", "expression"),
     ("persona.path", "system"),
     ("database_path", "system"),
     ("background_check_minutes", "system"),
@@ -240,7 +244,7 @@ def structured_config(config: Config) -> dict[str, Any]:
 
     return {
         "llm": {**llm, "api_key": ""},
-        "persona": {"path": config.persona_path},
+        "persona": {"path": config.persona_path, **config.persona_example_options()},
         "database_path": config.database_path,
         "memory": asdict(config.memory),
         "search": search,
@@ -262,6 +266,7 @@ def structured_config(config: Config) -> dict[str, Any]:
             "enabled": config.stickers.enabled,
             "collect": config.stickers.collect,
             "send_probability": config.stickers.send_probability,
+            "nonverbal_probability": config.stickers.nonverbal_probability,
             "cooldown_seconds": config.stickers.cooldown_seconds,
         },
         "plugins": {
@@ -469,6 +474,18 @@ def _validate_llm(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
         number = v.number(section["temperature"], "llm.temperature", minimum=0, maximum=2)
         if number is not None:
             out["temperature"] = float(number)
+    if "chat_temperature" in section:
+        value = section["chat_temperature"]
+        if value in (None, ""):
+            out["chat_temperature"] = None
+        else:
+            number = v.number(value, "llm.chat_temperature", minimum=0, maximum=2)
+            if number is not None:
+                out["chat_temperature"] = float(number)
+    if "chat_frequency_penalty" in section:
+        number = v.number(section["chat_frequency_penalty"], "llm.chat_frequency_penalty", minimum=-2, maximum=2)
+        if number is not None:
+            out["chat_frequency_penalty"] = float(number)
     if "timeout" in section:
         number = v.number(section["timeout"], "llm.timeout", minimum=0.1)
         if number is not None:
@@ -783,12 +800,23 @@ def _validate_decision(section: dict[str, Any], v: _Validator) -> dict[str, Any]
         "ratio_penalty": (0, 10),
         "cooldown_seconds": (0, None),
         "cooldown_penalty": (0, 10),
+        "refractory_seconds": (0, None),
+        "proactive_window_seconds": (0, None),
     }
     for key, (minimum, maximum) in number_fields.items():
         if key in section:
             number = v.number(section[key], f"decision.{key}", minimum=minimum, maximum=maximum)
             if number is not None:
                 out[key] = float(number)
+    for key in ("exclude_bot_momentum", "refractory_enabled", "proactive_window_enabled"):
+        if key in section:
+            value = v.boolean(section[key], f"decision.{key}")
+            if value is not None:
+                out[key] = value
+    if "proactive_window_limit" in section:
+        number = v.number(section["proactive_window_limit"], "decision.proactive_window_limit", minimum=0, integer=True)
+        if number is not None:
+            out["proactive_window_limit"] = int(number)
     if "ratio_window" in section:
         number = v.number(section["ratio_window"], "decision.ratio_window", minimum=1, integer=True)
         if number is not None:
@@ -921,10 +949,11 @@ def _validate_stickers(section: dict[str, Any], v: _Validator) -> dict[str, Any]
             value = v.boolean(section[key], f"stickers.{key}")
             if value is not None:
                 out[key] = value
-    if "send_probability" in section:
-        value = v.number(section["send_probability"], "stickers.send_probability", minimum=0, maximum=1)
-        if value is not None:
-            out["send_probability"] = float(value)
+    for key in ("send_probability", "nonverbal_probability"):
+        if key in section:
+            value = v.number(section[key], f"stickers.{key}", minimum=0, maximum=1)
+            if value is not None:
+                out[key] = float(value)
     if "cooldown_seconds" in section:
         value = v.number(section["cooldown_seconds"], "stickers.cooldown_seconds", minimum=0)
         if value is not None:
@@ -1132,10 +1161,25 @@ def validate_structured(payload: dict[str, Any]) -> dict[str, Any]:
             persona = {"path": persona}
         if not isinstance(persona, dict):
             v.fail("persona", "应为对象")
-        elif "path" in persona:
-            value = v.text(persona["path"], "persona.path")
-            if value is not None:
-                update["persona"] = {"path": value}
+        else:
+            options = {}
+            for key in ("path", "examples_path"):
+                if key in persona:
+                    options[key] = v.text(persona[key], f"persona.{key}")
+            if "examples_enabled" in persona:
+                options["examples_enabled"] = v.boolean(persona["examples_enabled"], "persona.examples_enabled")
+            if "examples_count" in persona:
+                options["examples_count"] = v.number(
+                    persona["examples_count"], "persona.examples_count", integer=True, minimum=0
+                )
+            if "examples_position" in persona:
+                position = persona["examples_position"]
+                if position not in ("before", "after"):
+                    v.fail("persona.examples_position", "只能是 before 或 after")
+                else:
+                    options["examples_position"] = position
+            if options:
+                update["persona"] = options
     if "database_path" in payload:
         value = v.text(payload["database_path"], "database_path")
         if value is not None:
@@ -1168,6 +1212,9 @@ def validate_structured(payload: dict[str, Any]) -> dict[str, Any]:
 def merge_config(raw: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
     """把规范字典合并进现有 YAML 数据，保留更新里没提到的键。"""
     base = copy.deepcopy(raw) if isinstance(raw, dict) else {}
+    if isinstance(base.get("persona"), str) and isinstance(update.get("persona"), dict):
+        # 旧格式只写人格路径；仅修改示例设置时也不能丢掉它。
+        base["persona"] = {"path": base["persona"]}
     _deep_merge(base, update, ())
     return base
 

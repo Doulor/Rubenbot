@@ -3350,7 +3350,9 @@ function settingsCardSpecs(draft, secrets, pluginsAvailable) {
             { path: "llm.chat_model", label: "对话模型", hint: "回复消息用的模型", mono: true },
             { path: "llm.extract_model", label: "抽取模型", hint: "记忆抽取用；留空跟随对话模型", mono: true },
             { path: "llm.consolidate_model", label: "归纳模型", hint: "记忆归纳用；留空跟随对话模型", mono: true },
-            { path: "llm.temperature", label: "温度", kind: "number", step: "0.05", min: 0, max: 2, hint: "0–2，越大越发散" },
+            { path: "llm.temperature", label: "默认温度", kind: "number", step: "0.05", min: 0, max: 2, hint: "非聊天角色的默认温度；0–2" },
+            { path: "llm.chat_temperature", label: "聊天温度", kind: "number", step: "0.05", min: 0, max: 2, hint: "留空沿用默认温度；聊天角色单独生效" },
+            { path: "llm.chat_frequency_penalty", label: "聊天重复惩罚", kind: "number", step: "0.05", min: -2, max: 2, hint: "聊天角色 frequency_penalty，默认 0.3" },
             { path: "llm.timeout", label: "超时（秒）", kind: "number", step: "1", min: 0.1, hint: "单次请求超时" },
             { path: "llm.max_retries", label: "重试次数", kind: "number", step: "1", min: 0, max: 10, hint: "失败后的重试次数" },
           ],
@@ -3612,11 +3614,25 @@ function settingsCardSpecs(draft, secrets, pluginsAvailable) {
               path: "generation.two_stage.enabled",
               label: "两段式生成",
               kind: "switch",
-              hint: "先让快速模型想一段简短指导，再按指导写正文；第一段失败会自动回退单段直出",
+              hint: "所有回复都有表达决策书；开启后，闲聊碎片也由快速模型决定，不走本地快速通道",
             },
           ],
           draft
         ),
+      }),
+    },
+    {
+      path: "persona.examples_enabled",
+      node: card("我说话的样子", {
+        hint: "用自己的短回复作示例，不改人格正文",
+        body: fieldGrid([
+          { path: "persona.examples_enabled", label: "注入示例", kind: "switch" },
+          { path: "persona.examples_count", label: "最多注入几条", kind: "number", min: 0, step: "1" },
+          { path: "persona.examples_position", label: "注入位置", kind: "select", options: [
+            { value: "before", label: "人格正文前" }, { value: "after", label: "人格正文后" },
+          ] },
+          { path: "persona.examples_path", label: "示例文件", mono: true, wide: true },
+        ], draft),
       }),
     },
     {
@@ -3684,10 +3700,11 @@ function settingsCardSpecs(draft, secrets, pluginsAvailable) {
       node: card("表情包行为", {
         hint: "核心功能默认关闭；保存后立即生效",
         body: fieldGrid([
-          { path: "stickers.enabled", label: "启用表情包行为", kind: "switch", hint: "关闭时不收集、不补发表情，也不会创建表情库" },
+          { path: "stickers.enabled", label: "启用表情包行为", kind: "switch", hint: "关闭时不收集、不发表情，也不会创建表情库" },
           { path: "stickers.collect", label: "收集群聊表情", kind: "switch", hint: "把群里的图片、贴纸和商城表情去重后存入表情库" },
           { path: "stickers.send_probability", label: "回复后补发概率", kind: "number", step: "0.01", min: 0, max: 1, hint: "每次正常回复后补发表情的概率（0–1）" },
-          { path: "stickers.cooldown_seconds", label: "会话冷却（秒）", kind: "number", step: "1", min: 0, hint: "同一平台会话两次补发表情的最短间隔" },
+          { path: "stickers.nonverbal_probability", label: "只发表情概率", kind: "number", step: "0.01", min: 0, max: 1, hint: "接梗或短附和时只发一张表情、不发文字的概率（0–1）" },
+          { path: "stickers.cooldown_seconds", label: "会话冷却（秒）", kind: "number", step: "1", min: 0, hint: "同一平台会话两次尝试发表情的最短间隔，两种方式共用" },
         ], draft),
       }),
     },
@@ -3719,8 +3736,14 @@ function settingsCardSpecs(draft, secrets, pluginsAvailable) {
             { path: "decision.ratio_threshold", label: "占比阈值", kind: "number", step: "0.01", min: 0, max: 1, hint: "bot 占比超过这个值开始减分" },
             { path: "decision.ratio_silence", label: "占比静默线", kind: "number", step: "0.01", min: 0, max: 1, hint: "占比到这个值直接静默" },
             { path: "decision.ratio_penalty", label: "占比最大减分", kind: "number", step: "0.1", min: 0, max: 10, hint: "占比超阈值时的最大减分" },
-            { path: "decision.cooldown_seconds", label: "发言后冷却（秒）", kind: "number", step: "1", min: 0, hint: "发言后这段时间内降低意愿" },
+            { path: "decision.cooldown_seconds", label: "软冷却（秒）", kind: "number", step: "1", min: 0, hint: "发言后这段时间内降低意愿" },
             { path: "decision.cooldown_penalty", label: "冷却最大减分", kind: "number", step: "0.1", min: 0, max: 10, hint: "冷却期内最多减多少分" },
+            { path: "decision.exclude_bot_momentum", label: "bot 不计入自身动量", kind: "boolean", hint: "关闭后保留旧的动量来源语义" },
+            { path: "decision.refractory_enabled", label: "启用发言不应期", kind: "boolean", hint: "普通消息在不应期内不触发；硬触发不受影响" },
+            { path: "decision.refractory_seconds", label: "不应期（秒）", kind: "number", step: "1", min: 0, hint: "默认 45 秒" },
+            { path: "decision.proactive_window_enabled", label: "启用主动发言窗口上限", kind: "boolean", hint: "普通群消息的主动开口受限；硬触发不计入" },
+            { path: "decision.proactive_window_seconds", label: "主动发言窗口（秒）", kind: "number", step: "1", min: 0, hint: "默认 300 秒" },
+            { path: "decision.proactive_window_limit", label: "窗口内主动发言上限", kind: "number", step: "1", min: 0, hint: "默认 3 条" },
             { path: "decision.veto_marker", label: "不回复标记", hint: "模型输出这个标记就静默丢弃" },
           ],
           draft
