@@ -205,7 +205,7 @@ def test_loader_rejects_invalid_manifest(tmp_path):
 
 
 def test_official_plugins_all_have_valid_manifest():
-    for name in ("hello", "privacy", "qzone_post"):
+    for name in ("hello", "privacy", "qzone_post", "music", "image_gen", "group_insights"):
         manifest = load_manifest(OFFICIAL_DIR / name)
         assert manifest.id == name
         assert manifest.permissions
@@ -223,9 +223,12 @@ def test_official_plugins_all_have_valid_manifest():
 def test_builtin_index_lists_official_plugins():
     entries = builtin_index(OFFICIAL_DIR)
     by_id = {entry.id: entry for entry in entries}
-    assert {"hello", "privacy", "qzone_post"} <= set(by_id)
+    assert {"hello", "privacy", "qzone_post", "music", "image_gen", "group_insights"} <= set(by_id)
     assert set(by_id["qzone_post"].permissions) == {
         "read_messages", "send_messages", "qzone_write", "scheduler", "llm"
+    }
+    assert set(by_id["group_insights"].permissions) == {
+        "read_messages", "send_messages", "llm"
     }
     # 内置索引里的官方插件没有下载地址（随框架发布，天然已安装）
     assert all(entry.download_url is None for entry in entries)
@@ -257,7 +260,7 @@ def test_index_unavailable_falls_back_to_builtin(tmp_path):
     assert "超时" in snapshot["index"]["error"]
     # 回退后页面数据不能空
     assert {item["id"] for item in snapshot["items"]} >= {
-        "hello", "privacy", "qzone_post"
+        "hello", "privacy", "qzone_post", "music", "image_gen", "group_insights"
     }
 
 
