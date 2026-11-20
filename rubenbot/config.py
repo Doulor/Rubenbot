@@ -864,8 +864,8 @@ class MCPServerConfig:
         item = cls(**{k: v for k, v in raw.items() if _has(cls, k)})
         if not isinstance(item.name, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", item.name):
             raise ValueError("name 只能包含英文字母、数字、下划线或短横线")
-        if "__" in item.name:
-            raise ValueError("name 不能包含双下划线")
+        if "__" in item.name or item.name.endswith("_"):
+            raise ValueError("name 不能包含双下划线或以下划线结尾")
         if item.transport not in ("stdio", "http") or not isinstance(item.enabled, bool):
             raise ValueError("transport 应为 stdio/http，enabled 应为布尔值")
         if not isinstance(item.args, list) or not all(isinstance(x, str) for x in item.args):
