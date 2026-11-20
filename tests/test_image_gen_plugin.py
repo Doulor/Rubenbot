@@ -106,7 +106,11 @@ def make_generator(
 ):
     """构造插件实例；生图与下载都走 MockTransport。"""
     calls = requests if requests is not None else []
-    body = api_json if api_json is not None else {"images": [{"url": "https://cdn.example/out.png"}]}
+    body = (
+        api_json
+        if api_json is not None
+        else {"data": [{"url": "https://cdn.example/out.png"}]}
+    )
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(
@@ -124,7 +128,13 @@ def make_generator(
         return httpx.Response(download_status, content=image_bytes)
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    cfg = {"api_key": "sk-test", "cooldown_seconds": 0, "daily_limit": 20}
+    cfg = {
+        "base_url": "https://img.example/v1",
+        "api_key": "sk-test",
+        "model": "Kwai-Kolors/Kolors",
+        "cooldown_seconds": 0,
+        "daily_limit": 20,
+    }
     cfg.update(config or {})
     generator = plugin.ImageGenerator(
         cfg,
@@ -172,16 +182,23 @@ def test_parse_trigger_custom_and_longest_first():
 
 
 def test_parse_response_variants():
+    # 标准 OpenAI 形状：data[0].url / data[0].b64_json
+    assert plugin.parse_response({"data": [{"url": "https://x/a.png"}]}) == (
+        "https://x/a.png",
+        "",
+    )
+    assert plugin.parse_response({"data": [{"b64_json": "AAAA"}]}) == ("AAAA", ".png")
+    # 硅基流动形状：images[0].url
     assert plugin.parse_response({"images": [{"url": "https://x/a.png"}]}) == (
         "https://x/a.png",
         "",
     )
-    # 兼容 OpenAI 风格的 data / b64_json
-    assert plugin.parse_response({"data": [{"b64_json": "AAAA"}]}) == ("AAAA", ".png")
     assert plugin.parse_response({"images": []}) is None
+    assert plugin.parse_response({"data": []}) is None
     assert plugin.parse_response({}) is None
     assert plugin.parse_response(None) is None
     assert plugin.parse_response({"images": [{"nope": 1}]}) is None
+    assert plugin.parse_response({"data": [{"nope": 1}]}) is None
 
 
 def test_detect_suffix():
@@ -207,12 +224,20 @@ def test_is_review_failure():
 
 
 def test_config_defaults_and_env(monkeypatch):
-    monkeypatch.setenv("RUBENBOT_IMAGE_KEY", "sk-from-env")
-    cfg = plugin.ImageGenConfig.from_mapping({"api_key": "${RUBENBOT_IMAGE_KEY}"})
+    monkeypatch.setenv("IMAGE_API_KEY", "sk-from-env")
+    cfg = plugin.ImageGenConfig.from_mapping(
+        {
+            "base_url": "https://api.siliconflow.cn/v1/",
+            "api_key": "${IMAGE_API_KEY}",
+            "model": "Kwai-Kolors/Kolors",
+        }
+    )
+    assert cfg.base_url == "https://api.siliconflow.cn/v1"
     assert cfg.api_key == "sk-from-env"
-    assert cfg.configured is True
-    assert cfg.provider == "siliconflow"
     assert cfg.model == "Kwai-Kolors/Kolors"
+    assert cfg.configured is True
+    assert cfg.endpoint == "https://api.siliconflow.cn/v1/images/generations"
+    assert cfg.size == "1024x1024"
     assert cfg.triggers == plugin.DEFAULT_TRIGGERS
     assert cfg.cooldown_seconds == 120
     assert cfg.daily_limit == 20
@@ -221,21 +246,41 @@ def test_config_defaults_and_env(monkeypatch):
 
     # 没配 / 未展开的占位符都算没配
     assert plugin.ImageGenConfig.from_mapping(None).configured is False
-    monkeypatch.delenv("RUBENBOT_IMAGE_KEY", raising=False)
-    assert plugin.ImageGenConfig.from_mapping({"api_key": "${RUBENBOT_IMAGE_KEY}"}).api_key == ""
+    monkeypatch.delenv("IMAGE_API_KEY", raising=False)
+    assert (
+        plugin.ImageGenConfig.from_mapping(
+            {"base_url": "https://x/v1", "api_key": "${IMAGE_API_KEY}", "model": "m"}
+        ).api_key
+        == ""
+    )
 
 
-def test_config_unsupported_provider_and_bad_types():
+def test_config_requires_all_three():
+    """base_url / api_key / model 缺任一项都不注册触发。"""
+    full = {"base_url": "https://x/v1", "api_key": "k", "model": "m"}
+    assert plugin.ImageGenConfig.from_mapping(full).configured is True
+    for key in ("base_url", "api_key", "model"):
+        partial = {k: v for k, v in full.items() if k != key}
+        assert plugin.ImageGenConfig.from_mapping(partial).configured is False
+        blank = dict(full, **{key: "  "})
+        assert plugin.ImageGenConfig.from_mapping(blank).configured is False
+
+
+def test_config_bad_types_and_defaults():
     cfg = plugin.ImageGenConfig.from_mapping(
         {
-            "provider": "midjourney",
+            "base_url": "https://x/v1",
+            "api_key": "k",
+            "model": "m",
+            "size": "",
             "triggers": "画个",
             "cooldown_seconds": "abc",
             "daily_limit": -5,
             "blacklist": ["血腥"],
         }
     )
-    assert cfg.provider == "siliconflow"
+    # 空 size 退回默认；不认的类型/负数走默认或 0
+    assert cfg.size == "1024x1024"
     assert cfg.triggers == ("画个",)
     assert cfg.cooldown_seconds == 120
     assert cfg.daily_limit == 0
@@ -244,13 +289,15 @@ def test_config_unsupported_provider_and_bad_types():
 
 def test_shipped_config_example_is_valid():
     cfg = plugin.read_config(PLUGIN_DIR)
-    assert cfg.provider == "siliconflow"
-    assert cfg.model == "Kwai-Kolors/Kolors"
+    # 示例里三件套留空，预设写在注释中；没填时视为未配置
+    assert cfg.base_url == ""
+    assert cfg.api_key == ""
+    assert cfg.model == ""
+    assert cfg.configured is False
+    assert cfg.size == "1024x1024"
     assert cfg.cooldown_seconds == 120
     assert cfg.daily_limit == 20
     assert "血腥" in cfg.blacklist
-    # 示例里写的是 ${ENV} 占位；没设环境变量时视为未配置
-    assert cfg.configured is False
 
 
 def test_manifest_is_market_compliant():
@@ -259,13 +306,15 @@ def test_manifest_is_market_compliant():
     assert set(manifest.permissions) == {"read_messages", "send_messages", "network"}
     keys = {item["key"] for item in manifest.config_schema}
     assert {
-        "provider",
+        "base_url",
         "api_key",
         "model",
+        "size",
         "triggers",
         "cooldown_seconds",
         "daily_limit",
     } <= keys
+    assert "provider" not in keys
 
 
 # ----------------------------------------------------------------------
@@ -282,11 +331,12 @@ def test_generate_downloads_and_sends_image(tmp_path):
     # 一次 POST 生成 + 一次 GET 下载
     assert [call["method"] for call in calls] == ["POST", "GET"]
     post = calls[0]
-    assert post["url"].startswith("https://api.siliconflow.cn/v1/images/generations")
+    assert post["url"] == "https://img.example/v1/images/generations"
     assert post["headers"]["authorization"] == "Bearer sk-test"
     # 描述直接用用户原话，不做改写
     assert post["json"]["prompt"] == "一只橘猫在晒太阳"
     assert post["json"]["model"] == "Kwai-Kolors/Kolors"
+    assert post["json"]["size"] == "1024x1024"
     assert calls[1]["url"] == "https://cdn.example/out.png"
 
     # 下载后的图片以 base64 图片段发送
@@ -308,13 +358,35 @@ def test_generate_downloads_and_sends_image(tmp_path):
 def test_generate_supports_b64_response(tmp_path):
     encoded = base64.b64encode(PNG_BYTES).decode("ascii")
     generator, adapter, calls = make_generator(
-        api_json={"images": [{"b64_json": encoded}]}, data_dir=tmp_path
+        api_json={"data": [{"b64_json": encoded}]}, data_dir=tmp_path
     )
 
     asyncio.run(generator.on_message(runtime(adapter), event("画个 一只猫")))
 
     assert [call["method"] for call in calls] == ["POST"]  # 不需要下载
     assert adapter.sent[0][2][0]["type"] == "image"
+
+
+def test_generate_supports_siliconflow_shape(tmp_path):
+    """硅基流动的 images[0].url 也认（自定义端点的预设示例）。"""
+    generator, adapter, calls = make_generator(
+        api_json={"images": [{"url": "https://cdn.example/out.png"}]}, data_dir=tmp_path
+    )
+
+    asyncio.run(generator.on_message(runtime(adapter), event("画个 一只猫")))
+
+    assert [call["method"] for call in calls] == ["POST", "GET"]
+    assert adapter.sent[0][2][0]["type"] == "image"
+
+
+def test_custom_size_is_sent(tmp_path):
+    generator, adapter, calls = make_generator(
+        config={"size": "512x768"}, data_dir=tmp_path
+    )
+
+    asyncio.run(generator.on_message(runtime(adapter), event("画一张 一只猫")))
+
+    assert calls[0]["json"]["size"] == "512x768"
 
 
 def test_review_failure_replies_honestly(tmp_path):
@@ -574,19 +646,25 @@ class StubCtx:
 
 def test_register_without_key_does_not_register_trigger(caplog, monkeypatch):
     caplog.set_level("INFO", logger=LOGGER_NAME)
-    # 示例配置里的 key 是未展开的 ${ENV}；确保环境里也没有这个变量
-    monkeypatch.delenv("RUBENBOT_IMAGE_KEY", raising=False)
+    # 示例配置里三件套都是空值；确保环境里也没有同名变量可展开
+    monkeypatch.delenv("IMAGE_API_KEY", raising=False)
     ctx = StubCtx(PLUGIN_DIR)
     plugin.register(ctx)
     assert ctx.message_hooks == []
     assert ctx.stop_hooks == []
     assert "image_gen" not in ctx.extras
     assert any("未配置" in record.message for record in caplog.records)
+    # 缺的项要在日志里点名
+    assert any("base_url" in record.message for record in caplog.records)
 
 
 def test_register_with_key_registers_trigger(tmp_path):
     ctx = StubCtx(PLUGIN_DIR)
-    ctx.extras["image_gen_config"] = {"api_key": "sk-test"}
+    ctx.extras["image_gen_config"] = {
+        "base_url": "https://x/v1",
+        "api_key": "sk-test",
+        "model": "m",
+    }
     plugin.register(ctx)
     assert len(ctx.message_hooks) == 1
     assert len(ctx.stop_hooks) == 1
