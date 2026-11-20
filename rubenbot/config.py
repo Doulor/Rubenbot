@@ -423,6 +423,94 @@ class SearchConfig:
         return any(self.channel(name).configured for name in self.order)
 
 
+# 语音转写（STT）与语音合成（TTS）的可选后端
+STT_PROVIDERS: tuple[str, ...] = ("siliconflow", "openai_compatible")
+TTS_PROVIDERS: tuple[str, ...] = ("edge_tts", "siliconflow")
+# tts_mode：off 从不发语音；reply_voice 对方发语音时用语音回；
+# on_request 在 reply_voice 基础上，被明确要求用语音说时也发
+TTS_MODES: tuple[str, ...] = ("off", "reply_voice", "on_request")
+
+
+@dataclass
+class VoiceConfig:
+    """语音双向：入站语音条转写（STT）与出站语音回复（TTS）。
+
+    STT 未配置（siliconflow 缺 ``stt_api_key``，或 openai_compatible 缺
+    ``stt_base_url``）时语音消息只记 ``[语音]`` 占位，不发起任何请求。
+    TTS 默认 ``off``；``edge_tts`` 通过可选命令行调用，不需要新增依赖，
+    命令行缺失或合成失败都降级为照常发文字。
+    """
+
+    # ---- STT ----
+    stt_provider: str = "siliconflow"
+    stt_api_key: str = ""
+    # openai_compatible 用：任意 OpenAI 兼容接口的 base_url（如 https://host/v1）
+    stt_base_url: str = ""
+    stt_model: str = "FunAudioLLM/SenseVoiceSmall"
+    stt_timeout_seconds: float = 30.0
+    # 单条音频上限：超过任一上限就不转写，正文只留 [语音] 占位
+    stt_max_seconds: float = 60.0
+    stt_max_bytes: int = 5 * 1024 * 1024
+
+    # ---- TTS ----
+    tts_mode: str = "off"
+    tts_provider: str = "edge_tts"
+    # edge_tts：命令行名与音色；siliconflow：模型与音色
+    edge_tts_command: str = "edge-tts"
+    tts_voice: str = "zh-CN-XiaoxiaoNeural"
+    tts_model: str = "FunAudioLLM/CosyVoice2-0.5B"
+    tts_siliconflow_voice: str = "FunAudioLLM/CosyVoice2-0.5B:alex"
+    # 留空时 siliconflow TTS 复用 stt_api_key（同一账号）
+    tts_api_key: str = ""
+    # 正文超过这么多字就不合成语音（太长没人听），照常发文字
+    tts_max_chars: int = 60
+    tts_timeout_seconds: float = 30.0
+
+    def __post_init__(self) -> None:
+        provider = str(self.stt_provider or "").strip().lower()
+        self.stt_provider = provider if provider in STT_PROVIDERS else "siliconflow"
+        tts_provider = str(self.tts_provider or "").strip().lower()
+        self.tts_provider = tts_provider if tts_provider in TTS_PROVIDERS else "edge_tts"
+        mode = str(self.tts_mode or "").strip().lower()
+        self.tts_mode = mode if mode in TTS_MODES else "off"
+        for key in (
+            "stt_api_key",
+            "stt_base_url",
+            "stt_model",
+            "tts_api_key",
+            "tts_voice",
+            "tts_model",
+            "tts_siliconflow_voice",
+            "edge_tts_command",
+        ):
+            setattr(self, key, str(getattr(self, key) or "").strip())
+        self.stt_timeout_seconds = max(0.1, _as_float(self.stt_timeout_seconds, 30.0))
+        self.tts_timeout_seconds = max(0.1, _as_float(self.tts_timeout_seconds, 30.0))
+        self.stt_max_seconds = max(0.0, _as_float(self.stt_max_seconds, 60.0))
+        self.stt_max_bytes = max(0, _as_int(self.stt_max_bytes, 5 * 1024 * 1024))
+        self.tts_max_chars = max(1, _as_int(self.tts_max_chars, 60))
+
+    @property
+    def stt_configured(self) -> bool:
+        """STT 是否可用：siliconflow 看 key，openai_compatible 看 base_url。"""
+        if self.stt_provider == "openai_compatible":
+            return bool(self.stt_base_url)
+        return bool(self.stt_api_key)
+
+    @property
+    def tts_enabled(self) -> bool:
+        return self.tts_mode != "off"
+
+    @property
+    def tts_configured(self) -> bool:
+        """TTS 是否可用；siliconflow 需要有 key（可复用 STT 的 key）。"""
+        if not self.tts_enabled:
+            return False
+        if self.tts_provider == "siliconflow":
+            return bool(self.tts_api_key or self.stt_api_key)
+        return True
+
+
 @dataclass
 class PluginsConfig:
     """插件目录与启停。
@@ -566,6 +654,7 @@ class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     search: SearchConfig = field(default_factory=SearchConfig)
+    voice: VoiceConfig = field(default_factory=VoiceConfig)
     chat: ChatConfig = field(default_factory=ChatConfig)
     decision: DecisionConfig = field(default_factory=DecisionConfig)
     generation: GenerationConfig = field(default_factory=GenerationConfig)
@@ -644,6 +733,9 @@ class Config:
         llm = LLMConfig(**{k: v for k, v in (data.get("llm") or {}).items() if _has(LLMConfig, k)})
         memory = _load_memory(data.get("memory") or {})
         search = _load_search(data.get("search") or {})
+        voice = VoiceConfig(
+            **{k: v for k, v in (data.get("voice") or {}).items() if _has(VoiceConfig, k)}
+        )
         chat = ChatConfig(**{k: v for k, v in (data.get("chat") or {}).items() if _has(ChatConfig, k)})
         decision = _load_decision(data.get("decision") or {})
         generation = _load_generation(data.get("generation") or {})
@@ -665,6 +757,7 @@ class Config:
             llm=llm,
             memory=memory,
             search=search,
+            voice=voice,
             chat=chat,
             decision=decision,
             generation=generation,

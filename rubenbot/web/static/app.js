@@ -2457,6 +2457,8 @@ function groupName(key) {
     log_level: "日志级别",
     background_check_minutes: "后台检查",
     database_path: "数据库路径",
+    search: "联网搜索",
+    voice: "语音双向",
   }[key] || key;
 }
 
@@ -2694,6 +2696,75 @@ async function renderSettings(view) {
           },
           { path: "search.timeout_seconds", label: "超时（秒）", kind: "number", step: "1", min: 0.1, hint: "单次搜索请求的超时" },
           { path: "search.cooldown_seconds", label: "每会话冷却（秒）", kind: "number", step: "5", min: 0, hint: "冷却内重复搜索直接返回已有结果提示，不发请求" },
+        ],
+        draft
+      ),
+    }),
+    card("语音双向", {
+      hint: "听懂语音条（STT）与用语音回复（TTS）；未配置时全部降级为文字",
+      body: fieldGrid(
+        [
+          {
+            path: "voice.stt_provider",
+            label: "语音转写后端",
+            kind: "select",
+            hint: "硅基流动（SenseVoiceSmall）或任意 OpenAI 兼容接口",
+            options: [
+              { value: "siliconflow", label: "硅基流动 SiliconFlow" },
+              { value: "openai_compatible", label: "OpenAI 兼容接口" },
+            ],
+          },
+          {
+            path: "voice.stt_api_key",
+            label: "转写 API Key",
+            kind: "password",
+            hint: "留空表示保留原值；不填则语音消息只记 [语音] 占位",
+            secretSet: Boolean(secrets["voice.stt_api_key"]),
+          },
+          {
+            path: "voice.stt_base_url",
+            label: "兼容接口地址",
+            hint: "仅 OpenAI 兼容后端用，例如 https://host/v1；填了才启用",
+            mono: true,
+          },
+          { path: "voice.stt_model", label: "转写模型", mono: true, hint: "默认 FunAudioLLM/SenseVoiceSmall" },
+          { path: "voice.stt_timeout_seconds", label: "转写超时（秒）", kind: "number", step: "1", min: 0.1, hint: "单次转写请求的超时" },
+          { path: "voice.stt_max_seconds", label: "单条时长上限（秒）", kind: "number", step: "5", min: 0, hint: "超过就不转写，正文只留 [语音] 占位" },
+          { path: "voice.stt_max_bytes", label: "单条大小上限（字节）", kind: "number", step: "1024", min: 0, hint: "默认 5MB；超过就不转写" },
+          {
+            path: "voice.tts_mode",
+            label: "语音回复模式",
+            kind: "select",
+            hint: "off 从不发语音；reply_voice 对方发语音时回语音；on_request 再加「用语音说」的明确要求",
+            options: [
+              { value: "off", label: "关闭（默认）" },
+              { value: "reply_voice", label: "对方发语音时回语音" },
+              { value: "on_request", label: "被要求时也发语音" },
+            ],
+          },
+          {
+            path: "voice.tts_provider",
+            label: "语音合成后端",
+            kind: "select",
+            hint: "edge-tts 免 Key，走可选命令行；硅基流动 CosyVoice2 需要 Key",
+            options: [
+              { value: "edge_tts", label: "edge-tts（免 Key）" },
+              { value: "siliconflow", label: "硅基流动 CosyVoice2" },
+            ],
+          },
+          {
+            path: "voice.tts_api_key",
+            label: "合成 API Key",
+            kind: "password",
+            hint: "留空表示保留原值；硅基流动后端留空时复用转写 Key",
+            secretSet: Boolean(secrets["voice.tts_api_key"]),
+          },
+          { path: "voice.edge_tts_command", label: "edge-tts 命令行", mono: true, hint: "默认 edge-tts；找不到命令时自动降级发文字" },
+          { path: "voice.tts_voice", label: "edge-tts 音色", mono: true, hint: "默认 zh-CN-XiaoxiaoNeural" },
+          { path: "voice.tts_model", label: "合成模型", mono: true, hint: "硅基流动后端用，默认 FunAudioLLM/CosyVoice2-0.5B" },
+          { path: "voice.tts_siliconflow_voice", label: "合成音色（硅基流动）", mono: true },
+          { path: "voice.tts_max_chars", label: "语音回复字数上限", kind: "number", step: "5", min: 1, hint: "正文超过就不合成语音；被拆成多条的长回复一律发文字" },
+          { path: "voice.tts_timeout_seconds", label: "合成超时（秒）", kind: "number", step: "1", min: 0.1, hint: "单次合成请求的超时" },
         ],
         draft
       ),

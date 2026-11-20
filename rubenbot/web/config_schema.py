@@ -12,8 +12,9 @@ WebUI 用与 ``config.yaml`` 同构的嵌套字典编辑配置，这个模块负
   ``decision.groups`` 和 ``adapters`` 这类整体语义的段按表单为准替换/更新。
 
 密钥字段（``llm.api_key``、``search.tavily.api_key`` / ``search.deepseek.api_key``、
-``adapters.snowluma.access_token``、``webui.password``）提交空值表示保留原值：校验阶段
-直接把这些键从更新里剔除，因此脱敏占位符和空字符串都不会写回文件。
+``voice.stt_api_key`` / ``voice.tts_api_key``、``adapters.snowluma.access_token``、
+``webui.password``）提交空值表示保留原值：校验阶段直接把这些键从更新里剔除，因此
+脱敏占位符和空字符串都不会写回文件。
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ import copy
 from dataclasses import asdict
 from typing import Any
 
-from ..config import SEARCH_PROVIDERS, Config
+from ..config import SEARCH_PROVIDERS, STT_PROVIDERS, TTS_MODES, TTS_PROVIDERS, Config
 from ..decision import parse_quiet_hours
 
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
@@ -40,6 +41,8 @@ SECRET_PATHS = (
     "llm.api_key",
     "search.tavily.api_key",
     "search.deepseek.api_key",
+    "voice.stt_api_key",
+    "voice.tts_api_key",
     "adapters.snowluma.access_token",
     "webui.password",
 )
@@ -88,6 +91,9 @@ def structured_config(config: Config) -> dict[str, Any]:
         search_keys[name] = channel.get("api_key", "")
         if isinstance(search.get(name), dict):
             search[name]["api_key"] = ""
+    voice = asdict(config.voice)
+    stt_key = voice.pop("stt_api_key", "")
+    tts_key = voice.pop("tts_api_key", "")
     access_token = snow.get("access_token", "")
 
     return {
@@ -96,6 +102,7 @@ def structured_config(config: Config) -> dict[str, Any]:
         "database_path": config.database_path,
         "memory": asdict(config.memory),
         "search": search,
+        "voice": {**voice, "stt_api_key": "", "tts_api_key": ""},
         "chat": asdict(config.chat),
         "decision": decision,
         "generation": asdict(config.generation),
@@ -126,6 +133,8 @@ def structured_config(config: Config) -> dict[str, Any]:
             "llm.api_key": bool(api_key),
             "search.tavily.api_key": bool(search_keys.get("tavily")),
             "search.deepseek.api_key": bool(search_keys.get("deepseek")),
+            "voice.stt_api_key": bool(stt_key),
+            "voice.tts_api_key": bool(tts_key),
             "adapters.snowluma.access_token": bool(access_token),
             "webui.password": bool(password),
         },
@@ -436,6 +445,67 @@ def _validate_search(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
     return out
 
 
+def _validate_voice(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
+    """语音双向：STT / TTS 的后端、密钥与上限；密钥留空表示保留原值。"""
+    out: dict[str, Any] = {}
+    provider_fields = (
+        ("stt_provider", STT_PROVIDERS, "stt_provider"),
+        ("tts_provider", TTS_PROVIDERS, "tts_provider"),
+    )
+    for key, allowed, field in provider_fields:
+        if key in section:
+            value = v.text(section[key], f"voice.{field}", max_len=40)
+            if value is not None:
+                provider = value.lower()
+                if provider not in allowed:
+                    v.fail(f"voice.{field}", f"只能是 {' / '.join(allowed)} 之一")
+                else:
+                    out[key] = provider
+    if "tts_mode" in section:
+        value = v.text(section["tts_mode"], "voice.tts_mode", max_len=20)
+        if value is not None:
+            mode = value.lower()
+            if mode not in TTS_MODES:
+                v.fail("voice.tts_mode", f"只能是 {' / '.join(TTS_MODES)} 之一")
+            else:
+                out["tts_mode"] = mode
+    for key in ("stt_api_key", "tts_api_key"):
+        if key in section:
+            copied = {key: section[key]}
+            _prune_secret(copied, key)
+            if key in copied:
+                out[key] = str(copied[key])
+    text_fields = {
+        "stt_base_url": 400,
+        "stt_model": 120,
+        "tts_model": 120,
+        "tts_voice": 120,
+        "tts_siliconflow_voice": 120,
+        "edge_tts_command": 120,
+    }
+    for key, max_len in text_fields.items():
+        if key in section:
+            value = v.text(section[key], f"voice.{key}", allow_empty=True, max_len=max_len)
+            if value is not None:
+                out[key] = value
+    float_fields = {
+        "stt_timeout_seconds": 0.1,
+        "tts_timeout_seconds": 0.1,
+        "stt_max_seconds": 0,
+    }
+    for key, minimum in float_fields.items():
+        if key in section:
+            number = v.number(section[key], f"voice.{key}", minimum=minimum)
+            if number is not None:
+                out[key] = float(number)
+    for key, minimum in (("stt_max_bytes", 0), ("tts_max_chars", 1)):
+        if key in section:
+            number = v.number(section[key], f"voice.{key}", minimum=minimum, integer=True)
+            if number is not None:
+                out[key] = int(number)
+    return out
+
+
 def _validate_chat(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
     out: dict[str, Any] = {}
     if "bot_name" in section:
@@ -734,6 +804,9 @@ def validate_structured(payload: dict[str, Any]) -> dict[str, Any]:
     search = _section(payload, "search", v)
     if search is not None:
         update["search"] = _validate_search(search, v)
+    voice = _section(payload, "voice", v)
+    if voice is not None:
+        update["voice"] = _validate_voice(voice, v)
     chat = _section(payload, "chat", v)
     if chat is not None:
         update["chat"] = _validate_chat(chat, v)

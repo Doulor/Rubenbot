@@ -778,8 +778,9 @@ def test_start_without_token_returns_cleanly(caplog):
     assert any("bot_token" in record.message for record in caplog.records)
 
 
-def test_capabilities_empty_and_send_uses_segments():
-    assert TelegramAdapter.capabilities == frozenset()
+def test_capabilities_voice_and_unsupported_raise():
+    """Telegram 只声明语音回复；其他能力仍按「不支持」优雅失败。"""
+    assert TelegramAdapter.capabilities == frozenset({"message.voice"})
 
     async def scenario():
         adapter = make_adapter(FakeTelegram())
