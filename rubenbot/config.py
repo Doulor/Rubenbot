@@ -317,9 +317,16 @@ class DecisionConfig:
     ratio_threshold: float = 0.20
     ratio_silence: float = 0.60
     ratio_penalty: float = 1.50
-    # 发言后冷却
+    # 发言后冷却（软抑制）
     cooldown_seconds: float = 30.0
     cooldown_penalty: float = 0.60
+    # 活人感节奏闸门：普通消息在不应期内直接不触发；窗口内主动发言封顶
+    exclude_bot_momentum: bool = True
+    refractory_enabled: bool = True
+    refractory_seconds: float = 45.0
+    proactive_window_enabled: bool = True
+    proactive_window_seconds: float = 300.0
+    proactive_window_limit: int = 3
     # 模型输出该标记时静默丢弃
     veto_marker: str = "[不回复]"
     # 每群覆盖：群 id -> 配置

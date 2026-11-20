@@ -1160,6 +1160,7 @@ class RubenBot:
             return False
         self.opener.note_opened(platform, chat_id, now)
         await self.send_proactive(platform, chat_id, reply, now=now)
+        self.decision_engine.note_bot_reply(f"{platform}:{chat_id}", now, proactive=True)
         try:
             self.store.add_decision_log(
                 platform=platform,
@@ -1332,7 +1333,12 @@ class RubenBot:
         if not reply:
             return
 
-        await self.send_reply(event, reply, now=now)
+        await self.send_reply(
+            event,
+            reply,
+            now=now,
+            proactive=event.is_group and decision.hard_trigger is None,
+        )
         await self.sticker_behavior.on_after_reply(self.context, event, reply)
         if self.plugins is not None:
             try:
@@ -2247,6 +2253,7 @@ class RubenBot:
         reply: str | list[Segment] | list[dict[str, Any]],
         *,
         now: float | None = None,
+        proactive: bool = False,
     ) -> None:
         """拆条发送，并把 bot 自己的话写进流水（``processed=True``，不参与记忆抽取）。
 
@@ -2281,8 +2288,9 @@ class RubenBot:
             ok, sent_id = await self._send_voice(adapter, event, text, voice_audio, voice_mime)
             if ok:
                 self._record_bot_message(event, text, sent_id)
-                self.decision_engine.note_reply(
-                    self.decision_engine.chat_key(event), time.time() if now is None else now
+                self.decision_engine.note_bot_reply(
+                    self.decision_engine.chat_key(event), time.time() if now is None else now,
+                    proactive=proactive,
                 )
                 return
         for index, segments in enumerate(parts):
@@ -2298,7 +2306,10 @@ class RubenBot:
                 continue
             self._record_bot_message(event, text, message_id)
         # 发言时间交给决策引擎：动量加成与发言后冷却都依赖它
-        self.decision_engine.note_reply(self.decision_engine.chat_key(event), time.time() if now is None else now)
+        self.decision_engine.note_bot_reply(
+            self.decision_engine.chat_key(event), time.time() if now is None else now,
+            proactive=proactive,
+        )
         # 情绪侧：刚说过话 = 有人理；群里热闹就兴奋一下
         self.note_emotion_after_reply(event, now=now)
 

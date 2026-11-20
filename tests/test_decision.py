@@ -340,6 +340,49 @@ def test_relevance_can_push_over_threshold():
 # ----------------------------------------------------------------------
 
 
+def test_refractory_blocks普通消息_but_not_hard_trigger():
+    engine = make_engine(
+        base=1.0, threshold=0.0, threshold_noise=0.0,
+        momentum_bonus=0.0, cooldown_seconds=0.0,
+        refractory_enabled=True, refractory_seconds=45.0,
+    )
+    engine.note_bot_reply("test:g1", 100.0)
+    blocked = engine.evaluate(group_event(), now=120.0)
+    assert not blocked.should_reply
+    assert blocked.reason == "refractory"
+    hard = engine.evaluate(group_event(mentions=True), now=120.0)
+    assert hard.should_reply
+
+
+def test_proactive_window_caps_active_replies_and_slides():
+    engine = make_engine(
+        base=1.0, threshold=0.0, threshold_noise=0.0,
+        momentum_bonus=0.0, cooldown_seconds=0.0,
+        refractory_enabled=False, proactive_window_enabled=True,
+        proactive_window_seconds=300.0, proactive_window_limit=3,
+    )
+    for timestamp in (0.0, 60.0, 120.0):
+        engine.note_reply("test:g1", timestamp, proactive=True)
+    blocked = engine.evaluate(group_event(), now=180.0)
+    assert not blocked.should_reply
+    assert blocked.reason == "proactive_window"
+    assert engine.evaluate(group_event(), now=301.0).should_reply
+    assert engine.evaluate(group_event(mentions=True), now=180.0).should_reply
+
+
+def test_bot_momentum_can_be_disabled_without_counting_message_history():
+    engine = make_engine(
+        base=0.0, threshold=0.5, threshold_noise=0.0,
+        momentum_bonus=1.0, cooldown_seconds=0.0,
+        refractory_enabled=False, exclude_bot_momentum=False,
+    )
+    engine.note_reply("test:g1", 100.0)
+    engine._last_momentum_at["test:g1"] = 100.0
+    assert engine.evaluate(group_event(), now=100.0).factors.momentum == pytest.approx(1.0)
+    engine.config.exclude_bot_momentum = True
+    assert engine.evaluate(group_event(), now=100.0).factors.momentum == pytest.approx(1.0)
+
+
 def test_cooldown_penalizes_recent_reply():
     engine = make_engine(
         base=0.9,

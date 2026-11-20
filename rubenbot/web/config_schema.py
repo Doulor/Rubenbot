@@ -795,12 +795,23 @@ def _validate_decision(section: dict[str, Any], v: _Validator) -> dict[str, Any]
         "ratio_penalty": (0, 10),
         "cooldown_seconds": (0, None),
         "cooldown_penalty": (0, 10),
+        "refractory_seconds": (0, None),
+        "proactive_window_seconds": (0, None),
     }
     for key, (minimum, maximum) in number_fields.items():
         if key in section:
             number = v.number(section[key], f"decision.{key}", minimum=minimum, maximum=maximum)
             if number is not None:
                 out[key] = float(number)
+    for key in ("exclude_bot_momentum", "refractory_enabled", "proactive_window_enabled"):
+        if key in section:
+            value = v.boolean(section[key], f"decision.{key}")
+            if value is not None:
+                out[key] = value
+    if "proactive_window_limit" in section:
+        number = v.number(section["proactive_window_limit"], "decision.proactive_window_limit", minimum=0, integer=True)
+        if number is not None:
+            out["proactive_window_limit"] = int(number)
     if "ratio_window" in section:
         number = v.number(section["ratio_window"], "decision.ratio_window", minimum=1, integer=True)
         if number is not None:
