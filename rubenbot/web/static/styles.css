@@ -32,9 +32,14 @@
   --sidebar-w: 252px;
   --content-max: 1240px;
 
-  /* M3 emphasized 曲线 */
-  --ease: cubic-bezier(0.2, 0, 0, 1);
-  --ease-soft: cubic-bezier(0.05, 0.7, 0.1, 1);
+  /* FlClash 的 easeOutCubic / easeOutBack；只有回弹的几何属性使用后者。 */
+  --ease: cubic-bezier(.215, .61, .355, 1);
+  --ease-back: cubic-bezier(.175, .885, .32, 1.275);
+  --press-in: 120ms;
+  --release: 250ms;
+  --presence: 200ms;
+  --select: 240ms;
+  --surface-motion: var(--presence) var(--ease);
 }
 
 /* ---------------- 明色：暖奶油 ---------------- */
@@ -274,7 +279,7 @@ button {
   font-size: 13.5px;
   font-weight: 500;
   letter-spacing: 0.01em;
-  transition: background 0.2s var(--ease), color 0.2s var(--ease);
+  transition: background-color var(--surface-motion), color var(--surface-motion);
 }
 
 .nav-item .icon {
@@ -376,16 +381,12 @@ button {
   background: transparent;
   color: var(--text-soft);
   cursor: pointer;
-  transition: background 0.18s var(--ease), color 0.18s var(--ease);
+  transition: background-color var(--surface-motion), color var(--surface-motion);
 }
 
 .icon-button:hover {
   background: var(--surface-soft);
   color: var(--text);
-}
-
-.icon-button:active {
-  transform: scale(0.94);
 }
 
 /* ---------------- 主区 ---------------- */
@@ -465,9 +466,9 @@ button {
   *,
   *::before,
   *::after {
-    animation-duration: 0.001ms !important;
-    animation-iteration-count: 1 !important;
-    transition-duration: 0.001ms !important;
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
   }
 }
 
@@ -694,7 +695,7 @@ button {
   padding: 13px 24px;
   border-top: 1px solid var(--hairline);
   min-width: 0;
-  transition: background 0.15s var(--ease);
+  transition: background-color var(--surface-motion);
 }
 
 .rows > .row:first-child {
@@ -818,8 +819,8 @@ button {
   font-weight: 500;
   cursor: pointer;
   white-space: nowrap;
-  transition: background 0.18s var(--ease), color 0.18s var(--ease),
-    transform 0.12s var(--ease), box-shadow 0.18s var(--ease);
+  transition: background-color var(--surface-motion), color var(--surface-motion),
+    box-shadow var(--surface-motion);
 }
 
 .btn .icon {
@@ -829,10 +830,6 @@ button {
 
 .btn:hover {
   background: var(--surface-high);
-}
-
-.btn:active {
-  transform: scale(0.98);
 }
 
 .btn:disabled {
@@ -891,7 +888,7 @@ button {
   background: transparent;
   color: var(--muted);
   cursor: pointer;
-  transition: background 0.15s var(--ease), color 0.15s var(--ease);
+  transition: background-color var(--surface-motion), color var(--surface-motion);
 }
 
 .icon-btn-sm:hover {
@@ -936,7 +933,7 @@ button {
   color: var(--text);
   font: inherit;
   font-size: 13.5px;
-  transition: background 0.18s var(--ease), box-shadow 0.18s var(--ease);
+  transition: background-color var(--surface-motion), box-shadow var(--surface-motion);
 }
 
 .select {
@@ -1038,7 +1035,7 @@ button {
   font-size: 12.5px;
   font-weight: 500;
   cursor: pointer;
-  transition: background 0.18s var(--ease), color 0.18s var(--ease);
+  transition: background-color var(--surface-motion), color var(--surface-motion);
 }
 
 .segmented button:hover {
@@ -1223,7 +1220,7 @@ button {
   padding: 14px 24px;
   border-top: 1px solid var(--hairline);
   align-items: flex-start;
-  transition: background 0.15s var(--ease);
+  transition: background-color var(--surface-motion);
 }
 
 .memory:first-child {
@@ -1259,7 +1256,7 @@ button {
   gap: 2px;
   flex: none;
   opacity: 0;
-  transition: opacity 0.15s var(--ease);
+  transition: opacity var(--surface-motion);
 }
 
 .memory:hover .memory-actions,
@@ -1460,7 +1457,7 @@ button {
   gap: 14px;
   padding: 16px 24px;
   border-top: 1px solid var(--hairline);
-  transition: background 0.15s var(--ease);
+  transition: background-color var(--surface-motion);
 }
 
 .plugin-row:first-child {
@@ -1496,7 +1493,7 @@ button {
   border: 0;
   background: var(--surface-highest);
   cursor: pointer;
-  transition: background 0.2s var(--ease);
+  transition: background-color var(--surface-motion);
   padding: 0;
 }
 
@@ -1509,8 +1506,13 @@ button {
   height: 20px;
   border-radius: 50%;
   background: var(--surface);
-  transition: transform 0.22s var(--ease), background 0.22s var(--ease);
+  transition: transform 300ms var(--ease-back), scale 150ms var(--ease),
+    background-color 300ms var(--ease);
   box-shadow: 0 1px 3px rgba(50, 25, 5, 0.22);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .switch:active:not(:disabled)::after { scale: 1.08; }
 }
 
 .switch:hover::after {
@@ -1559,7 +1561,7 @@ button {
   font: inherit;
   font-size: 12.5px;
   cursor: pointer;
-  transition: background 0.16s var(--ease), color 0.16s var(--ease);
+  transition: background-color var(--surface-motion), color var(--surface-motion);
 }
 
 .market-tab:hover {
@@ -1865,7 +1867,7 @@ button {
   font-weight: 500;
   text-align: left;
   cursor: pointer;
-  transition: background 0.18s var(--ease), color 0.18s var(--ease);
+  transition: background-color var(--surface-motion), color var(--surface-motion);
 }
 
 .settings-menu-item:hover {
@@ -2678,4 +2680,31 @@ button {
 
 *::-webkit-scrollbar-track {
   background: transparent;
+}
+
+/* ElasticPress 向外轻涨而非按扁。只动操作面，表单、只读数据卡与文字仍在原位。 */
+@media (prefers-reduced-motion: no-preference) {
+  :is(.btn, .icon-button, .icon-btn-sm, .row[role="button"], .emotion-person, .chat-open) {
+    transition: scale var(--release) var(--ease-back), background-color var(--surface-motion),
+      color var(--surface-motion), box-shadow var(--surface-motion);
+  }
+
+  :is(.btn, .icon-button, .icon-btn-sm, .emotion-person, .chat-open, .row[role="button"]):active:not(:disabled) {
+    scale: 1.025;
+    transition-duration: var(--press-in), var(--presence), var(--presence), var(--presence);
+    transition-timing-function: var(--ease);
+  }
+
+  /* 市场卡仅在其真实操作按钮受压时响应，不把空白伪装成点击区。 */
+  .market-card {
+    transition: scale var(--release) var(--ease-back), translate 260ms var(--ease);
+  }
+  .market-card:has(button:enabled:active) {
+    scale: 1.008;
+    transition: scale var(--press-in) var(--ease), translate 260ms var(--ease);
+  }
+}
+
+@media (hover: hover) and (pointer: fine) and (prefers-reduced-motion: no-preference) {
+  .market-card:hover { translate: 0 -2px; }
 }
