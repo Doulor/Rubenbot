@@ -282,6 +282,18 @@ CREATE TABLE IF NOT EXISTS gateway_audit (
 CREATE INDEX IF NOT EXISTS idx_gateway_audit_ts ON gateway_audit(ts);
 CREATE INDEX IF NOT EXISTS idx_gateway_audit_action ON gateway_audit(action, ts);
 
+-- 操作电脑的审计只保存参数规模，不落命令、文件内容、URL 或输出。
+CREATE TABLE IF NOT EXISTS computer_audit (
+    id           INTEGER PRIMARY KEY,
+    created_at   REAL NOT NULL,
+    who          TEXT NOT NULL,
+    context      TEXT NOT NULL,
+    tool         TEXT NOT NULL,
+    args_summary TEXT NOT NULL,
+    success      INTEGER NOT NULL,
+    duration_ms  INTEGER NOT NULL
+);
+
 -- 网关冷却状态：四维冷却里需要跨重启保留的部分
 -- scope: conversation（动作×会话）/ object（动作×对象）/ budget（会话日预算）
 --        / global（全局日上限）/ backoff（动作连续失败退避）
@@ -2541,6 +2553,26 @@ class MemoryStore:
     # ------------------------------------------------------------------
     # 网关审计与状态（行动面）
     # ------------------------------------------------------------------
+
+    def log_computer_action(self, who: str, context: str, tool: str,
+                            args_summary: dict[str, int], success: bool, duration_ms: int) -> None:
+        """每次电脑操作（含拒绝与失败）记录一次，沿用同一个加锁的 SQLite 连接。"""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO computer_audit(created_at, who, context, tool, args_summary, success, duration_ms) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (time.time(), who, context, tool, json.dumps(args_summary), int(success), duration_ms),
+            )
+            self._conn.commit()
+
+    def recent_computer_actions(self, limit: int = 50) -> list[dict]:
+        """按完成顺序返回最近的电脑操作，用于只读审计页。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM computer_audit ORDER BY id DESC LIMIT ?", (max(1, min(limit, 200)),),
+            ).fetchall()
+        return [{**dict(row), "args_summary": json.loads(row["args_summary"]),
+                 "success": bool(row["success"])} for row in rows]
 
     def add_gateway_audit(
         self,

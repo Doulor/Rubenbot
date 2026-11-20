@@ -608,6 +608,10 @@ class TelegramAdapter(BaseAdapter):
             payload["photo"] = str(value)
             await self._call("sendPhoto", payload)
 
+    async def send_file(self, chat_id: str, filename: str, content: bytes, *, chat_type: str) -> None:
+        await self._call("sendDocument", {"chat_id": _to_id(chat_id)},
+                         files={"document": (filename, content, "application/octet-stream")})
+
     async def _send_voice(
         self,
         chat_id: str,
