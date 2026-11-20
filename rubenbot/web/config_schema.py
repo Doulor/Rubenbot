@@ -11,7 +11,7 @@ WebUI 用与 ``config.yaml`` 同构的嵌套字典编辑配置，这个模块负
 - :func:`merge_config`：把规范字典合并进现有 YAML，保留未知键；
   ``decision.groups`` 和 ``adapters`` 这类整体语义的段按表单为准替换/更新。
 
-密钥字段（``llm.api_key``、``adapters.snowluma.access_token``、
+密钥字段（``llm.api_key``、``search.api_key``、``adapters.snowluma.access_token``、
 ``webui.password``）提交空值表示保留原值：校验阶段直接把这些键从更新里
 剔除，因此脱敏占位符和空字符串都不会写回文件。
 """
@@ -22,7 +22,7 @@ import copy
 from dataclasses import asdict
 from typing import Any
 
-from ..config import Config
+from ..config import SEARCH_PROVIDERS, Config
 from ..decision import parse_quiet_hours
 
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
@@ -38,6 +38,7 @@ SNOWLUMA_DEFAULTS = {
 # 表单视图里永远留空的密钥字段（键是点分路径）
 SECRET_PATHS = (
     "llm.api_key",
+    "search.api_key",
     "adapters.snowluma.access_token",
     "webui.password",
 )
@@ -78,6 +79,8 @@ def structured_config(config: Config) -> dict[str, Any]:
     llm["models"] = dict(models) if isinstance(models, dict) else {}
     webui = asdict(config.webui)
     password = webui.pop("password", "")
+    search = asdict(config.search)
+    search_key = search.pop("api_key", "")
     access_token = snow.get("access_token", "")
 
     return {
@@ -85,6 +88,7 @@ def structured_config(config: Config) -> dict[str, Any]:
         "persona": {"path": config.persona_path},
         "database_path": config.database_path,
         "memory": asdict(config.memory),
+        "search": {**search, "api_key": ""},
         "chat": asdict(config.chat),
         "decision": decision,
         "plugins": {
@@ -107,6 +111,7 @@ def structured_config(config: Config) -> dict[str, Any]:
         "log_level": config.log_level,
         "secrets": {
             "llm.api_key": bool(api_key),
+            "search.api_key": bool(search_key),
             "adapters.snowluma.access_token": bool(access_token),
             "webui.password": bool(password),
         },
@@ -369,6 +374,33 @@ def _validate_rolling_summary(section: dict[str, Any], v: _Validator) -> dict[st
     return out
 
 
+def _validate_search(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
+    """联网搜索：provider 只认两家；key 与 llm 一样，空值表示保留原值。"""
+    out: dict[str, Any] = {}
+    if "provider" in section:
+        value = v.text(section["provider"], "search.provider", max_len=30)
+        if value is not None:
+            provider = value.lower()
+            if provider not in SEARCH_PROVIDERS:
+                v.fail("search.provider", f"只能是 {' / '.join(SEARCH_PROVIDERS)} 之一")
+            else:
+                out["provider"] = provider
+    if "api_key" in section:
+        copied = {"api_key": section["api_key"]}
+        _prune_secret(copied, "api_key")
+        if "api_key" in copied:
+            out["api_key"] = str(copied["api_key"])
+    if "timeout_seconds" in section:
+        number = v.number(section["timeout_seconds"], "search.timeout_seconds", minimum=0.1)
+        if number is not None:
+            out["timeout_seconds"] = float(number)
+    if "cooldown_seconds" in section:
+        number = v.number(section["cooldown_seconds"], "search.cooldown_seconds", minimum=0)
+        if number is not None:
+            out["cooldown_seconds"] = float(number)
+    return out
+
+
 def _validate_chat(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
     out: dict[str, Any] = {}
     if "bot_name" in section:
@@ -582,6 +614,9 @@ def validate_structured(payload: dict[str, Any]) -> dict[str, Any]:
     memory = _section(payload, "memory", v)
     if memory is not None:
         update["memory"] = _validate_memory(memory, v)
+    search = _section(payload, "search", v)
+    if search is not None:
+        update["search"] = _validate_search(search, v)
     chat = _section(payload, "chat", v)
     if chat is not None:
         update["chat"] = _validate_chat(chat, v)
