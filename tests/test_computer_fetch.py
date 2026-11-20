@@ -3,6 +3,7 @@
 import asyncio
 import socket
 import ssl
+import zlib
 
 import httpcore
 import pytest
@@ -144,10 +145,57 @@ def test_truncates_utf8_and_stops_reading(network):
     assert network.connections[0][2].closed
 
 
-def test_rejects_forced_compression_without_reading_body(network):
+@pytest.mark.parametrize(('encoding', 'wbits'), [('gzip', 31), ('deflate', 15), ('deflate', -15)])
+def test_decodes_compressed_html(network, encoding, wbits):
+    packed = zlib.compress('<p>正文</p>'.encode('gbk'), wbits=wbits)
+    network.dns['page.test'] = [['1.1.1.1']]
+    network.replies = [[f'HTTP/1.1 200 OK\r\nContent-Encoding: {encoding}\r\n'
+                        'Content-Type: text/html; charset=gbk\r\n\r\n'.encode(), packed[:1], packed[1:]]]
+    assert fetch() == '正文'
+    wire = network.connections[0][2]
+    assert b'accept-encoding: gzip, deflate\r\n' in wire.sent.lower() and wire.closed
+
+
+@pytest.mark.parametrize(('encoding', 'wbits'), [('gzip', 31), ('deflate', 15), ('deflate', -15)])
+def test_compressed_body_stops_at_decoded_limit(network, check_inflate_budget, encoding, wbits):
+    packed = zlib.compress(b'x' * 65536, wbits=wbits)
+    assert len(packed) < 256
+
     def reply():
-        yield b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n\r\n"
-        pytest.fail("不应读取压缩体")
+        yield f'HTTP/1.1 200 OK\r\nContent-Encoding: {encoding}\r\n\r\n'.encode()
+        yield packed[:32]
+        yield packed[32:]
+        pytest.fail('超过正文读取上限后仍在读取响应')
+
+    sizes = check_inflate_budget(8192)
+    network.replies = [reply()]
+    with pytest.raises(ValueError, match='正文过大'):
+        fetch(sandbox=False, output_limit=256)
+    assert sum(sizes) == 8193 and network.connections[0][2].closed
+
+
+def test_compressed_html_at_body_limit_still_clips_display(network):
+    body = b'<p>' + b'x' * (8192 - 7) + b'</p>'
+    network.replies = [[b'HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Type: text/html\r\n\r\n',
+                        zlib.compress(body, wbits=31)]]
+    text = fetch(sandbox=False, output_limit=32)
+    assert text.startswith('x') and text.endswith('[已截断]') and len(text.encode()) == 32
+
+
+@pytest.mark.parametrize('damage', ['truncated', 'corrupt'])
+def test_bad_compressed_stream_rejected(network, damage):
+    packed = zlib.compress(b'partial page', wbits=31)
+    packed = packed[:-1] if damage == 'truncated' else packed[:-1] + b'\xff'
+    network.replies = [[b'HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n\r\n', packed]]
+    with pytest.raises(ValueError, match='压缩正文'):
+        fetch(sandbox=False)
+    assert network.connections[0][2].closed
+
+
+def test_rejects_unknown_encoding_without_reading_body(network):
+    def reply():
+        yield b"HTTP/1.1 200 OK\r\nContent-Encoding: br\r\n\r\n"
+        pytest.fail("不应读取未知编码正文")
 
     network.replies = [reply()]
     with pytest.raises(ValueError, match="压缩"):

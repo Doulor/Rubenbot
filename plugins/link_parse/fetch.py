@@ -14,6 +14,8 @@ import httpcore
 import httpx
 from httpx._utils import URLPattern, get_environment_proxies
 
+from rubenbot.http_body import CompressedBodyError, read_compressed_body
+
 
 @dataclass(frozen=True)
 class FetchResult:
@@ -114,7 +116,7 @@ async def _open(url: httpx.URL, ip: str, port: int):
             target = httpcore.URL(str(url))
             connection = httpcore.AsyncHTTP11Connection(target.origin, stream)
             response = await stack.enter_async_context(connection.stream(
-                'GET', target, headers={'Host': url.netloc, 'Accept-Encoding': 'identity'},
+                'GET', target, headers={'Host': url.netloc, 'Accept-Encoding': 'gzip, deflate'},
             ))
             yield response
     finally:
@@ -147,16 +149,20 @@ async def fetch(
                         continue
                     if not 200 <= response.status < 300:
                         raise FetchError(f'站点返回 HTTP {response.status}')
-                    # 禁止透明解压；即使对方忽略 identity 也不能制造解压膨胀。
-                    if headers.get('content-encoding', 'identity').lower() != 'identity':
-                        raise FetchError('不接受压缩正文')
-                    if int(headers.get('content-length', '0')) > max_bytes:
-                        raise FetchError('正文过大')
-                    body = bytearray()
-                    async for chunk in response.aiter_stream():
-                        if len(chunk) > max_bytes - len(body):
+                    encoding = headers.get('content-encoding', 'identity').strip().lower()
+                    if encoding == 'identity':
+                        if int(headers.get('content-length', '0')) > max_bytes:
                             raise FetchError('正文过大')
-                        body.extend(chunk)
+                        body = bytearray()
+                        async for chunk in response.aiter_stream():
+                            if len(chunk) > max_bytes - len(body):
+                                raise FetchError('正文过大')
+                            body.extend(chunk)
+                    else:
+                        try:
+                            body = await read_compressed_body(response.aiter_stream(), encoding, max_bytes)
+                        except CompressedBodyError as exc:
+                            raise FetchError(str(exc)) from exc
                     content_type = headers.get('content-type', '').split(';', 1)[0].strip().lower()
                     # 只接受网页字符集，不让 charset 触发 Python 的解压等通用 codec。
                     charset = (httpx.Response(200, headers=headers).charset_encoding or '').lower()

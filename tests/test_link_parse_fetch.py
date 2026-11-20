@@ -3,6 +3,7 @@
 import asyncio
 import socket
 import ssl
+import zlib
 
 import httpcore
 import pytest
@@ -187,6 +188,47 @@ def test_response_limits_and_cleanup(net, packets, reason):
     with pytest.raises(mod.FetchError, match=reason):
         run('http://' + PUBLIC, size=3)
     assert s.closed
+
+
+@pytest.mark.parametrize(('encoding', 'wbits'), [('gzip', 31), ('deflate', 15), ('deflate', -15)])
+def test_decodes_compressed_response_at_limit(net, encoding, wbits):
+    body = '网页'.encode('gbk')
+    packed = zlib.compress(body, wbits=wbits)
+    headers = [f'Content-Encoding: {encoding}', f'Content-Length: {len(packed)}',
+               'Content-Type: text/html; charset=gbk']
+    wire = net.serve(reply(headers=headers), packed[:1], packed[1:])
+    assert run('http://' + PUBLIC, size=len(body)).text == '网页'
+    assert b'accept-encoding: gzip, deflate\r\n' in wire.writes.lower() and wire.closed
+
+
+@pytest.mark.parametrize(('encoding', 'wbits'), [('gzip', 31), ('deflate', 15), ('deflate', -15)])
+def test_compressed_body_stops_at_decoded_limit(net, check_inflate_budget, encoding, wbits):
+    packed = zlib.compress(b'x' * 65536, wbits=wbits)
+    assert len(packed) < 1024
+    sizes = check_inflate_budget(1024)
+    wire = net.serve(reply(headers=[f'Content-Encoding: {encoding}']), packed[:32], packed[32:])
+    with pytest.raises(mod.FetchError, match='正文过大'):
+        run('http://' + PUBLIC)
+    assert sum(sizes) == 1025 and wire.closed
+
+
+@pytest.mark.parametrize('split', [True, False])
+def test_gzip_members_share_the_same_limit(net, split):
+    first = zlib.compress(b'abc', wbits=31)
+    second = zlib.compress(b'def', wbits=31)
+    packets = (first, second) if split else (first + second,)
+    net.serve(reply(headers=['Content-Encoding: gzip']), *packets)
+    assert run('http://' + PUBLIC, size=6).text == 'abcdef'
+    net.serve(reply(headers=['Content-Encoding: gzip']), *packets)
+    with pytest.raises(mod.FetchError, match='正文过大'):
+        run('http://' + PUBLIC, size=5)
+
+
+def test_rejects_unknown_encoding(net):
+    wire = net.serve(reply(headers=['Content-Encoding: br'], body=b'ok'))
+    with pytest.raises(mod.FetchError, match='编码'):
+        run('http://' + PUBLIC)
+    assert wire.closed
 
 
 def test_untrusted_charset_is_not_a_python_transform(net):
