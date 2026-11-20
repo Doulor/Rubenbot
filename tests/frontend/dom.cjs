@@ -60,8 +60,10 @@ function loadUI() {
     querySelector: selector => root.walk().find(node => '#' + node.getAttribute('id') === selector) ?? null,
   };
   const context = vm.createContext({root, document, Node: TestNode, location: {hash: ''},
-    window: {}, console, URL, setTimeout, clearTimeout, markListChange() {}});
+    window: {}, console, URL, setTimeout, clearTimeout, performance,
+    matchMedia: () => ({matches: false, addEventListener() {}})});
   const run = code => vm.runInContext(code, context);
+  run(fs.readFileSync(path.join(__dirname, '../../rubenbot/web/static/motion.js'), 'utf8'));
   const file = path.join(__dirname, '../../rubenbot/web/static/app.js');
   run(fs.readFileSync(file, 'utf8').replace(/\bmain\(\);\s*$/, ''));
   return {root, document, run};
