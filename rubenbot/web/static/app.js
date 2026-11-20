@@ -938,6 +938,42 @@ const memoryState = {
   limit: 50,
 };
 
+/** 只读的待执行提醒：没有取消入口（一期不做取消工具），只在记忆页顺带展示。 */
+function remindersCard() {
+  const body = h("div", { class: "rows" }, skeleton(2));
+  const wrap = card("待执行提醒", {
+    hint: "只读；到点后 bot 会在原会话说一句",
+    flush: true,
+    body,
+  });
+  api
+    .get("/api/reminders?limit=50")
+    .then((result) => {
+      if (!result.items.length) {
+        body.replaceChildren(emptyState("pulse", "没有待执行的提醒", "用户明确要求「提醒我」时，模型会创建提醒"));
+        return;
+      }
+      body.replaceChildren(
+        ...result.items.map((item) =>
+          h(
+            "div",
+            { class: "row" },
+            h("div", { class: "row-main" },
+              h("div", { class: "row-title" }, item.text),
+              h("div", { class: "row-sub" },
+                `${platformName(item.platform)} · ${item.chat_type === "private" ? "私聊" : `群 ${item.chat_id}`}` +
+                `${item.requester_name ? ` · ${item.requester_name}` : ""} · 由 ${item.created_by || "未知"} 设定`)),
+            h("div", { class: "row-side" }, h("span", { class: "tag accent" }, fmtDateTime(item.fire_at)))
+          )
+        )
+      );
+    })
+    .catch(() => {
+      body.replaceChildren(emptyState("warning", "提醒列表加载失败", "稍后刷新页面试试"));
+    });
+  return wrap;
+}
+
 async function renderMemory(view) {
   const data = await api.get("/api/people?limit=500");
   memoryState.people = data.items;
@@ -990,7 +1026,7 @@ async function renderMemory(view) {
   );
 
   const content = h("div", { id: "memory-content" });
-  view.replaceChildren(h("section", { class: "card" }, toolbar, content));
+  view.replaceChildren(h("section", { class: "card" }, toolbar, content), remindersCard());
 
   function tabButton(value, label) {
     return h(
@@ -2412,6 +2448,7 @@ function groupName(key) {
     memory: "记忆",
     chat: "聊天与回复",
     decision: "回复意愿",
+    reminder: "提醒",
     plugins: "插件",
     webui: "WebUI",
     persona: "人格",
@@ -2671,6 +2708,18 @@ async function renderSettings(view) {
     card("每群覆盖", {
       hint: "单独调节某个群",
       body: groupsEditor(draft, secrets),
+    }),
+    card("提醒", {
+      hint: "模型被明确要求「提醒我」时创建，不自动提醒",
+      body: fieldGrid(
+        [
+          { path: "reminder.enabled", label: "启用提醒工具", kind: "switch", hint: "关闭后模型无法设置提醒，已设的提醒照常触发" },
+          { path: "reminder.max_pending_per_chat", label: "每会话提醒上限", kind: "number", step: "1", min: 0, max: 50, hint: "同一会话最多同时挂多少条待执行提醒" },
+          { path: "reminder.max_delay_minutes", label: "最远提前（分钟）", kind: "number", step: "60", min: 1, hint: "超过这个跨度的提醒请求会被拒绝" },
+          { path: "reminder.max_text_chars", label: "提醒正文上限（字）", kind: "number", step: "10", min: 20, max: 2000, hint: "超出部分会被截断" },
+        ],
+        draft
+      ),
     }),
     card("插件", {
       hint: "默认全关，逐个启用",

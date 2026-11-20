@@ -251,6 +251,43 @@ def test_quiet_hours_validation():
         validate_structured({"decision": {"groups": {"g1": {"quiet_hours": ["25:00-30:00"]}}}})
 
 
+# ----------------------------------------------------------------------
+# 提醒与冷场开口
+# ----------------------------------------------------------------------
+
+
+def test_structured_config_lists_reminder(config):
+    view = structured_config(config)
+    assert view["reminder"]["enabled"] is True
+    assert view["reminder"]["max_pending_per_chat"] == 5
+
+
+def test_validate_reminder():
+    update = validate_structured(
+        {
+            "reminder": {"enabled": False, "max_pending_per_chat": "3", "max_delay_minutes": 60},
+        }
+    )
+    assert update["reminder"] == {
+        "enabled": False,
+        "max_pending_per_chat": 3,
+        "max_delay_minutes": 60,
+    }
+
+
+@pytest.mark.parametrize(
+    "payload,field",
+    [
+        ({"reminder": {"max_pending_per_chat": -1}}, "reminder.max_pending_per_chat"),
+        ({"reminder": {"max_text_chars": 5}}, "reminder.max_text_chars"),
+    ],
+)
+def test_validate_reminder_rejects_bad(payload, field):
+    with pytest.raises(ConfigValidationError) as info:
+        validate_structured(payload)
+    assert any(item["field"] == field for item in info.value.fields)
+
+
 def test_merge_config_keeps_unknown_keys():
     merged = merge_config(
         {"chat": {"bot_name": "Ruben", "extra": 1}, "custom": {"a": 2}},

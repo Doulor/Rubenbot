@@ -230,6 +230,23 @@ class ChatConfig:
 
 
 @dataclass
+class ReminderConfig:
+    """提醒工具（``set_reminder``）参数。
+
+    提醒只回应用户明确请求：模型在对话里自己决定调工具，核心不开任何
+    自动提醒。每会话待执行提醒有上限，防止模型被反复要求时无限堆积。
+    """
+
+    enabled: bool = True
+    # 每个会话（platform:chat_id）最多同时挂多少个待执行提醒
+    max_pending_per_chat: int = 5
+    # 单条提醒最多延迟多久（分钟）；超过的请求直接拒绝，避免误设远期任务
+    max_delay_minutes: int = 60 * 24 * 30
+    # 提醒正文的截断长度
+    max_text_chars: int = 200
+
+
+@dataclass
 class GroupDecisionConfig:
     """单个群的决策覆盖项；未写的字段沿用全局默认。"""
 
@@ -421,6 +438,7 @@ class Config:
     decision: DecisionConfig = field(default_factory=DecisionConfig)
     plugins: PluginsConfig = field(default_factory=PluginsConfig)
     webui: WebUIConfig = field(default_factory=WebUIConfig)
+    reminder: ReminderConfig = field(default_factory=ReminderConfig)
     persona_path: str = "data/SOUL.md"
     database_path: str = "data/rubenbot.db"
     adapters: dict[str, Any] = field(default_factory=dict)
@@ -495,6 +513,7 @@ class Config:
         decision = _load_decision(data.get("decision") or {})
         plugins = PluginsConfig(**{k: v for k, v in (data.get("plugins") or {}).items() if _has(PluginsConfig, k)})
         webui = WebUIConfig(**{k: v for k, v in (data.get("webui") or {}).items() if _has(WebUIConfig, k)})
+        reminder = _load_reminder(data.get("reminder") or {})
         persona = data.get("persona") or {}
         if isinstance(persona, str):
             persona = {"path": persona}
@@ -512,8 +531,26 @@ class Config:
             decision=decision,
             plugins=plugins,
             webui=webui,
+            reminder=reminder,
             **basics,
         )
+
+
+def _load_reminder(data: dict[str, Any]) -> ReminderConfig:
+    """解析 reminder 段：宽松取值，写错类型回落默认，不让配置问题挡住启动。"""
+    if not isinstance(data, dict):
+        return ReminderConfig()
+    default = ReminderConfig()
+    return ReminderConfig(
+        enabled=data.get("enabled") is not False,
+        max_pending_per_chat=_as_int(
+            data.get("max_pending_per_chat"), default.max_pending_per_chat, minimum=0
+        ),
+        max_delay_minutes=_as_int(
+            data.get("max_delay_minutes"), default.max_delay_minutes, minimum=1
+        ),
+        max_text_chars=_as_int(data.get("max_text_chars"), default.max_text_chars, minimum=20),
+    )
 
 
 def _load_memory(data: dict[str, Any]) -> MemoryConfig:

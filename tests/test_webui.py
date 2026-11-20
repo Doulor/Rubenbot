@@ -479,6 +479,36 @@ def test_decisions_list_and_filter(client, store):
 
 
 # ----------------------------------------------------------------------
+# 提醒（只读列表）
+# ----------------------------------------------------------------------
+
+
+def test_reminders_list_is_read_only(client, store):
+    job = store.add_scheduled_job(
+        kind="reminder",
+        fire_at=time.time() + 600,
+        platform="snowluma",
+        chat_id="1001",
+        chat_type="private",
+        payload={"text": "吃药", "requester_name": "阿花"},
+        created_by="snowluma:1001",
+    )
+    # 其它 kind 不该混进提醒列表
+    store.add_scheduled_job(kind="other", fire_at=time.time() + 60, platform="snowluma", chat_id="g1")
+    items = client.get("/api/reminders").json()["items"]
+    assert len(items) == 1
+    assert items[0]["id"] == job.id
+    assert items[0]["text"] == "吃药" and items[0]["requester_name"] == "阿花"
+    # 一期没有取消入口
+    for method in (client.post, client.delete, client.put):
+        assert method(f"/api/reminders/{job.id}").status_code in (404, 405)
+
+    # 已执行的不再出现在待执行列表
+    store.finish_scheduled_job(job.id, status="done")
+    assert client.get("/api/reminders").json()["items"] == []
+
+
+# ----------------------------------------------------------------------
 # 插件
 # ----------------------------------------------------------------------
 

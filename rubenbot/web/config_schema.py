@@ -87,6 +87,7 @@ def structured_config(config: Config) -> dict[str, Any]:
         "memory": asdict(config.memory),
         "chat": asdict(config.chat),
         "decision": decision,
+        "reminder": asdict(config.reminder),
         "plugins": {
             "dir": config.plugins.dir,
             "enabled": list(config.plugins.enabled),
@@ -473,6 +474,26 @@ def _validate_groups(value: Any, v: _Validator) -> dict[str, Any] | None:
     return result
 
 
+def _validate_reminder(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    if "enabled" in section:
+        flag = v.boolean(section["enabled"], "reminder.enabled")
+        if flag is not None:
+            out["enabled"] = flag
+    for key, minimum, maximum in (
+        ("max_pending_per_chat", 0, 50),
+        ("max_delay_minutes", 1, 60 * 24 * 365),
+        ("max_text_chars", 20, 2000),
+    ):
+        if key in section:
+            number = v.number(
+                section[key], f"reminder.{key}", minimum=minimum, maximum=maximum, integer=True
+            )
+            if number is not None:
+                out[key] = int(number)
+    return out
+
+
 def _validate_plugins(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
     out: dict[str, Any] = {}
     if "dir" in section:
@@ -588,6 +609,9 @@ def validate_structured(payload: dict[str, Any]) -> dict[str, Any]:
     decision = _section(payload, "decision", v)
     if decision is not None:
         update["decision"] = _validate_decision(decision, v)
+    reminder = _section(payload, "reminder", v)
+    if reminder is not None:
+        update["reminder"] = _validate_reminder(reminder, v)
     plugins = _section(payload, "plugins", v)
     if plugins is not None:
         update["plugins"] = _validate_plugins(plugins, v)

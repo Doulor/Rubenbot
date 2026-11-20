@@ -46,6 +46,8 @@ from .memory.store import MemoryStore, make_person_id
 from .memory.summary import RollingSummarizer, format_summary_block
 from .persona import Persona
 from .plugins.loader import PluginContext, PluginManager
+from .reminder import REMINDER_TOOL, build_reminder_prompt, describe_fire_at, resolve_fire_at
+from .scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +84,20 @@ RECALL_TOOL = {
         },
     },
 }
+
+
+def chat_tools(config: Config) -> list[dict[str, Any]]:
+    """当前配置下可用的工具集：recall（可选）+ set_reminder（可选）。
+
+    两个开关都在 ``memory`` / ``reminder`` 段；工具不可用时模型自然只会
+    普通生成，不需要别处再判断。
+    """
+    tools: list[dict[str, Any]] = []
+    if config.memory.recall_tool_enabled:
+        tools.append(RECALL_TOOL)
+    if config.reminder.enabled:
+        tools.append(REMINDER_TOOL)
+    return tools
 
 
 # ----------------------------------------------------------------------
@@ -309,6 +325,19 @@ def format_scene(event: MessageEvent, display: str) -> str:
     )
 
 
+def _parse_tool_arguments(arguments: Any) -> dict[str, Any]:
+    """工具参数可能是 JSON 字符串，也可能已经是 dict；解析失败按空参数处理。"""
+    if isinstance(arguments, dict):
+        return arguments
+    if isinstance(arguments, str) and arguments.strip():
+        try:
+            parsed = json.loads(arguments)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
 @dataclass
 class BotContext:
     """插件钩子与命令处理拿到的运行时上下文。"""
@@ -401,6 +430,9 @@ class RubenBot:
         self._chat_locks: dict[str, asyncio.Lock] = {}
         self._bg_task: asyncio.Task | None = None
         self._merge_task: asyncio.Task | None = None
+        # 定时任务：跟随主程序生命周期启停
+        self.scheduler = Scheduler(store, self.handle_scheduled_job)
+        self._scheduler_task: asyncio.Task | None = None
         self._stop = asyncio.Event()
 
     # ------------------------------------------------------------------
@@ -471,6 +503,7 @@ class RubenBot:
         tasks = [asyncio.create_task(self._run_adapter(adapter)) for adapter in self.adapters.values()]
         self._bg_task = asyncio.create_task(self._background_loop())
         self._merge_task = asyncio.create_task(self._merge_loop())
+        self._scheduler_task = asyncio.create_task(self.scheduler.run(self._stop))
         try:
             if tasks:
                 await asyncio.gather(*tasks)
@@ -482,11 +515,12 @@ class RubenBot:
                 await self.flush_merger(all_rounds=True)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("退出前处理待合并消息失败：%s", exc)
-            for task in (self._bg_task, self._merge_task):
+            for task in (self._bg_task, self._merge_task, self._scheduler_task):
                 if task is not None:
                     task.cancel()
             self._bg_task = None
             self._merge_task = None
+            self._scheduler_task = None
             for task in tasks:
                 task.cancel()
 
@@ -561,6 +595,49 @@ class RubenBot:
         rounds = self.merger.flush_all() if all_rounds else self.merger.pop_ready(now)
         for round_ in rounds:
             await self.process_round(round_)
+
+    # ------------------------------------------------------------------
+    # 定时任务
+    # ------------------------------------------------------------------
+
+    async def handle_scheduled_job(self, job, *, late: bool = False) -> None:
+        """执行一条到期任务（目前只有提醒）：让模型按提醒文本现写一句话发出。
+
+        发送走正常通道（拆条、清洗、落流水）；失败只记日志，不重试轰炸。
+        """
+        if job.kind != "reminder":
+            logger.warning("未知的定时任务类型 %s（#%s），已跳过", job.kind, job.id)
+            return
+        text = str(job.payload.get("text") or "").strip()
+        if not text:
+            logger.warning("提醒 #%s 没有正文，已跳过", job.id)
+            return
+        adapter = self.adapters.get(job.platform)
+        if adapter is None:
+            logger.warning("提醒 #%s 的平台 %s 不在线，无法发送", job.id, job.platform)
+            return
+        requester = str(job.payload.get("requester_name") or job.created_by or "")
+        messages = build_reminder_prompt(
+            persona=self.persona.system_prompt(),
+            text=text,
+            requester=requester,
+            is_private=job.chat_type == "private",
+            late=late,
+        )
+        reply = await self.generate(messages)
+        if not reply:
+            # 模型一句话都写不出：退回提醒原文，别把事吞掉
+            reply = f"{text}" if not late else f"来晚了——{text}"
+        event = MessageEvent(
+            platform=job.platform,
+            chat_type=job.chat_type,
+            chat_id=job.chat_id,
+            sender_id=BOT_SENDER_ID,
+            sender_name=self.config.chat.bot_name,
+            text=reply,
+        )
+        await self.send_reply(event, reply)
+        logger.info("提醒 #%s 已发送%s：%s", job.id, "（迟到）" if late else "", text[:40])
 
     async def run_maintenance(self, *, now: float | None = None, force_extract: bool = False) -> None:
         """抽取 + 归纳的一次检查；两个环节互不影响。"""
@@ -1027,18 +1104,18 @@ class RubenBot:
     # ------------------------------------------------------------------
 
     async def generate(self, messages: list[dict[str, str]], *, event: MessageEvent | None = None) -> str:
-        """生成回复；模型支持工具调用时先给最多两轮 recall 工具循环。
+        """生成回复；模型支持工具调用时先给最多两轮工具循环（recall / 提醒）。
 
         工具不可用、模型不用工具、或任何一步出问题，都退化为普通单次生成。
         """
-        if event is not None and self.config.memory.recall_tool_enabled:
+        if event is not None and chat_tools(self.config):
             try:
                 reply = await self._generate_with_tools(messages, event)
             except ToolUnsupported as exc:
                 logger.debug("当前模型不支持工具调用，退化为单次生成：%s", exc)
                 reply = None
             except Exception as exc:  # noqa: BLE001 - 工具循环失败不能拖死回复
-                logger.warning("recall 工具循环失败，退化为单次生成：%s", exc)
+                logger.warning("工具循环失败，退化为单次生成：%s", exc)
                 reply = None
             if reply is not None:
                 return reply.strip()
@@ -1050,7 +1127,7 @@ class RubenBot:
         return (reply or "").strip()
 
     async def _generate_with_tools(self, messages: list[dict[str, str]], event: MessageEvent) -> str | None:
-        """最多两轮 recall 工具循环；返回 None 表示应当退化为单次生成。"""
+        """最多两轮工具循环（recall + set_reminder）；返回 None 表示应退化为单次生成。"""
         if not getattr(self.llm, "supports_tools", True):
             raise ToolUnsupported("当前模型已确认不支持工具调用")
         chat_with_tools = getattr(self.llm, "chat_with_tools", None)
@@ -1058,11 +1135,11 @@ class RubenBot:
             raise ToolUnsupported("当前 LLM 客户端不支持工具调用")
         max_rounds = max(0, int(self.config.memory.recall_tool_max_rounds))
         if max_rounds == 0:
-            raise ToolUnsupported("recall 工具循环已关闭")
+            raise ToolUnsupported("工具循环已关闭")
+        tools = chat_tools(self.config)
         working: list[dict[str, Any]] = list(messages)
-        used_tool = False
         for _ in range(max_rounds):
-            message = await chat_with_tools(working, [RECALL_TOOL], role="chat")
+            message = await chat_with_tools(working, tools, role="chat")
             tool_calls = message.get("tool_calls") or []
             if not tool_calls:
                 content = (message.get("content") or "").strip()
@@ -1070,7 +1147,6 @@ class RubenBot:
                     # 模型没要工具、直接给了回复：这就是一次正常生成，不必再花一次请求
                     return content
                 return None
-            used_tool = True
             working.append(
                 {
                     "role": "assistant",
@@ -1081,29 +1157,28 @@ class RubenBot:
             for call in tool_calls:
                 working.append(await self._tool_result_message(call, event))
         # 两轮后模型还在要工具：不再给，直接让模型收尾一次
-        message = await chat_with_tools(
-            working, [RECALL_TOOL], role="chat", tool_choice="none"
-        )
+        message = await chat_with_tools(working, tools, role="chat", tool_choice="none")
         return message.get("content") or ""
+
     async def _tool_result_message(self, call: dict[str, Any], event: MessageEvent) -> dict[str, Any]:
-        """执行一次 recall 工具调用，把结果包装成 tool 消息。"""
+        """执行一次工具调用（recall / set_reminder），把结果包装成 tool 消息。"""
         call_id = str(call.get("id") or "")
         function = call.get("function") or {}
         name = str(function.get("name") or "")
-        if name != "recall":
+        if name not in ("recall", "set_reminder"):
             return {
                 "role": "tool",
                 "tool_call_id": call_id,
                 "content": f"没有名为 {name or '（空）'} 的工具。",
             }
-        arguments = function.get("arguments") or "{}"
-        if isinstance(arguments, str):
+        args = _parse_tool_arguments(function.get("arguments"))
+        if name == "set_reminder":
             try:
-                args = json.loads(arguments)
-            except json.JSONDecodeError:
-                args = {}
-        else:
-            args = arguments if isinstance(arguments, dict) else {}
+                content = await self.set_reminder(args, event=event)
+            except Exception as exc:  # noqa: BLE001 - 工具失败只把原因告诉模型
+                logger.warning("set_reminder 执行失败：%s", exc)
+                content = f"设置提醒失败：{exc}"
+            return {"role": "tool", "tool_call_id": call_id, "content": content}
         try:
             content = await self.recall(
                 str(args.get("person_query") or ""),
@@ -1115,6 +1190,55 @@ class RubenBot:
             logger.warning("recall 工具执行失败：%s", exc)
             content = f"回忆失败：{exc}"
         return {"role": "tool", "tool_call_id": call_id, "content": content}
+
+    async def set_reminder(
+        self,
+        args: dict[str, Any],
+        *,
+        event: MessageEvent | None = None,
+        now: float | None = None,
+    ) -> str:
+        """set_reminder 工具实现：校验参数、检查每会话上限、落库。
+
+        返回给模型看的说明文字（成功或拒绝原因）；不抛异常给工具循环。
+        """
+        now = time.time() if now is None else now
+        cfg = self.config.reminder
+        if not cfg.enabled:
+            return "提醒功能当前未开启。"
+        if event is None:
+            return "当前没有可用的会话，无法设置提醒。"
+        text = str(args.get("text") or "").strip()
+        if not text:
+            return "提醒内容不能为空，请用 text 参数写清楚要提醒什么。"
+        text = text[: max(1, int(cfg.max_text_chars))]
+        fire_at, error = resolve_fire_at(
+            args, now, max_delay_minutes=max(1, int(cfg.max_delay_minutes))
+        )
+        if error is not None:
+            return error
+        pending = self.store.count_pending_jobs(
+            kind="reminder", platform=event.platform, chat_id=event.chat_id
+        )
+        if pending >= cfg.max_pending_per_chat:
+            return (
+                f"这个会话已经有 {pending} 条提醒在等，达到上限 {cfg.max_pending_per_chat} 条，"
+                "这次先记不了了；可以等前面的提醒到点后再设。"
+            )
+        job = self.store.add_scheduled_job(
+            kind="reminder",
+            fire_at=float(fire_at),
+            platform=event.platform,
+            chat_id=event.chat_id,
+            chat_type=event.chat_type,
+            payload={"text": text, "requester_name": event.sender_name},
+            created_by=make_person_id(event.platform, event.sender_id),
+            now=now,
+        )
+        logger.info(
+            "设置提醒 #%s：%s/%s %s（%s）", job.id, event.platform, event.chat_id, text, describe_fire_at(fire_at, now)
+        )
+        return f"已设好提醒：{describe_fire_at(fire_at, now)}提醒「{text}」。"
 
     def split_reply(self, reply: str) -> list[str]:
         """按句/长度拆成 2~3 条短消息。
