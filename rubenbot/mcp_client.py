@@ -175,10 +175,17 @@ class MCPManager:
         """并行连接，所有调用者都等到每台启用服务已发布目录或已记录首次错误。"""
         if not self._tasks:
             for s in self._servers.values():
-                if s.config.enabled:
-                    attempted = asyncio.Event()
-                    task = asyncio.create_task(self._supervise(s, attempted), name=f"mcp:{s.config.name}")
-                    self._tasks[task] = attempted
+                if not s.config.enabled:
+                    continue
+                if (s.config.transport == "stdio"
+                        and os.path.basename(s.config.command) not in self.config.stdio_allowed_commands):
+                    s.state = "error"
+                    s.last_error = "stdio 启动器不在 mcp.stdio_allowed_commands 白名单中"
+                    logger.warning("MCP %s：%s", s.config.name, s.last_error)
+                    continue
+                attempted = asyncio.Event()
+                task = asyncio.create_task(self._supervise(s, attempted), name=f"mcp:{s.config.name}")
+                self._tasks[task] = attempted
         for attempted in tuple(self._tasks.values()):
             await attempted.wait()
 

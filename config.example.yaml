@@ -108,12 +108,13 @@ mcp:
   connect_timeout: 10       # 每台服务器的连接与发现时限（秒）
   call_timeout: 30          # 单次工具调用时限（秒）
   max_result_bytes: 32768   # 包括截断标记在内的 UTF-8 字节数，最少 32
+  stdio_allowed_commands: [python, python3, uv, uvx, npx, node]  # 按文件名匹配；覆盖默认值，[] 全禁 stdio
   servers: []               # 启用示例时，改为 servers: 并取消下列对应注释
     # - name: local-docs
     #   enabled: true
     #   transport: stdio
-    #   command: /absolute/path/to/docs-server
-    #   args: ["--stdio"]
+    #   command: python
+    #   args: ["/absolute/path/to/docs_server.py", "--stdio"]
     #   env: {DOCS_TOKEN: "${DOCS_TOKEN}"}
     # - name: remote-docs
     #   enabled: true
