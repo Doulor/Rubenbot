@@ -263,9 +263,28 @@ button {
 }
 
 .nav {
+  position: relative;
+  isolation: isolate;
+  --nav-gap: 4px;
+  --nav-height: 44px;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: var(--nav-gap);
+}
+
+/* 同一块药丸跟随选中项，横竖布局共用索引；首帧不从概览滑入。 */
+.nav:has(.active)::before {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  inset: 0 auto auto 0;
+  width: 100%;
+  height: var(--nav-height);
+  border-radius: var(--r-pill);
+  background: var(--accent-container);
+  pointer-events: none;
+  transform: translateY(calc(var(--nav-index) * (100% + var(--nav-gap))));
+  transition: transform 400ms var(--ease);
 }
 
 .nav-item {
@@ -298,6 +317,8 @@ button {
   color: var(--on-accent-container);
   font-weight: 600;
 }
+
+.nav:has(.active) .nav-item.active { background: transparent; }
 
 .nav-item.active .icon {
   opacity: 1;
@@ -434,31 +455,15 @@ button {
   gap: 18px;
 }
 
-/* 页面进入的轻微上浮；尊重 reduce-motion */
-.view > * {
-  animation: rise 0.38s var(--ease) both;
-}
-
-.view > *:nth-child(2) {
-  animation-delay: 36ms;
-}
-
-.view > *:nth-child(3) {
-  animation-delay: 72ms;
-}
-
-.view > *:nth-child(4) {
-  animation-delay: 108ms;
-}
-
-@keyframes rise {
-  from {
-    opacity: 0;
-    transform: translateY(8px);
+/* 仅实际换页完成时淡入；常驻容器不随轮询重新入场。 */
+@media (prefers-reduced-motion: no-preference) {
+  .route-arriving { animation: route-arrive 220ms cubic-bezier(.42, 0, .58, 1); }
+  @keyframes route-arrive { from { opacity: .55; } to { opacity: 1; } }
+  @starting-style {
+    .subpage-motion .settings-content { opacity: 0; translate: 0 4px; }
   }
-  to {
-    opacity: 1;
-    transform: none;
+  .subpage-motion .settings-content {
+    transition: opacity var(--select) var(--ease), translate var(--select) var(--ease);
   }
 }
 
@@ -2095,7 +2100,7 @@ button {
   padding: 24px;
   background: var(--scrim);
   backdrop-filter: blur(3px);
-  animation: toast-in 0.25s var(--ease) both;
+  transition: opacity var(--surface-motion);
 }
 
 .restart-card {
@@ -2393,7 +2398,7 @@ button {
   border: 0;
   box-shadow: var(--shadow-pop);
   font-size: 13px;
-  animation: toast-in 0.28s var(--ease) both;
+  transition: opacity var(--surface-motion), translate var(--surface-motion);
   pointer-events: auto;
 }
 
@@ -2407,15 +2412,39 @@ button {
   color: var(--bad);
 }
 
-@keyframes toast-in {
-  from {
+/* 原生 dialog 仍立即 close；只延迟顶层绘制的撤销，不延迟焦点归还。 */
+@media (prefers-reduced-motion: no-preference) {
+  .dialog, .dialog::backdrop {
     opacity: 0;
-    transform: translateY(6px) scale(0.98);
+    transition: opacity 404ms var(--ease), scale 404ms var(--ease),
+      overlay 404ms allow-discrete, display 404ms allow-discrete;
   }
-  to {
-    opacity: 1;
-    transform: none;
+  .dialog[open], .dialog[open]::backdrop { opacity: 1; }
+  .dialog:not([open]), .dialog:not([open])::backdrop { pointer-events: none; }
+
+  .settings-savebar, .item-arriving {
+    transition: opacity var(--surface-motion), translate var(--surface-motion);
   }
+  .toast.is-leaving { opacity: 0; translate: 0 4px; }
+  @starting-style {
+    .dialog[open] { opacity: 0; scale: 1.025; }
+    .dialog[open]::backdrop, .restart-overlay { opacity: 0; }
+    .toast, .settings-savebar, .item-arriving { opacity: 0; translate: 0 4px; }
+  }
+}
+
+/* 离场快照只绘制，不占位置、不接收焦点或点击。 */
+.motion-copy {
+  position: absolute !important;
+  z-index: 6;
+  margin: 0 !important;
+  pointer-events: none !important;
+  overflow: hidden;
+  transition: opacity var(--surface-motion), translate var(--surface-motion);
+}
+.motion-copy.is-leaving { opacity: 0; translate: 0 -4px; }
+@starting-style {
+  .motion-copy.is-leaving { opacity: 1; translate: none; }
 }
 
 /* ---------------- 窄屏：侧栏变底部悬浮 dock ---------------- */
@@ -2470,6 +2499,11 @@ button {
     justify-content: center;
     min-height: 44px;
     white-space: nowrap;
+  }
+
+  .nav:has(.active)::before {
+    width: calc(100% / var(--nav-count));
+    transform: translateX(calc(var(--nav-index) * 100%));
   }
 
   .nav-item span {
