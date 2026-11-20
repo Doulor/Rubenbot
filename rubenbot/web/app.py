@@ -61,6 +61,7 @@ from ..persona import DEFAULT_PERSONA, Persona, load_persona
 from .auth import COOKIE_NAME, BindSecurityError, check_bind_security, mask_secret
 from .config_schema import (
     ConfigValidationError,
+    config_layout,
     merge_config,
     structured_config,
     validate_structured,
@@ -972,6 +973,7 @@ def create_app(state: WebState):
             "exists": path.exists(),
             "effective": _mask_config(_config_to_dict(state.config)),
             "structured": structured_config(state.config),
+            "layout": config_layout(),
             "plugins_available": state.plugin_list(),
             "restart_fields": _pending_restart_fields(state),
         }

@@ -346,13 +346,15 @@ async function pollHealth() {
 
 const PAGES = {
   overview: { title: "概览", sub: "运行状态与最近动静", render: renderOverview },
-  persona: { title: "人设", sub: "编辑人格文件，保存即热生效", render: renderPersona },
+  bot: { title: "机器人", sub: "人设、聊天、表达、记忆、情绪、语音与表情", render: renderBot },
+  // 旧链接 #/persona 仍然打开人设编辑器（已并入「机器人」选项卡）
+  persona: { title: "机器人", sub: "人设", render: renderLegacyPersona },
   memory: { title: "记忆", sub: "按人浏览、搜索与维护记忆库", render: renderMemory },
   people: { title: "人物", sub: "见过的每个人和他们的档案", render: renderPeople },
   groups: { title: "群组与意愿", sub: "每群活跃度、静默时段与决策记录", render: renderGroups },
   plugins: { title: "插件市场", sub: "已装与可装同列表；安装后默认关闭，手动启用才加载", render: renderPlugins },
   logs: { title: "日志", sub: "最近的运行日志", render: renderLogs },
-  settings: { title: "设置", sub: "模型、记忆、意愿与运行参数，保存即生效", render: renderSettings },
+  settings: { title: "设置", sub: "模型、搜索、主动触达、适配器与运行环境", render: renderSettings },
 };
 
 const state = {
@@ -383,8 +385,10 @@ async function renderRoute() {
   const route = currentRoute();
   state.page = route.page;
   state.param = route.param;
+  // 旧路由 #/persona 已并入机器人选项卡，侧栏高亮跟着「机器人」
+  const navPage = route.page === "persona" ? "bot" : route.page;
   document.querySelectorAll(".nav-item").forEach((item) => {
-    item.classList.toggle("active", item.dataset.page === route.page);
+    item.classList.toggle("active", item.dataset.page === navPage);
   });
   if (state.pollTimer) {
     clearInterval(state.pollTimer);
@@ -841,7 +845,16 @@ function setPersonaDirty(dirty, { dot, saveButton, note } = {}) {
   }
 }
 
-async function renderPersona(view) {
+async function renderLegacyPersona(view) {
+  // 旧路由 #/persona：人设已并入机器人选项卡，这里仍显示编辑器并保持侧栏高亮
+  await renderBot(view, "persona");
+}
+
+/**
+ * 人设编辑器的全部节点。人设页已搬进「机器人」选项卡做人设二级页，
+ * 但编辑器本身（保存、.bak 备份、热重载、只读预览）保持原样。
+ */
+async function personaNodes() {
   const data = await api.get("/api/persona");
 
   const editor = h("textarea", {
@@ -1028,8 +1041,8 @@ async function renderPersona(view) {
   };
   await loadEffective();
 
-  view.replaceChildren(editCard, h("div", { class: "grid grid-2" }, effectiveCard, previewCard));
-  // 切到别的页时由 renderRoute 统一清掉脏标记与 beforeunload 提醒
+  // 切到别的页时由 renderRoute / 二级菜单统一清掉脏标记与 beforeunload 提醒
+  return [editCard, h("div", { class: "grid grid-2" }, effectiveCard, previewCard)];
 }
 
 /* ------------------------------------------------------------------ */
@@ -2610,6 +2623,151 @@ function listEditor(values, onChange, { placeholder = "输入后回车或点添�
   return chips;
 }
 
+/** 模型角色表：预置角色 + 自定义角色名，值留空表示跟随对话模型。 */
+function modelsEditor(draft) {
+  const ROLES = [
+    ["fast", "快速档（小任务）"],
+    ["summary", "滚动摘要"],
+    ["vision", "看图"],
+    ["gate", "分寸审查"],
+    ["distill", "画像提炼"],
+  ];
+  const models = () => {
+    const current = draft.llm && draft.llm.models;
+    return current && typeof current === "object" ? current : {};
+  };
+  const field = (role, label) =>
+    h(
+      "div",
+      { class: "settings-field" },
+      h("span", { class: "field-label" }, `${label}（${role}）`),
+      h("input", {
+        class: "input mono",
+        type: "text",
+        value: models()[role] || "",
+        placeholder: "留空跟随对话模型",
+        "aria-label": `${label} 模型`,
+        oninput: (event) => {
+          const next = { ...models() };
+          const value = event.target.value.trim();
+          if (value) next[role] = value;
+          else delete next[role];
+          draft.llm = draft.llm || {};
+          draft.llm.models = next;
+        },
+      })
+    );
+
+  const extraRoles = Object.keys(models()).filter((role) => !ROLES.some(([name]) => name === role));
+
+  return h(
+    "div",
+    { style: { display: "grid", gap: "12px" } },
+    h("div", { class: "settings-fields" }, ...ROLES.map(([role, label]) => field(role, label)),
+      ...extraRoles.map((role) => field(role, role))),
+    h("span", { class: "field-hint" }, "留空即跟随对话模型；配置里写过的自定义角色名会原样保留在下面（刷新页面后可见）。")
+  );
+}
+
+/** 任意键 → 数值 的表（目前用于 emotion.threshold_adjust 的「心情 → 微调」）。 */
+function mapEditor(draft, path, { keyPlaceholder = "键", valuePlaceholder = "值" } = {}) {
+  const table = () => {
+    const current = getPath(draft, path);
+    return current && typeof current === "object" ? current : {};
+  };
+  const rows = h("div", { style: { display: "grid", gap: "8px" } });
+
+  function render() {
+    const current = table();
+    const entries = Object.keys(current);
+    rows.replaceChildren(
+      ...(entries.length
+        ? entries.map((key) =>
+            h(
+              "div",
+              { style: { display: "flex", alignItems: "center", gap: "10px" } },
+              h("span", { class: "field-label", style: { minWidth: "56px", margin: 0 } }, key),
+              h("input", {
+                class: "input",
+                type: "number",
+                step: "0.01",
+                min: "-1",
+                max: "1",
+                value: String(current[key] ?? ""),
+                "aria-label": `${key} 的微调值`,
+                oninput: (event) => {
+                  const next = { ...table() };
+                  next[key] = event.target.value;
+                  setPath(draft, path, next);
+                },
+              }),
+              h(
+                "button",
+                {
+                  class: "icon-btn-sm danger",
+                  type: "button",
+                  title: `删除 ${key}`,
+                  "aria-label": `删除 ${key}`,
+                  onclick: () => {
+                    const next = { ...table() };
+                    delete next[key];
+                    setPath(draft, path, next);
+                    render();
+                  },
+                },
+                icon("trash")
+              )
+            )
+          )
+        : [h("div", { class: "field-hint" }, "还没有条目；没配的心情按 0 处理。")])
+    );
+  }
+
+  const keyInput = h("input", {
+    class: "input",
+    placeholder: keyPlaceholder,
+    style: { maxWidth: "140px" },
+    "aria-label": keyPlaceholder,
+  });
+  const valueInput = h("input", {
+    class: "input",
+    type: "number",
+    step: "0.01",
+    min: "-1",
+    max: "1",
+    placeholder: valuePlaceholder,
+    style: { maxWidth: "120px" },
+    "aria-label": valuePlaceholder,
+  });
+  const addButton = h(
+    "button",
+    {
+      class: "btn btn-sm btn-ghost",
+      type: "button",
+      onclick: () => {
+        const key = keyInput.value.trim();
+        if (!key) return;
+        const next = { ...table() };
+        next[key] = valueInput.value === "" ? 0 : valueInput.value;
+        setPath(draft, path, next);
+        keyInput.value = "";
+        valueInput.value = "";
+        render();
+      },
+    },
+    icon("plus"),
+    "添加"
+  );
+
+  render();
+  return h(
+    "div",
+    { style: { display: "grid", gap: "10px" } },
+    rows,
+    h("div", { style: { display: "flex", gap: "8px", alignItems: "center" } }, keyInput, valueInput, addButton)
+  );
+}
+
 /** 一个表单项：标签 + 控件 + 说明。 */
 function settingsField(def, draft) {
   const value = getPath(draft, def.path);
@@ -3050,468 +3208,580 @@ async function restartAndWait() {
   setTimeout(tick, 1200);
 }
 
-async function renderSettings(view) {
-  const data = await api.get("/api/config");
-  const structured = data.structured || {};
-  const secrets = structured.secrets || {};
-  const draft = JSON.parse(JSON.stringify(structured));
-  delete draft.secrets;
-
-  const noticeBox = h("div", { hidden: true });
-  const errorBox = h("div", { hidden: true });
-
-  const showResult = (result) => {
-    noticeBox.hidden = false;
-    noticeBox.replaceChildren(resultNotice(result, () => confirmRestart()));
-  };
-
-  function confirmRestart() {
-    confirmDialog({
-      title: "立即重启 RubenBot？",
-      message: "进程会原地重启，正在处理的对话会中断，WebUI 需要重新登录。确定现在重启吗？",
-      confirmText: "立即重启",
-      danger: true,
-      onConfirm: () => restartAndWait(),
-    });
-  }
-
-  const saveButton = h(
-    "button",
-    { class: "btn btn-primary", type: "button" },
-    icon("check"),
-    "保存全部设置"
-  );
-  const saveBar = h(
-    "div",
-    { class: "settings-savebar" },
-    h(
-      "div",
-      { class: "row-main" },
-      h("div", { class: "row-title" }, "设置"),
-      h("div", { class: "row-sub" }, `配置文件：${data.path}`)
-    ),
-    h("div", { class: "spacer" }),
-    h("button", { class: "btn", type: "button", onclick: () => renderRoute() }, icon("refresh"), "放弃修改"),
-    saveButton
-  );
-
-  saveButton.addEventListener("click", async () => {
-    saveButton.disabled = true;
-    errorBox.hidden = true;
-    noticeBox.hidden = true;
-    try {
-      const result = await api.put("/api/config", { config: draft });
-      toast("配置已保存");
-      if (result.relogin) {
-        // 口令变了，当前会话立即作废；重新登录后再看结果
-        showLogin();
-        toast("访问口令已更新，请重新登录", "error");
-        return;
-      }
-      state.settingsNotice = result;
-      await renderRoute();
-    } catch (err) {
-      if (err instanceof Unauthorized) return;
-      errorBox.hidden = false;
-      const fields = (err.fields || []).map((item) =>
-        h("div", { class: "result-line" },
-          h("span", { class: "tag bad" }, item.field),
-          h("span", {}, item.message))
-      );
-      errorBox.replaceChildren(
-        h("div", { class: "notice" },
-          icon("warning"),
-          h("div", { style: { display: "grid", gap: "6px", flex: "1" } },
-            h("strong", {}, "保存失败，配置没有写入"),
-            fields.length ? null : h("div", {}, err.message || "请检查填写内容"),
-            ...fields))
-      );
-      errorBox.scrollIntoView({ behavior: "smooth", block: "nearest" });
-      toast("配置校验未通过", "error");
-    } finally {
-      saveButton.disabled = false;
+/** 字段路径 → 二级页面：规则由后端 config_layout() 提供，前端只做最长前缀匹配。 */
+function pageOf(layout, path) {
+  let best = null;
+  for (const rule of (layout && layout.rules) || []) {
+    if (path === rule.prefix || path.startsWith(`${rule.prefix}.`)) {
+      if (!best || rule.prefix.length > best.prefix.length) best = rule;
     }
-  });
+  }
+  return best ? best.page : "";
+}
 
-  const cards = [
-    card("模型与接口", {
-      hint: "OpenAI 兼容接口",
-      body: fieldGrid(
-        [
-          { path: "llm.base_url", label: "接口地址", hint: "例如 https://api.deepseek.com/v1", wide: true, mono: true },
-          {
-            path: "llm.api_key",
-            label: "API Key",
-            kind: "password",
-            hint: "留空表示保留原值；也可以写成 ${ENV_VAR} 从环境变量读取",
-            secretSet: Boolean(secrets["llm.api_key"]),
-          },
-          { path: "llm.chat_model", label: "对话模型", hint: "回复消息用的模型", mono: true },
-          { path: "llm.extract_model", label: "抽取模型", hint: "记忆抽取用；留空跟随对话模型", mono: true },
-          { path: "llm.consolidate_model", label: "归纳模型", hint: "记忆归纳用；留空跟随对话模型", mono: true },
-          { path: "llm.temperature", label: "温度", kind: "number", step: "0.05", min: 0, max: 2, hint: "0–2，越大越发散" },
-          { path: "llm.timeout", label: "超时（秒）", kind: "number", step: "1", min: 0.1, hint: "单次请求超时" },
-          { path: "llm.max_retries", label: "重试次数", kind: "number", step: "1", min: 0, max: 10, hint: "失败后的重试次数" },
-        ],
-        draft
-      ),
-    }),
-    card("人格与数据", {
-      hint: "路径改动需重启",
-      body: fieldGrid(
-        [
-          { path: "persona.path", label: "人格文件", hint: "SOUL.md 风格；路径不变时保存会顺带重读内容", wide: true, mono: true, restart: true },
-          { path: "database_path", label: "数据库文件", hint: "SQLite 路径；改动需重启", wide: true, mono: true, restart: true },
-        ],
-        draft
-      ),
-    }),
-    card("记忆", {
-      hint: "抽取与归纳参数",
-      body: fieldGrid(
-        [
-          { path: "memory.extract_every_n", label: "触发抽取的消息数", kind: "number", step: "1", min: 1, hint: "同一会话攒够多少条未抽取消息就触发" },
-          { path: "memory.extract_silence_seconds", label: "静默触发（秒）", kind: "number", step: "1", min: 0, hint: "会话静默这么久后触发抽取" },
-          { path: "memory.extract_min_pending", label: "单人最少条数", kind: "number", step: "1", min: 1, hint: "一个人至少积累几条才抽取" },
-          { path: "memory.extract_window", label: "单次抽取窗口", kind: "number", step: "1", min: 1, hint: "一次最多喂给模型的该人消息数" },
-          { path: "memory.inject_limit", label: "回复注入上限", kind: "number", step: "1", min: 0, hint: "回复时最多注入多少条记忆" },
-          { path: "memory.dedupe_threshold", label: "去重阈值", kind: "number", step: "0.01", min: 0, max: 1, hint: "与已有记忆的相似度达到多少算重复（0–1）" },
-          { path: "memory.consolidate_new_threshold", label: "归纳触发条数", kind: "number", step: "1", min: 1, hint: "新增记忆达到多少条触发归纳" },
-          { path: "memory.consolidate_interval_hours", label: "归纳间隔（小时）", kind: "number", step: "0.5", min: 0.1, hint: "距上次归纳超过这么久也会触发" },
-          { path: "memory.consolidate_max_memories", label: "归纳输入上限", kind: "number", step: "1", min: 1, hint: "单次最多送多少条记忆给模型" },
-          { path: "memory.consolidate_remove_ratio", label: "本轮移除比例", kind: "number", step: "0.01", min: 0, max: 1, hint: "一轮最多移除的比例" },
-          { path: "memory.consolidate_remove_min", label: "最少允许移除", kind: "number", step: "1", min: 1, hint: "一轮至少允许移除的条数" },
-          { path: "memory.raw_keep_per_chat", label: "原始消息保留", kind: "number", step: "1", min: 1, hint: "每个会话保留多少条原始消息" },
-        ],
-        draft
-      ),
-    }),
-    card("滚动摘要", {
-      hint: "把本会话的早期对话压成摘要，prompt 里只放摘要 + 近期原文",
-      body: fieldGrid(
-        [
-          { path: "memory.rolling_summary.enabled", label: "启用滚动摘要", kind: "switch", hint: "关闭后行为与以前一致：只带最近原文" },
-          { path: "memory.rolling_summary.trigger_after", label: "触发条数", kind: "number", step: "1", min: 1, hint: "未摘要的原文超过这么多条时压缩一次" },
-          { path: "memory.rolling_summary.keep_recent", label: "保留近期原文", kind: "number", step: "1", min: 0, hint: "始终不压缩的最新原文条数" },
-          { path: "memory.rolling_summary.max_chars", label: "摘要上限（字）", kind: "number", step: "50", min: 100, hint: "五段式摘要的总长上限，更新时模型需在此取舍" },
-        ],
-        draft
-      ),
-    }),
-    card("联网搜索", {
-      hint: "给 bot 一个 web_search 工具：按顺序尝试各渠道，未配任何 Key 时工具不开放",
-      body: fieldGrid(
-        [
-          {
-            path: "search.order",
-            label: "渠道顺序",
-            kind: "list",
-            wide: true,
-            placeholder: "例如 tavily",
-            hint: "按顺序尝试；没配 Key 的渠道自动跳过，失败或没结果就换下一个。可选：tavily / deepseek",
-          },
-          {
-            path: "search.tavily.api_key",
-            label: "Tavily API Key",
-            kind: "password",
-            hint: "留空表示保留原值；api.tavily.com",
-            secretSet: Boolean(secrets["search.tavily.api_key"]),
-          },
-          {
-            path: "search.deepseek.api_key",
-            label: "DeepSeek API Key",
-            kind: "password",
-            hint: "留空表示保留原值；与 DeepSeek 模型用同一把 Key",
-            secretSet: Boolean(secrets["search.deepseek.api_key"]),
-          },
-          { path: "search.timeout_seconds", label: "超时（秒）", kind: "number", step: "1", min: 0.1, hint: "单次搜索请求的超时" },
-          { path: "search.cooldown_seconds", label: "每会话冷却（秒）", kind: "number", step: "5", min: 0, hint: "冷却内重复搜索直接返回已有结果提示，不发请求" },
-        ],
-        draft
-      ),
-    }),
-    card("语音双向", {
-      hint: "听懂语音条（STT）与用语音回复（TTS）；未配置时全部降级为文字",
-      body: fieldGrid(
-        [
-          {
-            path: "voice.stt_provider",
-            label: "语音转写后端",
-            kind: "select",
-            hint: "首选后端；失败或空文本会顺延到其他已配置的后端。qq_native 仅 SnowLuma 可用",
-            options: [
-              { value: "siliconflow", label: "硅基流动 SiliconFlow" },
-              { value: "openai_compatible", label: "OpenAI 兼容接口" },
-              { value: "qq_native", label: "QQ 原生转写（仅 SnowLuma）" },
+/** 找到分组与二级页面；缺省回落到第一个，未知 id 不会把页面打空。 */
+function findPage(layout, groupId, pageId) {
+  const groups = (layout && layout.groups) || [];
+  const group = groups.find((item) => item.id === groupId) || groups[0];
+  const page =
+    (group && group.pages.find((item) => item.id === pageId)) || (group && group.pages[0]);
+  return { group, page };
+}
+
+/** 左侧二级菜单：只列当前分组（机器人 / 设置）的页面。 */
+function settingsMenu(layout, group, page) {
+  return h(
+    "nav",
+    { class: "settings-menu", "aria-label": `${group.title}分类` },
+    h("div", { class: "settings-menu-group" }, group.title),
+    ...group.pages.map((item) =>
+      h(
+        "button",
+        {
+          type: "button",
+          class: `settings-menu-item ${item.id === page.id ? "active" : ""}`,
+          "aria-current": item.id === page.id ? "page" : null,
+          onclick: () => navigate(group.route, item.id),
+        },
+        item.title
+      )
+    )
+  );
+}
+
+/**
+ * 配置卡片清单（只有标签与控件形态，不含分类）。
+ * 每张卡用 ``path`` 标出它覆盖的代表字段，具体归到哪个二级页面由后端
+ * ``layout.rules`` 决定；这里不再维护第二份「字段 → 页面」表。
+ */
+function settingsCardSpecs(draft, secrets, pluginsAvailable) {
+  return [
+    {
+      path: "llm.base_url",
+      node: card("模型与接口", {
+        hint: "OpenAI 兼容接口",
+        body: fieldGrid(
+          [
+            { path: "llm.base_url", label: "接口地址", hint: "例如 https://api.deepseek.com/v1", wide: true, mono: true },
+            {
+              path: "llm.api_key",
+              label: "API Key",
+              kind: "password",
+              hint: "留空表示保留原值；也可以写成 ${ENV_VAR} 从环境变量读取",
+              secretSet: Boolean(secrets["llm.api_key"]),
+            },
+            { path: "llm.chat_model", label: "对话模型", hint: "回复消息用的模型", mono: true },
+            { path: "llm.extract_model", label: "抽取模型", hint: "记忆抽取用；留空跟随对话模型", mono: true },
+            { path: "llm.consolidate_model", label: "归纳模型", hint: "记忆归纳用；留空跟随对话模型", mono: true },
+            { path: "llm.temperature", label: "温度", kind: "number", step: "0.05", min: 0, max: 2, hint: "0–2，越大越发散" },
+            { path: "llm.timeout", label: "超时（秒）", kind: "number", step: "1", min: 0.1, hint: "单次请求超时" },
+            { path: "llm.max_retries", label: "重试次数", kind: "number", step: "1", min: 0, max: 10, hint: "失败后的重试次数" },
+          ],
+          draft
+        ),
+      }),
+    },
+    {
+      path: "llm.models",
+      node: card("模型角色与审查模型", {
+        hint: "「角色 → 模型名」；角色配了就用，没配回退对话模型",
+        body: h(
+          "div",
+          { style: { display: "grid", gap: "16px" } },
+          fieldGrid(
+            [
+              { path: "llm.gate_model", label: "分寸审查模型", hint: "记忆分寸审查用；留空跟随对话模型", mono: true },
             ],
-          },
-          {
-            path: "voice.stt_api_key",
-            label: "转写 API Key",
-            kind: "password",
-            hint: "留空表示保留原值；不填则语音消息只记 [语音] 占位（qq_native 不需要）",
-            secretSet: Boolean(secrets["voice.stt_api_key"]),
-          },
-          {
-            path: "voice.stt_base_url",
-            label: "兼容接口地址",
-            hint: "仅 OpenAI 兼容后端用，例如 https://host/v1；填了才启用",
-            mono: true,
-          },
-          { path: "voice.stt_model", label: "转写模型", mono: true, hint: "默认 FunAudioLLM/SenseVoiceSmall" },
-          { path: "voice.stt_timeout_seconds", label: "转写超时（秒）", kind: "number", step: "1", min: 0.1, hint: "单次转写请求的超时" },
-          { path: "voice.stt_max_seconds", label: "单条时长上限（秒）", kind: "number", step: "5", min: 0, hint: "超过就不转写，正文只留 [语音] 占位" },
-          { path: "voice.stt_max_bytes", label: "单条大小上限（字节）", kind: "number", step: "1024", min: 0, hint: "默认 5MB；超过就不转写" },
-          {
-            path: "voice.tts_mode",
-            label: "语音回复模式",
-            kind: "select",
-            hint: "off 从不发语音；reply_voice 对方发语音时回语音；on_request 再加「用语音说」的明确要求",
-            options: [
-              { value: "off", label: "关闭（默认）" },
-              { value: "reply_voice", label: "对方发语音时回语音" },
-              { value: "on_request", label: "被要求时也发语音" },
-            ],
-          },
-          {
-            path: "voice.tts_provider",
-            label: "语音合成后端",
-            kind: "select",
-            hint: "自定义 TTS 走 OpenAI 兼容的 /audio/speech；硅基流动 CosyVoice2 需要 Key",
-            options: [
-              { value: "custom", label: "自定义 TTS（OpenAI 兼容）" },
-              { value: "siliconflow", label: "硅基流动 CosyVoice2" },
-            ],
-          },
-          {
-            path: "voice.tts_api_key",
-            label: "合成 API Key",
-            kind: "password",
-            hint: "留空表示保留原值；硅基流动后端留空时复用转写 Key",
-            secretSet: Boolean(secrets["voice.tts_api_key"]),
-          },
-          { path: "voice.tts_base_url", label: "自定义 TTS 地址", mono: true, hint: "OpenAI 兼容 base_url，例如 https://host/v1；留空视为未配置，降级发文字" },
-          { path: "voice.tts_model", label: "合成模型", mono: true, hint: "自定义 TTS 必填；硅基流动留空用默认 CosyVoice2-0.5B" },
-          { path: "voice.tts_voice", label: "合成音色", mono: true, hint: "自定义 TTS 的音色名，随请求一起发给接口" },
-          { path: "voice.tts_siliconflow_voice", label: "合成音色（硅基流动）", mono: true },
-          { path: "voice.tts_max_chars", label: "语音回复字数上限", kind: "number", step: "5", min: 1, hint: "正文超过就不合成语音；被拆成多条的长回复一律发文字" },
-          { path: "voice.tts_timeout_seconds", label: "合成超时（秒）", kind: "number", step: "1", min: 0.1, hint: "单次合成请求的超时" },
-        ],
-        draft
-      ),
-    }),
-    card("聊天与回复", {
-      hint: "回复长度与上下文",
-      body: fieldGrid(
-        [
-          { path: "chat.bot_name", label: "Bot 名称", hint: "会写进消息流水，也用作默认的叫名硬触发" },
-          { path: "chat.history_size", label: "上下文条数", kind: "number", step: "1", min: 1, hint: "拼进提示词的最近消息条数" },
-          { path: "chat.split_max_parts", label: "最多拆成几条", kind: "number", step: "1", min: 1, hint: "长回复按句拆条，避免刷屏" },
-          { path: "chat.split_part_chars", label: "每段字数上限", kind: "number", step: "1", min: 8, hint: "超过就拆成下一条" },
-          { path: "chat.split_delay_seconds", label: "拆条间隔（秒）", kind: "number", step: "0.1", min: 0, hint: "多条消息之间的停顿" },
-          { path: "chat.history_ttl_hours", label: "上下文有效期（小时）", kind: "number", step: "0.5", min: 0, hint: "超过这个时间的旧消息不再拼进上下文" },
-        ],
-        draft
-      ),
-    }),
-    card("生成", {
-      hint: "决定回复之后怎么写出正文",
-      body: fieldGrid(
-        [
-          {
-            path: "generation.two_stage.enabled",
-            label: "两段式生成",
-            kind: "switch",
-            hint: "先让快速模型想一段简短指导，再按指导写正文；第一段失败会自动回退单段直出",
-          },
-        ],
-        draft
-      ),
-    }),
-    card("情绪与好感度", {
-      hint: "状态由规则计算，只做背景注入与阈值微调",
-      body: fieldGrid(
-        [
-          {
-            path: "emotion.enabled",
-            label: "启用情绪系统",
-            kind: "switch",
-            hint: "关掉后不记录好感度、不注入状态、不调整开口阈值",
-          },
-          { path: "emotion.chat_delta", label: "每轮对话加分", kind: "number", step: "0.1", min: 0, max: 10, hint: "与 bot 完成一轮对话的好感度增量" },
-          { path: "emotion.chat_daily_cap", label: "对话加分每日上限", kind: "number", step: "0.5", min: 0, hint: "每人每个自然日靠对话最多加多少" },
-          { path: "emotion.praise_delta", label: "被夸 / 感谢加分", kind: "number", step: "0.5", min: -50, max: 50, hint: "关键词命中且确认是对 bot 说的" },
-          { path: "emotion.insult_delta", label: "被骂减分", kind: "number", step: "0.5", min: -50, max: 50, hint: "同一套保守规则，宁可漏判" },
-          { path: "emotion.decay_weekly", label: "每周回归基线比例", kind: "number", step: "0.01", min: 0, max: 1, hint: "好感度每周向 50 靠拢的比例（惰性折算）" },
-          { path: "emotion.half_life_seconds", label: "情绪半衰期（秒）", kind: "number", step: "60", min: 1, hint: "情绪强度减半所需时间，默认一小时" },
-          { path: "emotion.boredom_after_seconds", label: "多久没人理算无聊（秒）", kind: "number", step: "60", min: 0, hint: "超过这么久没人说话、情绪也淡了才判无聊" },
-          {
-            path: "emotion.praise_mood",
-            label: "被夸时的情绪",
-            kind: "select",
-            options: MOOD_NAMES.map((name) => ({ value: name, label: name })),
-            hint: "情绪枚举之一；强度在下面几项里配",
-          },
-          { path: "emotion.praise_intensity", label: "被夸情绪强度", kind: "number", step: "0.05", min: 0, max: 1 },
-          {
-            path: "emotion.insult_mood",
-            label: "被骂时的情绪",
-            kind: "select",
-            options: MOOD_NAMES.map((name) => ({ value: name, label: name })),
-          },
-          { path: "emotion.insult_intensity", label: "被骂情绪强度", kind: "number", step: "0.05", min: 0, max: 1 },
-          {
-            path: "emotion.excitement_mood",
-            label: "热闹时的情绪",
-            kind: "select",
-            options: MOOD_NAMES.map((name) => ({ value: name, label: name })),
-          },
-          { path: "emotion.excitement_intensity", label: "兴奋强度", kind: "number", step: "0.05", min: 0, max: 1, hint: "群里热闹且 bot 参与多时" },
-          {
-            path: "emotion.boredom_mood",
-            label: "没人理时的情绪",
-            kind: "select",
-            options: MOOD_NAMES.map((name) => ({ value: name, label: name })),
-          },
-          { path: "emotion.boredom_intensity", label: "无聊强度", kind: "number", step: "0.05", min: 0, max: 1 },
-          { path: "emotion.min_intensity", label: "情绪有效期阈值", kind: "number", step: "0.01", min: 0, max: 1, hint: "强度低于它视为平静：不再注入、不调阈值" },
-        ],
-        draft
-      ),
-    }),
-    card("回复意愿", {
-      hint: "群聊里什么时候开口",
-      body: fieldGrid(
-        [
-          { path: "decision.merge_window_seconds", label: "合并窗口（秒）", kind: "number", step: "0.5", min: 0, hint: "同一人连发的多条先攒着合并成一轮" },
-          { path: "decision.hard_merge_window_seconds", label: "硬触发窗口（秒）", kind: "number", step: "0.5", min: 0, hint: "私聊/@/回复/叫名字的短窗口，0 表示立即处理" },
-          { path: "decision.aliases", label: "叫名别名", kind: "list", wide: true, placeholder: "例如 小R", hint: "叫到这些名字算硬触发；留空则用 Bot 名称" },
-          { path: "decision.base", label: "基础意愿", kind: "number", step: "0.01", min: 0, max: 1, hint: "每个群的基础分，默认低，靠动量和相关性加分" },
-          { path: "decision.threshold", label: "开口阈值", kind: "number", step: "0.01", min: 0, max: 1, hint: "分数达到多少才开口" },
-          { path: "decision.threshold_noise", label: "阈值随机扰动", kind: "number", step: "0.01", min: 0, max: 1, hint: "阈值附近的随机波动幅度" },
-          { path: "decision.threshold_noise_band", label: "扰动生效范围", kind: "number", step: "0.01", min: 0, max: 1, hint: "离阈值多近才摇骰子" },
-          { path: "decision.momentum_bonus", label: "动量加成", kind: "number", step: "0.05", min: 0, max: 10, hint: "刚参与过这个会话时的加分" },
-          { path: "decision.momentum_half_life_seconds", label: "动量半衰期（秒）", kind: "number", step: "10", min: 1, hint: "动量随时间衰减的速度" },
-          { path: "decision.relevance_bonus", label: "相关性加成", kind: "number", step: "0.05", min: 0, max: 10, hint: "记忆检索命中时的最大加分" },
-          { path: "decision.relevance_scale", label: "相关性归一尺度", kind: "number", step: "0.5", min: 0.1, hint: "检索分数除以它后封顶" },
-          { path: "decision.ratio_window", label: "占比统计窗口", kind: "number", step: "1", min: 1, hint: "统计发言占比时看最近多少条消息" },
-          { path: "decision.ratio_threshold", label: "占比阈值", kind: "number", step: "0.01", min: 0, max: 1, hint: "bot 占比超过这个值开始减分" },
-          { path: "decision.ratio_silence", label: "占比静默线", kind: "number", step: "0.01", min: 0, max: 1, hint: "占比到这个值直接静默" },
-          { path: "decision.ratio_penalty", label: "占比最大减分", kind: "number", step: "0.1", min: 0, max: 10, hint: "占比超阈值时的最大减分" },
-          { path: "decision.cooldown_seconds", label: "发言后冷却（秒）", kind: "number", step: "1", min: 0, hint: "发言后这段时间内降低意愿" },
-          { path: "decision.cooldown_penalty", label: "冷却最大减分", kind: "number", step: "0.1", min: 0, max: 10, hint: "冷却期内最多减多少分" },
-          { path: "decision.veto_marker", label: "不回复标记", hint: "模型输出这个标记就静默丢弃" },
-        ],
-        draft
-      ),
-    }),
-    card("每群覆盖", {
-      hint: "单独调节某个群",
-      body: groupsEditor(draft, secrets),
-    }),
-    card("提醒", {
-      hint: "模型被明确要求「提醒我」时创建，不自动提醒",
-      body: fieldGrid(
-        [
-          { path: "reminder.enabled", label: "启用提醒工具", kind: "switch", hint: "关闭后模型无法设置提醒，已设的提醒照常触发" },
-          { path: "reminder.max_pending_per_chat", label: "每会话提醒上限", kind: "number", step: "1", min: 0, max: 50, hint: "同一会话最多同时挂多少条待执行提醒" },
-          { path: "reminder.max_delay_minutes", label: "最远提前（分钟）", kind: "number", step: "60", min: 1, hint: "超过这个跨度的提醒请求会被拒绝" },
-          { path: "reminder.max_text_chars", label: "提醒正文上限（字）", kind: "number", step: "10", min: 20, max: 2000, hint: "超出部分会被截断" },
-        ],
-        draft
-      ),
-    }),
-    card("冷场开口", {
-      hint: "默认关闭：群里长时间没人才可能主动说一句，宁可漏不可扰",
-      body: fieldGrid(
-        [
-          { path: "proactive.enabled", label: "启用冷场开口", kind: "switch", hint: "只在群聊里生效，私聊不主动开口" },
-          { path: "proactive.idle_hours", label: "安静多久才考虑（小时）", kind: "number", step: "0.5", min: 0.1, hint: "距上一条消息超过这个时长" },
-          { path: "proactive.daily_limit", label: "每群每日上限", kind: "number", step: "1", min: 0, max: 100, hint: "每个群每天最多主动开口几次" },
-          { path: "proactive.cooldown_minutes", label: "评估冷却（分钟）", kind: "number", step: "5", min: 0, hint: "没开口时，隔多久再评估一次" },
-          { path: "proactive.quiet_hours", label: "不开口时段", kind: "list", wide: true, placeholder: "例如 23:00-08:00", hint: "格式 HH:MM-HH:MM，可写多个；这段时间内不主动开口" },
-          { path: "proactive.base", label: "基础意愿", kind: "number", step: "0.01", min: 0, max: 1, hint: "主动开口场景的基础分，给得低大多数时候不开口" },
-          { path: "proactive.threshold", label: "开口阈值", kind: "number", step: "0.01", min: 0, max: 1, hint: "分数达到多少才开口" },
-          { path: "proactive.threshold_noise", label: "阈值随机扰动", kind: "number", step: "0.01", min: 0, max: 1, hint: "阈值附近的随机波动幅度" },
-          { path: "proactive.threshold_noise_band", label: "扰动生效范围", kind: "number", step: "0.01", min: 0, max: 1, hint: "离阈值多近才摇骰子" },
-          { path: "proactive.relevance_bonus", label: "相关性加成", kind: "number", step: "0.01", min: 0, max: 10, hint: "群里近期话题命中记忆时最多加多少分" },
-          { path: "proactive.relevance_scale", label: "相关性归一尺度", kind: "number", step: "0.5", min: 0.1, hint: "检索分数除以它后封顶" },
-        ],
-        draft
-      ),
-    }),
-    card("插件市场", {
-      hint: "索引地址与远程来源；装卸启停在插件市场页",
-      body: h(
-        "div",
-        { style: { display: "grid", gap: "16px" } },
-        fieldGrid(
+            draft
+          ),
+          modelsEditor(draft)
+        ),
+      }),
+    },
+    {
+      path: "memory.extract_every_n",
+      node: card("记忆：抽取与归纳", {
+        hint: "抽取与归纳参数",
+        body: fieldGrid(
+          [
+            { path: "memory.extract_every_n", label: "触发抽取的消息数", kind: "number", step: "1", min: 1, hint: "同一会话攒够多少条未抽取消息就触发" },
+            { path: "memory.extract_silence_seconds", label: "静默触发（秒）", kind: "number", step: "1", min: 0, hint: "会话静默这么久后触发抽取" },
+            { path: "memory.extract_min_pending", label: "单人最少条数", kind: "number", step: "1", min: 1, hint: "一个人至少积累几条才抽取" },
+            { path: "memory.extract_window", label: "单次抽取窗口", kind: "number", step: "1", min: 1, hint: "一次最多喂给模型的该人消息数" },
+            { path: "memory.inject_limit", label: "回复注入上限", kind: "number", step: "1", min: 0, hint: "回复时最多注入多少条记忆" },
+            { path: "memory.dedupe_threshold", label: "去重阈值", kind: "number", step: "0.01", min: 0, max: 1, hint: "与已有记忆的相似度达到多少算重复（0–1）" },
+            { path: "memory.consolidate_new_threshold", label: "归纳触发条数", kind: "number", step: "1", min: 1, hint: "新增记忆达到多少条触发归纳" },
+            { path: "memory.consolidate_interval_hours", label: "归纳间隔（小时）", kind: "number", step: "0.5", min: 0.1, hint: "距上次归纳超过这么久也会触发" },
+            { path: "memory.consolidate_max_memories", label: "归纳输入上限", kind: "number", step: "1", min: 1, hint: "单次最多送多少条记忆给模型" },
+            { path: "memory.consolidate_remove_ratio", label: "本轮移除比例", kind: "number", step: "0.01", min: 0, max: 1, hint: "一轮最多移除的比例" },
+            { path: "memory.consolidate_remove_min", label: "最少允许移除", kind: "number", step: "1", min: 1, hint: "一轮至少允许移除的条数" },
+            { path: "memory.raw_keep_per_chat", label: "原始消息保留", kind: "number", step: "1", min: 1, hint: "每个会话保留多少条原始消息" },
+          ],
+          draft
+        ),
+      }),
+    },
+    {
+      path: "memory.distill_new_threshold",
+      node: card("记忆：画像与时间线", {
+        hint: "记忆 v2 的画像提炼、近况过期与时间线压缩",
+        body: fieldGrid(
+          [
+            { path: "memory.distill_new_threshold", label: "画像提炼触发条数", kind: "number", step: "1", min: 1, hint: "新增事件 + 事实达到多少条触发提炼" },
+            { path: "memory.distill_interval_hours", label: "提炼间隔（小时）", kind: "number", step: "1", min: 0.1, hint: "距上次提炼超过这么久也会触发" },
+            { path: "memory.distill_max_events", label: "提炼事件上限", kind: "number", step: "1", min: 1, hint: "一次提炼最多喂多少条新事件" },
+            { path: "memory.distill_max_facts", label: "提炼事实上限", kind: "number", step: "1", min: 1, hint: "一次提炼最多喂多少条新事实" },
+            { path: "memory.status_expiry_min_days", label: "近况过期下限（天）", kind: "number", step: "1", min: 1, hint: "模型估计的过期天数夹取到这一段区间" },
+            { path: "memory.status_expiry_max_days", label: "近况过期上限（天）", kind: "number", step: "1", min: 1 },
+            { path: "memory.timeline_compress_after_days", label: "时间线压缩阈值（天）", kind: "number", step: "1", min: 0.1, hint: "比这更早的事件按人按周压成 digest" },
+            { path: "memory.timeline_prune_after_days", label: "时间线清理阈值（天）", kind: "number", step: "1", min: 0.1, hint: "比这更早的事件只保留高显著度的" },
+            { path: "memory.timeline_prune_keep_salience", label: "清理时保留的显著度", kind: "number", step: "0.05", min: 0, max: 1, hint: "显著度高于它的旧事件不清理" },
+            { path: "memory.self_event_max_chars", label: "自我事件截断（字）", kind: "number", step: "10", min: 1, hint: "bot 自己发的每条消息记进自我时间线时的截断长度" },
+          ],
+          draft
+        ),
+      }),
+    },
+    {
+      path: "memory.index_active_days",
+      node: card("记忆：读取侧", {
+        hint: "索引、预拉取、跨会话回看与分寸审查",
+        body: fieldGrid(
+          [
+            { path: "memory.index_active_days", label: "索引活跃窗口（天）", kind: "number", step: "1", min: 0.1, hint: "群成员索引只收近 N 天在本群活跃过的人" },
+            { path: "memory.index_max_members", label: "索引人数上限", kind: "number", step: "1", min: 1 },
+            { path: "memory.index_ttl_seconds", label: "索引缓存时效（秒）", kind: "number", step: "10", min: 0, hint: "画像更新时缓存会立即失效" },
+            { path: "memory.index_identity_chars", label: "索引身份截断（字）", kind: "number", step: "4", min: 4, hint: "索引里「一句话身份」的截断长度" },
+            { path: "memory.mentioned_max_people", label: "预拉画像人数", kind: "number", step: "1", min: 0, hint: "一轮里最多拉几个被提及者的核心画像" },
+            { path: "memory.profile_inject_max_chars", label: "说话人画像上限（字）", kind: "number", step: "20", min: 120, hint: "画像核心不参与预算裁剪" },
+            { path: "memory.inject_budget_tokens", label: "注入预算（token）", kind: "number", step: "100", min: 0, hint: "超出后先砍事实、再砍时间线，画像核心不动" },
+            { path: "memory.timeline_hit_limit", label: "每人相关旧事条数", kind: "number", step: "1", min: 1 },
+            { path: "memory.cross_session_hours", label: "跨会话回看（小时）", kind: "number", step: "1", min: 0.1, hint: "私聊跨会话摘要回看的小时数" },
+            { path: "memory.self_inject_hours", label: "自我回看（小时）", kind: "number", step: "1", min: 0.1, hint: "回看本会话里 bot 自己最近说过/做过的事" },
+            { path: "memory.self_inject_limit", label: "自我注入条数", kind: "number", step: "1", min: 0 },
+            { path: "memory.gate_confidence_threshold", label: "分寸审查置信度", kind: "number", step: "0.05", min: 0, max: 1, hint: "模型裁定置信度低于它不放行" },
+            { path: "memory.gate_ask_high_sensitivity", label: "高敏感项进待问队列", kind: "switch", hint: "高敏感跨场合内容是否顺带进待问队列" },
+            { path: "memory.recall_tool_enabled", label: "启用 recall 工具", kind: "switch", hint: "模型支持 OpenAI 工具调用时生效" },
+            { path: "memory.recall_tool_max_rounds", label: "recall 最多轮数", kind: "number", step: "1", min: 0 },
+          ],
+          draft
+        ),
+      }),
+    },
+    {
+      path: "memory.rolling_summary.enabled",
+      node: card("滚动摘要", {
+        hint: "把本会话的早期对话压成摘要，prompt 里只放摘要 + 近期原文",
+        body: fieldGrid(
+          [
+            { path: "memory.rolling_summary.enabled", label: "启用滚动摘要", kind: "switch", hint: "关闭后行为与以前一致：只带最近原文" },
+            { path: "memory.rolling_summary.trigger_after", label: "触发条数", kind: "number", step: "1", min: 1, hint: "未摘要的原文超过这么多条时压缩一次" },
+            { path: "memory.rolling_summary.keep_recent", label: "保留近期原文", kind: "number", step: "1", min: 0, hint: "始终不压缩的最新原文条数" },
+            { path: "memory.rolling_summary.max_chars", label: "摘要上限（字）", kind: "number", step: "50", min: 100, hint: "五段式摘要的总长上限，更新时模型需在此取舍" },
+          ],
+          draft
+        ),
+      }),
+    },
+    {
+      path: "search.order",
+      node: card("联网搜索", {
+        hint: "给 bot 一个 web_search 工具：按顺序尝试各渠道，未配任何 Key 时工具不开放",
+        body: fieldGrid(
           [
             {
-              path: "market.index_url",
-              label: "索引地址",
-              hint: "索引仓库 plugins.json 的 raw 地址；留空或拉取失败时回退内置官方索引",
+              path: "search.order",
+              label: "渠道顺序",
+              kind: "list",
               wide: true,
+              placeholder: "例如 tavily",
+              hint: "按顺序尝试；没配 Key 的渠道自动跳过，失败或没结果就换下一个。可选：tavily / deepseek",
+            },
+            {
+              path: "search.tavily.api_key",
+              label: "Tavily API Key",
+              kind: "password",
+              hint: "留空表示保留原值；api.tavily.com",
+              secretSet: Boolean(secrets["search.tavily.api_key"]),
+            },
+            {
+              path: "search.deepseek.api_key",
+              label: "DeepSeek API Key",
+              kind: "password",
+              hint: "留空表示保留原值；与 DeepSeek 模型用同一把 Key",
+              secretSet: Boolean(secrets["search.deepseek.api_key"]),
+            },
+            { path: "search.timeout_seconds", label: "超时（秒）", kind: "number", step: "1", min: 0.1, hint: "单次搜索请求的超时" },
+            { path: "search.cooldown_seconds", label: "每会话冷却（秒）", kind: "number", step: "5", min: 0, hint: "冷却内重复搜索直接返回已有结果提示，不发请求" },
+          ],
+          draft
+        ),
+      }),
+    },
+    {
+      path: "voice.stt_provider",
+      node: card("语音双向", {
+        hint: "听懂语音条（STT）与用语音回复（TTS）；未配置时全部降级为文字",
+        body: fieldGrid(
+          [
+            {
+              path: "voice.stt_provider",
+              label: "语音转写后端",
+              kind: "select",
+              hint: "首选后端；失败或空文本会顺延到其他已配置的后端。qq_native 仅 SnowLuma 可用",
+              options: [
+                { value: "siliconflow", label: "硅基流动 SiliconFlow" },
+                { value: "openai_compatible", label: "OpenAI 兼容接口" },
+                { value: "qq_native", label: "QQ 原生转写（仅 SnowLuma）" },
+              ],
+            },
+            {
+              path: "voice.stt_api_key",
+              label: "转写 API Key",
+              kind: "password",
+              hint: "留空表示保留原值；不填则语音消息只记 [语音] 占位（qq_native 不需要）",
+              secretSet: Boolean(secrets["voice.stt_api_key"]),
+            },
+            {
+              path: "voice.stt_base_url",
+              label: "兼容接口地址",
+              hint: "仅 OpenAI 兼容后端用，例如 https://host/v1；填了才启用",
               mono: true,
+            },
+            { path: "voice.stt_model", label: "转写模型", mono: true, hint: "默认 FunAudioLLM/SenseVoiceSmall" },
+            { path: "voice.stt_timeout_seconds", label: "转写超时（秒）", kind: "number", step: "1", min: 0.1, hint: "单次转写请求的超时" },
+            { path: "voice.stt_max_seconds", label: "单条时长上限（秒）", kind: "number", step: "5", min: 0, hint: "超过就不转写，正文只留 [语音] 占位" },
+            { path: "voice.stt_max_bytes", label: "单条大小上限（字节）", kind: "number", step: "1024", min: 0, hint: "默认 5MB；超过就不转写" },
+            {
+              path: "voice.tts_mode",
+              label: "语音回复模式",
+              kind: "select",
+              hint: "off 从不发语音；reply_voice 对方发语音时回语音；on_request 再加「用语音说」的明确要求",
+              options: [
+                { value: "off", label: "关闭（默认）" },
+                { value: "reply_voice", label: "对方发语音时回语音" },
+                { value: "on_request", label: "被要求时也发语音" },
+              ],
+            },
+            {
+              path: "voice.tts_provider",
+              label: "语音合成后端",
+              kind: "select",
+              hint: "自定义 TTS 走 OpenAI 兼容的 /audio/speech；硅基流动 CosyVoice2 需要 Key",
+              options: [
+                { value: "custom", label: "自定义 TTS（OpenAI 兼容）" },
+                { value: "siliconflow", label: "硅基流动 CosyVoice2" },
+              ],
+            },
+            {
+              path: "voice.tts_api_key",
+              label: "合成 API Key",
+              kind: "password",
+              hint: "留空表示保留原值；硅基流动后端留空时复用转写 Key",
+              secretSet: Boolean(secrets["voice.tts_api_key"]),
+            },
+            { path: "voice.tts_base_url", label: "自定义 TTS 地址", mono: true, hint: "OpenAI 兼容 base_url，例如 https://host/v1；留空视为未配置，降级发文字" },
+            { path: "voice.tts_model", label: "合成模型", mono: true, hint: "自定义 TTS 必填；硅基流动留空用默认 CosyVoice2-0.5B" },
+            { path: "voice.tts_voice", label: "合成音色", mono: true, hint: "自定义 TTS 的音色名，随请求一起发给接口" },
+            { path: "voice.tts_siliconflow_voice", label: "合成音色（硅基流动）", mono: true },
+            { path: "voice.tts_max_chars", label: "语音回复字数上限", kind: "number", step: "5", min: 1, hint: "正文超过就不合成语音；被拆成多条的长回复一律发文字" },
+            { path: "voice.tts_timeout_seconds", label: "合成超时（秒）", kind: "number", step: "1", min: 0.1, hint: "单次合成请求的超时" },
+          ],
+          draft
+        ),
+      }),
+    },
+    {
+      path: "chat.bot_name",
+      node: card("聊天与上下文", {
+        hint: "回复长度与上下文",
+        body: fieldGrid(
+          [
+            { path: "chat.bot_name", label: "Bot 名称", hint: "会写进消息流水，也用作默认的叫名硬触发" },
+            { path: "chat.history_size", label: "上下文条数", kind: "number", step: "1", min: 1, hint: "拼进提示词的最近消息条数" },
+            { path: "chat.history_ttl_hours", label: "上下文有效期（小时）", kind: "number", step: "0.5", min: 0, hint: "超过这个时间的旧消息不再拼进上下文" },
+            { path: "chat.dedupe_ttl_seconds", label: "入站去重窗口（秒）", kind: "number", step: "10", min: 0, hint: "同一平台消息 id 在这个时间窗内重复到达就丢弃；0 表示不去重" },
+            { path: "decision.batch_max_seconds", label: "整批最长等待（秒）", kind: "number", step: "1", min: 0, hint: "从首条消息算起最多攒这么久就放出；0 表示不设上限" },
+            { path: "decision.urgent_seconds", label: "@/回复的截止（秒）", kind: "number", step: "0.5", min: 0, hint: "整批里有 @ 或回复 bot 的消息时，不晚于「首条 + 这个秒数」放出；0 表示不启用" },
+          ],
+          draft
+        ),
+      }),
+    },
+    {
+      // 拆条属于「回复形态」：这一段在 YAML 里仍属于 chat 段，但按语义归到表达页
+      path: "chat.split_max_parts",
+      node: card("长回复拆条", {
+        hint: "按句拆成多条发送，避免刷屏；属于回复形态，和生成策略放在一起",
+        body: fieldGrid(
+          [
+            { path: "chat.split_max_parts", label: "最多拆成几条", kind: "number", step: "1", min: 1, hint: "长回复按句拆条，避免刷屏" },
+            { path: "chat.split_part_chars", label: "每段字数上限", kind: "number", step: "1", min: 8, hint: "超过就拆成下一条" },
+            { path: "chat.strip_action_parens", label: "剥离动作描写", kind: "switch", hint: "发送前去掉括号里的动作描写（如「（笑）」），默认关闭" },
+            { path: "chat.type_speed", label: "打字节奏倍率", kind: "number", step: "0.1", min: 0, hint: "中文字约 0.3 秒/字、其他字符约 0.15 秒/字，再乘这个倍率；0 表示两条之间不停顿" },
+            { path: "chat.type_delay_max_seconds", label: "单条打字停顿上限（秒）", kind: "number", step: "0.5", min: 0, hint: "长文也不会等太久；只影响多条之间的停顿" },
+          ],
+          draft
+        ),
+      }),
+    },
+    {
+      path: "generation.two_stage.enabled",
+      node: card("生成", {
+        hint: "决定回复之后怎么写出正文",
+        body: fieldGrid(
+          [
+            {
+              path: "generation.two_stage.enabled",
+              label: "两段式生成",
+              kind: "switch",
+              hint: "先让快速模型想一段简短指导，再按指导写正文；第一段失败会自动回退单段直出",
             },
           ],
           draft
         ),
-        pluginEditor(draft, data.plugins_available || [])
-      ),
-    }),
-    card("适配器", {
-      hint: "连接参数改动需重启",
-      body: adaptersEditor(draft, secrets),
-    }),
-    card("网关与事件通道", {
-      hint: "默认关闭：开启后模型可查/调平台接口，notice 与 request 事件也会进事件流",
-      body: fieldGrid(
-        [
-          { path: "gateway.enabled", label: "启用适配器网关", kind: "switch", hint: "关时模型看不见 adapter_actions / adapter_call" },
-          { path: "gateway.judge_events", label: "事件快判", kind: "switch", hint: "关时事件只落库；开时才让模型判断要不要动作" },
-          { path: "gateway.allow_sensitive", label: "允许敏感动作", kind: "switch", hint: "踢人/禁言/撤回/处理申请等；开启后每次调用都会标红审计" },
-          { path: "gateway.enabled_conversations", label: "允许的会话", kind: "list", wide: true, placeholder: "例如 snowluma:123456789", hint: "platform:chat_id；私聊会话恒可，群聊需在这里列出" },
-          { path: "gateway.quiet_hours", label: "安静时段", hint: "HH:MM-HH:MM；这段时间里非必判事件只记录，必判事件也只挂待办" },
-          { path: "gateway.daily_budget_per_conversation", label: "每会话每日额度", kind: "number", step: "1", min: 0, hint: "每个会话每天最多主动动作次数" },
-          { path: "gateway.global_daily_cap", label: "全局每日上限", kind: "number", step: "1", min: 0, hint: "所有会话合计的熔断线" },
-        ],
-        draft
-      ),
-    }),
-    card("WebUI 与高级", {
-      hint: "监听地址与运行参数",
-      body: h(
-        "div",
-        { style: { display: "grid", gap: "16px" } },
-        fieldGrid(
+      }),
+    },
+    {
+      path: "emotion.enabled",
+      node: card("情绪与好感度", {
+        hint: "状态由规则计算，只做背景注入与阈值微调",
+        body: fieldGrid(
           [
-            { path: "webui.enabled", label: "启用 WebUI", kind: "switch", hint: "关闭后本次运行仍然可用，重启后不再启动", restart: true },
-            { path: "webui.host", label: "监听地址", hint: "默认 127.0.0.1；绑非本地地址必须设置口令", restart: true, mono: true },
-            { path: "webui.port", label: "端口", kind: "number", step: "1", min: 1, max: 65535, hint: "改动需重启", restart: true },
             {
-              path: "webui.password",
-              label: "访问口令",
-              kind: "password",
-              hint: "留空表示保留原值；绑非本地地址时必须设置",
-              secretSet: Boolean(secrets["webui.password"]),
+              path: "emotion.enabled",
+              label: "启用情绪系统",
+              kind: "switch",
+              hint: "关掉后不记录好感度、不注入状态、不调整开口阈值",
             },
-            { path: "webui.session_hours", label: "登录有效期（小时）", kind: "number", step: "1", min: 0.1, hint: "会话 Cookie 的有效时长" },
-            { path: "background_check_minutes", label: "后台检查间隔（分钟）", kind: "number", step: "1", min: 0.1, hint: "记忆抽取/归纳的定期检查频率" },
+            { path: "emotion.chat_delta", label: "每轮对话加分", kind: "number", step: "0.1", min: 0, max: 10, hint: "与 bot 完成一轮对话的好感度增量" },
+            { path: "emotion.chat_daily_cap", label: "对话加分每日上限", kind: "number", step: "0.5", min: 0, hint: "每人每个自然日靠对话最多加多少" },
+            { path: "emotion.praise_delta", label: "被夸 / 感谢加分", kind: "number", step: "0.5", min: -50, max: 50, hint: "关键词命中且确认是对 bot 说的" },
+            { path: "emotion.insult_delta", label: "被骂减分", kind: "number", step: "0.5", min: -50, max: 50, hint: "同一套保守规则，宁可漏判" },
+            { path: "emotion.decay_weekly", label: "每周回归基线比例", kind: "number", step: "0.01", min: 0, max: 1, hint: "好感度每周向 50 靠拢的比例（惰性折算）" },
+            { path: "emotion.half_life_seconds", label: "情绪半衰期（秒）", kind: "number", step: "60", min: 1, hint: "情绪强度减半所需时间，默认一小时" },
+            { path: "emotion.boredom_after_seconds", label: "多久没人理算无聊（秒）", kind: "number", step: "60", min: 0, hint: "超过这么久没人说话、情绪也淡了才判无聊" },
             {
-              path: "log_level",
-              label: "日志级别",
+              path: "emotion.praise_mood",
+              label: "被夸时的情绪",
               kind: "select",
-              hint: "立即生效",
-              options: LOG_LEVELS.map((value) => ({ value, label: value })),
+              options: MOOD_NAMES.map((name) => ({ value: name, label: name })),
+              hint: "情绪枚举之一；强度在下面几项里配",
             },
+            { path: "emotion.praise_intensity", label: "被夸情绪强度", kind: "number", step: "0.05", min: 0, max: 1 },
+            {
+              path: "emotion.insult_mood",
+              label: "被骂时的情绪",
+              kind: "select",
+              options: MOOD_NAMES.map((name) => ({ value: name, label: name })),
+            },
+            { path: "emotion.insult_intensity", label: "被骂情绪强度", kind: "number", step: "0.05", min: 0, max: 1 },
+            {
+              path: "emotion.excitement_mood",
+              label: "热闹时的情绪",
+              kind: "select",
+              options: MOOD_NAMES.map((name) => ({ value: name, label: name })),
+            },
+            { path: "emotion.excitement_intensity", label: "兴奋强度", kind: "number", step: "0.05", min: 0, max: 1, hint: "群里热闹且 bot 参与多时" },
+            {
+              path: "emotion.boredom_mood",
+              label: "没人理时的情绪",
+              kind: "select",
+              options: MOOD_NAMES.map((name) => ({ value: name, label: name })),
+            },
+            { path: "emotion.boredom_intensity", label: "无聊强度", kind: "number", step: "0.05", min: 0, max: 1 },
+            { path: "emotion.min_intensity", label: "情绪有效期阈值", kind: "number", step: "0.01", min: 0, max: 1, hint: "强度低于它视为平静：不再注入、不调阈值" },
+            { path: "emotion.affinity_baseline", label: "好感度基线", kind: "number", step: "1", min: 0, max: 100, hint: "好感度长期回归的基准值" },
+            { path: "emotion.affinity_min", label: "好感度下限", kind: "number", step: "1", min: 0, max: 100 },
+            { path: "emotion.affinity_max", label: "好感度上限", kind: "number", step: "1", min: 0, max: 100 },
+            { path: "emotion.excitement_window_seconds", label: "热闹统计窗口（秒）", kind: "number", step: "30", min: 0, hint: "统计「群里热闹」时看最近多久的消息" },
+            { path: "emotion.excitement_min_messages", label: "热闹的最少消息数", kind: "number", step: "1", min: 0 },
+            { path: "emotion.excitement_min_bot_messages", label: "热闹时 bot 最少发言", kind: "number", step: "1", min: 0 },
           ],
           draft
-        )
-      ),
-    }),
+        ),
+      }),
+    },
+    {
+      path: "emotion.threshold_adjust",
+      node: card("情绪阈值微调", {
+        hint: "按当前心情调整开口阈值：正数更难开口，负数更容易",
+        body: mapEditor(draft, "emotion.threshold_adjust", { keyPlaceholder: "心情，如 开心", valuePlaceholder: "如 -0.05" }),
+      }),
+    },
+    {
+      path: "decision.merge_window_seconds",
+      node: card("回复意愿", {
+        hint: "群聊里什么时候开口",
+        body: fieldGrid(
+          [
+            { path: "decision.merge_window_seconds", label: "合并窗口（秒）", kind: "number", step: "0.5", min: 0, hint: "同一人连发的多条先攒着合并成一轮" },
+            { path: "decision.hard_merge_window_seconds", label: "硬触发窗口（秒）", kind: "number", step: "0.5", min: 0, hint: "私聊/@/回复/叫名字的短窗口，0 表示立即处理" },
+            { path: "decision.aliases", label: "叫名别名", kind: "list", wide: true, placeholder: "例如 小R", hint: "叫到这些名字算硬触发；留空则用 Bot 名称" },
+            { path: "decision.base", label: "基础意愿", kind: "number", step: "0.01", min: 0, max: 1, hint: "每个群的基础分，默认低，靠动量和相关性加分" },
+            { path: "decision.threshold", label: "开口阈值", kind: "number", step: "0.01", min: 0, max: 1, hint: "分数达到多少才开口" },
+            { path: "decision.threshold_noise", label: "阈值随机扰动", kind: "number", step: "0.01", min: 0, max: 1, hint: "阈值附近的随机波动幅度" },
+            { path: "decision.threshold_noise_band", label: "扰动生效范围", kind: "number", step: "0.01", min: 0, max: 1, hint: "离阈值多近才摇骰子" },
+            { path: "decision.momentum_bonus", label: "动量加成", kind: "number", step: "0.05", min: 0, max: 10, hint: "刚参与过这个会话时的加分" },
+            { path: "decision.momentum_half_life_seconds", label: "动量半衰期（秒）", kind: "number", step: "10", min: 1, hint: "动量随时间衰减的速度" },
+            { path: "decision.relevance_bonus", label: "相关性加成", kind: "number", step: "0.05", min: 0, max: 10, hint: "记忆检索命中时的最大加分" },
+            { path: "decision.relevance_scale", label: "相关性归一尺度", kind: "number", step: "0.5", min: 0.1, hint: "检索分数除以它后封顶" },
+            { path: "decision.ratio_window", label: "占比统计窗口", kind: "number", step: "1", min: 1, hint: "统计发言占比时看最近多少条消息" },
+            { path: "decision.ratio_threshold", label: "占比阈值", kind: "number", step: "0.01", min: 0, max: 1, hint: "bot 占比超过这个值开始减分" },
+            { path: "decision.ratio_silence", label: "占比静默线", kind: "number", step: "0.01", min: 0, max: 1, hint: "占比到这个值直接静默" },
+            { path: "decision.ratio_penalty", label: "占比最大减分", kind: "number", step: "0.1", min: 0, max: 10, hint: "占比超阈值时的最大减分" },
+            { path: "decision.cooldown_seconds", label: "发言后冷却（秒）", kind: "number", step: "1", min: 0, hint: "发言后这段时间内降低意愿" },
+            { path: "decision.cooldown_penalty", label: "冷却最大减分", kind: "number", step: "0.1", min: 0, max: 10, hint: "冷却期内最多减多少分" },
+            { path: "decision.veto_marker", label: "不回复标记", hint: "模型输出这个标记就静默丢弃" },
+          ],
+          draft
+        ),
+      }),
+    },
+    {
+      path: "decision.groups",
+      node: card("每群覆盖", {
+        hint: "单独调节某个群",
+        body: groupsEditor(draft, secrets),
+      }),
+    },
+    {
+      path: "reminder.enabled",
+      node: card("提醒", {
+        hint: "模型被明确要求「提醒我」时创建，不自动提醒",
+        body: fieldGrid(
+          [
+            { path: "reminder.enabled", label: "启用提醒工具", kind: "switch", hint: "关闭后模型无法设置提醒，已设的提醒照常触发" },
+            { path: "reminder.max_pending_per_chat", label: "每会话提醒上限", kind: "number", step: "1", min: 0, max: 50, hint: "同一会话最多同时挂多少条待执行提醒" },
+            { path: "reminder.max_delay_minutes", label: "最远提前（分钟）", kind: "number", step: "60", min: 1, hint: "超过这个跨度的提醒请求会被拒绝" },
+            { path: "reminder.max_text_chars", label: "提醒正文上限（字）", kind: "number", step: "10", min: 20, max: 2000, hint: "超出部分会被截断" },
+          ],
+          draft
+        ),
+      }),
+    },
+    {
+      path: "proactive.enabled",
+      node: card("冷场开口", {
+        hint: "默认关闭：群里长时间没人才可能主动说一句，宁可漏不可扰",
+        body: fieldGrid(
+          [
+            { path: "proactive.enabled", label: "启用冷场开口", kind: "switch", hint: "只在群聊里生效，私聊不主动开口" },
+            { path: "proactive.idle_hours", label: "安静多久才考虑（小时）", kind: "number", step: "0.5", min: 0.1, hint: "距上一条消息超过这个时长" },
+            { path: "proactive.daily_limit", label: "每群每日上限", kind: "number", step: "1", min: 0, max: 100, hint: "每个群每天最多主动开口几次" },
+            { path: "proactive.cooldown_minutes", label: "评估冷却（分钟）", kind: "number", step: "5", min: 0, hint: "没开口时，隔多久再评估一次" },
+            { path: "proactive.quiet_hours", label: "不开口时段", kind: "list", wide: true, placeholder: "例如 23:00-08:00", hint: "格式 HH:MM-HH:MM，可写多个；这段时间内不主动开口" },
+            { path: "proactive.base", label: "基础意愿", kind: "number", step: "0.01", min: 0, max: 1, hint: "主动开口场景的基础分，给得低大多数时候不开口" },
+            { path: "proactive.threshold", label: "开口阈值", kind: "number", step: "0.01", min: 0, max: 1, hint: "分数达到多少才开口" },
+            { path: "proactive.threshold_noise", label: "阈值随机扰动", kind: "number", step: "0.01", min: 0, max: 1, hint: "阈值附近的随机波动幅度" },
+            { path: "proactive.threshold_noise_band", label: "扰动生效范围", kind: "number", step: "0.01", min: 0, max: 1, hint: "离阈值多近才摇骰子" },
+            { path: "proactive.relevance_bonus", label: "相关性加成", kind: "number", step: "0.01", min: 0, max: 10, hint: "群里近期话题命中记忆时最多加多少分" },
+            { path: "proactive.relevance_scale", label: "相关性归一尺度", kind: "number", step: "0.5", min: 0.1, hint: "检索分数除以它后封顶" },
+          ],
+          draft
+        ),
+      }),
+    },
+    {
+      path: "plugins.dir",
+      node: card("插件市场", {
+        hint: "索引地址与远程来源；装卸启停在插件市场页",
+        body: h(
+          "div",
+          { style: { display: "grid", gap: "16px" } },
+          fieldGrid(
+            [
+              {
+                path: "market.index_url",
+                label: "索引地址",
+                hint: "索引仓库 plugins.json 的 raw 地址；留空或拉取失败时回退内置官方索引",
+                wide: true,
+                mono: true,
+              },
+            ],
+            draft
+          ),
+          pluginEditor(draft, pluginsAvailable)
+        ),
+      }),
+    },
+    {
+      path: "adapters.console",
+      node: card("适配器", {
+        hint: "连接参数改动需重启",
+        body: adaptersEditor(draft, secrets),
+      }),
+    },
+    {
+      path: "gateway.enabled",
+      node: card("网关与事件通道", {
+        hint: "默认关闭：开启后模型可查/调平台接口，notice 与 request 事件也会进事件流",
+        body: fieldGrid(
+          [
+            { path: "gateway.enabled", label: "启用适配器网关", kind: "switch", hint: "关时模型看不见 adapter_actions / adapter_call" },
+            { path: "gateway.judge_events", label: "事件快判", kind: "switch", hint: "关时事件只落库；开时才让模型判断要不要动作" },
+            { path: "gateway.allow_sensitive", label: "允许敏感动作", kind: "switch", hint: "踢人/禁言/撤回/处理申请等；开启后每次调用都会标红审计" },
+            { path: "gateway.enabled_conversations", label: "允许的会话", kind: "list", wide: true, placeholder: "例如 snowluma:123456789", hint: "platform:chat_id；私聊会话恒可，群聊需在这里列出" },
+            { path: "gateway.quiet_hours", label: "安静时段", hint: "HH:MM-HH:MM；这段时间里非必判事件只记录，必判事件也只挂待办" },
+            { path: "gateway.daily_budget_per_conversation", label: "每会话每日额度", kind: "number", step: "1", min: 0, hint: "每个会话每天最多主动动作次数" },
+            { path: "gateway.global_daily_cap", label: "全局每日上限", kind: "number", step: "1", min: 0, hint: "所有会话合计的熔断线" },
+          ],
+          draft
+        ),
+      }),
+    },
+    {
+      path: "webui.enabled",
+      node: card("WebUI 与高级", {
+        hint: "监听地址与运行参数",
+        body: h(
+          "div",
+          { style: { display: "grid", gap: "16px" } },
+          fieldGrid(
+            [
+              { path: "webui.enabled", label: "启用 WebUI", kind: "switch", hint: "关闭后本次运行仍然可用，重启后不再启动", restart: true },
+              { path: "webui.host", label: "监听地址", hint: "默认 127.0.0.1；绑非本地地址必须设置口令", restart: true, mono: true },
+              { path: "webui.port", label: "端口", kind: "number", step: "1", min: 1, max: 65535, hint: "改动需重启", restart: true },
+              {
+                path: "webui.password",
+                label: "访问口令",
+                kind: "password",
+                hint: "留空表示保留原值；绑非本地地址时必须设置",
+                secretSet: Boolean(secrets["webui.password"]),
+              },
+              { path: "webui.session_hours", label: "登录有效期（小时）", kind: "number", step: "1", min: 0.1, hint: "会话 Cookie 的有效时长" },
+              { path: "background_check_minutes", label: "后台检查间隔（分钟）", kind: "number", step: "1", min: 0.1, hint: "记忆抽取/归纳的定期检查频率" },
+              {
+                path: "log_level",
+                label: "日志级别",
+                kind: "select",
+                hint: "立即生效",
+                options: LOG_LEVELS.map((value) => ({ value, label: value })),
+              },
+            ],
+            draft
+          )
+        ),
+      }),
+    },
+    {
+      path: "persona.path",
+      node: card("人格与数据", {
+        hint: "路径改动需重启",
+        body: fieldGrid(
+          [
+            { path: "persona.path", label: "人格文件", hint: "SOUL.md 风格；路径不变时保存会顺带重读内容", wide: true, mono: true, restart: true },
+            { path: "database_path", label: "数据库文件", hint: "SQLite 路径；改动需重启", wide: true, mono: true, restart: true },
+          ],
+          draft
+        ),
+      }),
+    },
   ];
+}
 
+/** 只有系统页展示的纯前端设置（主题、原始 YAML），不参与配置字段归类。 */
+function systemExtras(data) {
   const themeButton = (value, label) =>
     h("button", { type: "button", "data-theme-choice": value, onclick: () => applyTheme(value) }, label);
   const appearance = card("外观", {
@@ -3579,6 +3849,120 @@ async function renderSettings(view) {
       yamlNotice
     )
   );
+  return [appearance, advanced];
+}
+
+/**
+ * 「机器人」与「设置」共用的分组渲染：一级选项卡 + 左侧二级菜单。
+ *
+ * 分组、页面与字段归属都来自后端 ``/api/config`` 的 ``layout``；
+ * 这里只负责按当前页面筛卡片并渲染。
+ */
+async function renderSettingsGroup(view, groupId, sub) {
+  const data = await api.get("/api/config");
+  const layout = data.layout || { groups: [] };
+  const { group, page } = findPage(layout, groupId, sub);
+  if (!group || !page) {
+    view.replaceChildren(emptyState("warning", "没有这个分类", "刷新页面后再试"));
+    return;
+  }
+  setHeader(`${group.title} · ${page.title}`, page.sub || group.sub, []);
+
+  const menu = settingsMenu(layout, group, page);
+  const content = h("div", { class: "settings-content" });
+
+  // 人设页是 SOUL 编辑器，不走结构化表单；保存、备份与热重载保持原样
+  if (page.id === "persona" && group.id === "bot") {
+    content.replaceChildren(...(await personaNodes()));
+    view.replaceChildren(h("div", { class: "settings-layout" }, menu, content));
+    return;
+  }
+
+  const structured = data.structured || {};
+  const secrets = structured.secrets || {};
+  const draft = JSON.parse(JSON.stringify(structured));
+  delete draft.secrets;
+
+  const noticeBox = h("div", { hidden: true });
+  const errorBox = h("div", { hidden: true });
+
+  const showResult = (result) => {
+    noticeBox.hidden = false;
+    noticeBox.replaceChildren(resultNotice(result, () => confirmRestart()));
+  };
+
+  function confirmRestart() {
+    confirmDialog({
+      title: "立即重启 RubenBot？",
+      message: "进程会原地重启，正在处理的对话会中断，WebUI 需要重新登录。确定现在重启吗？",
+      confirmText: "立即重启",
+      danger: true,
+      onConfirm: () => restartAndWait(),
+    });
+  }
+
+  const saveButton = h(
+    "button",
+    { class: "btn btn-primary", type: "button" },
+    icon("check"),
+    "保存全部设置"
+  );
+  const saveBar = h(
+    "div",
+    { class: "settings-savebar" },
+    h(
+      "div",
+      { class: "row-main" },
+      h("div", { class: "row-title" }, group.title),
+      h("div", { class: "row-sub" }, `配置文件：${data.path}`)
+    ),
+    h("div", { class: "spacer" }),
+    h("button", { class: "btn", type: "button", onclick: () => renderRoute() }, icon("refresh"), "放弃修改"),
+    saveButton
+  );
+
+  saveButton.addEventListener("click", async () => {
+    saveButton.disabled = true;
+    errorBox.hidden = true;
+    noticeBox.hidden = true;
+    try {
+      const result = await api.put("/api/config", { config: draft });
+      toast("配置已保存");
+      if (result.relogin) {
+        // 口令变了，当前会话立即作废；重新登录后再看结果
+        showLogin();
+        toast("访问口令已更新，请重新登录", "error");
+        return;
+      }
+      state.settingsNotice = result;
+      await renderRoute();
+    } catch (err) {
+      if (err instanceof Unauthorized) return;
+      errorBox.hidden = false;
+      const fields = (err.fields || []).map((item) =>
+        h("div", { class: "result-line" },
+          h("span", { class: "tag bad" }, item.field),
+          h("span", {}, item.message))
+      );
+      errorBox.replaceChildren(
+        h("div", { class: "notice" },
+          icon("warning"),
+          h("div", { style: { display: "grid", gap: "6px", flex: "1" } },
+            h("strong", {}, "保存失败，配置没有写入"),
+            fields.length ? null : h("div", {}, err.message || "请检查填写内容"),
+            ...fields))
+      );
+      errorBox.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      toast("配置校验未通过", "error");
+    } finally {
+      saveButton.disabled = false;
+    }
+  });
+
+  // 卡片按后端规则落到当前二级页面；同页卡片保持清单里的顺序
+  const cards = settingsCardSpecs(draft, secrets, data.plugins_available || [])
+    .filter((spec) => pageOf(layout, spec.path) === page.id)
+    .map((spec) => spec.node);
 
   // 重启提示：磁盘上已有改动但还没重启的字段
   const pending = data.restart_fields || [];
@@ -3603,21 +3987,27 @@ async function renderSettings(view) {
     state.settingsNotice = null;
   }
 
-  view.replaceChildren(
-    ...[
-      saveBar,
-      noticeBox,
-      errorBox,
-      pendingCard,
-      h(
-        "div",
-        { class: "settings-stack" },
-        ...cards,
-        h("div", { class: "settings-stack-foot" }, appearance, advanced)
-      ),
-    ].filter(Boolean)
+  const extras = page.id === "system" ? systemExtras(data) : [];
+  const hasContent = cards.length > 0;
+  const stack = hasContent
+    ? h("div", { class: "settings-stack" }, ...cards, ...extras)
+    : page.empty
+    ? emptyState("plugins", page.title, page.empty)
+    : emptyState("settings", page.title, "这个分类暂时没有可调参数。");
+
+  // 没有结构化字段的页面（例如「表情」「人设」）不显示保存栏，避免误点
+  content.replaceChildren(
+    ...[saveBar, noticeBox, errorBox, pendingCard, stack].filter((node) => node && (node !== saveBar || hasContent))
   );
-  applyTheme(localStorage.getItem("rubenbot.theme") || "auto");
+  view.replaceChildren(h("div", { class: "settings-layout" }, menu, content));
+}
+
+async function renderBot(view, sub) {
+  await renderSettingsGroup(view, "bot", sub);
+}
+
+async function renderSettings(view, sub) {
+  await renderSettingsGroup(view, "settings", sub);
 }
 
 /* ------------------------------------------------------------------ */
