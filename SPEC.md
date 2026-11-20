@@ -235,12 +235,12 @@ SnowLuma 适配器（OneBot v11）：
 - `config_schema`：配置项声明（key/类型/默认/说明），供设置界面自动渲染表单（二期落地，一期先解析存下）
 - `hooks`：用到的钩子名列表（on_message / on_command / scheduled 等，与 loader 的 register(ctx) 对应）
 
-loader 加载时校验 manifest：缺失或字段不全的插件拒绝加载并在 WebUI 标「不合规」；现有 7 个官方插件（hello / privacy / qzone_post / music / image_gen / group_insights / sticker）都声明了 manifest；emoji_react 已于 2026-11-20 删除——贴表情改由适配器网关在模型思考中判断，不再用规则+概率插件；新增插件（音乐 / 画图 / 群聊总结）沿用同一规范，默认不启用。画图走**自定义生图端点（OpenAI 兼容）**：`base_url` / `api_key` / `model` 三件套齐全才注册触发，硅基流动退为预设示例、不再写死。
+loader 加载时校验 manifest：缺失或字段不全的插件拒绝加载并在 WebUI 标「不合规」；现有 6 个官方插件（hello / privacy / qzone_post / music / image_gen / group_insights）都声明了 manifest；表情包行为已于 2026-11-20 移入 core，emoji_react 已删除；新增插件（音乐 / 画图 / 群聊总结）沿用同一规范，默认不启用。画图走**自定义生图端点（OpenAI 兼容）**：`base_url` / `api_key` / `model` 三件套齐全才注册触发，硅基流动退为预设示例、不再写死。
 
 ### 分发：GitHub 索引仓库
 
 - 索引仓库 `Doulor/Rubenbot-plugins`：根目录 `plugins.json`（条目：id / name / version / description / author / permissions / path），每个插件一个目录（代码 + manifest.json）。
-- bot 侧索引地址可配置（`market.index_url`），拉取失败或未配置时回退到框架内置的官方索引（随框架发布的 7 个官方插件），市场页明确标注当前索引来源与「索引不可用」状态，不许静默空白。
+- bot 侧索引地址可配置（`market.index_url`），拉取失败或未配置时回退到框架内置的官方索引（随框架发布的 6 个官方插件），市场页明确标注当前索引来源与「索引不可用」状态，不许静默空白。
 - 安装 = 拉索引仓库对应插件目录落盘到 `plugins/` → 校验 manifest 与 min_core_version → 默认不启用，用户在卡片上手动启用（与「插件默认关」一致）。
 - 更新：索引 version 高于已装 manifest version 时卡片挂「可更新」角标，一键更新（保留该插件的配置段，只换代码与 manifest）。
 
@@ -266,7 +266,7 @@ loader 加载时校验 manifest：缺失或字段不全的插件拒绝加载并�
 
 - 能力层新增 `send_sticker` 原语：给一个表情引用，当前会话能发就发。适配器各自翻译——SnowLuma/QQ 走 mface 或图片段，Telegram 走原生 sendSticker（file_id），QQ 官方走图片兜底，Console 走文本占位。不支持的平台抛 `CapabilityNotSupported`，按既有能力降级惯例处理。
 - 表情库：一份本体（图片文件 + 标签 + 平台原生引用）。发送时优先用目标平台的原生引用（如 Telegram file_id），没有才退到图片文件发送；发送成功后把平台回给的原生引用回填进库，下次直达。
-- `sticker` 插件（本节的交付主体）：负责收集（群里出现的表情自动入库、去重）、打标签、决定何时发哪张。插件只经能力层行事，不感知平台差异。它是第一个严格按插件市场 manifest 规范写的插件，permissions = read_messages + send_messages + capabilities，作为市场样例。
+- core 表情行为（本节的交付主体）：负责收集（群里出现的表情自动入库、去重）、打标签、决定何时发哪张。只经能力层行事，不感知平台差异；行为默认关闭，配置位于主 config 的 stickers 段。
 - 同批顺带修适配器装配线缺口：`build_adapters` 目前只装配 console 与 snowluma，Telegram 与 QQ 官方适配器类已存在但从未接线——补齐装配分支、配置示例与装配测试（生产只用 SnowLuma，此缺口不影响线上，但框架完整性要补）。
 
 ## 情绪与好感度（2026-11-20 多萝定：core 内置，不做插件）

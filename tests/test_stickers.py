@@ -111,6 +111,24 @@ def test_reference_shape(tmp_path):
     assert ref["file"] == str(store.path_of(sticker))
 
 
+def test_delete_removes_index_and_file(tmp_path):
+    store = make_store(tmp_path)
+    sticker = store.add(b"delete-me", file_name="x.png")
+    path = store.path_of(sticker)
+    assert path is not None and path.exists()
+    assert store.delete(sticker.id) is True
+    assert not path.exists()
+    assert store.get(sticker.id) is None
+    assert StickerStore(tmp_path / "stickers").get(sticker.id) is None
+
+
+def test_delete_reference_only_entry(tmp_path):
+    store = make_store(tmp_path)
+    sticker = store.add(native_refs={"snowluma": {"id": "1"}})
+    assert store.delete(sticker.id) is True
+    assert store.find_by_tags(None) == []
+
+
 def test_broken_index_is_ignored(tmp_path):
     root = tmp_path / "stickers"
     root.mkdir()
