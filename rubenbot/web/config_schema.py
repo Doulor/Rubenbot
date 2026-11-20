@@ -51,6 +51,150 @@ SECRET_PATHS = (
 _REPLACE_PATHS = {("decision", "groups")}
 
 
+# ----------------------------------------------------------------------
+# 设置页信息架构（纯展示层：不改字段路径、不改校验语义）
+# ----------------------------------------------------------------------
+#
+# 选择：顶层导航单列「机器人」选项卡，bot 本体的行为参数收进去做左侧二级
+# 菜单；其余分类（模型 / 搜索 / 提醒与主动 / 适配器 / 系统）留在「设置」页
+# 内做一级分组。理由：现有导航已经在顶层区分「bot 本体」与「运行环境」，
+# 把机器人提到顶层与「记忆 / 人物 / 群组」同级最自然，也避免设置页再长一截。
+#
+# 归属按「前缀最长优先」解析：``chat`` 默认归聊天页，再给拆条 / 打字节奏
+# 等「回复形态」字段单独标到表达页；前端只按这里的规则把表单控件分到页面，
+# 字段路径与校验完全不变。人设页是 SOUL 编辑器、表情页暂无结构化字段，
+# 两页不参与规则匹配，由分组里的 ``empty`` 说明现状。
+SETTINGS_GROUPS: tuple[dict[str, Any], ...] = (
+    {
+        "id": "bot",
+        "route": "bot",
+        "title": "机器人",
+        "sub": "bot 本体的行为参数：人设、聊天、表达、记忆、情绪、语音与表情",
+        "pages": (
+            {"id": "persona", "title": "人设", "sub": "编辑人格文件，保存即热生效"},
+            {"id": "chat", "title": "聊天", "sub": "上下文、回复意愿、动量与冷却"},
+            {"id": "expression", "title": "表达", "sub": "两段式生成与长回复拆条"},
+            {"id": "memory", "title": "记忆设置", "sub": "抽取、归纳、检索与滚动摘要"},
+            {"id": "emotion", "title": "情绪", "sub": "好感度与心情规则"},
+            {"id": "voice", "title": "语音", "sub": "语音转写（STT）与语音回复（TTS）"},
+            {
+                "id": "emoji",
+                "title": "表情",
+                "sub": "贴表情与表情包插件",
+                # 表情插件目前没有结构化配置入口：不编造字段，只说明现状
+                "empty": (
+                    "还没有可在这里配置的表情项。现有的贴表情插件（emoji_react）"
+                    "参数在插件目录的 config.yaml 里；表情包插件上线后在此配置。"
+                ),
+            },
+        ),
+    },
+    {
+        "id": "settings",
+        "route": "settings",
+        "title": "设置",
+        "sub": "模型、搜索、主动触达、适配器与运行环境",
+        "pages": (
+            {"id": "model", "title": "模型", "sub": "接口、密钥、模型角色与重试"},
+            {"id": "search", "title": "搜索", "sub": "web_search 的渠道顺序与密钥"},
+            {"id": "reminder", "title": "提醒与主动", "sub": "提醒工具与冷场开口"},
+            {"id": "adapters", "title": "适配器", "sub": "Console 与 OneBot 连接参数"},
+            {"id": "system", "title": "系统", "sub": "WebUI、插件、路径与运行参数"},
+        ),
+    },
+)
+
+# 字段路径前缀 → 二级页面 id；前端按「最长前缀」匹配，匹配不到就不渲染。
+#
+# 归位原则（展示层）：
+# - 按配置段（YAML 顶层键）的语义归属，不按字段在字典里的物理位置切碎；
+# - 只有「回复形态」是例外：拆条、打字节奏、动作描写剥离虽然物理上在
+#   ``chat`` 段，但描述的是回复长什么样，统一归到「表达」页，其余 ``chat.*``
+#   留在「聊天」页。新增字段时先看语义，默认跟随所在段。
+_SETTINGS_PAGE_RULES: tuple[tuple[str, str], ...] = (
+    # ---- 机器人 ----
+    # 表达：生成策略 + 回复形态（拆条 / 打字节奏 / 动作描写）
+    ("generation", "expression"),
+    ("chat.split_max_parts", "expression"),
+    ("chat.split_part_chars", "expression"),
+    ("chat.split_delay_seconds", "expression"),
+    ("chat.type_speed", "expression"),
+    ("chat.type_delay_max_seconds", "expression"),
+    ("chat.strip_action_parens", "expression"),
+    # 聊天：上下文、入站去重、说话时机（回复意愿 / 动量 / 冷却 / 每群覆盖）
+    ("chat", "chat"),
+    ("decision", "chat"),
+    ("memory", "memory"),
+    ("emotion", "emotion"),
+    ("voice", "voice"),
+    # persona 页是 SOUL 编辑器，没有结构化字段；表情页暂时也没有
+    # ---- 设置 ----
+    ("llm", "model"),
+    ("search", "search"),
+    ("reminder", "reminder"),
+    ("proactive", "reminder"),
+    ("adapters", "adapters"),
+    # 系统页兜底：运行环境与不属于 bot 本体的零散项
+    ("webui", "system"),
+    ("plugins", "system"),
+    ("market", "system"),
+    ("persona.path", "system"),
+    ("database_path", "system"),
+    ("background_check_minutes", "system"),
+    ("log_level", "system"),
+)
+
+
+def config_layout() -> dict[str, Any]:
+    """给前端的信息架构：一级分组、二级页面与字段归属规则。
+
+    只描述「哪个字段显示在哪个页面」，不参与校验；返回的新字典可安全修改。
+    """
+    return {
+        "groups": copy.deepcopy(list(SETTINGS_GROUPS)),
+        "rules": [{"prefix": prefix, "page": page} for prefix, page in _SETTINGS_PAGE_RULES],
+    }
+
+
+def resolve_page(path: str) -> str | None:
+    """字段路径归属的二级页面 id；没有规则覆盖时返回 ``None``。
+
+    前缀最长优先：``chat.split_max_parts`` 归表达页，其余 ``chat.*`` 归聊天页。
+    """
+    best: tuple[str, str] | None = None
+    for prefix, page in _SETTINGS_PAGE_RULES:
+        if path == prefix or path.startswith(prefix + "."):
+            if best is None or len(prefix) > len(best[0]):
+                best = (prefix, page)
+    return best[1] if best else None
+
+
+def field_paths(view: dict[str, Any], prefix: tuple[str, ...] = ()) -> list[str]:
+    """把表单视图摊平成叶子路径；``secrets`` 只是密钥标记，不算配置字段。"""
+    paths: list[str] = []
+    for key, value in view.items():
+        if not prefix and key == "secrets":
+            continue
+        path = ".".join(prefix + (key,))
+        if isinstance(value, dict) and value:
+            paths.extend(field_paths(value, prefix + (key,)))
+        else:
+            paths.append(path)
+    return paths
+
+
+def assign_pages(view: dict[str, Any]) -> dict[str, list[str]]:
+    """按 :func:`resolve_page` 把每个字段分到页面；未归属的放进 ``""``。
+
+    归类完整性测试用它检查「每个字段恰好归入一个页面、无遗漏无重复」。
+    """
+    result: dict[str, list[str]] = {}
+    for path in field_paths(view):
+        page = resolve_page(path) or ""
+        result.setdefault(page, []).append(path)
+    return result
+
+
 class ConfigValidationError(ValueError):
     """结构化配置校验失败；``fields`` 是 [{field, message}, ...]。"""
 
@@ -984,7 +1128,11 @@ __all__ = [
     "ConfigValidationError",
     "LOG_LEVELS",
     "SECRET_PATHS",
+    "assign_pages",
+    "config_layout",
+    "field_paths",
     "merge_config",
+    "resolve_page",
     "structured_config",
     "validate_structured",
 ]

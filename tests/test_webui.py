@@ -958,6 +958,20 @@ def test_index_serves_spa(client):
     assert "/static/app.js" in response.text
 
 
+def test_index_nav_has_bot_tab_instead_of_persona():
+    """人设已并入「机器人」选项卡：顶层导航不再单列人设页。"""
+    from pathlib import Path
+
+    html = (Path(__file__).parent.parent / "rubenbot" / "web" / "static" / "index.html").read_text(encoding="utf-8")
+    assert 'href="#/bot/persona"' in html
+    assert 'data-page="bot"' in html
+    assert 'data-page="persona"' not in html
+    assert 'href="#/persona"' not in html
+    # 记忆数据浏览页（画像 / 时间线）与机器人里的「记忆设置」是两回事，导航保留
+    assert 'data-page="memory"' in html
+    assert 'data-page="settings"' in html
+
+
 def test_static_assets_served(client):
     for asset in ("/static/app.js", "/static/styles.css", "/static/fonts.css", "/static/favicon.svg"):
         response = client.get(asset)

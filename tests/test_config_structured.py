@@ -21,8 +21,13 @@ from fastapi.testclient import TestClient  # noqa: E402
 from rubenbot.web.app import create_app  # noqa: E402
 from rubenbot.web.config_schema import (  # noqa: E402
     SECRET_PATHS,
+    SETTINGS_GROUPS,
     ConfigValidationError,
+    assign_pages,
+    config_layout,
+    field_paths,
     merge_config,
+    resolve_page,
     structured_config,
     validate_structured,
 )
@@ -200,6 +205,95 @@ def test_structured_config_covers_every_field(config):
     assert view["webui"]["password"] == ""
     assert view["adapters"]["snowluma"]["access_token"] == ""
     assert view["secrets"]["llm.api_key"] is True
+
+
+# ----------------------------------------------------------------------
+# 设置页信息架构（二级菜单归类）
+# ----------------------------------------------------------------------
+
+
+def _page_ids() -> list[str]:
+    return [page["id"] for group in SETTINGS_GROUPS for page in group["pages"]]
+
+
+def test_settings_layout_assigns_every_field_exactly_once(config):
+    """归类完整性：每个结构化字段恰好归入一个二级页面，无遗漏、无重复。"""
+    view = structured_config(config)
+    paths = field_paths(view)
+    assigned = assign_pages(view)
+    assert "" not in assigned, f"有字段没有归属页面：{assigned.get('', [])}"
+    assert set(assigned) <= set(_page_ids())
+    flattened = [path for page_paths in assigned.values() for path in page_paths]
+    assert sorted(flattened) == sorted(paths)
+    assert len(flattened) == len(set(flattened))
+
+
+def test_settings_layout_pages_and_groups():
+    layout = config_layout()
+    groups = {group["id"]: group for group in layout["groups"]}
+    assert [page["id"] for page in groups["bot"]["pages"]] == [
+        "persona",
+        "chat",
+        "expression",
+        "memory",
+        "emotion",
+        "voice",
+        "emoji",
+    ]
+    assert [page["id"] for page in groups["settings"]["pages"]] == [
+        "model",
+        "search",
+        "reminder",
+        "adapters",
+        "system",
+    ]
+    emoji = next(page for page in groups["bot"]["pages"] if page["id"] == "emoji")
+    assert emoji["empty"], "表情页没有字段时必须给空状态说明"
+    # 空状态不能编造配置项：表情页只说明现状
+    assert not any(page == "emoji" for page in assign_pages(structured_config(Config())).keys())
+    # 人设页是 SOUL 编辑器，没有结构化字段
+    assert "persona" not in assign_pages(structured_config(Config()))
+
+
+def test_settings_layout_prefix_resolution():
+    """最长前缀优先：拆条字段归表达页，其余 chat.* 归聊天页。"""
+    assert resolve_page("chat.split_max_parts") == "expression"
+    assert resolve_page("chat.type_speed") == "expression"
+    assert resolve_page("chat.history_size") == "chat"
+    assert resolve_page("chat.bot_name") == "chat"
+    assert resolve_page("generation.two_stage.enabled") == "expression"
+    assert resolve_page("decision.threshold") == "chat"
+    assert resolve_page("decision.groups.123.base") == "chat"
+    assert resolve_page("llm.models.fast") == "model"
+    assert resolve_page("market.index_url") == "system"
+    assert resolve_page("persona.path") == "system"
+    assert resolve_page("database_path") == "system"
+    # 字段名是前缀的一部分但不是子路径时不能误判
+    assert resolve_page("chatty.foo") is None
+    assert resolve_page("persona") is None
+
+
+def test_settings_layout_api_exposes_rules(client):
+    """前端只按 /api/config 的 layout 渲染，后端不能再让前端维护第二份清单。"""
+    body = client.get("/api/config").json()
+    layout = body["layout"]
+    assert {group["id"] for group in layout["groups"]} == {"bot", "settings"}
+    assert layout["rules"]
+    paths = field_paths(body["structured"])
+    covered = [path for path in paths if resolve_page(path)]
+    assert sorted(covered) == sorted(paths)
+
+
+def test_structured_config_view_paths_unchanged(config):
+    """分类只是展示层：字段路径集合不因归类改动。"""
+    view = structured_config(config)
+    assert "chat.type_speed" in field_paths(view)
+    assert "chat.dedupe_ttl_seconds" in field_paths(view)
+    assert "decision.batch_max_seconds" in field_paths(view)
+    assert "emotion.affinity_baseline" in field_paths(view)
+    assert "memory.rolling_summary.enabled" in field_paths(view)
+    # secrets 是密钥标记，不算配置字段
+    assert "secrets" not in field_paths(view)
 
 
 def test_validate_structured_models_map():
