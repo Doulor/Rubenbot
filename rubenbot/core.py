@@ -426,6 +426,15 @@ def _strip_segments_actions(segments: list[Segment]) -> list[Segment]:
     return cleaned
 
 
+def _log_identity(event: MessageEvent | PlatformEvent) -> dict[str, str]:
+    """把日志关联到实际事件，不从日志文本或模型输出推断身份。"""
+    if isinstance(event, PlatformEvent):
+        return {"platform": event.platform, "chat_type": event.conversation_type, "chat_id": event.conversation_id,
+                "sender_id": event.actor_id, "sender_name": event.actor_name}
+    return {"platform": event.platform, "chat_type": event.chat_type, "chat_id": event.chat_id,
+            "sender_id": event.sender_id, "sender_name": event.sender_name}
+
+
 def format_scene(event: MessageEvent, display: str) -> str:
     """拼装场景说明行。
 
@@ -833,7 +842,7 @@ class RubenBot:
         self_id = getattr(adapter, "self_id", None) if adapter is not None else None
         # 自身引发的事件在入口过滤：自己戳自己、自己的操作回执等不自言自语
         if event.self_generated(self_id):
-            logger.debug("忽略自身引发的平台事件：%s", event.description)
+            logger.debug("忽略自身引发的平台事件：%s", event.description, extra=_log_identity(event))
             return None
         route = self.event_router.route(event, now=now)
         # 全部事件先落库（摘要进 platform_events，时间线进 events）
@@ -842,7 +851,7 @@ class RubenBot:
         # 申请类事件：pending 状态已由落库写入，这里补一条「红点」日志
         if event.kind == KIND_REQUEST:
             pending = self.store.count_pending_platform_events(kind=KIND_REQUEST)
-            logger.info("收到申请（未处理 %s 条）：%s", pending, event.description)
+            logger.info("收到申请（未处理 %s 条）：%s", pending, event.description, extra=_log_identity(event))
         if not self.config.gateway.judge_events:
             return None
         if route.route == "record":
@@ -855,7 +864,7 @@ class RubenBot:
             return None
         if route.quiet:
             # 安静时段：只挂起记录，不当场动作；批次到期后由 flush 静默丢弃
-            logger.info("安静时段事件已记录（挂起）：%s", event.description)
+            logger.info("安静时段事件已记录（挂起）：%s", event.description, extra=_log_identity(event))
             return None
         return None
 
@@ -877,7 +886,8 @@ class RubenBot:
             return None
         verdict = await self.event_judge.judge(batch)
         first = batch.first
-        logger.info("事件快判 %s → %s（%s）", first.description[:40], verdict.verdict, verdict.reason[:60])
+        logger.info("事件快判 %s → %s（%s）", first.description[:40], verdict.verdict, verdict.reason[:60],
+                    extra=_log_identity(first))
         try:
             await self.apply_event_verdict(batch, verdict, now=now)
         except Exception as exc:  # noqa: BLE001 - 执行失败只记日志，不影响后续事件
@@ -1117,7 +1127,8 @@ class RubenBot:
             )
             if decision.decision is not None:
                 logger.debug(
-                    "冷场开口评估 %s/%s：%s", platform, chat_id, decision.decision.log_text()
+                    "冷场开口评估 %s/%s：%s", platform, chat_id, decision.decision.log_text(),
+                    extra={"platform": platform, "chat_id": chat_id, "chat_type": "group"},
                 )
             if not decision.should_open:
                 continue
@@ -1154,7 +1165,8 @@ class RubenBot:
         # 不传 event：主动开口不需要工具循环（也不该在没触发消息时调 recall）
         reply = await self.generate(messages)
         if not is_acceptable_opener(reply):
-            logger.info("冷场开口尝试放弃：%s/%s（%s）", platform, chat_id, (reply or "")[:30])
+            logger.info("冷场开口尝试放弃：%s/%s（%s）", platform, chat_id, (reply or "")[:30],
+                        extra={"platform": platform, "chat_id": chat_id, "chat_type": "group"})
             return False
         self.opener.note_opened(platform, chat_id, now)
         await self.send_proactive(platform, chat_id, reply, now=now)
@@ -1176,7 +1188,8 @@ class RubenBot:
             )
         except Exception as exc:  # noqa: BLE001 - 观测数据写不进去不影响发送
             logger.debug("写主动开口决策日志失败：%s", exc)
-        logger.info("冷场开口 %s/%s：%s", platform, chat_id, reply[:40])
+        logger.info("冷场开口 %s/%s：%s", platform, chat_id, reply[:40],
+                    extra={"platform": platform, "chat_id": chat_id, "chat_type": "group"})
         return True
 
     async def run_maintenance(self, *, now: float | None = None, force_extract: bool = False) -> None:
@@ -1293,6 +1306,7 @@ class RubenBot:
             "群聊" if event.is_group else "私聊",
             event.sender_name,
             decision.log_text(),
+            extra=_log_identity(event),
         )
         if not decision.should_reply:
             self._log_decision(event, decision, now)
@@ -1334,12 +1348,12 @@ class RubenBot:
             parsed = parse_generation_output(body, marker)
             if parsed.vetoed:
                 decision.should_reply, decision.reason = False, parsed.reason
-                logger.info("生成后否决(%s)：%s/%s", parsed.reason, event.platform, event.chat_id)
+                logger.info("生成后否决(%s)：%s/%s", parsed.reason, event.platform, event.chat_id, extra=_log_identity(event))
                 break
             if not is_repetitive_agreement(event.text, parsed.text):
                 break
             logger.info("附和闸门命中：%s/%s，%s", event.platform, event.chat_id,
-                        "重写仍是复述，本轮沉默" if attempt else "尝试一次重写")
+                        "重写仍是复述，本轮沉默" if attempt else "尝试一次重写", extra=_log_identity(event))
             if attempt:
                 decision.should_reply, decision.reason = False, "agreement_veto"
             else:
@@ -1415,6 +1429,11 @@ class RubenBot:
             return True
         person_id = make_person_id(event.platform, event.sender_id)
         self.store.upsert_person(event.platform, event.sender_id, event.sender_name, now=now)
+        if event.is_group and event.sender_name and event.sender_name != event.sender_id:
+            self.store.upsert_identity(event.platform, event.sender_id, kind="user", group_id=event.chat_id,
+                                       name=event.sender_name, now=now)
+        if event.is_group and event.chat_name:
+            self.store.upsert_identity(event.platform, event.chat_id, kind="group", name=event.chat_name, now=now)
         self.store.add_raw_message(
             platform=event.platform,
             chat_id=event.chat_id,
@@ -1428,7 +1447,7 @@ class RubenBot:
         )
         self._last_activity[f"{event.platform}:{event.chat_id}"] = now
         self.last_message_at = now
-        logger.debug("记录消息 %s: %s", person_id, event.text[:60])
+        logger.debug("记录消息 %s: %s", person_id, event.text[:60], extra=_log_identity(event))
         return True
 
     def _is_duplicate(self, event: MessageEvent, now: float) -> bool:
@@ -2235,7 +2254,8 @@ class RubenBot:
             now=now,
         )
         logger.info(
-            "设置提醒 #%s：%s/%s %s（%s）", job.id, event.platform, event.chat_id, text, describe_fire_at(fire_at, now)
+            "设置提醒 #%s：%s/%s %s（%s）", job.id, event.platform, event.chat_id, text, describe_fire_at(fire_at, now),
+            extra=_log_identity(event),
         )
         return f"已设好提醒：{describe_fire_at(fire_at, now)}提醒「{text}」。"
 

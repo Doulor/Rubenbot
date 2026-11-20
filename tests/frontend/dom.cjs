@@ -22,6 +22,10 @@ class TestNode {
       node.parentNode = this;
     }
   }
+  remove() {
+    if (this.parentNode) this.parentNode.childNodes = this.parentNode.childNodes.filter(node => node !== this);
+    this.parentNode = null;
+  }
   replaceChildren(...children) {
     this.childNodes = [];
     this.text = '';

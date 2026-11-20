@@ -43,9 +43,11 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import asdict
 import logging
 import sqlite3
 import time
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +60,7 @@ from ..adapters.base import MessageEvent
 from ..config import Config, GroupDecisionConfig, is_loopback_host
 from ..core import format_scene
 from ..decision import parse_quiet_hours
+from ..identity import IdentityService
 from ..emotion import EmotionEngine
 from ..memory.store import make_person_id
 from ..persona import DEFAULT_PERSONA, Persona, load_persona
@@ -131,8 +134,8 @@ def _memory_payload(mem) -> dict[str, Any]:
     }
 
 
-def _person_payload(person, count: int = 0) -> dict[str, Any]:
-    return {
+def _person_payload(person, count: int = 0, *, identities: IdentityService | None = None) -> dict[str, Any]:
+    item = {
         "person_id": person.person_id,
         "platform": person.platform,
         "platform_uid": person.platform_uid,
@@ -141,6 +144,9 @@ def _person_payload(person, count: int = 0) -> dict[str, Any]:
         "last_seen": person.last_seen,
         "memory_count": count,
     }
+    if identities is not None:
+        item["identity"] = identities.person(person)
+    return item
 
 
 def _log_payload(entry) -> dict[str, Any]:
@@ -420,6 +426,27 @@ def create_app(state: WebState):
         openapi_url=None,
     )
     app.state.web = state
+    identities = IdentityService(state)
+
+    def decision_payload(row):
+        platform, chat_id = row["platform"], row["chat_id"]
+        return {**row,
+                "chat_identity": identities.chat(platform, chat_id, chat_type=row["chat_type"]),
+                "sender_identity": identities.person_id(
+                    f"{platform}:{row['sender_id']}", hint=row.get("sender_name", ""),
+                    group_id=chat_id if row["chat_type"] == "group" else "",
+                ) if row.get("sender_id") else None}
+
+    def configured_group(chat_id):
+        # 每群覆盖沿用原始群号作键；不能用「第一个适配器」猜名字。
+        platforms = state.store.group_platforms(chat_id)
+        return identities.chat(platforms[0] if len(platforms) == 1 else "", chat_id)
+
+    def memory_payload(mem):
+        person = identities.person_id(mem.person_id)
+        return {**_memory_payload(mem), "person_identity": person,
+                "chat_identity": identities.chat(person["platform"] if person else "", mem.scope_id)
+                if mem.scope_type == "group" else None}
 
     # ------------------------------------------------------------------
     # 鉴权
@@ -551,7 +578,7 @@ def create_app(state: WebState):
                 "hard_triggers": stats["hard_triggers"],
             },
             "adapters": state.adapters_status(),
-            "recent_decisions": state.recent_decisions(limit=10),
+            "recent_decisions": [decision_payload(row) for row in state.recent_decisions(limit=10)],
             "plugins": {
                 "total": len(state.plugin_list()),
                 "enabled": sum(1 for p in state.plugin_list() if p.get("enabled")),
@@ -615,7 +642,32 @@ def create_app(state: WebState):
             sensitive=sensitive,
             limit=limit,
         )
+        for item in items:
+            if not item["chat_id"]:
+                item["chat_identity"] = None
+            elif item["chat_type"] in ("private", "group"):
+                item["chat_identity"] = identities.chat(item["platform"], item["chat_id"], chat_type=item["chat_type"])
+            else:
+                # 旧记录没有会话类型，同号可能是群也可能是人。保留原 ID，不猜头像。
+                item["chat_identity"] = {"kind": "chat", "name": "未知会话", "avatar_url": "",
+                                         "id": item["chat_id"], "platform": item["platform"]}
         return {"ok": True, "items": items}
+
+    @app.post("/api/identities/refresh")
+    async def refresh_identities(request: Request):
+        require_session(request)
+        body = await _json_body(request)
+        result = await identities.refresh(
+            platform=str(body.get("platform") or ""),
+            chat_id=str(body.get("chat_id") or ""),
+            person_id=str(body.get("person_id") or ""), force=True,
+        )
+        return result
+
+    @app.get("/api/identities")
+    async def list_identities(request: Request, platform: str | None = None, kind: str | None = None):
+        require_session(request)
+        return {"ok": True, "items": state.store.list_identities(platform=platform or None, kind=kind or None)}
 
     @app.get("/api/memories")
     async def list_memories(
@@ -639,7 +691,7 @@ def create_app(state: WebState):
         return {
             "ok": True,
             "total": total,
-            "items": [_memory_payload(mem) for mem in memories],
+            "items": [memory_payload(mem) for mem in memories],
         }
 
     @app.post("/api/memories")
@@ -667,7 +719,7 @@ def create_app(state: WebState):
             source_ref="webui",
         )
         logger.info("WebUI 新增记忆 #%s：%s", memory.id, content[:40])
-        return {"ok": True, "item": _memory_payload(memory)}
+        return {"ok": True, "item": memory_payload(memory)}
 
     @app.put("/api/memories/{memory_id}")
     async def update_memory(memory_id: int, request: Request):
@@ -682,7 +734,7 @@ def create_app(state: WebState):
             raise ApiError(422, f"未知类别：{category}")
         updated = state.store.update_memory(memory_id, content=content, category=category)
         logger.info("WebUI 编辑记忆 #%s", memory_id)
-        return {"ok": True, "item": _memory_payload(updated)}
+        return {"ok": True, "item": memory_payload(updated)}
 
     @app.delete("/api/memories/{memory_id}")
     async def delete_memory(memory_id: int, request: Request):
@@ -704,7 +756,12 @@ def create_app(state: WebState):
         require_session(request)
         limit = max(1, min(int(limit), 200))
         logs = state.store.list_logs(limit=limit, person_id=person_id or None)
-        return {"ok": True, "items": [_log_payload(entry) for entry in logs]}
+        items = []
+        for entry in logs:
+            item = _log_payload(entry)
+            item["person_identity"] = identities.person_id(entry.person_id or "")
+            items.append(item)
+        return {"ok": True, "items": items}
 
     @app.post("/api/memory-log/{log_id}/restore")
     async def restore_log(log_id: int, request: Request):
@@ -737,10 +794,12 @@ def create_app(state: WebState):
                     "platform": job.platform,
                     "chat_id": job.chat_id,
                     "chat_type": job.chat_type,
+                    "chat_identity": identities.chat(job.platform, job.chat_id, chat_type=job.chat_type),
                     "fire_at": job.fire_at,
                     "text": str(job.payload.get("text") or ""),
                     "requester_name": str(job.payload.get("requester_name") or ""),
                     "created_by": job.created_by,
+                    "requester_identity": identities.person_id(job.created_by, hint=str(job.payload.get("requester_name") or "")),
                     "created_at": job.created_at,
                 }
                 for job in jobs
@@ -757,12 +816,13 @@ def create_app(state: WebState):
         limit = max(1, min(int(limit), 500))
         keyword = (q or "").strip().lower()
         rows = state.store.list_people_with_counts(limit=limit)
-        items = [_person_payload(person, count) for person, count in rows]
+        items = [_person_payload(person, count, identities=identities) for person, count in rows]
         if keyword:
             items = [
                 item
                 for item in items
-                if keyword in item["display_name"].lower()
+                if keyword in item["identity"]["name"].lower()
+                or keyword in item["display_name"].lower()
                 or keyword in item["person_id"].lower()
                 or keyword in item["platform_uid"].lower()
             ]
@@ -775,10 +835,20 @@ def create_app(state: WebState):
         if person is None:
             raise ApiError(404, "人物不存在")
         memories = state.store.list_memories(person_id=person_id, limit=200)
+        profile = state.store.get_profile(person_id)
+        timeline = state.store.list_events(person_id=person_id, limit=200)
+        profile_payload = asdict(profile) if profile is not None else None
+        timeline_payload = []
+        for event in timeline:
+            row = event.to_dict()
+            row["chat_identity"] = identities.chat_source(event.source_chat, audience=event.audience)
+            timeline_payload.append(row)
         return {
             "ok": True,
-            "person": _person_payload(person, len(memories)),
-            "memories": [_memory_payload(mem) for mem in memories],
+            "person": _person_payload(person, len(memories), identities=identities),
+            "profile": profile_payload,
+            "timeline": timeline_payload,
+            "memories": [memory_payload(mem) for mem in memories],
         }
 
     # ------------------------------------------------------------------
@@ -788,16 +858,36 @@ def create_app(state: WebState):
     @app.get("/api/chats")
     async def list_chats(request: Request, limit: int = 200):
         require_session(request)
-        chats = state.store.list_chats(limit=max(1, min(int(limit), 500)))
+        limit = max(1, min(int(limit), 500))
+        chats = state.store.list_chats(limit=limit)
+        # 列表一次读群名，不为名单里的每个群/人发一个 HTTP 请求。
+        for platform in getattr(state.bot, "adapters", {}):
+            await identities.refresh(platform=platform)
         configured = state.config.decision.groups
+        seen = {(row["platform"], row["chat_id"]) for row in chats if row["chat_type"] == "group"}
+        for row in state.store.list_identities(kind="group"):
+            key = row["platform"], row["object_id"]
+            if len(chats) >= limit:
+                break
+            if key not in seen:
+                chats.append({"platform": key[0], "chat_id": key[1], "chat_type": "group",
+                              "last_ts": None, "message_count": 0})
+                seen.add(key)
+        # 仅配置过、没有消息的群也保留卡片；配置键没有平台，不跨平台猜测。
+        for chat_id in sorted(configured.keys() - {key[1] for key in seen}):
+            group = configured_group(chat_id)
+            chats.append({"platform": group["platform"], "chat_id": chat_id, "chat_type": "group",
+                          "last_ts": None, "message_count": 0})
         for chat in chats:
-            override = configured.get(str(chat["chat_id"]))
+            platform, chat_id = chat["platform"], chat["chat_id"]
+            chat["chat_identity"] = identities.chat(platform, chat_id, chat_type=chat["chat_type"])
+            override = configured.get(chat_id) if chat["chat_type"] == "group" else None
             chat["activity_multiplier"] = override.activity_multiplier if override else 1.0
             chat["quiet_hours"] = list(override.quiet_hours) if override else []
             chat["configured"] = override is not None
-            chat["recent_decisions"] = state.store.list_decision_logs(
-                chat_id=str(chat["chat_id"]), limit=3
-            )
+            chat["recent_decisions"] = [decision_payload(row) for row in state.store.list_decision_logs(
+                chat_id=chat_id, platform=platform, chat_type=chat["chat_type"], limit=3
+            )]
         return {"ok": True, "items": chats}
 
     @app.get("/api/chats/{chat_id}/decision")
@@ -810,19 +900,22 @@ def create_app(state: WebState):
         require_session(request)
         body = await _json_body(request)
         payload = _write_group_decision(state, chat_id, body)
-        logger.info("WebUI 更新群 %s 的决策配置", chat_id)
+        logger.info("WebUI 更新群 %s 的决策配置", chat_id,
+                    extra={"platform": configured_group(chat_id)["platform"], "chat_type": "group", "chat_id": chat_id})
         return {"ok": True, **payload, "restart_required": False}
 
     @app.get("/api/decisions")
     async def list_decisions(
         request: Request,
         chat_id: str | None = None,
+        platform: str | None = None,
+        chat_type: str | None = None,
         limit: int = 50,
     ):
         require_session(request)
         limit = max(1, min(int(limit), 200))
-        items = state.store.list_decision_logs(chat_id=chat_id or None, limit=limit)
-        return {"ok": True, "items": items}
+        rows = state.store.list_decision_logs(chat_id=chat_id or None, platform=platform, chat_type=chat_type, limit=limit)
+        return {"ok": True, "items": [decision_payload(row) for row in rows]}
 
     @app.get("/api/stickers")
     async def list_stickers(request: Request):
@@ -870,6 +963,10 @@ def create_app(state: WebState):
                 key: row["args_summary"][key] for key in ("arg_count", "input_bytes")
             }} for row in rows
         ]
+        if request.query_params.get("identities", "").lower() in ("1", "true", "yes"):
+            for item in items:
+                who = str(item.get("who", ""))
+                item["person_identity"] = identities.person_id(who)
         return {"ok": True, "items": items}
 
     @app.get("/api/mcp/status")
@@ -906,6 +1003,10 @@ def create_app(state: WebState):
             payload = engine.status(recent_limit=limit)
         except sqlite3.Error as exc:
             raise ApiError(500, f"读取情绪状态失败：{exc}") from exc
+        for item in payload.get("affinity", {}).get("top", []) + payload.get("affinity", {}).get("bottom", []):
+            item["person_identity"] = identities.person_id(item.get("person_id", ""), hint=item.get("display_name", ""))
+        for item in payload.get("recent_changes", []):
+            item["person_identity"] = identities.person_id(item.get("person_id", ""), hint=item.get("display_name", ""))
         return {"ok": True, **payload}
 
     # ------------------------------------------------------------------
@@ -1046,7 +1147,31 @@ def create_app(state: WebState):
     async def get_logs(request: Request, limit: int = 200, level: str | None = None, q: str | None = None):
         require_session(request)
         limit = max(1, min(int(limit), 1000))
-        return {"ok": True, "items": log_records(limit=limit, level=level, query=q)}
+        # 按昵称或 ID 也能查；同一页重复的发送者/会话只解析一次。
+        person_for = lru_cache(maxsize=1000)(identities.person_id)
+        chat_for = lru_cache(maxsize=1000)(identities.chat)
+        query = (q or "").strip().casefold()
+        items = []
+        for row in log_records(limit=1000 if query else limit, level=level):
+            item = dict(row)
+            platform = row.get("platform", "")
+            person_id = row.get("person_id")
+            if not person_id and platform and row.get("sender_id"):
+                person_id = f"{platform}:{row['sender_id']}"
+            if person_id:
+                item["person_identity"] = person_for(person_id, hint=row.get("sender_name", ""),
+                                                  group_id=row.get("chat_id", "") if row.get("chat_type") == "group" else "")
+            if row.get("chat_id") and row.get("chat_type"):
+                item["chat_identity"] = chat_for(platform, row["chat_id"], chat_type=row["chat_type"])
+            fields = [row["message"], row["logger"], person_id or ""]
+            for key in ("person_identity", "chat_identity"):
+                if value := item.get(key):
+                    fields.extend([value["name"], value["id"]])
+            if not query or any(query in value.casefold() for value in fields):
+                items.append(item)
+                if len(items) == limit:
+                    break
+        return {"ok": True, "items": items}
 
     # ------------------------------------------------------------------
     # 设置
@@ -1073,6 +1198,7 @@ def create_app(state: WebState):
             "exists": path.exists(),
             "effective": _mask_config(_config_to_dict(state.config)),
             "structured": structured_config(state.config),
+            "group_identities": {key: configured_group(key) for key in state.config.decision.groups},
             "layout": config_layout(),
             "plugins_available": state.plugin_list(),
             "restart_fields": _pending_restart_fields(state),

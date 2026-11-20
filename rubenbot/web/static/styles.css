@@ -1291,7 +1291,32 @@ button {
   color: var(--on-accent-container);
 }
 
-.avatar.lg {
+/* 群、人物和紧凑流水共用一个署名组件；ID 保持可选中复制。 */
+.identity {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  max-width: 100%;
+  vertical-align: middle;
+  text-align: start;
+}
+.identity .avatar { position: relative; overflow: hidden; }
+.identity .avatar img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.identity-label { display: grid; min-width: 0; gap: 1px; }
+.identity-name { font: 500 13.5px/1.4 var(--font-sans); color: var(--text); overflow-wrap: anywhere; }
+.identity-id { font: 11px/1.45 var(--font-mono); color: var(--muted); overflow-wrap: anywhere; user-select: text; }
+.identity-small { gap: 6px; }
+.identity-small .avatar { width: 27px; height: 27px; border-radius: 9px; font-size: 12px; }
+.identity-small .identity-name { font-size: 12px; }
+.identity-large .identity-name { font-size: 17px; }
+.person-head .identity, .side-list .identity { flex: 1; }
+.factors, .memory-meta { align-items: center; }
+.profile-text { white-space: pre-line; }
+.chat-open > .row-sub { margin-left: 46px; }
+.log-identities { display: flex; gap: 8px 16px; flex-wrap: wrap; margin-bottom: 4px; }
+
+.identity-large .avatar {
   width: 52px;
   height: 52px;
   border-radius: 18px;
@@ -1392,6 +1417,12 @@ button {
   text-align: left;
   cursor: pointer;
   min-width: 0;
+}
+
+@media (max-width: 720px) {
+  .chat-row { grid-template-columns: minmax(0, 1fr); row-gap: 9px; }
+  .chat-settings { flex-wrap: wrap; }
+  .person-head { flex-wrap: wrap; }
 }
 
 .chat-detail {

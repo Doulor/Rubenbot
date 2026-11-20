@@ -166,6 +166,7 @@ class MessageEvent:
     raw: dict[str, Any] = field(default_factory=dict)
     segments: list[Segment] = field(default_factory=list)
     platform_msg_id: str | None = None
+    chat_name: str = ""  # 仅用于展示，不作为会话或授权标识
 
     @property
     def is_private(self) -> bool:
@@ -222,6 +223,12 @@ class BaseAdapter(abc.ABC):
     async def send_file(self, chat_id: str, filename: str, content: bytes, *, chat_type: str) -> None:
         """上传已在执行上下文中读出的快照，不接受由协议端再解析的用户路径。"""
         raise CapabilityNotSupported(self.name, "send_file")
+
+    async def refresh_identities(
+        self, *, chat_id: str | None = None, person_id: str | None = None
+    ) -> list[dict[str, str]]:
+        """按需返回身份展示信息；不支持的平台保持空结果。"""
+        return []
 
     @abc.abstractmethod
     async def stop(self) -> None:

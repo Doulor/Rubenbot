@@ -129,6 +129,7 @@ class ConsoleAdapter(BaseAdapter):
             chat_id=chat_id,
             sender_id=self.user_id,
             sender_name=sender_name,
+            chat_name=chat_id if chat_type == "group" else "",
             text=text,
             mentions_bot=True if chat_type == "private" else False,
             raw={"console": True},

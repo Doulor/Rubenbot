@@ -243,6 +243,7 @@ class GatewayService:
                 action=action,
                 source=source,
                 chat_key=chat_key,
+                chat_type=chat_type,
                 params=params,
                 ok=False,
                 reject_reason="unknown action",
@@ -255,6 +256,7 @@ class GatewayService:
                 action=action,
                 source=source,
                 chat_key=chat_key,
+                chat_type=chat_type,
                 params=params,
                 ok=False,
                 reject_reason=reason,
@@ -269,6 +271,7 @@ class GatewayService:
                 action=action,
                 source=source,
                 chat_key=chat_key,
+                chat_type=chat_type,
                 params=params,
                 ok=False,
                 reject_reason=problem,
@@ -288,6 +291,7 @@ class GatewayService:
                 action=action,
                 source=source,
                 chat_key=chat_key,
+                chat_type=chat_type,
                 params=params,
                 ok=False,
                 reject_reason=decision.reason,
@@ -303,6 +307,7 @@ class GatewayService:
                 action=action,
                 source=source,
                 chat_key=chat_key,
+                chat_type=chat_type,
                 params=params,
                 ok=False,
                 reject_reason=str(exc),
@@ -317,6 +322,7 @@ class GatewayService:
                 action=action,
                 source=source,
                 chat_key=chat_key,
+                chat_type=chat_type,
                 params=params,
                 ok=False,
                 result=summary,
@@ -332,13 +338,15 @@ class GatewayService:
             action=action,
             source=source,
             chat_key=chat_key,
+            chat_type=chat_type,
             params=params,
             ok=True,
             result=summary,
             sensitive=entry.risk == RISK_SENSITIVE,
             now=now,
         )
-        logger.info("网关动作 %s 成功（%s）", action, chat_key)
+        logger.info("网关动作 %s 成功（%s）", action, chat_key,
+                    extra={"platform": adapter.name, "chat_type": chat_type, "chat_id": chat_id})
         return f"{action} 调用成功：{summary}" if summary else f"{action} 调用成功。"
 
     # ------------------------------------------------------------------

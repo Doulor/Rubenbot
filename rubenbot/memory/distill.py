@@ -186,7 +186,7 @@ class ProfileDistiller:
             try:
                 results.append(await self.distill_person(person_id, now=now))
             except Exception as exc:  # noqa: BLE001 - 单人失败不影响其他人
-                logger.warning("画像提炼失败（%s）：%s", person_id, exc)
+                logger.warning("画像提炼失败（%s）：%s", person_id, exc, extra={"person_id": person_id})
                 results.append(ProfileUpdate(person_id=person_id, error=str(exc)))
         if results and all(r.error is None for r in results):
             self.store.set_meta("distill:last_at", str(now))
@@ -228,7 +228,7 @@ class ProfileDistiller:
         stable, status, hooks = parse_profile(raw)
         if not stable and not status and not hooks:
             # 模型什么都没给（多半是坏输出）：保留旧画像，别把已有的画像清空
-            logger.info("画像提炼没有产出有效内容（%s），保留旧画像", person_id)
+            logger.info("画像提炼没有产出有效内容（%s），保留旧画像", person_id, extra={"person_id": person_id})
             return ProfileUpdate(person_id=person_id)
 
         allowed = {f"event:{e.id}" for e in events} | {f"memory:{m.id}" for m in facts}
@@ -242,7 +242,7 @@ class ProfileDistiller:
         if old is not None and not stable_lines and not status_lines and dropped:
             # 模型给的行全被证据校验挡下（或漏写旧行）：宁可保留旧画像，
             # 也不要因为一次坏输出把画像清空
-            logger.info("画像提炼的结果全部无有效证据（%s），保留旧画像", person_id)
+            logger.info("画像提炼的结果全部无有效证据（%s），保留旧画像", person_id, extra={"person_id": person_id})
             return ProfileUpdate(person_id=person_id, dropped_lines=dropped)
 
         expires_days = [

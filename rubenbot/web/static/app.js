@@ -151,7 +151,56 @@ function sourceName(value) {
 function avatarText(name, fallback = "?") {
   const text = String(name || "").trim();
   if (!text) return fallback;
-  return text.slice(0, 1).toUpperCase();
+  return String.fromCodePoint(text.codePointAt(0)).toUpperCase();
+}
+
+/** 身份只用于展示；路由、筛选和权限仍使用原始 ID。 */
+function identityBadge(identity, size = "small") {
+  if (!identity) return null;
+  const { id, platform, kind, avatar_url: url } = identity;
+  const name = identity.name?.trim() || (kind === "group" ? "未知群" : "未知用户");
+  const avatar = h("span", { class: "avatar", "aria-hidden": "true" }, avatarText(name));
+  if (url) avatar.append(h("img", {
+    alt: "", loading: "lazy", decoding: "async", referrerpolicy: "no-referrer",
+    onerror: (event) => event.currentTarget.remove(), src: url,
+  }));
+  return h("span", { class: `identity identity-${size}` }, avatar,
+    h("span", { class: "identity-label" },
+      h("strong", { class: "identity-name", title: name }, name),
+      h("small", { class: "identity-id" }, platform ? `${platformName(platform)} · ` : "", id)));
+}
+
+function personBadge(person, size) {
+  return identityBadge(person.identity || person.person_identity || {
+    id: person.platform_uid || person.person_id, name: person.display_name, platform: person.platform,
+  }, size);
+}
+
+function chatBadge(chat, size) {
+  return identityBadge(chat.chat_identity || {
+    id: chat.chat_id, platform: chat.platform, kind: chat.chat_type,
+  }, size);
+}
+
+function refreshIdentityButton(params, reload) {
+  return h("button", { type: "button", class: "btn btn-sm", title: "从平台重新读取名称", onclick: async event => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    try {
+      const result = await api.post("/api/identities/refresh", params);
+      if (!result.ok) throw new Error(result.error);
+      await reload();
+      toast(result.refreshed ? "名称已刷新" : "平台未返回名称，已保留原资料");
+    } catch (err) {
+      if (!(err instanceof Unauthorized)) toast(err.message || "刷新失败，已保留原资料", "error");
+    } finally { button.disabled = false; }
+  } }, icon("refresh"), "刷新名称");
+}
+
+function memoryScope(memory) {
+  return memory.scope_type === "group"
+    ? identityBadge(memory.chat_identity || { id: memory.scope_id, kind: "group" })
+    : h("span", {}, "全局");
 }
 
 let toastSeq = 0;
@@ -545,8 +594,8 @@ function decisionItem(decision, { showChat = false } = {}) {
   const meta = h(
     "div",
     { class: "factors" },
-    showChat ? h("span", {}, h("b", {}, platformName(decision.platform)), " ", decision.chat_id) : null,
-    h("span", {}, decision.sender_name || decision.sender_id || "未知"),
+    showChat ? chatBadge(decision) : null,
+    identityBadge(decision.sender_identity || { id: decision.sender_id, name: decision.sender_name, platform: decision.platform }),
     h("span", {}, fmtTime(decision.created_at)),
     ...parts.map(([name, value]) =>
       h("span", { class: value >= 0 ? "factor-pos" : "factor-neg" }, `${name} ${value >= 0 ? "+" : ""}${value.toFixed(2)}`)
@@ -645,10 +694,7 @@ function affinityRow(item) {
       onkeydown: (event) => {
         if (event.key === "Enter") navigate("people", encodeURIComponent(item.person_id));
       } },
-    h("div", { class: "avatar" }, avatarText(item.display_name)),
-    h("div", { class: "row-main" },
-      h("div", { class: "row-title" }, item.display_name),
-      affinityBar(item.score)),
+    h("div", { class: "row-main" }, personBadge(item), affinityBar(item.score)),
     h("div", { class: "row-side" },
       h("span", { class: "num" }, Number(item.score).toFixed(1)),
       h("span", { class: `tag ${AFFINITY_TONE[item.band] || "outline"}` }, item.band))
@@ -699,7 +745,7 @@ function emotionCard(data) {
             h("div", { class: "emotion-change" },
               h("span", { class: entry.delta >= 0 ? "num pos" : "num neg" },
                 `${entry.delta >= 0 ? "+" : ""}${Number(entry.delta).toFixed(2)}`),
-              h("span", { class: "row-title" }, entry.display_name),
+              personBadge(entry),
               h("span", { class: "tag outline" }, entry.reason || "变化"),
               h("span", { class: "muted" }, fmtRelative(entry.created_at)))))
       : h("div", { class: "muted emotion-empty" }, "还没有好感度变化")
@@ -1093,9 +1139,8 @@ function remindersCard() {
             { class: "row" },
             h("div", { class: "row-main" },
               h("div", { class: "row-title" }, item.text),
-              h("div", { class: "row-sub" },
-                `${platformName(item.platform)} · ${item.chat_type === "private" ? "私聊" : `群 ${item.chat_id}`}` +
-                `${item.requester_name ? ` · ${item.requester_name}` : ""} · 由 ${item.created_by || "未知"} 设定`)),
+              h("div", { class: "memory-meta" }, chatBadge(item), "由",
+                identityBadge(item.requester_identity || { id: item.created_by, name: item.requester_name }), "设定")),
             h("div", { class: "row-side" }, h("span", { class: "tag accent" }, fmtDateTime(item.fire_at)))
           )
         )
@@ -1105,6 +1150,25 @@ function remindersCard() {
       body.replaceChildren(emptyState("warning", "提醒列表加载失败", "稍后刷新页面试试"));
     });
   return wrap;
+}
+
+/** 画像属于人，时间线的来源属于会话，两者不要把同号的群和用户混为一谈。 */
+function portraitPanel(data) {
+  const { person, profile, timeline = [] } = data;
+  const current = profile?.status_text && (!profile.status_expires_at || profile.status_expires_at * 1000 > Date.now());
+  const section = (title, text) => h("div", { class: "memory" }, h("div", { class: "memory-body" },
+    h("div", { class: "field-label" }, title), h("div", { class: "memory-text profile-text" }, text)));
+  return h("section", {},
+    h("div", { class: "person-head" }, personBadge(person, "large")),
+    section("稳定画像", profile?.stable_text || "还没有稳定画像"),
+    section("当前近况", current ? profile.status_text : "暂无有效近况"),
+    h("div", { class: "card-head" }, h("h2", {}, "时间线")),
+    timeline.length ? h("div", { class: "rows" }, ...timeline.map(event =>
+      h("div", { class: "memory" }, h("div", { class: "memory-body" },
+        h("div", { class: "memory-text" }, event.summary),
+        h("div", { class: "memory-meta" }, fmtDateTime(event.ts), identityBadge(event.chat_identity),
+          event.kind === "digest" ? h("span", { class: "tag outline" }, "周梗概") : null)))))
+      : emptyState("memory", "时间线还是空的", "积累的事件会按时间出现在这里"));
 }
 
 async function renderMemory(view) {
@@ -1139,7 +1203,8 @@ async function renderMemory(view) {
         "aria-label": "按人物筛选",
         onchange: (event) => {
           memoryState.personId = event.target.value;
-          loadList();
+          memoryState.offset = 0;
+          loadTab();
         },
       },
       h("option", { value: "" }, "全部人物"),
@@ -1147,19 +1212,40 @@ async function renderMemory(view) {
         h(
           "option",
           { value: person.person_id, selected: person.person_id === memoryState.personId },
-          `${person.display_name || person.person_id}（${person.memory_count}）`
+          `${person.identity?.name || person.display_name || "未知用户"} · ${person.platform_uid}（${person.memory_count}）`
         )
       )
     ),
     h("div", { class: "spacer" }),
-    h("div", { class: "segmented", role: "tablist" },
+    h("div", { class: "segmented", role: "tablist", "aria-label": "记忆视图" },
       tabButton("list", "记忆列表"),
+      tabButton("portrait", "画像与时间线"),
       tabButton("log", "变更日志")),
     h("button", { class: "btn btn-primary", onclick: () => openMemoryDialog() }, icon("plus"), "新增记忆")
   );
 
   const content = h("div", { id: "memory-content" });
   view.replaceChildren(h("section", { class: "card" }, toolbar, content), remindersCard());
+
+  let requestVersion = 0;
+  async function loadTab() {
+    const version = ++requestVersion;
+    if (memoryState.tab === "list") return loadList(version);
+    if (memoryState.tab === "log") return loadLog(version);
+    if (!memoryState.personId) {
+      content.replaceChildren(emptyState("people", "先选一个人物", "在上方人物列表中选择要查看的画像与时间线"));
+      return;
+    }
+    content.replaceChildren(skeleton(2));
+    try {
+      const data = await api.get(`/api/people/${encodeURIComponent(memoryState.personId)}`);
+      if (version === requestVersion) content.replaceChildren(portraitPanel(data));
+    } catch (err) {
+      if (version === requestVersion && !(err instanceof Unauthorized)) {
+        content.replaceChildren(emptyState("warning", "画像与时间线加载失败", err.message));
+      }
+    }
+  }
 
   function tabButton(value, label) {
     return h(
@@ -1177,8 +1263,7 @@ async function renderMemory(view) {
             button.classList.toggle("active", active);
             button.setAttribute("aria-selected", active ? "true" : "false");
           });
-          if (value === "list") loadList();
-          else loadLog();
+          loadTab();
         },
         dataset: { tab: value },
       },
@@ -1188,15 +1273,16 @@ async function renderMemory(view) {
 
   const debouncedSearch = debounce(() => {
     memoryState.offset = 0;
-    loadList();
+    if (memoryState.tab === "list") loadTab();
   }, 280);
 
-  async function loadList() {
+  async function loadList(version = ++requestVersion) {
     const params = new URLSearchParams({ limit: String(memoryState.limit), offset: String(memoryState.offset) });
     if (memoryState.query.trim()) params.set("q", memoryState.query.trim());
     if (memoryState.personId) params.set("person_id", memoryState.personId);
     content.replaceChildren(skeleton(3));
     const result = await api.get(`/api/memories?${params.toString()}`);
+    if (version !== requestVersion) return;
     memoryState.total = result.total;
     if (!result.items.length) {
       content.replaceChildren(
@@ -1251,9 +1337,12 @@ async function renderMemory(view) {
     content.replaceChildren(list, footer);
   }
 
-  async function loadLog() {
+  async function loadLog(version = ++requestVersion) {
     content.replaceChildren(skeleton(3));
-    const result = await api.get("/api/memory-log?limit=80");
+    const params = new URLSearchParams({ limit: "80" });
+    if (memoryState.personId) params.set("person_id", memoryState.personId);
+    const result = await api.get(`/api/memory-log?${params}`);
+    if (version !== requestVersion) return;
     if (!result.items.length) {
       content.replaceChildren(emptyState("logs", "还没有变更记录", "抽取、归纳和手动修改都会写在这里"));
       return;
@@ -1266,12 +1355,9 @@ async function renderMemory(view) {
   }
 
   function memoryRow(memory, person) {
-    const display = person ? person.display_name || person.person_id : memory.person_id;
-    const scope = memory.scope_type === "group" ? `群 ${memory.scope_id}` : "全局";
     return h(
       "div",
       { class: "memory", dataset: { motionKey: memory.id } },
-      h("div", { class: "avatar" }, avatarText(display)),
       h(
         "div",
         { class: "memory-body" },
@@ -1279,9 +1365,9 @@ async function renderMemory(view) {
         h(
           "div",
           { class: "memory-meta" },
-          h("span", {}, display),
+          memory.person_identity ? identityBadge(memory.person_identity) : personBadge(person || memory),
           h("span", { class: "tag accent", style: { height: "18px", padding: "0 7px" } }, categoryName(memory.category)),
-          h("span", {}, scope),
+          memoryScope(memory),
           h("span", {}, sourceName(memory.source)),
           h("span", {}, fmtRelative(memory.created_at))
         )
@@ -1347,7 +1433,7 @@ async function renderMemory(view) {
           "div",
           { class: "memory-meta", style: { margin: 0 } },
           h("span", { class: "tag accent" }, ACTION_NAMES[entry.action] || entry.action),
-          h("span", {}, entry.person_id || ""),
+          entry.person_id ? personBadge(entry) : null,
           h("span", {}, fmtDateTime(entry.created_at)),
           entry.reverted ? h("span", { class: "tag outline" }, "已撤销") : null
         ),
@@ -1391,7 +1477,7 @@ async function renderMemory(view) {
         h(
           "option",
           { value: person.person_id, selected: memory ? memory.person_id === person.person_id : person.person_id === memoryState.personId },
-          `${person.display_name || person.person_id} · ${person.person_id}`
+          `${person.identity?.name || person.display_name || "未知用户"} · ${person.person_id}`
         )
       )
     );
@@ -1486,8 +1572,7 @@ async function renderMemory(view) {
     contentInput.focus();
   }
 
-  if (memoryState.tab === "list") await loadList();
-  else await loadLog();
+  await loadTab();
 }
 
 /* ------------------------------------------------------------------ */
@@ -1525,7 +1610,7 @@ async function renderPeople(view, param) {
     const items = q
       ? people.filter(
           (p) =>
-            (p.display_name || "").toLowerCase().includes(q) ||
+            (p.identity?.name || p.display_name || "").toLowerCase().includes(q) ||
             p.person_id.toLowerCase().includes(q) ||
             p.platform_uid.toLowerCase().includes(q)
         )
@@ -1554,10 +1639,8 @@ async function renderPeople(view, param) {
               }
             },
           },
-          h("div", { class: "avatar" }, avatarText(person.display_name)),
-          h("div", { class: "row-main" },
-            h("div", { class: "row-title" }, person.display_name || person.platform_uid),
-            h("div", { class: "row-sub" }, `${platformName(person.platform)} · ${person.memory_count} 条记忆`))
+          personBadge(person, "normal"),
+          h("small", { class: "row-sub" }, `${person.memory_count} 条记忆`)
         )
       )
     );
@@ -1568,19 +1651,20 @@ async function renderPeople(view, param) {
     const encoded = encodeURIComponent(personId);
     const data = await api.get(`/api/people/${encoded}`);
     const person = data.person;
+    const entry = people.find(row => row.person_id === personId);
+    if (entry) entry.identity = person.identity;
     const memories = data.memories;
     const globals = memories.filter((m) => m.scope_type === "global").length;
     detailNode.replaceChildren(
       h(
         "div",
         { class: "person-head" },
-        h("div", { class: "avatar lg" }, avatarText(person.display_name)),
-        h(
-          "div",
-          { style: { flex: "1", minWidth: "0" } },
-          h("div", { class: "row-title", style: { fontSize: "16px" } }, person.display_name || person.platform_uid),
-          h("div", { class: "row-sub" }, `${platformName(person.platform)} · ${person.person_id}`)
-        ),
+        personBadge(person, "large"),
+        person.platform === "snowluma" ? refreshIdentityButton({ platform: person.platform, person_id: personId },
+          async () => {
+            await loadDetail(personId);
+            filter(searchBox.querySelector("input").value);
+          }) : null,
         h("span", { class: "tag accent" }, `${memories.length} 条记忆`)
       ),
       h(
@@ -1604,7 +1688,7 @@ async function renderPeople(view, param) {
                     "div",
                     { class: "memory-meta" },
                     h("span", { class: "tag accent", style: { height: "18px" } }, categoryName(memory.category)),
-                    h("span", {}, memory.scope_type === "group" ? `群 ${memory.scope_id}` : "全局"),
+                    memoryScope(memory),
                     h("span", {}, sourceName(memory.source)),
                     h("span", {}, fmtRelative(memory.created_at))
                   )
@@ -1636,47 +1720,43 @@ async function renderPeople(view, param) {
 /* ------------------------------------------------------------------ */
 
 async function renderGroups(view) {
+  const panel = h("div", { class: "grid" }, skeleton(3));
+  view.replaceChildren(panel);
+  let keyword = "";
   const load = async () => {
-    const [chatsData, configData] = await Promise.all([api.get("/api/chats?limit=300"), api.get("/api/config")]);
-    const configured = (configData.effective.decision && configData.effective.decision.groups) || {};
-    const chats = chatsData.items.slice();
-    for (const chatId of Object.keys(configured)) {
-      if (!chats.some((chat) => String(chat.chat_id) === chatId)) {
-        chats.push({
-          platform: "—",
-          chat_id: chatId,
-          chat_type: "group",
-          last_ts: null,
-          message_count: 0,
-          configured: true,
-          activity_multiplier: configured[chatId].activity_multiplier || 1,
-          quiet_hours: configured[chatId].quiet_hours || [],
-          recent_decisions: [],
-        });
-      }
-    }
+    const chatsData = await api.get("/api/chats?limit=300");
+    const chats = chatsData.items;
     if (!chats.length) {
-      view.replaceChildren(
+      panel.replaceChildren(
         h("section", { class: "card" },
           emptyState("groups", "还没有群聊记录", "群消息进来后会自动出现在这里，可以单独调节每群的活跃度与静默时段"))
       );
       return;
     }
     const list = h("div", { class: "rows" });
-    for (const chat of chats) list.append(await chatRow(chat));
-    view.replaceChildren(
+    const showChats = value => {
+      keyword = value;
+      const q = keyword.trim().toLowerCase();
+      const matches = chats.filter(chat => !q || [chat.chat_id, chat.chat_identity?.name, chat.platform]
+        .some(value => String(value || "").toLowerCase().includes(q)));
+      list.replaceChildren(...(matches.length ? matches.map(chatRow)
+        : [emptyState("groups", "没有匹配的会话", "换个群名、昵称或 ID 再试")]));
+    };
+    const search = h("div", { class: "input-search" }, icon("search"),
+      h("input", { class: "input", type: "search", value: keyword, placeholder: "搜索名字或 ID", "aria-label": "搜索会话",
+        oninput: event => showChats(event.target.value) }));
+    showChats(keyword);
+    panel.replaceChildren(
       h("div", { class: "notice" }, icon("warning"),
         "活跃度倍率会放大或压低这个群的意愿分数；静默时段内普通消息不会开口（@、回复和叫名字不受影响）。保存后写入 config.yaml，即时生效。"),
       h("section", { class: "card" },
-        h("div", { class: "card-head" }, h("h2", {}, "会话"), h("span", { class: "hint" }, `${chats.length} 个`)),
+        h("div", { class: "card-head" }, h("h2", {}, "会话"), h("span", { class: "hint" }, `${chats.length} 个`), search),
         list)
     );
   };
 
-  async function chatRow(chat) {
-    const chatId = String(chat.chat_id);
+  function chatRow(chat) {
     const detail = h("div", { class: "chat-detail", hidden: true });
-    const isGroup = chat.chat_type === "group";
     const head = h(
       "div",
       { class: "chat-row" },
@@ -1693,30 +1773,34 @@ async function renderGroups(view) {
             button.setAttribute("aria-expanded", open ? "true" : "false");
             if (open && !detail.dataset.loaded) {
               detail.dataset.loaded = "1";
-              await fillDetail(detail, chat);
+              try {
+                await fillDetail(detail, chat);
+              } catch (err) {
+                delete detail.dataset.loaded;
+                if (!(err instanceof Unauthorized)) detail.replaceChildren(emptyState("warning", "读取失败", "收起后重新展开即可重试"));
+              }
             }
           },
         },
-        h("div", { class: "row-title" }, isGroup ? `群 ${chatId}` : `私聊 ${chatId}`),
+        chatBadge(chat, "normal"),
         h("div", { class: "row-sub" },
-          `${platformName(chat.platform)} · ${fmtNumber(chat.message_count)} 条消息 · 最近活跃 ${fmtRelative(chat.last_ts)}`)
+          `${chat.chat_type === "private" ? "私聊" : "群聊"} · ${fmtNumber(chat.message_count)} 条消息 · 最近活跃 ${fmtRelative(chat.last_ts)}`)
       ),
       h(
         "div",
         { class: "chat-settings" },
+        chat.chat_type === "group" && chat.platform === "snowluma" ? refreshIdentityButton(
+          { platform: chat.platform, chat_id: chat.chat_id }, load) : null,
+        chat.chat_type === "private" ? h("span", { class: "tag outline" }, "私聊直达") : [
         chat.quiet_hours && chat.quiet_hours.length
           ? h("span", { class: "tag outline" }, "静默 ", chat.quiet_hours.join(" / "))
           : null,
-        h("span", { class: "tag" }, `倍率 ${(Number(chat.activity_multiplier) || 1).toFixed(2)}`),
-        h("span", { class: `tag ${chat.configured ? "accent" : "outline"}` }, chat.configured ? "已单独配置" : "默认")
+        h("span", { class: "tag" }, `倍率 ${Number(chat.activity_multiplier ?? 1).toFixed(2)}`),
+        h("span", { class: `tag ${chat.configured ? "accent" : "outline"}` }, chat.configured ? "已单独配置" : "默认")]
       ),
       detail
     );
     return head;
-  }
-
-  if (state.param) {
-    // 支持 #/groups/<chat_id> 直接展开
   }
 
   await load();
@@ -1727,10 +1811,19 @@ async function fillDetail(container, chat) {
   container.replaceChildren(skeleton(2));
   const encoded = encodeURIComponent(chatId);
   const [settings, decisions] = await Promise.all([
-    api.get(`/api/chats/${encoded}/decision`),
-    api.get(`/api/decisions?chat_id=${encoded}&limit=12`),
+    chat.chat_type === "group" ? api.get(`/api/chats/${encoded}/decision`) : null,
+    api.get(`/api/decisions?chat_id=${encoded}&platform=${encodeURIComponent(chat.platform)}&chat_type=${encodeURIComponent(chat.chat_type)}&limit=12`),
   ]);
 
+  const decisionList = decisions.items.length
+    ? h("div", { class: "rows", style: { border: "1px solid var(--border)", borderRadius: "10px", overflow: "hidden" } },
+        ...decisions.items.map((d) => decisionItem(d)))
+    : emptyState("pulse", "这个会话还没有决策记录", "收到消息并完成决策后会出现");
+
+  if (!settings) {
+    container.replaceChildren(h("div", { class: "field-label" }, "最近决策"), decisionList);
+    return;
+  }
   const multiplier = h("input", {
     class: "input",
     type: "number",
@@ -1862,11 +1955,6 @@ async function fillDetail(container, chat) {
         : null
     )
   );
-
-  const decisionList = decisions.items.length
-    ? h("div", { class: "rows", style: { border: "1px solid var(--border)", borderRadius: "10px", overflow: "hidden" } },
-        ...decisions.items.map((d) => decisionItem(d)))
-    : emptyState("pulse", "这个群还没有决策记录", "收到普通群消息并完成评分后会出现");
 
   container.replaceChildren(
     h(
@@ -2456,6 +2544,11 @@ async function renderPluginMarket(view) {
 /* 日志                                                               */
 /* ------------------------------------------------------------------ */
 
+function logIdentities(item) {
+  if (!item.chat_identity && !item.person_identity) return null;
+  return h("span", { class: "log-identities" }, identityBadge(item.chat_identity), identityBadge(item.person_identity));
+}
+
 async function renderLogs(view) {
   let level = "";
   let query = "";
@@ -2534,7 +2627,7 @@ async function renderLogs(view) {
           { class: "log-line" },
           h("span", { class: "log-time" }, fmtClock(item.ts)),
           h("span", { class: "log-level", dataset: { level: item.level } }, item.level),
-          h("span", { class: "log-msg" }, h("b", {}, item.logger), `  ${item.message}`)
+          h("span", { class: "log-msg" }, logIdentities(item), h("b", {}, item.logger), `  ${item.message}`)
         )
       )
     );
@@ -2578,7 +2671,7 @@ function auditCard() {
             h("span", { class: "log-level", dataset: { level: item.ok ? "INFO" : "WARNING" } },
               item.ok ? "OK" : "拒绝"),
             h("span", { class: "log-msg" },
-              h("b", {}, item.action),
+              logIdentities(item), h("b", {}, item.action),
               item.sensitive ? h("span", { class: "tag warn" }, "敏感") : null,
               `  ${item.reject_reason || item.result || ""}`)
           )
@@ -2962,7 +3055,7 @@ function quietHoursNormalize(value) {
 }
 
 /** 每群覆盖：增删群条目，每条可设倍率、基础意愿与静默时段。 */
-function groupsEditor(draft, secrets) {
+function groupsEditor(draft, identities) {
   const body = h("div", { style: { display: "grid", gap: "12px" } });
   const groupsNode = h("div", { class: "group-list" });
   const newId = h("input", {
@@ -2998,7 +3091,7 @@ function groupsEditor(draft, secrets) {
       h(
         "div",
         { class: "group-item-head" },
-        h("span", { class: "row-title" }, `群 ${chatId}`),
+        identityBadge(identities[chatId] || { kind: "group", id: chatId }, "normal"),
         h(
           "button",
           {
@@ -3213,12 +3306,13 @@ function computerAuditCard() {
   async function load() {
     refresh.disabled = true;
     try {
-      const { items } = await api.get("/api/computer/audit?limit=30");
+      const { items } = await api.get("/api/computer/audit?limit=30&identities=true");
       const contexts = { host: "真机", sandbox: "访客沙盒" };
       rows.replaceChildren(...(items.length ? items.map(item => h("div", { class: "plugin-row" },
         h("div", { class: "row-main" },
           h("div", { class: "row-title mono" }, item.tool),
-          h("div", { class: "row-sub" }, `${fmtDateTime(item.created_at)} · ${item.who} · ${contexts[item.context] || item.context}`),
+          identityBadge(item.person_identity || { id: item.who }),
+          h("div", { class: "row-sub" }, `${fmtDateTime(item.created_at)} · ${contexts[item.context] || item.context}`),
           h("div", { class: "row-sub" }, `参数 ${item.args_summary.arg_count} 项，输入 ${item.args_summary.input_bytes} 字节 · 耗时 ${item.duration_ms} 毫秒`)),
         h("span", { class: `tag ${item.success ? "good" : "bad"}` }, item.success ? "成功" : "失败")))
         : [h("p", { class: "field-hint" }, "还没有电脑操作记录。") ]));
@@ -3490,7 +3584,7 @@ function settingsMenu(layout, group, page) {
  * 每张卡用 ``path`` 标出它覆盖的代表字段，具体归到哪个二级页面由后端
  * ``layout.rules`` 决定；这里不再维护第二份「字段 → 页面」表。
  */
-function settingsCardSpecs(draft, secrets, pluginsAvailable) {
+function settingsCardSpecs(draft, secrets, pluginsAvailable, groupIdentities = {}) {
   return [
     {
       path: "llm.base_url",
@@ -3941,7 +4035,7 @@ function settingsCardSpecs(draft, secrets, pluginsAvailable) {
       path: "decision.groups",
       node: card("每群覆盖", {
         hint: "单独调节某个群",
-        body: groupsEditor(draft, secrets),
+        body: groupsEditor(draft, groupIdentities),
       }),
     },
     {
@@ -4337,7 +4431,7 @@ async function renderSettingsGroup(view, groupId, sub) {
   });
 
   // 卡片按后端规则落到当前二级页面；同页卡片保持清单里的顺序
-  const cards = settingsCardSpecs(draft, secrets, data.plugins_available || [])
+  const cards = settingsCardSpecs(draft, secrets, data.plugins_available || [], data.group_identities)
     .filter((spec) => pageOf(layout, spec.path) === page.id)
     .map((spec) => spec.node);
 

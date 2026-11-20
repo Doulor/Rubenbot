@@ -347,7 +347,7 @@ class PrivacyGate:
             if any(ask.item_ref == key for ask in existing):
                 return
             if len(existing) >= MAX_PENDING_PER_PERSON:
-                logger.debug("待询问已达上限，跳过：%s %s", item.person_id, key)
+                logger.debug("待询问已达上限，跳过：%s %s", item.person_id, key, extra={"person_id": item.person_id})
                 return
             scope = "群里" if audience_kind(audience_now) == "group" else "别人面前"
             question = (
@@ -355,7 +355,7 @@ class PrivacyGate:
                 f"我可以在{scope}提到吗？回我「可以」或「不行」就行。"
             )
             self.store.add_pending_ask(item.person_id, key, question)
-            logger.info("分寸拿不准，加入待询问：%s %s（%s）", item.person_id, key, reason)
+            logger.info("分寸拿不准，加入待询问：%s %s（%s）", item.person_id, key, reason, extra={"person_id": item.person_id})
         except Exception as exc:  # noqa: BLE001 - 加待问失败不能影响扣下结论
             logger.warning("写入待询问失败：%s", exc)
 
