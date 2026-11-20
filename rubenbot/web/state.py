@@ -306,7 +306,7 @@ class WebState:
                 logger.warning("热应用配置失败：%s", exc)
             if new_config.persona_path == old.persona_path:
                 try:
-                    bot.reload_persona(load_persona(new_config.persona_path))
+                    bot.reload_persona(load_persona(new_config.persona_path, **new_config.persona_example_options()))
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("重读人格文件失败：%s", exc)
         return restart

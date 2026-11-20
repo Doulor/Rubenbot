@@ -20,6 +20,15 @@ logger = logging.getLogger(__name__)
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
+def _safe_nonnegative_int(value: Any, default: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return default
+    try:
+        return max(0, int(value))
+    except ValueError:
+        return default
+
+
 def _expand_env(value: Any) -> Any:
     """递归展开字符串里的 ${VAR}；未定义时替换为空串。"""
     if isinstance(value, str):
@@ -850,6 +859,10 @@ class Config:
     proactive: ProactiveConfig = field(default_factory=ProactiveConfig)
     gateway: GatewayConfig = field(default_factory=GatewayConfig)
     persona_path: str = "data/SOUL.md"
+    persona_examples_path: str = "data/reply_examples.json"
+    persona_examples_enabled: bool = True
+    persona_examples_count: int = 5
+    persona_examples_position: str = "after"
     database_path: str = "data/rubenbot.db"
     adapters: dict[str, Any] = field(default_factory=dict)
     # 后台归纳检查间隔（分钟）
@@ -862,6 +875,15 @@ class Config:
     def enabled_adapters(self) -> list[str]:
         """返回配置中启用（值不为 null/false）的适配器名；``{}`` 也算启用。"""
         return [name for name, opts in self.adapters.items() if opts is not None and opts is not False]
+
+    def persona_example_options(self) -> dict[str, Any]:
+        """启动、热加载和只读预览共用的示例选项。"""
+        return {
+            "examples_path": self.persona_examples_path,
+            "examples_enabled": self.persona_examples_enabled,
+            "examples_count": self.persona_examples_count,
+            "examples_position": self.persona_examples_position,
+        }
 
     def adapter_options(self, name: str) -> dict[str, Any]:
         """某个适配器的配置段；未配置或不是 dict 时返回空 dict。"""
@@ -939,8 +961,14 @@ class Config:
         persona = data.get("persona") or {}
         if isinstance(persona, str):
             persona = {"path": persona}
+        elif not isinstance(persona, dict):
+            persona = {}
         basics = {
             "persona_path": persona.get("path", "data/SOUL.md"),
+            "persona_examples_path": persona.get("examples_path", "data/reply_examples.json"),
+            "persona_examples_enabled": persona.get("examples_enabled", True) is not False,
+            "persona_examples_count": _safe_nonnegative_int(persona.get("examples_count", 5), 5),
+            "persona_examples_position": "before" if persona.get("examples_position") == "before" else "after",
             "database_path": data.get("database_path", "data/rubenbot.db"),
             "adapters": data.get("adapters") or {},
             "background_check_minutes": data.get("background_check_minutes", 5.0),

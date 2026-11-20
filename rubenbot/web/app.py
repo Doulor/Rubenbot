@@ -334,9 +334,9 @@ def _effective_persona(state: WebState, file_text: str, exists: bool):
     persona = state.bot_persona()
     if persona is not None:
         return persona, "bot"
-    if not exists:
-        return Persona(name=_extract_name_safe(DEFAULT_PERSONA), text=DEFAULT_PERSONA), "default"
-    return Persona(name=_extract_name_safe(file_text), text=file_text), "file"
+    text = file_text if exists else DEFAULT_PERSONA
+    persona = Persona(name=_extract_name_safe(text), text=text, **state.config.persona_example_options())
+    return persona, "file" if exists else "default"
 
 
 def _persona_payload(state: WebState) -> dict[str, Any]:
@@ -387,7 +387,7 @@ def _preview_prompt(persona) -> str:
 def _apply_persona(state: WebState, text: str) -> dict[str, Any]:
     """写人格文件并热加载；返回给前端的落盘/生效信息。"""
     backup = save_persona_text(state.config.persona_path, text)
-    persona = load_persona(state.config.persona_path)
+    persona = load_persona(state.config.persona_path, **state.config.persona_example_options())
     applied = state.apply_persona(persona)
     return {
         "backup": str(backup) if backup else None,
@@ -1221,9 +1221,7 @@ async def _save_structured_config(state: WebState, payload: Any) -> dict[str, An
         )
 
     for group, value in update.items():
-        if group == "persona":
-            leaves = ["persona.path"]
-        elif group == "database_path":
+        if group == "database_path":
             leaves = ["database_path"]
         else:
             leaves = _leaf_paths(group, value)
@@ -1291,6 +1289,7 @@ def _config_snapshot(config: Config) -> dict[str, Any]:
 
     data = asdict(config)
     flat: dict[str, Any] = {"persona.path": config.persona_path}
+    flat.update({f"persona.{key}": value for key, value in config.persona_example_options().items()})
     for section, value in data.items():
         if not isinstance(value, dict):
             flat[section] = value

@@ -21,6 +21,10 @@ llm:
 
 persona:
   path: "data/SOUL.md"
+  examples_enabled: true                    # 注入「我说话的样子」，不改人格文件
+  examples_path: "data/reply_examples.json" # 可编辑 JSON 数组，每项是短回复字符串或带 text 的对象
+  examples_count: 5                         # 按文件顺序最多取几条（不足就全取，0 不注入）
+  examples_position: "after"                # before 在人格正文前，after 在正文后
 
 database_path: "data/rubenbot.db"
 

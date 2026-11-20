@@ -136,6 +136,10 @@ _SETTINGS_PAGE_RULES: tuple[tuple[str, str], ...] = (
     ("webui", "system"),
     ("plugins", "system"),
     ("market", "system"),
+    ("persona.examples_enabled", "expression"),
+    ("persona.examples_path", "expression"),
+    ("persona.examples_count", "expression"),
+    ("persona.examples_position", "expression"),
     ("persona.path", "system"),
     ("database_path", "system"),
     ("background_check_minutes", "system"),
@@ -240,7 +244,7 @@ def structured_config(config: Config) -> dict[str, Any]:
 
     return {
         "llm": {**llm, "api_key": ""},
-        "persona": {"path": config.persona_path},
+        "persona": {"path": config.persona_path, **config.persona_example_options()},
         "database_path": config.database_path,
         "memory": asdict(config.memory),
         "search": search,
@@ -1157,10 +1161,25 @@ def validate_structured(payload: dict[str, Any]) -> dict[str, Any]:
             persona = {"path": persona}
         if not isinstance(persona, dict):
             v.fail("persona", "应为对象")
-        elif "path" in persona:
-            value = v.text(persona["path"], "persona.path")
-            if value is not None:
-                update["persona"] = {"path": value}
+        else:
+            options = {}
+            for key in ("path", "examples_path"):
+                if key in persona:
+                    options[key] = v.text(persona[key], f"persona.{key}")
+            if "examples_enabled" in persona:
+                options["examples_enabled"] = v.boolean(persona["examples_enabled"], "persona.examples_enabled")
+            if "examples_count" in persona:
+                options["examples_count"] = v.number(
+                    persona["examples_count"], "persona.examples_count", integer=True, minimum=0
+                )
+            if "examples_position" in persona:
+                position = persona["examples_position"]
+                if position not in ("before", "after"):
+                    v.fail("persona.examples_position", "只能是 before 或 after")
+                else:
+                    options["examples_position"] = position
+            if options:
+                update["persona"] = options
     if "database_path" in payload:
         value = v.text(payload["database_path"], "database_path")
         if value is not None:
@@ -1193,6 +1212,9 @@ def validate_structured(payload: dict[str, Any]) -> dict[str, Any]:
 def merge_config(raw: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
     """把规范字典合并进现有 YAML 数据，保留更新里没提到的键。"""
     base = copy.deepcopy(raw) if isinstance(raw, dict) else {}
+    if isinstance(base.get("persona"), str) and isinstance(update.get("persona"), dict):
+        # 旧格式只写人格路径；仅修改示例设置时也不能丢掉它。
+        base["persona"] = {"path": base["persona"]}
     _deep_merge(base, update, ())
     return base
 

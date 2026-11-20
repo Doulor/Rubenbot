@@ -140,6 +140,53 @@ def test_load_persona_custom_name(tmp_path):
     assert "你是一只猫" in persona.system_prompt()
 
 
+@pytest.mark.parametrize("position", ["before", "after"])
+def test_persona_reply_examples(tmp_path, position):
+    soul = tmp_path / "SOUL.md"
+    soul.write_text("# 小满", encoding="utf-8")
+    examples = tmp_path / "examples.json"
+    examples.write_text(json.dumps([None, {"text": 7}, " ", {"text": "  第一条 "}, "第一条", "第二条", "第三条"]), encoding="utf-8")
+    cfg = Config.from_dict({"persona": {
+        "path": str(soul), "examples_path": str(examples), "examples_position": position, "examples_count": 2,
+    }})
+    persona = load_persona(cfg.persona_path, **cfg.persona_example_options())
+    section = "## 我说话的样子\n- 第一条\n- 第二条"
+    parts = (section, "# 小满") if position == "before" else ("# 小满", section)
+    assert persona.system_prompt() == "\n\n".join(parts) + "\n"
+    assert soul.read_text(encoding="utf-8") == persona.text == "# 小满"
+    examples.write_text('["改过的示例"]', encoding="utf-8")
+    assert "改过的示例" in persona.system_prompt()
+
+
+@pytest.mark.parametrize("data", [None, "{", "{}", "[]"])
+def test_persona_missing_or_invalid_examples_leave_prompt_unchanged(tmp_path, data):
+    examples = tmp_path / "examples.json"
+    if data is not None:
+        examples.write_text(data, encoding="utf-8")
+    persona = load_persona(tmp_path / "SOUL.md", examples_path=examples)
+    assert persona.system_prompt() == persona.text.strip() + "\n"
+
+
+@pytest.mark.parametrize("options", [{"examples_count": 0}, {"examples_enabled": False}])
+def test_persona_can_omit_valid_examples(tmp_path, options):
+    examples = tmp_path / "examples.json"
+    examples.write_text('["不该出现"]', encoding="utf-8")
+    cfg = Config.from_dict({"persona": {**options, "examples_path": str(examples)}})
+    persona = load_persona(tmp_path / "SOUL.md", **cfg.persona_example_options())
+    assert persona.system_prompt() == persona.text.strip() + "\n"
+
+
+def test_persona_example_defaults_and_fallback():
+    legacy = Config.from_dict({"persona": "my-soul.md"})
+    assert legacy.persona_path == "my-soul.md"
+    assert legacy.persona_example_options() == {
+        "examples_enabled": True, "examples_path": "data/reply_examples.json",
+        "examples_count": 5, "examples_position": "after",
+    }
+    invalid = Config.from_dict({"persona": {"examples_count": "many", "examples_position": "middle"}})
+    assert invalid.persona_example_options() == legacy.persona_example_options()
+
+
 def test_persona_name_fallback(tmp_path):
     path = tmp_path / "p.md"
     path.write_text("你是阿七，一个普通人。", encoding="utf-8")

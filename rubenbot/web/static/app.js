@@ -3622,6 +3622,20 @@ function settingsCardSpecs(draft, secrets, pluginsAvailable) {
       }),
     },
     {
+      path: "persona.examples_enabled",
+      node: card("我说话的样子", {
+        hint: "用自己的短回复作示例，不改人格正文",
+        body: fieldGrid([
+          { path: "persona.examples_enabled", label: "注入示例", kind: "switch" },
+          { path: "persona.examples_count", label: "最多注入几条", kind: "number", min: 0, step: "1" },
+          { path: "persona.examples_position", label: "注入位置", kind: "select", options: [
+            { value: "before", label: "人格正文前" }, { value: "after", label: "人格正文后" },
+          ] },
+          { path: "persona.examples_path", label: "示例文件", mono: true, wide: true },
+        ], draft),
+      }),
+    },
+    {
       path: "emotion.enabled",
       node: card("情绪与好感度", {
         hint: "状态由规则计算，只做背景注入与阈值微调",
