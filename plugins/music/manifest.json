@@ -1,0 +1,32 @@
+{
+  "id": "music",
+  "name": "点歌",
+  "version": "1.0.0",
+  "description": "「点歌 <歌名>」「我想听 <歌名>」搜网易云，用 OneBot 音乐段发送；失败降级成文字 + 封面",
+  "author": "RubenBot",
+  "min_core_version": "0.1.0",
+  "permissions": ["read_messages", "send_messages", "network"],
+  "config_schema": [
+    {
+      "key": "triggers",
+      "type": "list",
+      "default": ["点歌", "我想听"],
+      "description": "点歌触发词，消息以其中之一开头即触发"
+    },
+    {
+      "key": "cooldown_seconds",
+      "type": "number",
+      "default": 60,
+      "description": "单人两次点歌之间的冷却秒数"
+    },
+    {
+      "key": "source",
+      "type": "string",
+      "default": "netease",
+      "description": "默认音源（目前只支持 netease）"
+    }
+  ],
+  "hooks": ["on_message", "on_stop"],
+  "category": "工具",
+  "icon": "🎵"
+}

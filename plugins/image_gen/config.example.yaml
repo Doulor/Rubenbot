@@ -1,0 +1,27 @@
+# image_gen 插件配置（删掉本文件即使用 plugin.py 里的默认值）
+#
+# 没配 api_key 时插件照常加载，但**不注册画图触发**（启动日志会说明）。
+# 支持 ${ENV_VAR} 占位，建议把 key 放环境变量，不要写进仓库。
+
+# 生图服务商：目前只支持 siliconflow（硅基流动）
+provider: siliconflow
+
+# 服务商密钥；去 https://cloud.siliconflow.cn 申请
+api_key: "${RUBENBOT_IMAGE_KEY}"
+
+# 生图模型；默认 Kwai-Kolors/Kolors
+model: "Kwai-Kolors/Kolors"
+
+# 触发词：消息以其中之一开头即触发（「画一张 <描述>」「画个 <描述>」等）
+triggers: ["画一张", "画个", "画一幅", "帮我画", "生成图片"]
+
+# 单人冷却（秒）：同一个人两次画图之间的最小间隔
+cooldown_seconds: 120
+
+# 每日全群上限：同一个会话（平台 + chat_id）每天最多画几张；0 = 不限
+daily_limit: 20
+
+# 本地关键词黑名单：描述里出现任一关键词就直接拒绝，不请求接口。
+# 主要口径仍交给服务商审核，这里只收最明显越界的一小撮；按群规增删。
+# 写成 [] 表示本地不拦，只靠服务商审核。
+blacklist: ["儿童色情", "幼女", "恋童", "血腥", "分尸", "虐杀"]

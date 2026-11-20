@@ -1,0 +1,10 @@
+# music 插件配置（删掉本文件即使用 plugin.py 里的默认值）
+
+# 点歌触发词：消息以其中之一开头即触发（如「点歌 晴天」「我想听 晴天」）
+triggers: ["点歌", "我想听"]
+
+# 单人冷却（秒）：同一个人两次点歌之间的最小间隔
+cooldown_seconds: 60
+
+# 默认音源：目前只支持 netease（OneBot 音乐段 type=netease + 歌曲 id）
+source: netease
