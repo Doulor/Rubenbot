@@ -31,6 +31,7 @@ from .adapters.base import (
     render_segments,
 )
 from .adapters.platform import KIND_REQUEST, PlatformEvent
+from .agreement import is_repetitive_agreement
 from .config import Config
 from .decision import (
     BOT_SENDER_ID,
@@ -1308,22 +1309,37 @@ class RubenBot:
         if expression.intent == "沉默":
             decision.should_reply = False
             decision.reason = "expression_silence"
-        self._log_decision(event, decision, now, expression)
-        if not decision.should_reply:
+            self._log_decision(event, decision, now, expression)
             return
 
         messages = [*messages, {"role": "system", "content": expression.prompt_block()}]
         task = "chat" if expression.source == "fragment" else "gen_stage2"
-        raw_reply = await self.generate(messages, event=event, task=task)
-        parsed = parse_generation_output(raw_reply, marker)
-        if parsed.vetoed:
-            logger.info(
-                "生成后否决(%s)：%s %s", parsed.reason, event.sender_name, event.text[:40]
-            )
+        for attempt in range(2):
+            # 重写只改文字，不能再给工具，否则可能重复设提醒或执行平台动作。
+            raw = await self.generate(messages, event=None if attempt else event,
+                                      task="gen_agreement_retry" if attempt else task)
+            body = clean_reply_patterns(strip_transcript_prefix(raw))
+            if self.config.chat.strip_action_parens:
+                body = strip_action_parens(body)
+            parsed = parse_generation_output(body, marker)
+            if parsed.vetoed:
+                decision.should_reply, decision.reason = False, parsed.reason
+                logger.info("生成后否决(%s)：%s/%s", parsed.reason, event.platform, event.chat_id)
+                break
+            if not is_repetitive_agreement(event.text, parsed.text):
+                break
+            logger.info("附和闸门命中：%s/%s，%s", event.platform, event.chat_id,
+                        "重写仍是复述，本轮沉默" if attempt else "尝试一次重写")
+            if attempt:
+                decision.should_reply, decision.reason = False, "agreement_veto"
+            else:
+                messages = [*messages, {"role": "assistant", "content": parsed.text}, {
+                    "role": "system", "content": "刚才的草稿复述了对方。换一个新角度，或只回三个字以内。",
+                }]
+        self._log_decision(event, decision, now, expression)
+        if not decision.should_reply:
             return
         reply = parsed.text
-        if not reply:
-            return
 
         await self.send_reply(
             event,
