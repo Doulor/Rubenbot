@@ -480,10 +480,10 @@ def _validate_voice(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
     text_fields = {
         "stt_base_url": 400,
         "stt_model": 120,
+        "tts_base_url": 400,
         "tts_model": 120,
         "tts_voice": 120,
         "tts_siliconflow_voice": 120,
-        "edge_tts_command": 120,
     }
     for key, max_len in text_fields.items():
         if key in section:

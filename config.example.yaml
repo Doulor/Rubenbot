@@ -102,11 +102,13 @@ voice:
   # off 从不发语音（默认）；reply_voice 对方发语音时用语音回；
   # on_request 在 reply_voice 基础上，被明确要求「用语音说」时也发
   tts_mode: "off"
-  tts_provider: "edge_tts"          # edge_tts（免 Key，子进程调用可选 CLI）或 siliconflow（CosyVoice2）
-  tts_api_key: ""                   # 硅基流动合成用；留空复用 stt_api_key
-  edge_tts_command: "edge-tts"      # 找不到命令时自动降级发文字
-  tts_voice: "zh-CN-XiaoxiaoNeural" # edge-tts 音色
-  tts_model: "FunAudioLLM/CosyVoice2-0.5B"
+  # custom：任意 OpenAI 兼容的 /audio/speech 接口（默认）；siliconflow：CosyVoice2。
+  # custom 未配 tts_base_url 或 tts_model 视为未配置，照常发文字。
+  tts_provider: "custom"
+  tts_base_url: ""                  # custom 用，例如 https://host/v1；留空降级发文字
+  tts_api_key: ""                   # custom 的 Bearer Key；硅基流动留空复用 stt_api_key
+  tts_model: ""                     # custom 必填；硅基流动留空用 CosyVoice2-0.5B
+  tts_voice: ""                     # custom 的音色名，随请求一起发给接口
   tts_siliconflow_voice: "FunAudioLLM/CosyVoice2-0.5B:alex"
   tts_max_chars: 60                 # 正文超过这么多字不合成；被拆条的长回复一律发文字
   tts_timeout_seconds: 30

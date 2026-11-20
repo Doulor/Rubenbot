@@ -1,6 +1,6 @@
 """语音双向：配置、STT/TTS 后端、模式矩阵、降级路径与适配器翻译。
 
-音频转写/合成全部走假传输层或注入的假实现，不发真请求、不起真子进程。
+音频转写/合成全部走假传输层或注入的假实现，不发真请求。
 """
 
 from __future__ import annotations
@@ -41,6 +41,14 @@ def make_service(handler, **overrides) -> VoiceService:
     return VoiceService(config, transport=httpx.MockTransport(handler))
 
 
+def enable_tts(config, mode: str) -> None:
+    """打开语音回复并配好 custom 后端（发请求由假语音服务兜住）。"""
+    config.voice.tts_mode = mode
+    config.voice.tts_provider = "custom"
+    config.voice.tts_base_url = "https://tts.example/v1"
+    config.voice.tts_model = "my-tts"
+
+
 def audio_segment(data: bytes = b"amr-bytes", filename: str = "voice.amr") -> Segment:
     return Segment(
         "record",
@@ -61,7 +69,7 @@ def test_voice_config_defaults_and_fallbacks():
     config = VoiceConfig()
     assert config.stt_provider == "siliconflow"
     assert config.tts_mode == "off"
-    assert config.tts_provider == "edge_tts"
+    assert config.tts_provider == "custom"
     assert config.stt_max_bytes == 5 * 1024 * 1024
     assert config.stt_timeout_seconds == 30.0
     assert config.tts_max_chars == 60
@@ -70,7 +78,7 @@ def test_voice_config_defaults_and_fallbacks():
     assert config.tts_configured is False
     # 写错的后端/模式回落默认值，不报错
     assert VoiceConfig(stt_provider="whisper").stt_provider == "siliconflow"
-    assert VoiceConfig(tts_provider="azure").tts_provider == "edge_tts"
+    assert VoiceConfig(tts_provider="edge_tts").tts_provider == "custom"
     assert VoiceConfig(tts_mode="always").tts_mode == "off"
     # 兼容模式看 base_url；siliconflow 的 TTS 可以复用 STT 的 key
     assert VoiceConfig(stt_provider="openai_compatible").stt_configured is False
@@ -84,6 +92,20 @@ def test_voice_config_defaults_and_fallbacks():
     assert (
         VoiceConfig(
             tts_mode="reply_voice", tts_provider="siliconflow", stt_api_key="k"
+        ).tts_configured
+        is True
+    )
+    # custom TTS 要 base_url + model 才算配置好；缺一个都降级发文字
+    assert VoiceConfig(tts_mode="reply_voice").tts_configured is False
+    assert (
+        VoiceConfig(
+            tts_mode="reply_voice", tts_base_url="https://tts.example/v1"
+        ).tts_configured
+        is False
+    )
+    assert (
+        VoiceConfig(
+            tts_mode="reply_voice", tts_base_url="https://tts.example/v1", tts_model="m"
         ).tts_configured
         is True
     )
@@ -114,8 +136,8 @@ def test_config_loads_voice_section_and_env(tmp_path, monkeypatch):
 def test_build_voice_skips_when_unconfigured(caplog):
     with caplog.at_level(logging.INFO, logger="rubenbot.voice"):
         assert build_voice(VoiceConfig()) is None
-        # 只开了 TTS、但 siliconflow 没有 key：服务整体不可用，也只记一行日志
-        assert build_voice(VoiceConfig(tts_mode="reply_voice", tts_provider="siliconflow")) is None
+        # 只开了 TTS、但 custom 没有 base_url/model：服务整体不可用，也只记一行日志
+        assert build_voice(VoiceConfig(tts_mode="reply_voice")) is None
         service = build_voice(VoiceConfig(stt_api_key="k"))
     assert isinstance(service, VoiceService)
     assert any("语音转写未配置" in record.message for record in caplog.records)
@@ -243,31 +265,58 @@ def test_fetch_audio_sources(tmp_path):
 # ----------------------------------------------------------------------
 
 
-def test_edge_tts_uses_injected_runner():
+def test_custom_tts_posts_and_returns_audio():
     seen = {}
 
-    async def runner(text, voice, timeout):
-        seen.update(text=text, voice=voice, timeout=timeout)
-        return TTS_AUDIO
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["auth"] = request.headers.get("authorization")
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, content=TTS_AUDIO)
 
-    config = VoiceConfig(tts_mode="reply_voice", tts_voice="zh-CN-XiaoxiaoNeural")
-    service = VoiceService(config, edge_runner=runner)
+    service = make_service(
+        handler,
+        tts_mode="reply_voice",
+        tts_base_url="https://tts.example/v1/",
+        tts_api_key="k-tts",
+        tts_model="my-tts",
+        tts_voice="alice",
+    )
     assert asyncio.run(service.synthesize("你好呀")) == TTS_AUDIO
-    assert seen == {"text": "你好呀", "voice": "zh-CN-XiaoxiaoNeural", "timeout": 30.0}
+    assert seen["url"] == "https://tts.example/v1/audio/speech"
+    assert seen["auth"] == "Bearer k-tts"
+    assert seen["body"] == {"model": "my-tts", "input": "你好呀", "voice": "alice"}
 
 
-def test_edge_tts_missing_cli_degrades(monkeypatch):
-    monkeypatch.setattr("rubenbot.voice.shutil.which", lambda name: None)
-    config = VoiceConfig(tts_mode="reply_voice")
-    service = VoiceService(config)
-    assert asyncio.run(service.synthesize("你好")) is None
+def test_custom_tts_unconfigured_degrades_without_request():
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, content=TTS_AUDIO)
+
+    # 缺 model / 缺 base_url 都视为未配置：不发请求，返回 None 让上层发文字
+    for overrides in (
+        {"tts_mode": "reply_voice", "tts_base_url": "https://tts.example/v1"},
+        {"tts_mode": "reply_voice", "tts_model": "my-tts"},
+        {"tts_mode": "reply_voice"},
+    ):
+        service = make_service(handler, **overrides)
+        assert asyncio.run(service.synthesize("你好")) is None
+        assert asyncio.run(service.synthesize("   ")) is None
+    assert calls == []
 
 
-def test_edge_tts_runner_failure_degrades():
-    async def boom(text, voice, timeout):
-        raise RuntimeError("boom")
+def test_custom_tts_http_failure_degrades():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="boom")
 
-    service = VoiceService(VoiceConfig(tts_mode="reply_voice"), edge_runner=lambda *a: boom(*a))
+    service = make_service(
+        handler,
+        tts_mode="reply_voice",
+        tts_base_url="https://tts.example/v1",
+        tts_model="my-tts",
+    )
     assert asyncio.run(service.synthesize("你好")) is None
 
 
@@ -309,7 +358,7 @@ def test_siliconflow_tts_failure_degrades():
 
 
 class FakeVoice:
-    """记录调用、按预设返回的假语音服务（不碰网络/子进程）。"""
+    """记录调用、按预设返回的假语音服务（不碰网络）。"""
 
     def __init__(self, *, transcript="你好呀", audio=TTS_AUDIO):
         self.transcript = transcript
@@ -439,7 +488,7 @@ def test_inbound_voice_over_duration_limit_skips(config, store):
 
 
 def test_voice_reply_only_to_voice_message(config, store):
-    config.voice.tts_mode = "reply_voice"
+    enable_tts(config, "reply_voice")
     voice = FakeVoice()
     adapter = VoiceAdapter()
     bot, _ = make_bot(config, store, adapter=adapter, voice=voice)
@@ -457,7 +506,7 @@ def test_voice_reply_only_to_voice_message(config, store):
 
 
 def test_text_message_not_voiced_in_reply_voice_mode(config, store):
-    config.voice.tts_mode = "reply_voice"
+    enable_tts(config, "reply_voice")
     voice = FakeVoice()
     adapter = VoiceAdapter()
     bot, _ = make_bot(config, store, adapter=adapter, voice=voice)
@@ -482,8 +531,7 @@ def test_text_message_not_voiced_in_reply_voice_mode(config, store):
     ],
 )
 def test_voice_mode_matrix(config, store, mode, has_voice, text, expected):
-    config.voice.tts_mode = mode
-    config.voice.stt_api_key = "k"  # TTS 复用 key，保证 tts_configured
+    enable_tts(config, mode)
     if mode == "on_request" and has_voice:
         text = "[语音]"
     bot, _ = make_bot(config, store)
@@ -494,14 +542,14 @@ def test_voice_mode_matrix(config, store, mode, has_voice, text, expected):
 
 
 def test_no_voice_service_never_synthesizes(config, store):
-    """服务不可用（例如 edge-tts 未装且没配其他后端）：不合成，照常发文字。"""
-    config.voice.tts_mode = "on_request"
+    """服务不可用（没配任何转写后端、custom TTS 也没配好）：不合成，照常发文字。"""
+    enable_tts(config, "on_request")
     bot, _ = make_bot(config, store, voice=None)
     assert asyncio.run(bot.synthesize_reply(voice_event(), "好呀")) == (None, "")
 
 
 def test_long_reply_stays_text(config, store):
-    config.voice.tts_mode = "reply_voice"
+    enable_tts(config, "reply_voice")
     config.voice.tts_max_chars = 5
     config.chat.split_part_chars = 60
     voice = FakeVoice()
@@ -515,7 +563,7 @@ def test_long_reply_stays_text(config, store):
 
 
 def test_split_reply_stays_text(config, store):
-    config.voice.tts_mode = "reply_voice"
+    enable_tts(config, "reply_voice")
     config.chat.split_part_chars = 8
     voice = FakeVoice()
     adapter = VoiceAdapter()
@@ -529,7 +577,7 @@ def test_split_reply_stays_text(config, store):
 
 
 def test_adapter_without_voice_capability_sends_text(config, store):
-    config.voice.tts_mode = "reply_voice"
+    enable_tts(config, "reply_voice")
     voice = FakeVoice()
     adapter = RecordingAdapter()  # capabilities 为空
     bot, _ = make_bot(config, store, adapter=adapter, voice=voice)
@@ -540,7 +588,7 @@ def test_adapter_without_voice_capability_sends_text(config, store):
 
 
 def test_synthesis_failure_sends_text(config, store):
-    config.voice.tts_mode = "reply_voice"
+    enable_tts(config, "reply_voice")
     voice = FakeVoice(audio=None)
     adapter = VoiceAdapter()
     bot, _ = make_bot(config, store, adapter=adapter, voice=voice)
@@ -551,7 +599,7 @@ def test_synthesis_failure_sends_text(config, store):
 
 
 def test_platform_send_failure_sends_text(config, store):
-    config.voice.tts_mode = "reply_voice"
+    enable_tts(config, "reply_voice")
     voice = FakeVoice()
     adapter = VoiceAdapter(fail=True)
     bot, _ = make_bot(config, store, adapter=adapter, voice=voice)
@@ -562,7 +610,7 @@ def test_platform_send_failure_sends_text(config, store):
 
 
 def test_voice_capability_disabled_in_config_sends_text(config, store):
-    config.voice.tts_mode = "reply_voice"
+    enable_tts(config, "reply_voice")
     config.adapters["recording"] = {"capabilities": {"voice": False}}
     voice = FakeVoice()
     adapter = VoiceAdapter()
@@ -758,7 +806,7 @@ def test_telegram_voice_message_end_to_end(config, store):
     """Telegram 收到语音条 → 转写 → 语音回复：能力回执里的 message_id 落流水。"""
     fake = FakeTelegramVoice()
     adapter = make_telegram(fake)
-    config.voice.tts_mode = "reply_voice"
+    enable_tts(config, "reply_voice")
     config.voice.stt_api_key = "k"
     voice = FakeVoice(transcript="你好呀")
     bot = RubenBot(config, store, ScriptedLLM({"chat": ["在呢"]}), Persona("Ruben", "你是 Ruben"))

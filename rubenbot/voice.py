@@ -8,22 +8,18 @@
 - STT：``siliconflow``（默认，SenseVoiceSmall）与 ``openai_compatible``
   （任意 OpenAI 兼容 base_url，给中转站留口），都是 multipart 上传、
   取响应里的 ``text``。
-- TTS：``edge_tts``（默认，免 key，子进程调用可选 CLI，缺少命令行就降级）
-  与 ``siliconflow``（CosyVoice2，配了 key 才可用）。
+- TTS：``custom``（默认，任意 OpenAI 兼容 ``/audio/speech`` 接口）与
+  ``siliconflow``（CosyVoice2，配了 key 才可用）。
 
-所有网络/子进程失败都返回 ``None`` 并记日志，绝不向上抛——语音是锦上添花，
+所有网络失败都返回 ``None`` 并记日志，绝不向上抛——语音是锦上添花，
 失败时上层照常发文字。
 """
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import logging
 import mimetypes
-import shlex
-import shutil
-import tempfile
 from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -36,6 +32,8 @@ logger = logging.getLogger(__name__)
 
 SILICONFLOW_STT_URL = "https://api.siliconflow.cn/v1/audio/transcriptions"
 SILICONFLOW_TTS_URL = "https://api.siliconflow.cn/v1/audio/speech"
+# siliconflow 的预置模型：配置里 tts_model 留空时用它（custom 后端不兜底）
+SILICONFLOW_TTS_MODEL = "FunAudioLLM/CosyVoice2-0.5B"
 
 # 转写文本进入正文时的固定前缀：让模型知道这是「说出来的话」
 VOICE_PREFIX = "[语音] "
@@ -53,9 +51,6 @@ _AUDIO_MIME = {
     ".ogg": "audio/ogg",
     ".opus": "audio/ogg",
 }
-
-# edge-tts CLI 的调用签名（测试可注入假实现，避免真的起子进程）
-EdgeRunner = Callable[[str, str, float], Awaitable[bytes | None]]
 
 
 def build_voice(config: VoiceConfig) -> "VoiceService | None":
@@ -111,11 +106,9 @@ class VoiceService:
         config: VoiceConfig,
         *,
         transport: httpx.AsyncBaseTransport | None = None,
-        edge_runner: EdgeRunner | None = None,
     ):
         self.config = config
         self._transport = transport
-        self._edge_runner = edge_runner
         self._client: httpx.AsyncClient | None = None
 
     # ------------------------------------------------------------------
@@ -302,10 +295,34 @@ class VoiceService:
         try:
             if self.config.tts_provider == "siliconflow":
                 return await self._synthesize_siliconflow(text)
-            return await self._synthesize_edge(text)
+            return await self._synthesize_custom(text)
         except Exception as exc:  # noqa: BLE001 - 合成失败只降级发文字
             logger.warning("语音合成失败（%s）：%s", self.config.tts_provider, exc)
             return None
+
+    async def _synthesize_custom(self, text: str) -> bytes | None:
+        """自定义 TTS：OpenAI 兼容 ``POST {base_url}/audio/speech``，返回音频字节。"""
+        base = self.config.tts_base_url.rstrip("/")
+        headers: dict[str, str] = {}
+        if self.config.tts_api_key:
+            headers["Authorization"] = f"Bearer {self.config.tts_api_key}"
+        client = await self._get_client()
+        response = await client.post(
+            base + "/audio/speech",
+            json={
+                "model": self.config.tts_model,
+                "input": text,
+                "voice": self.config.tts_voice,
+            },
+            headers=headers,
+            timeout=self.config.tts_timeout_seconds,
+        )
+        response.raise_for_status()
+        content = response.content
+        if not content:
+            logger.info("语音合成返回空音频（custom）")
+            return None
+        return content
 
     async def _synthesize_siliconflow(self, text: str) -> bytes | None:
         """SiliconFlow CosyVoice2：POST /v1/audio/speech，直接返回音频字节。"""
@@ -315,7 +332,7 @@ class VoiceService:
         response = await client.post(
             SILICONFLOW_TTS_URL,
             json={
-                "model": self.config.tts_model,
+                "model": self.config.tts_model or SILICONFLOW_TTS_MODEL,
                 "input": text,
                 "voice": self.config.tts_siliconflow_voice,
                 "response_format": "mp3",
@@ -330,60 +347,11 @@ class VoiceService:
             return None
         return content
 
-    async def _synthesize_edge(self, text: str) -> bytes | None:
-        """edge-tts：默认走可选命令行；测试可注入 ``edge_runner`` 不发真请求。"""
-        runner = self._edge_runner or self._run_edge_cli
-        data = await runner(text, self.config.tts_voice, self.config.tts_timeout_seconds)
-        if not data:
-            logger.info("语音合成返回空音频（edge_tts）")
-            return None
-        return data
-
-    async def _run_edge_cli(self, text: str, voice: str, timeout: float) -> bytes:
-        """子进程调用 ``edge-tts`` CLI：不新增 Python 依赖，缺命令行就走降级。"""
-        command = shlex.split(self.config.edge_tts_command or "")
-        executable = shutil.which(command[0]) if command else None
-        if executable is None:
-            raise RuntimeError(
-                f"找不到 {self.config.edge_tts_command or 'edge-tts'} 命令行"
-                "（可 pip install edge-tts，或改用 siliconflow）"
-            )
-        with tempfile.TemporaryDirectory(prefix="rubenbot-tts-") as tmp:
-            output = Path(tmp) / "voice.mp3"
-            argv = [
-                executable,
-                *command[1:],
-                "--voice",
-                voice or self.config.tts_voice,
-                f"--text={text}",
-                "--write-media",
-                str(output),
-            ]
-            process = await asyncio.create_subprocess_exec(
-                *argv,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            try:
-                _, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
-            except asyncio.TimeoutError:
-                process.kill()
-                await process.communicate()
-                raise RuntimeError(f"edge-tts 合成超时（{timeout:g}s）") from None
-            if process.returncode != 0:
-                message = (stderr or b"").decode("utf-8", "replace").strip()
-                raise RuntimeError(f"edge-tts 退出码 {process.returncode}：{message[:200]}")
-            if not output.is_file():
-                raise RuntimeError("edge-tts 没有写出音频文件")
-            data = output.read_bytes()
-            if not data:
-                raise RuntimeError("edge-tts 写出的音频为空")
-            return data
-
 
 __all__ = [
     "SILICONFLOW_STT_URL",
     "SILICONFLOW_TTS_URL",
+    "SILICONFLOW_TTS_MODEL",
     "VOICE_PLACEHOLDER",
     "VOICE_PREFIX",
     "VoiceService",

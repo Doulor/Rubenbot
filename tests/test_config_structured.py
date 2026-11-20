@@ -574,7 +574,10 @@ def test_voice_section_structured_view_and_secrets(config):
     view = structured_config(config)
     assert view["voice"]["stt_provider"] == "siliconflow"
     assert view["voice"]["tts_mode"] == "off"
-    assert view["voice"]["tts_provider"] == "edge_tts"
+    assert view["voice"]["tts_provider"] == "custom"
+    assert view["voice"]["tts_base_url"] == ""
+    assert view["voice"]["tts_voice"] == ""
+    assert "edge_tts_command" not in view["voice"]
     assert view["voice"]["stt_api_key"] == ""
     assert view["voice"]["tts_api_key"] == ""
     assert view["secrets"]["voice.stt_api_key"] is True
@@ -593,7 +596,10 @@ def test_put_structured_voice_section(client, config_path, state):
                     "stt_base_url": "https://relay.example/v1",
                     "stt_api_key": "sk-stt",
                     "tts_mode": "reply_voice",
-                    "tts_provider": "siliconflow",
+                    "tts_provider": "custom",
+                    "tts_base_url": "https://tts.example/v1",
+                    "tts_model": "my-tts",
+                    "tts_voice": "alice",
                     "tts_api_key": "sk-tts",
                     "tts_max_chars": "40",
                 }
@@ -605,7 +611,10 @@ def test_put_structured_voice_section(client, config_path, state):
     assert data["stt_provider"] == "openai_compatible"
     assert data["stt_base_url"] == "https://relay.example/v1"
     assert data["tts_mode"] == "reply_voice"
-    assert data["tts_provider"] == "siliconflow"
+    assert data["tts_provider"] == "custom"
+    assert data["tts_base_url"] == "https://tts.example/v1"
+    assert data["tts_model"] == "my-tts"
+    assert data["tts_voice"] == "alice"
     assert data["tts_max_chars"] == 40
     assert state.config.voice.stt_api_key == "sk-stt"
 
@@ -627,7 +636,7 @@ def test_validate_voice_rejects_unknown_values():
         validate_structured({"voice": {"tts_mode": "always"}})
     assert any(item["field"] == "voice.tts_mode" for item in info.value.fields)
     with pytest.raises(ConfigValidationError) as info:
-        validate_structured({"voice": {"tts_provider": "azure"}})
+        validate_structured({"voice": {"tts_provider": "edge_tts"}})
     assert any(item["field"] == "voice.tts_provider" for item in info.value.fields)
     with pytest.raises(ConfigValidationError) as info:
         validate_structured({"voice": {"tts_max_chars": 0}})

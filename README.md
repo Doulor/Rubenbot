@@ -8,7 +8,7 @@ RubenBot 是一个以**记忆**为核心的拟人社交聊天 bot 框架。它�
 - **适配器模式**：主循环不感知平台。已内置 Console（本地调试）与 SnowLuma（OneBot v11）。
 - **插件化**：目录式插件 + 消息钩子 + 命令注册。
 - **联网搜索**：配置 Tavily / DeepSeek 搜索渠道（有序回退链）后，模型多一个 `web_search` 工具，实时信息先搜再答。
-- **语音双向**：听懂语音条（可插拔转写后端）并用语音回复（edge-tts 免 Key / 硅基流动）；任何环节失败都降级为文字，不吞回复。
+- **语音双向**：听懂语音条（可插拔转写后端）并用语音回复（自定义 TTS 模型 / 硅基流动）；任何环节失败都降级为文字，不吞回复。
 - **可撤销**：记忆的合并/删除都会写变更日志，支持 `restore` 回滚。
 - **定时与提醒**：一次性定时任务落在 SQLite，重启后 pending 任务继续执行；模型可通过
   `set_reminder` 工具在用户明确要求时设置提醒。冷场开口默认关闭，宁可漏、不可扰。
@@ -101,9 +101,9 @@ RubenBot 是一个以**记忆**为核心的拟人社交聊天 bot 框架。它�
   转写后进正常流水线；转写失败/未配置/超限（60 秒、5MB）只记 `[语音]` 占位。转写后端可插拔：
   `siliconflow`（默认，SenseVoiceSmall）或任意 `openai_compatible` base_url。出站语音回复受
   `voice.tts_mode` 控制（`off` 默认 / `reply_voice` 对方发语音时回语音 / `on_request` 再加明确要求），
-  正文超过 60 字或被拆成多条时一律发文字；合成走 `edge-tts`（默认，子进程调用可选 CLI，免 Key）
-  或 `siliconflow` CosyVoice2。SnowLuma 发 record 段、Telegram 发 `sendVoice`，平台不支持
-  （如 QQ 官方）或合成/发送失败都降级为照常发文字。
+  正文超过 60 字或被拆成多条时一律发文字；合成走 `custom`（默认，任意 OpenAI 兼容
+  `/audio/speech` 接口，未配 base_url/model 即降级）或 `siliconflow` CosyVoice2。SnowLuma 发
+  record 段、Telegram 发 `sendVoice`，平台不支持（如 QQ 官方）或合成/发送失败都降级为照常发文字。
 - **跨会话接续**：私聊时把本人近 24h 在别处会话的要点压成背景摘要；群聊永不注入私聊来源。
 - **分寸审查口（`memory/gate.py`，唯一）**：跨场合候选按「同场合/公开放行 → 三档隐私 → 封存 →
   已有裁定 → 高敏感扣下并待问 → 模型按准则权衡」判定；模型低置信或任何一步异常一律扣下
@@ -153,7 +153,7 @@ bot 对每个人的好感度、以及自己当下的心情，都由确定性规�
 | `rubenbot/llm.py` | OpenAI 兼容客户端；按角色（`chat` / `extract` / `consolidate` / `fast` / `summary` / `vision` 及自定义）选模型；408/429/5xx 指数退避重试；每次调用写用量表 |
 | `rubenbot/core.py` | 消息主循环、合并窗口调度、决策、上下文拼装、拆条发送、后台维护 |
 | `rubenbot/search.py` | 联网搜索渠道（Tavily / DeepSeek）、有序回退链、结果归一与紧凑注入、每会话冷却 |
-| `rubenbot/voice.py` | 语音双向：入站语音条转写（硅基流动 / OpenAI 兼容）、出站语音合成（edge-tts / 硅基流动） |
+| `rubenbot/voice.py` | 语音双向：入站语音条转写（硅基流动 / OpenAI 兼容）、出站语音合成（自定义 OpenAI 兼容 TTS / 硅基流动） |
 | `rubenbot/decision.py` | 回复意愿系统：消息合并、硬触发、意愿评分、生成否决标记 |
 | `rubenbot/scheduler.py` | 轻量调度器：每 10 秒扫一次到期的 `scheduled_jobs` 并执行 |
 | `rubenbot/reminder.py` | 提醒工具 `set_reminder`：参数解析、（延迟/绝对时间）到点文案 |
@@ -322,9 +322,9 @@ pytest
 | | `timeout_seconds` `cooldown_seconds` | 单次搜索超时（默认 10 秒）与每会话冷却（默认 30 秒，整条链只过一次闸，冷却内只返回提示不发请求） |
 | `voice` | `stt_provider` `stt_api_key` `stt_base_url` `stt_model` | 语音转写后端（`siliconflow` / `openai_compatible`）；密钥支持 `${ENV_VAR}`，不填则语音消息只记 `[语音]` 占位。兼容模式靠 `stt_base_url` 判定可用 |
 | | `stt_timeout_seconds` `stt_max_seconds` `stt_max_bytes` | 转写超时（默认 30 秒）与单条上限（默认 60 秒 / 5MB，超限不转） |
-| | `tts_mode` `tts_provider` | 语音回复模式（`off` 默认 / `reply_voice` / `on_request`）与合成后端（`edge_tts` 默认免 Key / `siliconflow`） |
-| | `tts_api_key` `tts_model` `tts_siliconflow_voice` | 硅基流动合成的密钥（留空复用 `stt_api_key`）、模型与音色 |
-| | `edge_tts_command` `tts_voice` | edge-tts 命令行（默认 `edge-tts`）与音色（默认 `zh-CN-XiaoxiaoNeural`）；找不到命令自动降级发文字 |
+| | `tts_mode` `tts_provider` | 语音回复模式（`off` 默认 / `reply_voice` / `on_request`）与合成后端（`custom` 默认 / `siliconflow`） |
+| | `tts_base_url` `tts_api_key` `tts_model` `tts_voice` | 自定义 TTS：OpenAI 兼容 base_url（如 `https://host/v1`）、Bearer Key、模型与音色；base_url 或 model 缺一个都视为未配置、降级发文字 |
+| | `tts_siliconflow_voice` | 硅基流动 CosyVoice2 的音色；`tts_api_key` 留空复用 `stt_api_key`，`tts_model` 留空用默认模型 |
 | | `tts_max_chars` `tts_timeout_seconds` | 语音回复字数上限（默认 60，超过发文字）与合成超时（默认 30 秒） |
 | `market` | `index_url` | 插件市场索引地址（索引仓库 plugins.json 的 raw 地址）；留空或拉取失败时回退内置官方索引 |
 | `background_check_minutes` | — | 抽取/归纳检查间隔 |
@@ -527,7 +527,7 @@ WebUI 的「插件市场」页就是原来的插件页：已安装与可安装�
     条件矩阵全部满足才进入意愿评估：群聊、默认开关打开、不在安静时段、当日未达每群上限、距上条消息超过 `idle_hours`；评估复用 `DecisionEngine` 的评分结构但只保留「低基础分 + 话题相关性」，不带群消息的动量/占比/冷却（主动开口是冷启动场景）。模型写不出、输出否决标记 `[不开口]`、或写成罐头问候（「有人在吗」等黑名单）就放弃本次。私聊永不主动开口；当日计数与评估冷却只在内存里，重启即清零。
 
 30. **语音失败永远降级为文字，语音只是锦上添花**
-    转写前的语音条占位是正文本身：纯语音条原本是空正文，落流水时会被丢弃；现在至少保留 `[语音]`（合并轮次也据此给 `has_voice` 打标）。转写成功就读作 `[语音] 文本`，失败/未配置/超限都只留占位，下游记忆与统计不用改。出站语音只在「一条未拆分、且不超过 `tts_max_chars` 字的回复」上尝试：被拆条的长回复一律发文字（避免半句语音半句字），合成失败、平台不支持（QQ 官方）、能力被配置关闭都照常发文字。`edge-tts` 默认走子进程调用可选 CLI，不新增 Python 依赖，缺命令行时自动降级。
+    转写前的语音条占位是正文本身：纯语音条原本是空正文，落流水时会被丢弃；现在至少保留 `[语音]`（合并轮次也据此给 `has_voice` 打标）。转写成功就读作 `[语音] 文本`，失败/未配置/超限都只留占位，下游记忆与统计不用改。出站语音只在「一条未拆分、且不超过 `tts_max_chars` 字的回复」上尝试：被拆条的长回复一律发文字（避免半句语音半句字），合成失败、平台不支持（QQ 官方）、能力被配置关闭都照常发文字。合成默认走自定义 TTS（OpenAI 兼容 `/audio/speech`），未配 base_url/model 或请求失败都自动降级。
 
 ---
 
