@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import random
@@ -51,6 +52,30 @@ logger = logging.getLogger(__name__)
 # 适配器异常后的重启退避（秒）
 ADAPTER_RESTART_MIN = 1.0
 ADAPTER_RESTART_MAX = 30.0
+
+# ---- 两段式生成（默认关闭）----
+# 第一段用快速模型；没配 fast 时由 LLMConfig.model_for 沿回退链落到 chat
+GUIDANCE_ROLE = "fast"
+# 第一段只产出「怎么回」的简短指导，不做正文草稿；远超约定长度就截断
+GUIDANCE_MAX_CHARS = 200
+# 第一段最多等这么久（秒）；再长就直接回退单段，不让指导拖住回复
+GUIDANCE_TIMEOUT_CAP = 15.0
+# 第一段的任务说明：附在正文上下文末尾，只让模型想、不让它说
+GUIDANCE_TASK_PROMPT = (
+    "这条消息已经确定要回了，不用再判断该不该接话。"
+    "现在先不要写回复正文，只替自己想清楚该怎么接：\n"
+    "- 回应什么：这句话真正在说什么、需要接住哪一点\n"
+    "- 态度语气：这轮该用什么样的情绪和分寸\n"
+    "- 要提到的点：必须带上的信息；没有就写「无」\n"
+    "- 要避开的：容易说错、说重或显得敷衍的地方\n"
+    "只写几行要点，总长不超过 150 字；不要写成正文草稿，不要复述聊天记录。"
+)
+# 第二段末尾的生成指令：指导是内部材料，不能被说出来
+GENERATION_INSTRUCTION = (
+    "现在按上面的内部指导，直接写出这一轮要发出的回复正文；"
+    "如果仍然判断不该接话，照前面的规则处理。"
+    "不要输出思考过程，不要复述或提及这段指导。"
+)
 
 # recall 工具的定义（T2）。只开放这一个工具，模型不用/失败就退化为单次生成。
 RECALL_TOOL = {
@@ -658,7 +683,16 @@ class RubenBot:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("插件 on_before_reply 异常：%s", exc)
 
-        raw_reply = await self.generate(messages, event=event)
+        two_stage = bool(self.config.generation.two_stage.enabled)
+        task = "gen_stage2" if two_stage else "chat"
+        guidance = ""
+        if two_stage:
+            # 第一段只「想」：失败/空/超时都退化为单段直出，绝不影响回复
+            guidance = await self.guide_reply(messages)
+            if guidance:
+                messages = self.with_guidance(messages, guidance)
+
+        raw_reply = await self.generate(messages, event=event, task=task)
         parsed = parse_generation_output(raw_reply, marker)
         if parsed.vetoed:
             logger.info(
@@ -982,14 +1016,74 @@ class RubenBot:
     # 生成与发送
     # ------------------------------------------------------------------
 
-    async def generate(self, messages: list[dict[str, str]], *, event: MessageEvent | None = None) -> str:
+    async def guide_reply(self, messages: list[dict[str, str]]) -> str:
+        """两段式的第一段：按与正文相同的上下文，产出一段简短回复指导。
+
+        任何失败（调用异常、超时、空内容）都返回空串，由调用方回退单段直出；
+        这里只记日志，绝不向上抛。用量经由 LLM 客户端记 ``gen_stage1``。
+        """
+        request = list(messages) + [{"role": "user", "content": GUIDANCE_TASK_PROMPT}]
+        try:
+            text = await asyncio.wait_for(
+                self.llm.complete(request, role=GUIDANCE_ROLE, task="gen_stage1"),
+                timeout=self.guidance_timeout(),
+            )
+        except asyncio.TimeoutError:
+            logger.warning("两段式第一段超时（%.1fs），回退单段直出", self.guidance_timeout())
+            return ""
+        except Exception as exc:  # noqa: BLE001 - 指导失败不能拖垮回复
+            logger.warning("两段式第一段失败，回退单段直出：%s", exc)
+            return ""
+        guidance = (text or "").strip()
+        if not guidance:
+            logger.info("两段式第一段返回空内容，回退单段直出")
+            return ""
+        marker = self.config.decision.veto_marker
+        if marker and marker in guidance:
+            # 第一段顺着上下文里的「可以不接话」出口回了否决标记：这不是指导
+            logger.info("两段式第一段只返回了否决标记，回退单段直出")
+            return ""
+        if len(guidance) > GUIDANCE_MAX_CHARS:
+            # 明显跑偏成了草稿：宁可截断也不要让第二段照抄
+            guidance = guidance[:GUIDANCE_MAX_CHARS].rstrip()
+        logger.debug("两段式第一段指导：%s", guidance)
+        return guidance
+
+    def guidance_timeout(self) -> float:
+        """第一段的等待上限：不超过客户端超时，也不超过固定上限。"""
+        configured = float(self.config.llm.timeout or 0.0)
+        if configured <= 0:
+            return GUIDANCE_TIMEOUT_CAP
+        return max(0.1, min(configured, GUIDANCE_TIMEOUT_CAP))
+
+    @staticmethod
+    def with_guidance(
+        messages: list[dict[str, str]], guidance: str
+    ) -> list[dict[str, str]]:
+        """把指导插到历史之后、生成指令之前，标注为内部材料、不要复述。"""
+        block = (
+            "下面是给你自己的内部回复指导，只用来决定怎么说，不要复述、不要提及：\n"
+            f"{guidance}\n\n"
+            f"{GENERATION_INSTRUCTION}"
+        )
+        return list(messages) + [{"role": "system", "content": block}]
+
+    async def generate(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        event: MessageEvent | None = None,
+        task: str = "chat",
+    ) -> str:
         """生成回复；模型支持工具调用时先给最多两轮 recall 工具循环。
 
         工具不可用、模型不用工具、或任何一步出问题，都退化为普通单次生成。
+        ``task`` 只用于用量打标：单段直出是 ``chat``，两段式的第二段是
+        ``gen_stage2``。
         """
         if event is not None and self.config.memory.recall_tool_enabled:
             try:
-                reply = await self._generate_with_tools(messages, event)
+                reply = await self._generate_with_tools(messages, event, task=task)
             except ToolUnsupported as exc:
                 logger.debug("当前模型不支持工具调用，退化为单次生成：%s", exc)
                 reply = None
@@ -999,13 +1093,19 @@ class RubenBot:
             if reply is not None:
                 return reply.strip()
         try:
-            reply = await self.llm.complete(messages, role="chat", task="chat")
+            reply = await self.llm.complete(messages, role="chat", task=task)
         except Exception as exc:  # noqa: BLE001 - LLM 失败不能带死循环
             logger.warning("生成回复失败：%s", exc)
             return ""
         return (reply or "").strip()
 
-    async def _generate_with_tools(self, messages: list[dict[str, str]], event: MessageEvent) -> str | None:
+    async def _generate_with_tools(
+        self,
+        messages: list[dict[str, str]],
+        event: MessageEvent,
+        *,
+        task: str = "chat",
+    ) -> str | None:
         """最多两轮 recall 工具循环；返回 None 表示应当退化为单次生成。"""
         if not getattr(self.llm, "supports_tools", True):
             raise ToolUnsupported("当前模型已确认不支持工具调用")
@@ -1016,9 +1116,8 @@ class RubenBot:
         if max_rounds == 0:
             raise ToolUnsupported("recall 工具循环已关闭")
         working: list[dict[str, Any]] = list(messages)
-        used_tool = False
         for _ in range(max_rounds):
-            message = await chat_with_tools(working, [RECALL_TOOL], role="chat")
+            message = await self._call_with_tools(working, [RECALL_TOOL], role="chat", task=task)
             tool_calls = message.get("tool_calls") or []
             if not tool_calls:
                 content = (message.get("content") or "").strip()
@@ -1026,7 +1125,6 @@ class RubenBot:
                     # 模型没要工具、直接给了回复：这就是一次正常生成，不必再花一次请求
                     return content
                 return None
-            used_tool = True
             working.append(
                 {
                     "role": "assistant",
@@ -1037,10 +1135,37 @@ class RubenBot:
             for call in tool_calls:
                 working.append(await self._tool_result_message(call, event))
         # 两轮后模型还在要工具：不再给，直接让模型收尾一次
-        message = await chat_with_tools(
-            working, [RECALL_TOOL], role="chat", tool_choice="none"
+        message = await self._call_with_tools(
+            working, [RECALL_TOOL], role="chat", task=task, tool_choice="none"
         )
         return message.get("content") or ""
+
+    @staticmethod
+    def _accepts_kwarg(callable_: Any, name: str) -> bool:
+        """可调用对象是否接受 ``name`` 这个关键字参数（有 ``**kwargs`` 也算）。"""
+        try:
+            parameters = inspect.signature(callable_).parameters
+        except (TypeError, ValueError):  # 内建/无法取签名：按支持处理，交给调用方兜底
+            return True
+        return name in parameters or any(
+            item.kind is inspect.Parameter.VAR_KEYWORD for item in parameters.values()
+        )
+
+    async def _call_with_tools(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        role: str,
+        task: str,
+        tool_choice: str = "auto",
+    ) -> dict[str, Any]:
+        """调用客户端的工具接口；只给不认 ``task`` 参数的实现传它认识的参数。"""
+        kwargs: dict[str, Any] = {"role": role, "tool_choice": tool_choice}
+        if self._accepts_kwarg(self.llm.chat_with_tools, "task"):
+            kwargs["task"] = task
+        return await self.llm.chat_with_tools(messages, tools, **kwargs)
+
     async def _tool_result_message(self, call: dict[str, Any], event: MessageEvent) -> dict[str, Any]:
         """执行一次 recall 工具调用，把结果包装成 tool 消息。"""
         call_id = str(call.get("id") or "")

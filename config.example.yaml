@@ -122,6 +122,13 @@ decision:
   #     base: 0.15                 # 覆盖基础值（不写则用全局 base）
   #     quiet_hours: ["23:00-07:30"]  # 静默时段，可写多个
 
+# 回复生成策略：决定要回之后，正文怎么写
+generation:
+  # 两段式生成：先让 fast 角色（没配则跟随 chat）写一段简短指导，再按指导写正文。
+  # 默认关闭；第一段失败/超时/空内容都会自动回退单段直出。
+  two_stage:
+    enabled: false
+
 plugins:
   dir: "plugins"
   # 不写 enabled 表示全部启用；写列表则只启用列表中的
