@@ -13,8 +13,10 @@ import sys
 from pathlib import Path
 
 from .adapters.console import ConsoleAdapter
+from .adapters.qq_official import QQOfficialAdapter
 from .adapters.snowluma import SnowLumaAdapter
-from .config import Config
+from .adapters.telegram import TelegramAdapter
+from .config import Config, QQOfficialConfig, TelegramConfig
 from .core import RubenBot
 from .llm import LLMClient, make_usage_recorder
 from .memory.store import MemoryStore
@@ -38,7 +40,12 @@ def setup_logging(level: str = "INFO") -> None:
 
 
 def build_adapters(config: Config):
-    """按配置实例化启用的适配器。"""
+    """按配置实例化启用的适配器。
+
+    段内字段先用 ``config.py`` 里的强类型视图归一（类型不对回落默认），
+    缺省值仍集中在一处；凭证没填的适配器也会装配出来，由适配器自己在
+    ``start`` 时记一条明确的错误日志，不在这里静默吞掉。
+    """
     adapters = []
     for name, opts in config.adapters.items():
         if opts is None or opts is False:
@@ -55,8 +62,30 @@ def build_adapters(config: Config):
                     self_id=opts.get("self_id"),
                 )
             )
+        elif name == "telegram":
+            telegram = TelegramConfig.from_options(opts)
+            adapters.append(
+                TelegramAdapter(
+                    bot_token=telegram.bot_token,
+                    poll_timeout=telegram.poll_timeout,
+                    allowed_chat_ids=telegram.allowed_chat_ids,
+                    offset_file=telegram.offset_file or None,
+                )
+            )
+        elif name == "qq_official":
+            qq = QQOfficialConfig.from_options(opts)
+            adapters.append(
+                QQOfficialAdapter(
+                    app_id=qq.app_id,
+                    client_secret=qq.client_secret,
+                    sandbox=qq.sandbox,
+                    download_images=qq.download_images,
+                )
+            )
         else:
-            logging.warning("未知适配器：%s（可用：console / snowluma）", name)
+            logging.warning(
+                "未知适配器：%s（可用：console / snowluma / telegram / qq_official）", name
+            )
     return adapters
 
 
@@ -88,7 +117,10 @@ async def _run(config: Config, config_path: str = "config.yaml", *, no_webui: bo
     if config.webui.enabled and not no_webui:
         webui = await _start_webui(bot, config_path, webui_only=False)
     if not bot.adapters:
-        logging.error("没有启用任何适配器，请在配置里设置 adapters.console: {} 或 adapters.snowluma")
+        logging.error(
+            "没有启用任何适配器，请在配置里设置 adapters.console: {} 或 adapters.snowluma / "
+            "adapters.telegram / adapters.qq_official"
+        )
         if webui is not None:
             logging.info("仍然启动 WebUI：http://%s:%s（bot 无适配器）", webui.host, webui.port)
             try:
