@@ -3686,10 +3686,11 @@ function settingsCardSpecs(draft, secrets, pluginsAvailable) {
       node: card("表情包行为", {
         hint: "核心功能默认关闭；保存后立即生效",
         body: fieldGrid([
-          { path: "stickers.enabled", label: "启用表情包行为", kind: "switch", hint: "关闭时不收集、不补发表情，也不会创建表情库" },
+          { path: "stickers.enabled", label: "启用表情包行为", kind: "switch", hint: "关闭时不收集、不发表情，也不会创建表情库" },
           { path: "stickers.collect", label: "收集群聊表情", kind: "switch", hint: "把群里的图片、贴纸和商城表情去重后存入表情库" },
           { path: "stickers.send_probability", label: "回复后补发概率", kind: "number", step: "0.01", min: 0, max: 1, hint: "每次正常回复后补发表情的概率（0–1）" },
-          { path: "stickers.cooldown_seconds", label: "会话冷却（秒）", kind: "number", step: "1", min: 0, hint: "同一平台会话两次补发表情的最短间隔" },
+          { path: "stickers.nonverbal_probability", label: "只发表情概率", kind: "number", step: "0.01", min: 0, max: 1, hint: "接梗或短附和时只发一张表情、不发文字的概率（0–1）" },
+          { path: "stickers.cooldown_seconds", label: "会话冷却（秒）", kind: "number", step: "1", min: 0, hint: "同一平台会话两次尝试发表情的最短间隔，两种方式共用" },
         ], draft),
       }),
     },

@@ -1312,6 +1312,10 @@ class RubenBot:
             self._log_decision(event, decision, now, expression)
             return
 
+        proactive = event.is_group and decision.hard_trigger is None
+        if await self.try_sticker_reply(event, expression, proactive=proactive, now=now):
+            self._log_decision(event, decision, now, expression)
+            return
         messages = [*messages, {"role": "system", "content": expression.prompt_block()}]
         task = "chat" if expression.source == "fragment" else "gen_stage2"
         for attempt in range(2):
@@ -1345,7 +1349,7 @@ class RubenBot:
             event,
             reply,
             now=now,
-            proactive=event.is_group and decision.hard_trigger is None,
+            proactive=proactive,
         )
         await self.sticker_behavior.on_after_reply(self.context, event, reply)
         if self.plugins is not None:
@@ -2248,6 +2252,27 @@ class RubenBot:
         speed = max(0.0, float(self.config.chat.type_speed))
         cap = max(0.0, float(self.config.chat.type_delay_max_seconds))
         return min(raw * speed, cap) if speed > 0 else 0.0
+
+    async def try_sticker_reply(
+        self, event: MessageEvent, expression: ExpressionDecision | None, *, proactive: bool, now: float,
+    ) -> bool:
+        """接梗或短附和时尝试只发表情；未发出就交还文字生成路径。"""
+        if expression is None or expression.intent not in ("接梗", "短附和"):
+            return False
+        if not await self.sticker_behavior.try_send(
+            self.context, event, probability=self.config.stickers.nonverbal_probability,
+        ):
+            return False
+        reply = "[表情]"
+        self._record_bot_message(event, reply, None)
+        self.decision_engine.note_bot_reply(self.decision_engine.chat_key(event), now, proactive=proactive)
+        self.note_emotion_after_reply(event, now=now)
+        if self.plugins is not None:
+            try:
+                await self.plugins.run_after_reply(self.context, event, reply)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("插件 on_after_reply 异常：%s", exc)
+        return True
 
     async def send_reply(
         self,

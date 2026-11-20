@@ -262,6 +262,7 @@ def structured_config(config: Config) -> dict[str, Any]:
             "enabled": config.stickers.enabled,
             "collect": config.stickers.collect,
             "send_probability": config.stickers.send_probability,
+            "nonverbal_probability": config.stickers.nonverbal_probability,
             "cooldown_seconds": config.stickers.cooldown_seconds,
         },
         "plugins": {
@@ -944,10 +945,11 @@ def _validate_stickers(section: dict[str, Any], v: _Validator) -> dict[str, Any]
             value = v.boolean(section[key], f"stickers.{key}")
             if value is not None:
                 out[key] = value
-    if "send_probability" in section:
-        value = v.number(section["send_probability"], "stickers.send_probability", minimum=0, maximum=1)
-        if value is not None:
-            out["send_probability"] = float(value)
+    for key in ("send_probability", "nonverbal_probability"):
+        if key in section:
+            value = v.number(section[key], f"stickers.{key}", minimum=0, maximum=1)
+            if value is not None:
+                out[key] = float(value)
     if "cooldown_seconds" in section:
         value = v.number(section["cooldown_seconds"], "stickers.cooldown_seconds", minimum=0)
         if value is not None:

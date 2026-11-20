@@ -255,11 +255,13 @@ plugins:
   command_prefix: "/"
 
 stickers:
-  # 核心表情包行为默认关闭；打开 enabled 后才会收集/补发表情。
+  # 核心表情包行为默认关闭；打开 enabled 后以下设置才生效。
   enabled: false
   collect: false
-  send_probability: 0.15
-  cooldown_seconds: 300
+  send_probability: 0.15  # 文字回复后补发的概率
+  # 接梗或短附和时只发一张表情的概率；库空、冷却中、发送失败时照常回文字。
+  nonverbal_probability: 0.30
+  cooldown_seconds: 300  # 两种发表情方式共用的会话冷却
   # 表情库目录：图片本体放 files/，索引是 index.json（运行时数据，已在 .gitignore 里排除）。
   dir: "data/stickers"
 

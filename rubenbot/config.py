@@ -626,6 +626,8 @@ class StickerConfig:
     collect: bool = False
     send_probability: float = 0.15
     cooldown_seconds: float = 300.0
+    # 接梗/短附和时，只发一张表情包的概率；不满足条件时回落文字。
+    nonverbal_probability: float = 0.30
     dir: str = "data/stickers"
 
     def __post_init__(self) -> None:
@@ -634,6 +636,9 @@ class StickerConfig:
         if isinstance(self.send_probability, bool) or not isinstance(self.send_probability, (int, float)):
             self.send_probability = 0.15
         self.send_probability = min(1.0, max(0.0, float(self.send_probability)))
+        if isinstance(self.nonverbal_probability, bool) or not isinstance(self.nonverbal_probability, (int, float)):
+            self.nonverbal_probability = 0.30
+        self.nonverbal_probability = min(1.0, max(0.0, float(self.nonverbal_probability)))
         if isinstance(self.cooldown_seconds, bool) or not isinstance(self.cooldown_seconds, (int, float)):
             self.cooldown_seconds = 300.0
         self.cooldown_seconds = max(0.0, float(self.cooldown_seconds))
