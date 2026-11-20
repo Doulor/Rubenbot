@@ -214,10 +214,8 @@ function toast(message, kind = "ok") {
     h("span", {}, message)
   );
   box.append(node);
-  setTimeout(() => {
-    node.classList.add("is-leaving");
-    setTimeout(() => node.remove(), 220);
-  }, kind === "error" ? 5200 : 3000);
+  Motion.enter(node);
+  setTimeout(() => Motion.leave(node, () => node.remove()), kind === "error" ? 5200 : 3000);
 }
 
 /** 轻量防抖：用于搜索框。 */
@@ -321,7 +319,10 @@ function applyTheme(mode) {
   const button = $("#theme-toggle");
   if (button) button.setAttribute("aria-label", resolved === "dark" ? "切换到亮色" : "切换到暗色");
   const segmented = document.querySelectorAll("[data-theme-choice]");
+  const group = segmented[0]?.parentElement;
+  const from = Motion.selection(group);
   segmented.forEach((node) => node.classList.toggle("active", node.dataset.themeChoice === mode));
+  Motion.moveSelection(group, from);
 }
 
 function setupTheme() {
@@ -406,7 +407,7 @@ const PAGES = {
 };
 
 const state = {
-  page: "overview",
+  page: null,
   param: "",
   pollTimer: null,
   booted: false,
@@ -433,21 +434,22 @@ async function renderRoute() {
   const route = currentRoute();
   const view = $("#view");
   const routeChanged = route.page !== state.page || route.param !== state.param;
-  const subpage = routeChanged && route.page === state.page && ["bot", "settings"].includes(route.page);
+  const subpage = routeChanged && route.page === state.page && ["bot", "settings", "plugins"].includes(route.page);
+  const previous = subpage ? {
+    menu: Motion.selection(view.querySelector(".settings-menu")),
+    tab: Motion.selection(view.querySelector(".plugin-tabs")),
+  } : {};
   markRouteChange(view, routeChanged);
-  view.classList.toggle("subpage-motion", subpage);
-  view.classList.remove("route-arriving");
   state.page = route.page;
   state.param = route.param;
   // 旧路由 #/persona 已并入机器人选项卡，侧栏高亮跟着「机器人」
   const navPage = route.page === "persona" ? "bot" : route.page;
-  document.querySelectorAll(".nav-item").forEach((item, index, items) => {
-    if (item.dataset.page === navPage) {
-      item.parentNode.style.setProperty("--nav-index", index);
-      item.parentNode.style.setProperty("--nav-count", items.length);
-    }
-    item.classList.toggle("active", item.dataset.page === navPage);
-  });
+  const nav = $(".nav");
+  if (nav.querySelector(".active")?.dataset.page !== navPage) {
+    const from = Motion.selection(nav);
+    nav.querySelectorAll(".nav-item").forEach(item => item.classList.toggle("active", item.dataset.page === navPage));
+    Motion.moveSelection(nav, from);
+  }
   if (state.pollTimer) {
     clearInterval(state.pollTimer);
     state.pollTimer = null;
@@ -458,7 +460,7 @@ async function renderRoute() {
   setPersonaDirty(false);
   view.replaceChildren(skeleton(3));
   try {
-    await meta.render(view, route.param);
+    await meta.render(view, route.param, previous);
   } catch (err) {
     if (err instanceof Unauthorized) return;
     view.replaceChildren();
@@ -475,8 +477,9 @@ async function renderRoute() {
       )
     );
   } finally {
-    if (state.page === route.page && state.param === route.param) {
-      view.classList.toggle("route-arriving", routeChanged && !subpage);
+    if (routeChanged && state.page === route.page && state.param === route.param) {
+      const panel = subpage && (view.querySelector(".settings-content") || view.querySelector(".plugin-tabs + div"));
+      Motion.enter(panel || view, subpage);
     }
   }
 }
@@ -623,7 +626,7 @@ function decisionItem(decision, { showChat = false } = {}) {
 
 function confirmDialog({ title, message, confirmText = "确定", danger = false, onConfirm }) {
   const dialog = $("#dialog");
-  const close = () => dialog.close();
+  const close = () => Motion.dialogMotion(dialog, false);
   const confirm = h(
     "button",
     { class: `btn ${danger ? "btn-danger" : "btn-primary"}`, type: "button" },
@@ -652,7 +655,7 @@ function confirmDialog({ title, message, confirmText = "确定", danger = false,
       h("button", { class: "btn btn-ghost", type: "button", onclick: close }, "取消"),
       confirm)
   );
-  dialog.showModal();
+  Motion.dialogMotion(dialog, true);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1256,14 +1259,17 @@ async function renderMemory(view) {
         role: "tab",
         "aria-selected": value === memoryState.tab ? "true" : "false",
         onclick: (event) => {
+          if (memoryState.tab === value) return;
           memoryState.tab = value;
           const group = event.currentTarget.parentElement;
+          const from = Motion.selection(group);
           group.querySelectorAll("button").forEach((button) => {
             const active = button.dataset.tab === value;
             button.classList.toggle("active", active);
             button.setAttribute("aria-selected", active ? "true" : "false");
           });
-          loadTab();
+          Motion.moveSelection(group, from);
+          loadTab().then(() => { if (content.isConnected && memoryState.tab === value) Motion.enter(content, true); });
         },
         dataset: { tab: value },
       },
@@ -1330,11 +1336,12 @@ async function renderMemory(view) {
         "下一页"
       )
     );
-    for (const row of list.children) {
-      row.classList.toggle("item-arriving", row.dataset.motionKey === content.dataset.arrivingKey);
-    }
-    delete content.dataset.arrivingKey;
     content.replaceChildren(list, footer);
+    if (content.dataset.arrivingKey) {
+      const row = [...list.children].find(item => item.dataset.motionKey === content.dataset.arrivingKey);
+      if (row) Motion.enter(row);
+      delete content.dataset.arrivingKey;
+    }
   }
 
   async function loadLog(version = ++requestVersion) {
@@ -1516,7 +1523,7 @@ async function renderMemory(view) {
       { style: { display: "contents" } },
       h("div", { class: "dialog-head" },
         h("h2", {}, editing ? "编辑记忆" : "新增记忆"),
-        h("button", { class: "icon-button", type: "button", "aria-label": "关闭", onclick: () => dialog.close() }, icon("close"))),
+        h("button", { class: "icon-button", type: "button", "aria-label": "关闭", onclick: () => Motion.dialogMotion(dialog, false) }, icon("close"))),
       h(
         "div",
         { class: "dialog-body" },
@@ -1533,7 +1540,7 @@ async function renderMemory(view) {
         error
       ),
       h("div", { class: "dialog-foot" },
-        h("button", { class: "btn btn-ghost", type: "button", onclick: () => dialog.close() }, "取消"),
+        h("button", { class: "btn btn-ghost", type: "button", onclick: () => Motion.dialogMotion(dialog, false) }, "取消"),
         submit)
     );
     form.addEventListener("submit", async (event) => {
@@ -1559,7 +1566,7 @@ async function renderMemory(view) {
           content.dataset.arrivingKey = created.item.id;
           toast("已添加");
         }
-        dialog.close();
+        Motion.dialogMotion(dialog, false);
         if (memoryState.tab === "list") loadList();
       } catch (err) {
         if (!(err instanceof Unauthorized)) error.textContent = err.message || "保存失败";
@@ -1568,7 +1575,7 @@ async function renderMemory(view) {
       }
     });
     dialog.replaceChildren(form);
-    dialog.showModal();
+    Motion.dialogMotion(dialog, true);
     contentInput.focus();
   }
 
@@ -2020,7 +2027,7 @@ function marketTags(item) {
 /** 安装确认框：逐项列出权限；高权限（空间写入 / 定时任务）额外红色提示。 */
 function installDialog(item) {
   const dialog = $("#dialog");
-  const close = () => dialog.close();
+  const close = () => Motion.dialogMotion(dialog, false);
   const meta = item.permission_meta || [];
   const highRisk = meta.filter((info) => info.high_risk);
 
@@ -2097,13 +2104,13 @@ function installDialog(item) {
       confirm
     )
   );
-  dialog.showModal();
+  Motion.dialogMotion(dialog, true);
 }
 
 /** 详情抽屉：完整说明、版本、作者、权限、钩子与不合规原因。 */
 function detailDrawer(item) {
   const dialog = $("#dialog");
-  const close = () => dialog.close();
+  const close = () => Motion.dialogMotion(dialog, false);
   const kv = (label, value) =>
     h(
       "div",
@@ -2166,11 +2173,11 @@ function detailDrawer(item) {
       h("button", { class: "btn", type: "button", onclick: close }, "关闭")
     )
   );
-  dialog.showModal();
+  Motion.dialogMotion(dialog, true);
 }
 
 /** 配置页只读本地清单，不必等市场索引；没有 schema 的插件同样列出。 */
-async function renderPluginConfigs(panel, selected) {
+async function renderPluginConfigs(panel, selected, oldMenu) {
   const { items } = await api.get("/api/plugins");
   if (!items.length) {
     panel.replaceChildren(card("", { body: emptyState("plugins", "还没有已安装的插件", "到插件市场安装后，即可在这里配置。") }));
@@ -2188,6 +2195,7 @@ async function renderPluginConfigs(panel, selected) {
     }, nameOf(item))));
   const editor = h("div", { class: "settings-content" });
   panel.replaceChildren(h("div", { class: "settings-layout" }, menu, editor));
+  if (oldMenu) Motion.moveSelection(menu, oldMenu);
   const title = nameOf(current);
   if (!current.valid || !current.manifest?.config_schema?.length) {
     editor.replaceChildren(card(title, { body: emptyState("plugins", "无可配置项", current.invalid_reason || "该插件未声明配置项。") }));
@@ -2408,7 +2416,7 @@ function marketCard(item, refresh) {
   );
 }
 
-async function renderPlugins(view, sub = "") {
+async function renderPlugins(view, sub = "", previous = {}) {
   const [tab, selected] = sub.split("/");
   const config = tab === "config";
   const tabs = h("nav", { class: "segmented plugin-tabs", "aria-label": "插件页面" },
@@ -2419,7 +2427,8 @@ async function renderPlugins(view, sub = "") {
   const panel = h("div", {}, skeleton(3));
   view.replaceChildren(h("div", { class: "grid" }, tabs, panel));
   try {
-    if (config) await renderPluginConfigs(panel, selected);
+    if (previous.tab) Motion.moveSelection(tabs, previous.tab);
+    if (config) await renderPluginConfigs(panel, selected, previous.menu);
     else await renderPluginMarket(panel);
   } catch (err) {
     if (!(err instanceof Unauthorized)) panel.replaceChildren(card("", { body: [
@@ -2475,8 +2484,12 @@ async function renderPluginMarket(view) {
             role: "tab",
             "aria-selected": category.value === value ? "true" : "false",
             onclick: () => {
+              if (category.value === value) return;
+              const from = Motion.selection(tabsBox);
               category.value = value;
               drawBody();
+              Motion.moveSelection(tabsBox, from);
+              Motion.enter(gridBox, true);
             },
           },
           label
@@ -2753,16 +2766,18 @@ function textField(value, onInput, { placeholder = "", mono = false } = {}) {
 }
 
 function switchField(value, onToggle, { label } = {}) {
+  const thumb = h("span", { class: "switch-thumb", "aria-hidden": "true" });
   const toggle = h("button", {
     class: "switch",
     type: "button",
     role: "switch",
     "aria-checked": value ? "true" : "false",
     "aria-label": label || "开关",
-  });
+  }, thumb);
   toggle.addEventListener("click", () => {
     const next = toggle.getAttribute("aria-checked") !== "true";
     toggle.setAttribute("aria-checked", next ? "true" : "false");
+    Motion.switchThumb(thumb, next);
     onToggle(next);
   });
   return toggle;
@@ -3496,6 +3511,7 @@ function restartOverlay() {
     )
   );
   document.body.append(overlay);
+  Motion.enter(overlay.firstElementChild);
   return overlay;
 }
 
@@ -4220,7 +4236,7 @@ function stickerLibraryCard() {
 
 function systemExtras(data) {
   const themeButton = (value, label) =>
-    h("button", { type: "button", "data-theme-choice": value, onclick: () => applyTheme(value) }, label);
+    h("button", { type: "button", class: value === document.documentElement.dataset.themeMode ? "active" : "", "data-theme-choice": value, onclick: () => applyTheme(value) }, label);
   const appearance = card("外观", {
     body: h(
       "div",
@@ -4232,7 +4248,6 @@ function systemExtras(data) {
         themeButton("dark", "暗色"))
     ),
   });
-  applyTheme(localStorage.getItem("rubenbot.theme") || "auto");
 
   // 整份文件可能在命令、URL、参数或任意请求头中含凭据，不能安全回显。
   if (data.raw_hidden) return [appearance, card("高级：原始 YAML", {
@@ -4310,7 +4325,7 @@ function settingsMenuSkeleton(title) {
   );
 }
 
-async function renderSettingsGroup(view, groupId, sub) {
+async function renderSettingsGroup(view, groupId, sub, previous) {
   // 先把页头和分类菜单骨架放进 DOM；配置接口慢时也能立即确认已切页。
   const groupTitle = groupId === "bot" ? "机器人" : "设置";
   const groupSub = groupId === "bot"
@@ -4338,6 +4353,7 @@ async function renderSettingsGroup(view, groupId, sub) {
   menuHost.replaceChildren(...menu.childNodes);
   menuHost.setAttribute("aria-label", `${group.title}分类`);
   menuHost.removeAttribute("aria-busy");
+  if (previous?.menu) Motion.moveSelection(menuHost, previous.menu);
 
   // 人设页是 SOUL 编辑器，不走结构化表单；保存、备份与热重载保持原样
   if (page.id === "tools" && group.id === "bot") {
@@ -4423,7 +4439,7 @@ async function renderSettingsGroup(view, groupId, sub) {
             fields.length ? null : h("div", {}, err.message || "请检查填写内容"),
             ...fields))
       );
-      errorBox.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      errorBox.scrollIntoView({ behavior: Motion.enabled() ? "smooth" : "instant", block: "nearest" });
       toast("配置校验未通过", "error");
     } finally {
       saveButton.disabled = false;
@@ -4474,12 +4490,12 @@ async function renderSettingsGroup(view, groupId, sub) {
   );
 }
 
-async function renderBot(view, sub) {
-  await renderSettingsGroup(view, "bot", sub);
+async function renderBot(view, sub, previous) {
+  await renderSettingsGroup(view, "bot", sub, previous);
 }
 
-async function renderSettings(view, sub) {
-  await renderSettingsGroup(view, "settings", sub);
+async function renderSettings(view, sub, previous) {
+  await renderSettingsGroup(view, "settings", sub, previous);
 }
 
 /* ------------------------------------------------------------------ */
@@ -4499,6 +4515,11 @@ async function boot() {
 }
 
 async function main() {
+  Motion.bindPress();
+  $("#dialog").addEventListener("cancel", event => {
+    event.preventDefault();
+    Motion.dialogMotion(event.currentTarget, false);
+  });
   setupTheme();
   setupLogin();
   window.addEventListener("hashchange", () => {
