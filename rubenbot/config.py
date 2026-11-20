@@ -129,6 +129,22 @@ class LLMConfig:
 
 
 @dataclass
+class RollingSummaryConfig:
+    """会话滚动摘要参数（按会话压缩早期对话历史）。
+
+    - ``enabled``：总开关；关闭时既不生成摘要，也不用摘要拼上下文。
+    - ``trigger_after``：covered_until 之后未摘要的原文消息达到多少条触发一次压缩。
+    - ``keep_recent``：始终保留在上下文里的最新原文条数，不参与压缩。
+    - ``max_chars``：摘要总长上限；更新时要求模型在上限内取舍，代码兜底截断。
+    """
+
+    enabled: bool = True
+    trigger_after: int = 60
+    keep_recent: int = 30
+    max_chars: int = 800
+
+
+@dataclass
 class MemoryConfig:
     """记忆层参数。"""
 
@@ -189,6 +205,9 @@ class MemoryConfig:
     # recall 工具循环（模型支持 OpenAI 工具调用时生效）
     recall_tool_enabled: bool = True
     recall_tool_max_rounds: int = 2
+
+    # ---- 会话滚动摘要（只压缩本会话的对话历史，与跨会话记忆无关）----
+    rolling_summary: RollingSummaryConfig = field(default_factory=RollingSummaryConfig)
 
 
 @dataclass
@@ -471,7 +490,7 @@ class Config:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Config":
         llm = LLMConfig(**{k: v for k, v in (data.get("llm") or {}).items() if _has(LLMConfig, k)})
-        memory = MemoryConfig(**{k: v for k, v in (data.get("memory") or {}).items() if _has(MemoryConfig, k)})
+        memory = _load_memory(data.get("memory") or {})
         chat = ChatConfig(**{k: v for k, v in (data.get("chat") or {}).items() if _has(ChatConfig, k)})
         decision = _load_decision(data.get("decision") or {})
         plugins = PluginsConfig(**{k: v for k, v in (data.get("plugins") or {}).items() if _has(PluginsConfig, k)})
@@ -495,6 +514,28 @@ class Config:
             webui=webui,
             **basics,
         )
+
+
+def _load_memory(data: dict[str, Any]) -> MemoryConfig:
+    """解析 memory 段；``rolling_summary`` 单独解析成嵌套配置。
+
+    滚动摘要缺省开启（``enabled: true``），旧配置不写这个段时行为与新版
+    默认一致；写错类型的字段回落默认值，不让配置问题挡住启动。
+    """
+    if not isinstance(data, dict):
+        return MemoryConfig()
+    plain = {k: v for k, v in data.items() if _has(MemoryConfig, k) and k != "rolling_summary"}
+    config = MemoryConfig(**plain)
+    raw = data.get("rolling_summary")
+    if isinstance(raw, dict):
+        default = RollingSummaryConfig()
+        config.rolling_summary = RollingSummaryConfig(
+            enabled=raw.get("enabled") is not False,
+            trigger_after=_as_int(raw.get("trigger_after"), default.trigger_after, minimum=1),
+            keep_recent=_as_int(raw.get("keep_recent"), default.keep_recent, minimum=0),
+            max_chars=_as_int(raw.get("max_chars"), default.max_chars, minimum=100),
+        )
+    return config
 
 
 def _load_decision(data: dict[str, Any]) -> DecisionConfig:
@@ -531,3 +572,14 @@ def _as_float(value: Any, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _as_int(value: Any, default: int, *, minimum: int = 0) -> int:
+    """宽松转 int（配置里可能写成字符串），下限兜底到 ``minimum``。"""
+    if value is None or value == "" or isinstance(value, bool):
+        return default
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, number)

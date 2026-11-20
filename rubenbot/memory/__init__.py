@@ -25,6 +25,7 @@ from .retrieve import (
     tokenize,
 )
 from .store import (
+    ConversationSummary,
     Event,
     LogEntry,
     Memory,
@@ -37,12 +38,19 @@ from .store import (
     Ruling,
     make_person_id,
 )
+from .summary import (
+    SUMMARY_BLOCK_TITLE,
+    RollingSummarizer,
+    SummaryResult,
+    format_summary_block,
+)
 from .timeline import CompressResult, TimelineCompressor
 
 __all__ = [
     "CompressResult",
     "ConsolidateResult",
     "Consolidator",
+    "ConversationSummary",
     "Event",
     "ExtractResult",
     "ExtractedEvent",
@@ -66,11 +74,15 @@ __all__ = [
     "ReviewItem",
     "RawMessage",
     "Retriever",
+    "RollingSummarizer",
     "Ruling",
+    "SUMMARY_BLOCK_TITLE",
+    "SummaryResult",
     "TimelineCompressor",
     "audience_for_chat",
     "estimate_tokens",
     "format_relative_time",
+    "format_summary_block",
     "is_self_inquiry",
     "jaccard",
     "make_person_id",

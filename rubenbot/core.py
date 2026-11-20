@@ -43,6 +43,7 @@ from .memory.extract import MemoryExtractor, audience_for_chat
 from .memory.gate import PrivacyGate
 from .memory.retrieve import MemoryReader, Retriever
 from .memory.store import MemoryStore, make_person_id
+from .memory.summary import RollingSummarizer, format_summary_block
 from .persona import Persona
 from .plugins.loader import PluginContext, PluginManager
 
@@ -348,6 +349,8 @@ class RubenBot:
         )
         self.extractor = MemoryExtractor(llm, store, config.memory)
         self.consolidator = Consolidator(llm, store, config.memory)
+        # 会话滚动摘要：只压缩本会话的历史，与跨会话记忆各管各的
+        self.summarizer = RollingSummarizer(llm, store, config.memory)
         self.adapters: dict[str, BaseAdapter] = {}
         self.plugins = plugins
         self.context = BotContext(
@@ -411,6 +414,8 @@ class RubenBot:
         self.extractor.llm = self.llm
         self.consolidator.config = config.memory
         self.consolidator.llm = self.llm
+        self.summarizer.config = config.memory
+        self.summarizer.llm = self.llm
         # 读取侧与审查口：配置/模型一起热换，索引缓存保留（配置里 TTL 会立即生效）
         self.memory_reader.config = config.memory
         self.memory_reader.llm = self.llm
@@ -554,6 +559,11 @@ class RubenBot:
             await self.consolidator.maybe_consolidate(now=now)
         except Exception as exc:  # noqa: BLE001
             logger.warning("记忆归纳异常：%s", exc)
+        # 滚动摘要：开关关闭或没有会话需要压缩时开销很小；失败不影响其他维护
+        try:
+            await self.summarizer.maybe_summarize(now=now)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("会话摘要异常：%s", exc)
         self._trim_usage(now)
 
     def _trim_usage(self, now: float) -> None:
@@ -880,7 +890,11 @@ class RubenBot:
         )
 
     async def build_context(self, event: MessageEvent, *, now: float | None = None) -> list[dict[str, str]]:
-        """人格 + 记忆（索引/画像/时间线/事实/跨会话）+ 场景 + 上下文要求 + 最近历史。"""
+        """人格 + 记忆 + 本会话早期摘要 + 场景 + 上下文要求 + 最近历史。
+
+        会话有滚动摘要时，历史部分换成「摘要块 + 摘要水位之后的原文」；
+        没有摘要（或开关关闭）时和以前完全一致，直接带最近原文。
+        """
         now = time.time() if now is None else now
         persona_prompt = self.persona.system_prompt()
         person_id = make_person_id(event.platform, event.sender_id)
@@ -891,6 +905,14 @@ class RubenBot:
         memory_text = await self.memory_text(event, now=now)
         if memory_text:
             sections.append(memory_text)
+        # 本会话的早期对话压缩：只补对话历史，不涉及跨会话记忆
+        summary = self.summarizer.active_summary(event.platform, event.chat_id)
+        covered_until = 0
+        if summary is not None:
+            block = format_summary_block(summary.summary)
+            if block:
+                sections.append(block)
+                covered_until = int(summary.covered_until_msg_id or 0)
         # 场景说明带行为约束，压住人格文件里可能残留的场景想象
         sections.append(format_scene(event, display))
         requirements = self._requirements_section(self._reply_target_section(event))
@@ -906,6 +928,7 @@ class RubenBot:
             since=since,
             platform=event.platform,
             real_only=True,
+            after_id=covered_until,
         )
         messages.extend(self.render_history(history))
         return messages
