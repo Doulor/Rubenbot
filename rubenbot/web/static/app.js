@@ -457,36 +457,35 @@ function kpi(label, iconName, value, note, hint) {
   );
 }
 
-/** 概览英雄卡：运行状态 + 大号发光主按钮造型（跳设置）。 */
+/** 概览英雄卡：一张平整的 tonal 表面，信息优先 + 普通药丸设置入口。 */
 function overviewHero(data) {
   const running = Boolean(data.bot.running);
   const runningAdapters = data.adapters.filter((item) => item.running).length;
   return h(
     "section",
-    { class: "hero" },
+    { class: "card hero" },
     h(
       "div",
-      { class: "hero-copy" },
+      { class: "hero-head" },
       h(
         "span",
         { class: `hero-status ${running ? "" : "is-off"}` },
         h("span", { class: "live-dot", dataset: { state: running ? "ok" : "off" } }),
         running ? "运行中" : "已停止"
       ),
-      h("h2", { class: "hero-title" }, data.bot.name || "RubenBot"),
-      h("p", { class: "hero-sub" },
-        running ? `已运行 ${fmtDuration(data.bot.uptime_seconds)}，正在等待下一条消息` : "bot 当前没有运行"),
-      h(
-        "div",
-        { class: "hero-chips" },
-        h("span", { class: "hero-chip" }, `适配器 ${runningAdapters} / ${data.adapters.length}`),
-        h("span", { class: "hero-chip" }, `记忆 ${fmtNumber(data.counts.memories)} 条`),
-        h("span", { class: "hero-chip" }, `插件 ${data.plugins.enabled} / ${data.plugins.total}`),
-        h("span", { class: "hero-chip" }, `WebUI ${data.webui.host}:${data.webui.port}`)
-      )
+      h("a", { class: "btn btn-sm hero-action", href: "#/settings" }, icon("settings"), "设置")
     ),
-    h("a", { class: "hero-action", href: "#/settings", "aria-label": "打开设置" },
-      icon("settings"), "设置")
+    h("h2", { class: "hero-title" }, data.bot.name || "RubenBot"),
+    h("p", { class: "hero-sub" },
+      running ? `已运行 ${fmtDuration(data.bot.uptime_seconds)}，正在等待下一条消息` : "bot 当前没有运行"),
+    h(
+      "div",
+      { class: "hero-chips" },
+      h("span", { class: "hero-chip" }, `适配器 ${runningAdapters} / ${data.adapters.length}`),
+      h("span", { class: "hero-chip" }, `记忆 ${fmtNumber(data.counts.memories)} 条`),
+      h("span", { class: "hero-chip" }, `插件 ${data.plugins.enabled} / ${data.plugins.total}`),
+      h("span", { class: "hero-chip" }, `WebUI ${data.webui.host}:${data.webui.port}`)
+    )
   );
 }
 
