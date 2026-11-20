@@ -1739,14 +1739,16 @@ async function renderPlugins(view) {
         const next = toggle.getAttribute("aria-checked") !== "true";
         toggle.disabled = true;
         try {
-          await api.post(`/api/plugins/${encodeURIComponent(plugin.name)}`, { enabled: next });
-          toast(`插件 ${plugin.name} 已${next ? "启用" : "禁用"}（重启后回到配置文件设置）`);
+          const result = await api.post(`/api/plugins/${encodeURIComponent(plugin.name)}`, { enabled: next });
+          toast(result.message || `插件 ${plugin.name} 已${next ? "启用" : "禁用"}`);
           load();
         } catch (err) {
           if (!(err instanceof Unauthorized)) toast(err.message || "操作失败", "error");
           toggle.disabled = false;
         }
       });
+      const stateText = plugin.enabled ? (plugin.loaded ? "启用中" : "加载失败") : "已禁用";
+      const tagClass = plugin.enabled && plugin.loaded ? "tag good" : "tag";
       const hooks = plugin.hooks || {};
       const hookText = [
         hooks.on_message ? `on_message ${hooks.on_message}` : "",
@@ -1770,16 +1772,19 @@ async function renderPlugins(view) {
             )
           ),
           h("div", { class: "row-side" },
-            h("span", { class: `tag ${plugin.enabled ? "good" : ""}` }, plugin.enabled ? "启用中" : "已禁用"),
+            h("span", { class: tagClass }, stateText),
             toggle)
         )
       );
     }
+    const headHint = data.hot_reload === false
+      ? "插件默认全部关闭；当前 WebUI 没有运行中的 bot，开关会写入配置，重启 RubenBot 后生效"
+      : "插件默认全部关闭；开关立即生效，并写回 config.yaml 的 plugins.enabled";
     view.replaceChildren(
       h("section", { class: "card" },
         h("div", { class: "card-head" },
           h("h2", {}, "插件"),
-          h("span", { class: "hint" }, "运行时开关只影响本次运行，重启后以 config.yaml 的 plugins.enabled 为准")),
+          h("span", { class: "hint" }, headHint)),
         list)
     );
   };
@@ -2292,31 +2297,47 @@ function adaptersEditor(draft, secrets) {
   );
 }
 
-function pluginEditor(draft) {
+/** 插件开关：默认全关，逐个显式启用；保存后热生效并写回 plugins.enabled。 */
+function pluginEditor(draft, discovered = []) {
   const plugins = draft.plugins || (draft.plugins = {});
-  const allowAll = plugins.enabled === null || plugins.enabled === undefined;
+  let enabled = Array.isArray(plugins.enabled) ? plugins.enabled.slice() : [];
+  plugins.enabled = enabled;
 
-  const listWrap = h(
-    "div",
-    { class: "settings-field" },
-    h("span", { class: "field-label" }, "启用的插件"),
-    listEditor(plugins.enabled || [], (values) => {
-      plugins.enabled = values.length ? values : null;
-    }, { placeholder: "插件名", normalize: (v) => v.trim() }),
-    h("span", { class: "field-hint" }, "留空 = 启用全部；改动对运行中的 bot 立即生效")
-  );
-  listWrap.hidden = allowAll;
+  const setEnabled = (next) => {
+    // 去重、去空白；显式启用制下空列表就是「全部关闭」
+    enabled = [...new Set(next.map((name) => String(name).trim()).filter(Boolean))];
+    plugins.enabled = enabled;
+  };
 
-  const hint = h("span", { class: "field-hint" }, allowAll ? "全部启用" : "只启用列表中的插件");
-  const switchRow = h(
+  const discoveredNames = discovered.map((plugin) => plugin.name);
+  // 配置里有、目录里没找到的名字：保留但单独列出，避免保存时被悄悄丢掉
+  const orphans = enabled.filter((name) => !discoveredNames.includes(name));
+
+  const rows = h(
     "div",
-    { style: { display: "flex", alignItems: "center", gap: "10px" } },
-    switchField(allowAll, (value) => {
-      plugins.enabled = value ? null : [];
-      listWrap.hidden = value;
-      hint.textContent = value ? "全部启用" : "只启用列表中的插件";
-    }, { label: "全部启用插件" }),
-    hint
+    { class: "rows", style: { border: "1px solid var(--border)", borderRadius: "10px", overflow: "hidden" } },
+    ...discovered.map((plugin) => {
+      const status = h("div", { class: "row-sub", title: plugin.path }, plugin.enabled ? "当前已启用" : "当前未启用");
+      return h(
+        "div",
+        { class: "plugin-row", style: { padding: "10px 14px" } },
+        h("div", { class: "plugin-icon" }, icon("plugins")),
+        h(
+          "div",
+          { class: "row-main" },
+          h("div", { class: "row-title" }, plugin.name),
+          status
+        ),
+        h(
+          "div",
+          { class: "row-side" },
+          switchField(enabled.includes(plugin.name), (value) => {
+            setEnabled(value ? enabled.concat(plugin.name) : enabled.filter((name) => name !== plugin.name));
+            status.textContent = value ? "保存后启用" : "保存后停用";
+          }, { label: `启用插件 ${plugin.name}` })
+        )
+      );
+    })
   );
 
   return h(
@@ -2334,8 +2355,25 @@ function pluginEditor(draft) {
         draft
       )
     ),
-    switchRow,
-    listWrap
+    h(
+      "span",
+      { class: "field-hint" },
+      discovered.length
+        ? "插件默认全部关闭；打开开关后保存即热生效（立即加载或停用），无需重启。"
+        : "插件目录里还没有发现插件；放入 plugins/<名称>/plugin.py 后刷新页面即可在这里启用。"
+    ),
+    rows,
+    orphans.length
+      ? h(
+          "div",
+          { class: "settings-field" },
+          h("span", { class: "field-label" }, "配置里启用但目录中未找到"),
+          listEditor(orphans, (values) => {
+            setEnabled(enabled.filter((name) => discoveredNames.includes(name)).concat(values));
+          }, { placeholder: "插件名", normalize: (v) => v.trim() }),
+          h("span", { class: "field-hint" }, "这些名字写在 plugins.enabled 里，但插件目录下没有对应的 plugin.py")
+        )
+      : null
   );
 }
 
@@ -2624,8 +2662,8 @@ async function renderSettings(view) {
       body: groupsEditor(draft, secrets),
     }),
     card("插件", {
-      hint: "目录与启停",
-      body: pluginEditor(draft),
+      hint: "默认全关，逐个启用",
+      body: pluginEditor(draft, data.plugins_available || []),
     }),
     card("适配器", {
       hint: "连接参数改动需重启",

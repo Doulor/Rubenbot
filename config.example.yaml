@@ -124,7 +124,10 @@ decision:
 
 plugins:
   dir: "plugins"
-  # 不写 enabled 表示全部启用；写列表则只启用列表中的
+  # 插件默认全部关闭（显式启用制）：只有列在这里的插件才会加载，
+  # 留空或不写 enabled 都表示一个插件都不启用。
+  enabled: []
+  # 例如只启用 hello 示例插件（也可以直接在 WebUI 设置页开关，保存后写回这里并热生效）：
   # enabled: ["hello"]
   command_prefix: "/"
 

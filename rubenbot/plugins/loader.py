@@ -1,6 +1,9 @@
 """插件发现与加载。
 
 插件是一个目录，形如 ``plugins/<name>/plugin.py``，暴露 ``register(ctx)``。
+插件采用**显式启用**制：只有 ``config.plugins.enabled`` 里列出的插件才会
+加载；未配置或空列表表示一个都不启用。WebUI 的插件开关会把选择写回
+这个列表并热生效（新启用的现场 ``register``，停用的触发 ``on_stop``）。
 ctx 提供：
 
 - ``on_message(handler)``：消息预处理钩子，``handler(ctx, event)``；
@@ -63,7 +66,7 @@ class Plugin:
     stop_hooks: list[Callable[[], Any]] = field(default_factory=list)
     # 插件启用时的启动回调（拉起后台任务等）
     start_hooks: list[Callable[[], Any]] = field(default_factory=list)
-    enabled: bool = True
+    enabled: bool = False
     # 是否真的执行过 register；加载时被禁用的插件是 False
     loaded: bool = False
 
@@ -178,8 +181,32 @@ async def _call(handler: Callable[..., Any], *args: Any) -> Any:
     return result
 
 
+def discover_plugin_dirs(directory: str | Path | None = None) -> list[tuple[str, Path]]:
+    """扫描插件目录，返回 ``[(插件名, 目录路径), ...]``（按名称排序）。
+
+    只认 ``<目录>/<插件名>/plugin.py`` 的结构；下划线/点开头的目录跳过。
+    目录不存在时返回空列表。WebUI 不依赖插件管理器也能列出可用插件。
+    """
+    root = Path(directory or "plugins")
+    if not root.exists():
+        return []
+    found: list[tuple[str, Path]] = []
+    for entry in sorted(root.iterdir()):
+        if not entry.is_dir() or entry.name.startswith((".", "_")):
+            continue
+        if (entry / "plugin.py").exists():
+            found.append((entry.name, entry))
+    return found
+
+
 class PluginManager:
-    """发现、注册并分发插件钩子。"""
+    """发现、注册并分发插件。
+
+    插件采用显式启用制：只有 ``config.plugins.enabled`` 里列出的插件才会
+    调用 ``register`` 并分发钩子；未配置或空列表表示一个都不启用。
+    目录里发现的所有插件仍会记进 ``self.plugins``（``enabled=False``），
+    供 WebUI 列表与运行时开启使用。
+    """
 
     def __init__(self, config, store, *, extras: dict[str, Any] | None = None):
         self.config = config
@@ -197,35 +224,120 @@ class PluginManager:
     def enabled_plugins(self) -> list[Plugin]:
         return [p for p in self.plugins.values() if p.enabled]
 
-    def load_all(self, directory: str | Path | None = None) -> list[Plugin]:
-        """扫描目录加载全部插件。单个插件失败只跳过它。"""
+    @property
+    def enabled_names(self) -> list[str]:
+        """当前启用的插件名（保持发现顺序）。"""
+        return [p.name for p in self.plugins.values() if p.enabled]
+
+    def _discover(self, directory: str | Path | None = None) -> list[Plugin]:
+        """扫描目录，登记发现的插件但不执行 ``register``。
+
+        已经登记过的插件沿用原对象（保留已注册的钩子、启停状态与生命周期
+        回调），这里只更新路径；新发现的插件一律先记为未启用，由
+        :meth:`load_all` / :meth:`apply_enabled` / :meth:`set_enabled` 决定
+        是否真正加载。
+        """
         root = Path(directory or self.config.plugins.dir)
         if not root.exists():
             logger.info("插件目录不存在，跳过：%s", root)
             return []
-        allow = self.config.plugins.enabled
-        loaded: list[Plugin] = []
+        found: list[Plugin] = []
         for entry in sorted(root.iterdir()):
             if not entry.is_dir() or entry.name.startswith((".", "_")):
                 continue
             plugin_file = entry / "plugin.py"
             if not plugin_file.exists():
                 continue
-            enabled = True if allow is None else entry.name in allow
-            plugin = Plugin(name=entry.name, path=entry, enabled=enabled)
-            self.plugins[entry.name] = plugin
-            if not enabled:
-                # 禁用的插件不调用 register，也就不会注册任何钩子
-                logger.info("插件 %s 已禁用", entry.name)
+            plugin = self.plugins.get(entry.name)
+            if plugin is None:
+                plugin = Plugin(name=entry.name, path=entry)
+                self.plugins[entry.name] = plugin
+            else:
+                plugin.path = entry
+            found.append(plugin)
+        return found
+
+    def discover(self) -> list[Plugin]:
+        """重新扫描插件目录（发现新目录），返回当前登记的插件。
+
+        WebUI 列表用它保证新放进 ``plugins/`` 的插件不用重启即可出现在
+        页面上；新发现的插件先记为未启用，等真正启用时才 ``register``。
+        """
+        return self._discover()
+
+    def load_all(self, directory: str | Path | None = None) -> list[Plugin]:
+        """扫描目录并加载**启用列表里**的插件。单个插件失败只跳过它。
+
+        ``plugins.enabled`` 未配置或为空时不会加载任何插件（默认全关）。
+        """
+        found = self._discover(directory)
+        allow = set(self.config.plugins.enabled)
+        loaded: list[Plugin] = []
+        for plugin in found:
+            if plugin.name not in allow:
+                # 禁用的插件不调用 register，也就不会注册任何钩子；
+                # 之前在运行时启用过的，顺手触发 on_stop 干净退出
+                if plugin.enabled or plugin.loaded:
+                    self.set_enabled(plugin.name, False)
+                logger.debug("插件 %s 未在启用列表中，跳过", plugin.name)
                 continue
+            if plugin.loaded:
+                # 重复调用 load_all 不重复 register（避免钩子翻倍），
+                # 但运行中被停用的要补一次 on_start
+                if not plugin.enabled:
+                    plugin.enabled = True
+                    self._run_lifecycle(plugin, plugin.start_hooks, "on_start")
+                loaded.append(plugin)
+                continue
+            plugin.enabled = True  # _load_plugin 按启用状态决定是否跑 on_start
             try:
                 self._load_plugin(plugin)
                 loaded.append(plugin)
-                logger.info("插件 %s 已加载", entry.name)
+                logger.info("插件 %s 已加载", plugin.name)
             except Exception as exc:  # noqa: BLE001 - 插件失败不能拖垮宿主
-                logger.warning("加载插件 %s 失败：%s", entry.name, exc)
-                self.plugins.pop(entry.name, None)
+                plugin.enabled = False
+                logger.warning("加载插件 %s 失败：%s", plugin.name, exc)
+                self.plugins.pop(plugin.name, None)
+        missing = allow - {plugin.name for plugin in found}
+        for name in sorted(missing):
+            logger.warning("插件 %s 已写入 plugins.enabled，但目录里没有找到", name)
         return loaded
+
+    def apply_enabled(self, names: list[str] | None) -> list[str]:
+        """把新的启用列表写进配置并热应用，返回启用失败的插件名。
+
+        会重新扫描插件目录（发现新增的插件目录），然后逐个同步启停：
+        新启用的现场 ``register``，停用的触发 ``on_stop`` 并停止分发。
+        未找到的插件名只记日志，不影响其它插件。
+        """
+        cleaned: list[str] = []
+        for item in names or []:
+            name = str(item).strip()
+            if name and name not in cleaned:
+                cleaned.append(name)
+        self.config.plugins.enabled = cleaned
+        allow = set(cleaned)
+        self._discover()
+        failures: list[str] = []
+        for name in cleaned:
+            plugin = self.plugins.get(name)
+            if plugin is None:
+                logger.warning("插件 %s 已写入 plugins.enabled，但目录里没有找到", name)
+                failures.append(name)
+                continue
+            if plugin.enabled and plugin.loaded:
+                continue
+            if not self.set_enabled(name, True):
+                plugin.enabled = False
+                failures.append(name)
+                # 与 load_all 一致：加载失败的插件从列表移除，下次扫描再发现
+                self.plugins.pop(name, None)
+        for name, plugin in list(self.plugins.items()):
+            if name not in allow and (plugin.enabled or plugin.loaded):
+                self.set_enabled(name, False)
+        # set_enabled 会逐条增删内存列表（顺序跟着操作走），最后按提交顺序收敛
+        self.config.plugins.enabled = cleaned
+        return failures
 
     def _load_plugin(self, plugin: Plugin) -> None:
         module_name = f"rubenbot_plugin_{plugin.name}"
@@ -329,6 +441,7 @@ class PluginManager:
             {
                 "name": p.name,
                 "enabled": p.enabled,
+                "loaded": p.loaded,
                 "commands": sorted(p.commands),
                 "hooks": {
                     "on_message": len(p.message_hooks),
@@ -337,7 +450,7 @@ class PluginManager:
                 },
                 "path": str(p.path),
             }
-            for p in self.plugins.values()
+            for p in sorted(self.plugins.values(), key=lambda item: item.name)
         ]
 
     def set_enabled(self, name: str, enabled: bool) -> bool:
@@ -347,7 +460,9 @@ class PluginManager:
         启用一个加载时被跳过的插件时，会现场执行它的 ``register``。
         禁用/启用时会同步调用插件的 ``on_stop`` / ``on_start`` 回调，
         后台任务据此启动和干净退出。
-        这个开关只在内存里，重启后以配置文件为准。
+
+        这个开关会同步更新内存里 ``config.plugins.enabled``；WebUI 调用它
+        之后负责把列表写回 config.yaml。
         """
         plugin = self.plugins.get(name)
         if plugin is None:
@@ -367,8 +482,22 @@ class PluginManager:
                 self._run_lifecycle(plugin, plugin.start_hooks, "on_start")
             elif not enabled and was_enabled:
                 self._run_lifecycle(plugin, plugin.stop_hooks, "on_stop")
+        self._sync_enabled_config(name, enabled)
         logger.info("插件 %s 已%s", name, "启用" if enabled else "禁用")
         return True
+
+    def _sync_enabled_config(self, name: str, enabled: bool) -> None:
+        """把单个插件的开关同步进内存里 ``config.plugins.enabled``。
+
+        保持用户原有顺序，只增删这一个名字；写回 YAML 由 WebUI 负责。
+        """
+        names = list(self.config.plugins.enabled)
+        if enabled:
+            if name not in names:
+                names.append(name)
+        elif name in names:
+            names.remove(name)
+        self.config.plugins.enabled = names
 
     @staticmethod
     def _run_lifecycle(plugin: Plugin, hooks: list[Callable[[], Any]], label: str) -> None:

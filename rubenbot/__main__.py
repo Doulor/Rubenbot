@@ -66,7 +66,14 @@ def build_bot(config: Config) -> tuple[RubenBot, LLMClient, MemoryStore]:
     persona = load_persona(config.persona_path)
     plugins = PluginManager(config, store)
     try:
-        plugins.load_all()
+        loaded = plugins.load_all()
+        # 插件默认全关：没启用任何插件是正常情况，启动时说清楚
+        logging.info(
+            "插件：共发现 %s 个，已启用 %s 个%s",
+            len(plugins.plugins),
+            len(loaded),
+            f"（{', '.join(p.name for p in loaded)}）" if loaded else "（默认全部关闭，可在 WebUI 插件页开启）",
+        )
     except Exception as exc:  # noqa: BLE001 - 插件加载失败不阻塞启动
         logging.warning("插件加载失败：%s", exc)
     bot = RubenBot(config, store, llm, persona, plugins=plugins)

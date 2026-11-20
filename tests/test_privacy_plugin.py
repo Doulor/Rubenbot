@@ -41,6 +41,7 @@ def make_bot(tmp_path: Path):
     store = MemoryStore(":memory:")
     config = Config()
     config.plugins.dir = str(root)
+    config.plugins.enabled = ["privacy"]
     config.chat.split_delay_seconds = 0
     config.decision.merge_window_seconds = 0
     config.decision.hard_merge_window_seconds = 0

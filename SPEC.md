@@ -108,8 +108,9 @@ SnowLuma 适配器（OneBot v11）：
 ## 插件系统
 
 - `plugins/<name>/plugin.py`，暴露 `register(ctx)`；ctx 提供钩子注册：`on_message`（事件预处理）、`on_before_reply`、`on_after_reply`、命令注册 `command(name, handler)`
-- 插件可启用/禁用（配置里控制）；插件异常不能拖垮主循环
-- 附一个示例插件：`plugins/hello`（命令 /hello 回复 + 演示 on_message 钩子）
+- 插件**默认全部关闭**（显式启用制）：只有 `plugins.enabled` 里列出的插件才加载，未配置或空列表表示一个都不启用；可在 WebUI 的插件页逐个开关，保存后写回配置并热生效
+- 插件异常不能拖垮主循环
+- 附一个示例插件：`plugins/hello`（命令 /hello 回复 + 演示 on_message 钩子）；默认不启用，需要在配置或 WebUI 里显式打开
 
 ## 配置
 
@@ -120,6 +121,7 @@ SnowLuma 适配器（OneBot v11）：
 - memory：extract_every_n、inject_limit、consolidate_new_threshold、consolidate_interval_hours
 - chat：history_size、split_max_parts、拆条与历史上下文参数
 - decision：意愿系统参数（合并窗口、基础值/阈值、动量半衰期、发言占比抑制、冷却、否决标记、每群覆盖）
+- plugins：插件目录、`enabled` 显式启用列表（留空即全部关闭）、命令前缀
 - adapters：启用的适配器及各自参数（snowluma 的 ws_url、http_url、access_token）
 
 ## 第一阶段交付标准（本次任务）
@@ -157,7 +159,7 @@ SnowLuma 适配器（OneBot v11）：
   - **记忆**：按人浏览、全文搜索、手动新增/编辑/删除、变更日志查看与撤销（对接 memory_log）
   - **人物**：人物列表与档案（平台、首次/最近出现、记忆条数）
   - **群组与意愿**：每群活跃度倍率与静默时段配置、最近决策日志（分数与因子）查看
-  - **插件**：列表、启用/禁用
+  - **插件**：列表、启用/禁用（默认全关，逐个显式开启；保存后写回 `plugins.enabled` 并热生效）
   - **日志**：运行日志尾部查看
   - **设置**：config.yaml 查看与编辑（保存后提示需重启或热加载，v1 先做提示重启）
 - API：REST + JSON，前缀 `/api`；WebUI 与 bot 同进程运行（bot 启动时按配置决定是否拉起 UI 服务，默认开，端口可配，默认 8765）

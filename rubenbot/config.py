@@ -260,12 +260,35 @@ class DecisionConfig:
 class PluginsConfig:
     """插件目录与启停。
 
-    ``enabled`` 为 None 表示启用全部；给列表则只启用列表中的插件。
+    插件采用**显式启用**制：``enabled`` 里没列出的插件都不会加载，
+    未配置或空列表表示一个插件都不启用（默认全关）。WebUI 的插件开关
+    会把选择写回这个列表。
     """
 
     dir: str = "plugins"
-    enabled: list[str] | None = None
+    enabled: list[str] = field(default_factory=list)
     command_prefix: str = "/"
+
+    def __post_init__(self) -> None:
+        """把 ``enabled`` 归一化成去重、去空白的字符串列表。
+
+        兼容旧配置里写成 ``null`` 或单个字符串的写法：``None`` 按空列表
+        处理（即不启用任何插件），不会意外变成「全部启用」。
+        """
+        raw = self.enabled
+        if raw is None or raw == "":
+            raw = []
+        elif isinstance(raw, str):
+            raw = [raw]
+        cleaned: list[str] = []
+        if isinstance(raw, (list, tuple, set)):
+            for item in raw:
+                if item is None:
+                    continue
+                name = str(item).strip()
+                if name and name not in cleaned:
+                    cleaned.append(name)
+        self.enabled = cleaned
 
 
 @dataclass

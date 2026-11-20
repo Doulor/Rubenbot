@@ -56,14 +56,14 @@ def plugin_dir(tmp_path: Path) -> Path:
 def make_manager(plugin_dir: Path, enabled=None) -> PluginManager:
     config = Config()
     config.plugins.dir = str(plugin_dir)
-    config.plugins.enabled = enabled
+    config.plugins.enabled = list(enabled or [])
     config.decision.merge_window_seconds = 0
     config.decision.hard_merge_window_seconds = 0
     return PluginManager(config, MemoryStore(":memory:"))
 
 
 def test_load_all_skips_broken(plugin_dir):
-    manager = make_manager(plugin_dir)
+    manager = make_manager(plugin_dir, enabled=["demo", "broken"])
     loaded = manager.load_all()
     assert [p.name for p in loaded] == ["demo"]
     assert "broken" not in manager.plugins  # 加载失败的被移除
@@ -72,12 +72,84 @@ def test_load_all_skips_broken(plugin_dir):
     assert info["demo"]["hooks"]["on_message"] == 1
 
 
+def test_no_enabled_config_loads_no_plugins(plugin_dir):
+    """未配置 enabled（插件默认全关）：发现插件但不加载、不注册任何钩子。"""
+    manager = make_manager(plugin_dir)
+    assert manager.config.plugins.enabled == []
+    assert manager.load_all() == []
+    demo = manager.plugins["demo"]
+    assert demo.enabled is False and demo.loaded is False
+    assert demo.message_hooks == [] and demo.commands == {}
+    assert manager.enabled_plugins == []
+
+
+def test_only_listed_plugins_load(plugin_dir):
+    """enabled 列表是唯一依据：只加载列出的插件，未列出的保持禁用。"""
+    manager = make_manager(plugin_dir, enabled=["demo"])
+    loaded = manager.load_all()
+    assert [p.name for p in loaded] == ["demo"]
+    assert manager.plugins["demo"].enabled is True
+    assert manager.plugins["broken"].enabled is False
+    # broken 被显式列出但 import 就炸：只跳过它，不拖垮已启用的插件
+    manager2 = make_manager(plugin_dir, enabled=["broken"])
+    assert manager2.load_all() == []
+    assert "broken" not in manager2.plugins
+
+
+def test_enabled_name_missing_from_dir_is_ignored(plugin_dir, caplog):
+    manager = make_manager(plugin_dir, enabled=["demo", "ghost"])
+    loaded = manager.load_all()
+    assert [p.name for p in loaded] == ["demo"]
+    assert "ghost" not in manager.plugins
+
+
+def test_default_plugins_config_enabled_is_empty():
+    """配置默认值：不带 plugins 段时一个插件都不启用（旧语义是全部启用）。"""
+    from rubenbot.config import PluginsConfig
+
+    assert Config().plugins.enabled == []
+    assert PluginsConfig().enabled == []
+    # 旧配置里写 null 也按「全部关闭」处理，不能意外变成全部启用
+    assert PluginsConfig(enabled=None).enabled == []
+    assert PluginsConfig(enabled="hello").enabled == ["hello"]
+
+
 def test_disabled_plugin_not_registered(plugin_dir):
     manager = make_manager(plugin_dir, enabled=["other"])
     manager.load_all()
     demo = manager.plugins["demo"]
     assert demo.enabled is False
     assert demo.message_hooks == [] and demo.commands == {}
+
+
+def test_apply_enabled_hot_load_and_unload(plugin_dir):
+    """WebUI 保存启用列表：热加载新启用的、停用被移除的，并同步配置。"""
+    manager = make_manager(plugin_dir)
+    manager.load_all()
+    assert manager.enabled_plugins == []
+
+    assert manager.apply_enabled(["demo"]) == []
+    assert manager.plugins["demo"].enabled is True and manager.plugins["demo"].loaded is True
+    assert manager.config.plugins.enabled == ["demo"]
+
+    assert manager.apply_enabled([]) == []
+    assert manager.plugins["demo"].enabled is False
+    assert manager.enabled_plugins == []
+    assert manager.config.plugins.enabled == []
+
+
+def test_apply_enabled_report_unloadable(plugin_dir):
+    """启用列表里的插件加载失败时如实返回失败名，不拖垮其它插件。"""
+    manager = make_manager(plugin_dir)
+    manager.load_all()
+    assert manager.apply_enabled(["broken", "demo"]) == ["broken"]
+    assert manager.plugins["demo"].enabled is True
+    assert "broken" not in manager.plugins
+
+    # 再次 load_all：已加载的插件不重复 register，仍按配置列表保持启用
+    assert [p.name for p in manager.load_all()] == ["demo"]
+    assert len(manager.plugins["demo"].message_hooks) == 1
+    assert manager.plugins["demo"].enabled is True
 
 
 def test_load_missing_dir(tmp_path):
@@ -89,6 +161,7 @@ def make_bot(plugin_dir: Path, replies=None) -> tuple[RubenBot, RecordingAdapter
     store = MemoryStore(":memory:")
     config = Config()
     config.plugins.dir = str(plugin_dir)
+    config.plugins.enabled = ["demo"]
     config.chat.type_speed = 0
     config.decision.merge_window_seconds = 0
     config.decision.hard_merge_window_seconds = 0
@@ -148,7 +221,7 @@ def test_hooks_before_and_after(plugin_dir):
 
 
 def test_hook_exception_does_not_crash(plugin_dir):
-    manager = make_manager(plugin_dir)
+    manager = make_manager(plugin_dir, enabled=["demo"])
     manager.load_all()
     plugin = manager.plugins["demo"]
 
@@ -234,6 +307,7 @@ def test_plugin_can_call_capability(lifecycle_dir):
     store = MemoryStore(":memory:")
     config = Config()
     config.plugins.dir = str(lifecycle_dir)
+    config.plugins.enabled = ["life"]
     config.chat.type_speed = 0
     manager = PluginManager(config, store)
     manager.load_all()
@@ -255,7 +329,7 @@ def test_plugin_can_call_capability(lifecycle_dir):
 
 
 def test_plugin_capability_without_bot_fails_gracefully(lifecycle_dir):
-    manager = make_manager(lifecycle_dir)
+    manager = make_manager(lifecycle_dir, enabled=["life"])
     manager.load_all()
     ctx = manager.plugins["life"].commands["publish"]
 

@@ -109,10 +109,12 @@ RubenBot 是一个以**记忆**为核心的拟人社交聊天 bot 框架。它�
 | `rubenbot/adapters/base.py` | `BaseAdapter`、`MessageEvent`、`Segment` |
 | `rubenbot/adapters/console.py` | stdin/stdout 调试适配器 |
 | `rubenbot/adapters/snowluma.py` | OneBot v11 正向 WS 收事件 + HTTP API 发送 |
-| `rubenbot/plugins/loader.py` | 插件发现、钩子与命令分发 |
+| `rubenbot/plugins/loader.py` | 插件发现、钩子与命令分发；显式启用制与热启停 |
 | `rubenbot/__main__.py` | 命令行入口 `rubenbot` / `python -m rubenbot` |
-| `plugins/hello/` | 示例插件：`/hello` 命令 + `on_message` 钩子 |
-| `plugins/privacy/` | 内置插件：`/隐私` 命令（档位 / 自查 / 清空）与灰区询问投递 |
+| `plugins/hello/` | 示例插件：`/hello` 命令 + `on_message` 钩子（默认关闭，需显式启用） |
+| `plugins/privacy/` | 内置插件：`/隐私` 命令（档位 / 自查 / 清空）与灰区询问投递（默认关闭，需显式启用） |
+| `plugins/qzone_post/` | 说说发布插件（命令 / 定时 / 概率触发）；自动互动开关默认关闭（默认不启用，需显式开启） |
+| `plugins/emoji_react/` | 贴表情反应插件：跟随回复 / 关键词触发（默认关闭，需显式启用） |
 | `data/SOUL.md` | 默认人格示例 |
 
 ---
@@ -177,9 +179,9 @@ ConsoleAdapter 的输入格式：
 | `你好呀` | 私聊（必定回复） |
 | `[摸鱼群] 今天好累` | 在名为「摸鱼群」的群聊里发言 |
 | `[摸鱼群\|阿花] 今天好累` | 指定群名与昵称 |
-| `/hello` | 触发示例插件命令 |
+| `/hello` | 触发示例插件命令（需先在 `plugins.enabled` 或 WebUI 里启用 `hello`） |
 
-群聊里普通消息默认只拿 `decision.base`（0.10）的基础意愿，单靠它过不了阈值；被 @ / 被回复 / 叫到名字（`Ruben`）时必回。想调试时可以在配置里临时调高 `decision.base` / `decision.threshold`，或直接发 `/hello`。
+群聊里普通消息默认只拿 `decision.base`（0.10）的基础意愿，单靠它过不了阈值；被 @ / 被回复 / 叫到名字（`Ruben`）时必回。想调试时可以在配置里临时调高 `decision.base` / `decision.threshold`。插件默认全部关闭，想试 `/hello` 请在 WebUI 的「插件」页打开 `hello`，或在配置里写 `plugins.enabled: ["hello"]`。
 
 ### 4. 测试
 
@@ -187,7 +189,7 @@ ConsoleAdapter 的输入格式：
 pytest
 ```
 
-当前共 594 个测试，覆盖存储 CRUD / 变更日志与撤销、检索打分、抽取去重、归纳校验（不许新词、20% 上限、user 来源不可删）、画像提炼与时间线压缩、记忆读取侧（索引 / 预拉取 / 预算裁剪 / 跨会话 / 分寸审查 / 隐私命令）、回复决策（合并窗口、动量衰减、占比抑制、冷却、硬触发、生成否决）、主循环、插件、SnowLuma 事件解析，以及 Console + 假 LLM 的端到端流程。
+当前共 672 个测试，覆盖存储 CRUD / 变更日志与撤销、检索打分、抽取去重、归纳校验（不许新词、20% 上限、user 来源不可删）、画像提炼与时间线压缩、记忆读取侧（索引 / 预拉取 / 预算裁剪 / 跨会话 / 分寸审查 / 隐私命令）、回复决策（合并窗口、动量衰减、占比抑制、冷却、硬触发、生成否决）、主循环、插件（显式启用制与 WebUI 开关写回）、SnowLuma 事件解析，以及 Console + 假 LLM 的端到端流程。
 
 ---
 
@@ -233,12 +235,19 @@ pytest
 | | `cooldown_seconds` `cooldown_penalty` | 发言后冷却 |
 | | `veto_marker` | 模型输出该标记即静默丢弃 |
 | | `groups` | 每群覆盖：`activity_multiplier` / `base` / `quiet_hours` |
-| `plugins` | `dir` `enabled` `command_prefix` | `enabled` 为空表示全部启用 |
+| `plugins` | `dir` `enabled` `command_prefix` | 插件显式启用：`enabled` 里没列的插件不加载，留空表示全部关闭 |
 | `background_check_minutes` | — | 抽取/归纳检查间隔 |
 
 ---
 
 ## 插件开发
+
+插件默认**全部关闭**（显式启用制）：只有在 `config.yaml` 的 `plugins.enabled` 列表里出现的插件才会加载，不写或留空表示一个都不启用。最省事的开启方式是启动后打开 WebUI 的「插件」页，逐个打开开关——保存后立即热生效（现场 `register` / 触发 `on_stop`），并写回 `plugins.enabled`；也可以直接改配置：
+
+```yaml
+plugins:
+  enabled: ["hello"]   # 只启用 hello 插件
+```
 
 在插件目录下新建 `plugins/<name>/plugin.py`，暴露 `register(ctx)`：
 
@@ -311,8 +320,8 @@ def register(ctx):
 13. **LLM 只实现 `/chat/completions` 一条路径**
    OpenAI 兼容接口已成为事实标准。`json_mode` 走 `response_format`，但解析器同时兼容 ```json 代码块和前后夹带废话的输出，降低模型不听话时的失败率。重试只针对网络错误和 4xx/5xx，采用 0.5s 起的指数退避。
 
-14. **插件加载失败只跳过该插件**
-   插件是可选增强，不能阻塞启动；插件目录不存在也算正常情况。`on_message` 返回 `False` 的语义定为「拦截」，与常见事件钩子习惯一致。
+14. **插件加载失败只跳过该插件；插件默认全部关闭**
+   插件是可选增强，不能阻塞启动；插件目录不存在也算正常情况。插件采用显式启用制：只有 `plugins.enabled` 里列出的才加载，留空即全部关闭，避免升级或误配置时悄悄启用有对外写操作的插件。`on_message` 返回 `False` 的语义定为「拦截」，与常见事件钩子习惯一致。
 
 15. **ConsoleAdapter 是测试与本地调试的一等公民**
    它不依赖任何平台，支持 `reader` 注入和手动绑定回调，端到端测试正是靠它 + ScriptedLLM 跑通「发消息 → 落流水 → 抽取 → 引用记忆」。SnowLuma 的真实联调留到第二阶段。

@@ -121,9 +121,69 @@ class WebState:
         return self.store.list_decision_logs(limit=limit, chat_id=chat_id)
 
     def plugin_list(self) -> list[dict[str, Any]]:
+        """插件列表：有插件管理器时用它的实时状态，否则只按配置与目录展示。
+
+        WebUI 独立模式（``--webui-only``）没有运行中的插件管理器，这里
+        仍然扫描插件目录，让设置页能列出可启用的插件。
+        """
         if self.plugins is not None:
+            # 顺手重新扫描一次目录：新放进去的插件不重启也能出现在列表里
+            try:
+                self.plugins.discover()
+            except OSError as exc:  # noqa: BLE001 - 目录读不了不影响已有列表
+                logger.warning("扫描插件目录失败：%s", exc)
             return self.plugins.list_plugins()
-        return []
+        from ..plugins.loader import discover_plugin_dirs
+
+        allow = set(self.config.plugins.enabled)
+        return [
+            {
+                "name": name,
+                "enabled": name in allow,
+                "loaded": False,
+                "commands": [],
+                "hooks": {"on_message": 0, "on_before_reply": 0, "on_after_reply": 0},
+                "path": str(path),
+            }
+            for name, path in discover_plugin_dirs(self.config.plugins.dir)
+        ]
+
+    def set_plugin_enabled(self, name: str, enabled: bool) -> bool:
+        """运行时启用/停用插件，并把启用列表同步到内存里的配置。
+
+        插件框架支持热卸载（停用触发 ``on_stop``），因此这里无需重启；
+        写回 config.yaml 由调用方负责。找不到插件或启用失败返回 False。
+        """
+        manager = self.plugins
+        if manager is None:
+            return False
+        if not manager.set_enabled(name, enabled):
+            return False
+        names = self.enabled_plugin_names(manager)
+        self.config.plugins.enabled = names
+        # 管理器持有的配置可能是旧对象（没有运行中 bot 时不会走 bot.apply_config）
+        manager.config.plugins.enabled = list(names)
+        bot = self.bot
+        bot_config = getattr(bot, "config", None)
+        if bot_config is not None and bot_config is not self.config:
+            bot_config.plugins.enabled = list(names)
+        return True
+
+    def enabled_plugin_names(self, manager=None) -> list[str]:
+        """按用户原有顺序整理启用列表，只保留真正处于启用状态的插件。
+
+        ``set_enabled`` 只增删单个名字，这里以 ``self.config`` 里的顺序为准
+        （尽量不改动用户手写的顺序），再补上运行时启用但列表里漏掉的插件。
+        """
+        manager = manager or self.plugins
+        if manager is None:
+            return list(self.config.plugins.enabled)
+        actual = {plugin.name for plugin in manager.enabled_plugins}
+        names = [name for name in self.config.plugins.enabled if name in actual]
+        for plugin in manager.enabled_plugins:
+            if plugin.name not in names:
+                names.append(plugin.name)
+        return names
 
     def usage_summary(self, *, days: int = 7) -> dict[str, Any]:
         """近 ``days`` 天的 LLM 用量聚合：总量 + 按 task / model 分组。"""
@@ -211,13 +271,12 @@ class WebState:
                 new_config.webui.password, ttl_hours=new_config.webui.session_hours
             )
 
-        # 插件启停列表：运行时同步（新增启用会现场加载）
-        if self.plugins is not None and old.plugins != new_config.plugins:
-            allow = new_config.plugins.enabled
-            for name, plugin in list(self.plugins.plugins.items()):
-                desired = True if allow is None else name in allow
-                if plugin.enabled != desired:
-                    self.plugins.set_enabled(name, desired)
+        # 插件启停列表：显式启用制下，列表就是唯一来源；运行时同步（新增启用会现场加载）
+        if self.plugins is not None and old.plugins.enabled != new_config.plugins.enabled:
+            try:
+                self.plugins.apply_enabled(new_config.plugins.enabled)
+            except Exception as exc:  # noqa: BLE001 - 热应用失败不能让保存结果丢失
+                logger.warning("插件启用列表热应用失败：%s", exc)
 
         # bot 在跑：交给它替换 LLM 客户端与各模块的配置引用
         bot = self.bot
@@ -326,6 +385,7 @@ def describe_restart_fields(fields: list[str]) -> str:
         "database_path": "数据库路径",
         "persona.path": "人格文件路径",
         "plugins.dir": "插件目录",
+        "plugins.enabled": "插件开关",
         "webui.enabled": "WebUI 启用状态",
         "webui.host": "WebUI 监听地址",
         "webui.port": "WebUI 端口",

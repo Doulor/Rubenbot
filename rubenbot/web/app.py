@@ -22,8 +22,8 @@
 - ``GET  /api/chats/{id}/decision`` 群决策配置
 - ``PUT  /api/chats/{id}/decision`` 保存群决策配置（写 config.yaml）
 - ``GET  /api/decisions``       决策日志（可按 chat_id 过滤）
-- ``GET  /api/plugins``         插件列表
-- ``POST /api/plugins/{name}``  启用/禁用（运行时生效）
+- ``GET  /api/plugins``         插件列表（含目录里发现但未启用的）
+- ``POST /api/plugins/{name}``  启用/禁用：热生效并写回 plugins.enabled
 - ``GET  /api/logs``            运行日志尾部
 - ``GET  /api/config``          查看 config.yaml
 - ``PUT  /api/config``          编辑并校验后保存，返回需重启提示
@@ -250,6 +250,63 @@ def _apply_groups(state, data: dict[str, Any]) -> None:
             bot.apply_config(config, rebuild_llm=False)
         except Exception as exc:  # noqa: BLE001 - 热应用失败不影响已写盘的配置
             logger.warning("群决策配置热应用失败：%s", exc)
+
+
+def _write_plugin_enabled(state) -> None:
+    """把当前启用的插件列表写回 config.yaml 的 ``plugins.enabled``。
+
+    只动这一个键，保留其余内容与顺序；写盘沿用设置页的原子替换 + 备份。
+    """
+    import yaml
+
+    path = Path(state.config_path)
+    data = _read_raw_config(path)
+    plugins = data.get("plugins")
+    if plugins is None:
+        plugins = {}
+        data["plugins"] = plugins
+    if not isinstance(plugins, dict):
+        raise ValueError("config.yaml 里的 plugins 段格式不正确")
+    manager = state.plugins
+    if manager is None:
+        # 独立 WebUI 模式：没有管理器，按 state.config 里刚更新的列表写回
+        names = list(state.config.plugins.enabled)
+    else:
+        names = state.enabled_plugin_names(manager)
+        # 让磁盘配置与内存里管理器的状态保持一致（管理器可能持有旧配置对象）
+        state.config.plugins.enabled = list(names)
+        manager.config.plugins.enabled = list(names)
+    plugins["enabled"] = list(names)
+    if "dir" not in plugins:
+        plugins["dir"] = state.config.plugins.dir
+    text = yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
+    save_config_text(path, text)
+
+
+def _save_plugin_without_manager(state: WebState, name: str, enabled: bool) -> dict[str, Any]:
+    """独立 WebUI 模式：只把开关写进配置，并如实提示需要重启生效。"""
+    known = {item["name"] for item in state.plugin_list()}
+    if name not in known:
+        raise ApiError(404, f"插件不存在：{name}")
+    names = [item for item in state.config.plugins.enabled if item != name]
+    if enabled:
+        names.append(name)
+    state.config.plugins.enabled = names
+    try:
+        _write_plugin_enabled(state)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("插件开关写回 config.yaml 失败：%s", exc)
+        raise ApiError(500, f"写回配置失败：{exc}") from exc
+    return {
+        "ok": True,
+        "items": state.plugin_list(),
+        "restart_required": True,
+        "persisted": True,
+        "message": (
+            f"插件 {name} 的开关已写入配置；当前 WebUI 没有运行中的 bot，"
+            "重启 RubenBot 后生效。"
+        ),
+    }
 
 
 def _mask_config(data: Any) -> Any:
@@ -706,19 +763,52 @@ def create_app(state: WebState):
     @app.get("/api/plugins")
     async def list_plugins(request: Request):
         require_session(request)
-        return {"ok": True, "items": state.plugin_list()}
+        hot = state.plugins is not None
+        return {
+            "ok": True,
+            "items": state.plugin_list(),
+            "hot_reload": hot,
+            "restart_required": not hot,
+            "message": (
+                "插件默认全部关闭；开关会立即生效，并写回 config.yaml 的 plugins.enabled。"
+                if hot
+                else "插件默认全部关闭；当前 WebUI 没有运行中的 bot，开关会写入配置，重启后生效。"
+            ),
+        }
 
     @app.post("/api/plugins/{name}")
     async def toggle_plugin(name: str, request: Request):
+        """启用/停用插件：热生效，并写回 config.yaml 的 plugins.enabled。
+
+        独立 WebUI 模式（没有插件管理器）没有运行中的 bot，只能写配置，
+        响应里会如实标注需要重启。
+        """
         require_session(request)
         body = await _json_body(request)
         enabled = bool(body.get("enabled"))
         if state.plugins is None:
-            raise ApiError(503, "插件管理器未初始化")
-        if not state.plugins.set_enabled(name, enabled):
+            return _save_plugin_without_manager(state, name, enabled)
+        if not state.set_plugin_enabled(name, enabled):
             raise ApiError(404, f"插件不存在或启用失败：{name}")
-        logger.info("WebUI %s 插件 %s", "启用" if enabled else "禁用", name)
-        return {"ok": True, "items": state.plugin_list()}
+        try:
+            _write_plugin_enabled(state)
+        except Exception as exc:  # noqa: BLE001 - 已热生效，写盘失败只说清楚
+            logger.warning("插件开关写回 config.yaml 失败：%s", exc)
+            return {
+                "ok": True,
+                "items": state.plugin_list(),
+                "restart_required": False,
+                "persisted": False,
+                "message": f"插件已{'启用' if enabled else '停用'}，但写回配置失败：{exc}",
+            }
+        logger.info("WebUI %s 插件 %s（已写回 config.yaml）", "启用" if enabled else "禁用", name)
+        return {
+            "ok": True,
+            "items": state.plugin_list(),
+            "restart_required": False,
+            "persisted": True,
+            "message": f"插件已{'启用' if enabled else '停用'}，立即生效并已写回配置。",
+        }
 
     # ------------------------------------------------------------------
     # 日志
@@ -746,6 +836,7 @@ def create_app(state: WebState):
             "exists": path.exists(),
             "effective": _mask_config(_config_to_dict(state.config)),
             "structured": structured_config(state.config),
+            "plugins_available": state.plugin_list(),
             "restart_fields": _pending_restart_fields(state),
         }
 
@@ -914,6 +1005,13 @@ async def _save_structured_config(state: WebState, payload: Any) -> dict[str, An
     before = _config_snapshot(state.config)
     requires_restart = state.apply_config(new_config)
     after = _config_snapshot(new_config)
+    # 独立 WebUI 模式没有运行中的插件管理器，插件开关只能写配置、重启后生效
+    if (
+        state.plugins is None
+        and before.get("plugins.enabled") != after.get("plugins.enabled")
+        and "plugins.enabled" not in requires_restart
+    ):
+        requires_restart.append("plugins.enabled")
 
     # 逐个提交字段判定生效方式：只看真正改过的叶子，避免「全部已生效」的误导
     resolution: dict[str, str] = {}

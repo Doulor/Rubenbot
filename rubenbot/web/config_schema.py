@@ -89,7 +89,7 @@ def structured_config(config: Config) -> dict[str, Any]:
         "decision": decision,
         "plugins": {
             "dir": config.plugins.dir,
-            "enabled": list(config.plugins.enabled) if config.plugins.enabled is not None else None,
+            "enabled": list(config.plugins.enabled),
             "command_prefix": config.plugins.command_prefix,
         },
         "adapters": {
@@ -460,13 +460,14 @@ def _validate_plugins(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
         if value is not None:
             out["dir"] = value
     if "enabled" in section:
+        # 显式启用制：留空/null 就是「一个都不启用」，不再表示全部启用
         value = section["enabled"]
         if value is None or value == "":
-            out["enabled"] = None
+            out["enabled"] = []
         else:
             enabled = v.string_list(value, "plugins.enabled")
             if enabled is not None:
-                out["enabled"] = enabled or None
+                out["enabled"] = enabled
     if "command_prefix" in section:
         value = v.text(section["command_prefix"], "plugins.command_prefix", allow_empty=True, max_len=8)
         if value is not None:

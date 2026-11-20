@@ -509,11 +509,147 @@ def test_plugins_toggle_runtime(client, store, config):
     assert client.post("/api/plugins/nope", json={"enabled": True}).status_code == 404
 
 
-def test_plugins_without_manager(client):
+def test_plugins_without_manager(client, tmp_path):
+    """独立 WebUI 模式：没有插件管理器时仍能按目录列出插件，但不能热切换。"""
     state = client.app.state.web
     state.plugins = None
+    state.config.plugins.dir = str(tmp_path / "empty-plugins")
     assert client.get("/api/plugins").json()["items"] == []
-    assert client.post("/api/plugins/demo", json={"enabled": True}).status_code == 503
+    assert client.post("/api/plugins/demo", json={"enabled": True}).status_code == 404
+
+
+def test_structured_save_without_manager_marks_plugins_restart(client, tmp_path):
+    """独立 WebUI 模式保存插件开关：如实标注需要重启，不假装热生效。"""
+    import yaml
+
+    root = tmp_path / "plugins"
+    (root / "alpha").mkdir(parents=True)
+    (root / "alpha" / "plugin.py").write_text("def register(ctx):\n    pass\n", encoding="utf-8")
+    state = client.app.state.web
+    state.plugins = None
+    state.config.plugins.dir = str(root)
+    state.config.plugins.enabled = []
+
+    result = client.put("/api/config", json={"config": {"plugins": {"enabled": ["alpha"]}}}).json()
+    assert result["restart_required"] is True
+    assert "plugins.enabled" in result["requires_restart"]
+    assert result["resolution"]["plugins.enabled"] == "restart"
+    assert "插件" in result["message"]
+    data = yaml.safe_load(state.config_path.read_text(encoding="utf-8"))
+    assert data["plugins"]["enabled"] == ["alpha"]
+
+    # 换成运行中的 bot（有插件管理器）则同一改动是热生效
+    from rubenbot.plugins.loader import PluginManager
+
+    state.plugins = PluginManager(state.config, state.store)
+    result = client.put("/api/config", json={"config": {"plugins": {"enabled": []}}}).json()
+    assert result["restart_required"] is False
+    assert result["resolution"]["plugins.enabled"] == "hot"
+
+
+def test_plugins_toggle_without_manager_persists_and_says_restart(client, tmp_path):
+    """独立 WebUI 模式下的开关：写进配置，并如实标注需要重启（不假装热生效）。"""
+    import yaml
+
+    root = tmp_path / "plugins"
+    (root / "alpha").mkdir(parents=True)
+    (root / "alpha" / "plugin.py").write_text("def register(ctx):\n    pass\n", encoding="utf-8")
+    state = client.app.state.web
+    state.plugins = None
+    state.config.plugins.dir = str(root)
+    state.config.plugins.enabled = []
+
+    result = client.post("/api/plugins/alpha", json={"enabled": True}).json()
+    assert result["ok"] is True
+    assert result["persisted"] is True
+    assert result["restart_required"] is True
+    assert "重启" in result["message"]
+    assert result["items"][0]["enabled"] is True
+    data = yaml.safe_load(state.config_path.read_text(encoding="utf-8"))
+    assert data["plugins"]["enabled"] == ["alpha"]
+    assert state.config.plugins.enabled == ["alpha"]
+
+    result = client.post("/api/plugins/alpha", json={"enabled": False}).json()
+    assert result["items"][0]["enabled"] is False
+    data = yaml.safe_load(state.config_path.read_text(encoding="utf-8"))
+    assert data["plugins"]["enabled"] == []
+
+
+def test_plugins_list_scans_dir_without_manager(client, tmp_path):
+    root = tmp_path / "plugins"
+    (root / "alpha").mkdir(parents=True)
+    (root / "alpha" / "plugin.py").write_text("def register(ctx):\n    pass\n", encoding="utf-8")
+    state = client.app.state.web
+    state.plugins = None
+    state.config.plugins.dir = str(root)
+    state.config.plugins.enabled = []
+
+    items = client.get("/api/plugins").json()["items"]
+    assert [item["name"] for item in items] == ["alpha"]
+    assert items[0]["enabled"] is False
+
+    state.config.plugins.enabled = ["alpha"]
+    items = client.get("/api/plugins").json()["items"]
+    assert items[0]["enabled"] is True
+
+
+def test_plugin_toggle_writes_config(client, store, config, config_path, tmp_path):
+    """插件开关：热生效并写回 config.yaml 的 plugins.enabled。"""
+    import yaml
+
+    from rubenbot.plugins.loader import PluginManager
+
+    root = tmp_path / "plugins"
+    (root / "alpha").mkdir(parents=True)
+    (root / "alpha" / "plugin.py").write_text(
+        "def register(ctx):\n"
+        "    @ctx.command('alpha')\n"
+        "    async def alpha(runtime, event, args):\n"
+        "        return 'ok'\n",
+        encoding="utf-8",
+    )
+    (root / "beta").mkdir()
+    (root / "beta" / "plugin.py").write_text("def register(ctx):\n    pass\n", encoding="utf-8")
+
+    config.plugins.dir = str(root)
+    config.plugins.enabled = []
+    plugins = PluginManager(config, store)
+    plugins.load_all()
+    state = client.app.state.web
+    state.plugins = plugins
+    state.config = config
+
+    # 默认全关：发现的插件都在列表里，但一个都没加载
+    listing = client.get("/api/plugins").json()
+    assert listing["hot_reload"] is True
+    assert listing["restart_required"] is False
+    assert {item["name"] for item in listing["items"]} == {"alpha", "beta"}
+    assert all(item["enabled"] is False for item in listing["items"])
+    assert plugins.enabled_plugins == []
+
+    enabled = client.post("/api/plugins/alpha", json={"enabled": True}).json()
+    assert enabled["ok"] is True
+    assert enabled["restart_required"] is False
+    assert enabled["persisted"] is True
+    by_name = {item["name"]: item for item in enabled["items"]}
+    assert by_name["alpha"]["enabled"] is True
+    assert by_name["alpha"]["loaded"] is True
+    assert by_name["beta"]["enabled"] is False
+    # 热生效：钩子已注册、配置内存同步
+    assert plugins.plugins["alpha"].loaded is True
+    assert config.plugins.enabled == ["alpha"]
+
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert data["plugins"]["enabled"] == ["alpha"]
+    assert data["chat"]["bot_name"] == "Ruben"  # 其它段保留
+
+    disabled = client.post("/api/plugins/alpha", json={"enabled": False}).json()
+    assert disabled["items"][0]["enabled"] is False
+    assert plugins.plugins["alpha"].enabled is False
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert data["plugins"]["enabled"] == []
+
+    assert client.post("/api/plugins/nope", json={"enabled": True}).status_code == 404
 
 
 # ----------------------------------------------------------------------
