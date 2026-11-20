@@ -81,6 +81,35 @@ def config() -> Config:
     return cfg
 
 
+@pytest.fixture
+def check_inflate_budget(monkeypatch):
+    """检查实际交给 zlib 的输出额度，避免先全量展开再报超限也能通过测试。"""
+    import zlib
+
+    inflate = zlib.decompressobj
+
+    def check(limit):
+        produced = []
+
+        class Meter:
+            def __init__(self, *args, **kwargs):
+                self.inner = inflate(*args, **kwargs)
+
+            def decompress(self, data, max_length=0):
+                assert 0 < max_length <= limit + 1 - sum(produced)
+                part = self.inner.decompress(data, max_length)
+                produced.append(len(part))
+                return part
+
+            def __getattr__(self, name):
+                return getattr(self.inner, name)
+
+        monkeypatch.setattr(zlib, 'decompressobj', Meter)
+        return produced
+
+    return check
+
+
 def json_array(*items) -> str:
     return json.dumps(items, ensure_ascii=False)
 
