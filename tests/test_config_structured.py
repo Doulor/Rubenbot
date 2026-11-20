@@ -377,6 +377,73 @@ def test_validate_search_rejects_unknown_provider():
     assert any(item["field"] == "search.cooldown_seconds" for item in info.value.fields)
 
 
+def test_voice_section_structured_view_and_secrets(config):
+    """语音分组出现在表单视图里；两个 key 留空 + secrets 标记。"""
+    config.voice.stt_api_key = "sk-stt"
+    config.voice.tts_api_key = "sk-tts"
+    view = structured_config(config)
+    assert view["voice"]["stt_provider"] == "siliconflow"
+    assert view["voice"]["tts_mode"] == "off"
+    assert view["voice"]["tts_provider"] == "edge_tts"
+    assert view["voice"]["stt_api_key"] == ""
+    assert view["voice"]["tts_api_key"] == ""
+    assert view["secrets"]["voice.stt_api_key"] is True
+    assert view["secrets"]["voice.tts_api_key"] is True
+    assert "voice.stt_api_key" in SECRET_PATHS
+    assert "voice.tts_api_key" in SECRET_PATHS
+
+
+def test_put_structured_voice_section(client, config_path, state):
+    response = client.put(
+        "/api/config",
+        json={
+            "config": {
+                "voice": {
+                    "stt_provider": "openai_compatible",
+                    "stt_base_url": "https://relay.example/v1",
+                    "stt_api_key": "sk-stt",
+                    "tts_mode": "reply_voice",
+                    "tts_provider": "siliconflow",
+                    "tts_api_key": "sk-tts",
+                    "tts_max_chars": "40",
+                }
+            }
+        },
+    )
+    assert response.status_code == 200, response.text
+    data = read_yaml(config_path)["voice"]
+    assert data["stt_provider"] == "openai_compatible"
+    assert data["stt_base_url"] == "https://relay.example/v1"
+    assert data["tts_mode"] == "reply_voice"
+    assert data["tts_provider"] == "siliconflow"
+    assert data["tts_max_chars"] == 40
+    assert state.config.voice.stt_api_key == "sk-stt"
+
+    # 空 key 表示保留原值
+    again = client.put(
+        "/api/config",
+        json={"config": {"voice": {"stt_api_key": "", "tts_mode": "on_request"}}},
+    )
+    assert again.status_code == 200, again.text
+    assert read_yaml(config_path)["voice"]["stt_api_key"] == "sk-stt"
+    assert read_yaml(config_path)["voice"]["tts_mode"] == "on_request"
+
+
+def test_validate_voice_rejects_unknown_values():
+    with pytest.raises(ConfigValidationError) as info:
+        validate_structured({"voice": {"stt_provider": "whisper"}})
+    assert any(item["field"] == "voice.stt_provider" for item in info.value.fields)
+    with pytest.raises(ConfigValidationError) as info:
+        validate_structured({"voice": {"tts_mode": "always"}})
+    assert any(item["field"] == "voice.tts_mode" for item in info.value.fields)
+    with pytest.raises(ConfigValidationError) as info:
+        validate_structured({"voice": {"tts_provider": "azure"}})
+    assert any(item["field"] == "voice.tts_provider" for item in info.value.fields)
+    with pytest.raises(ConfigValidationError) as info:
+        validate_structured({"voice": {"tts_max_chars": 0}})
+    assert any(item["field"] == "voice.tts_max_chars" for item in info.value.fields)
+
+
 def test_put_structured_masked_placeholder_not_written(client, config_path, config, state):
     config.webui.password = "hunter2"
     data = read_yaml(config_path)

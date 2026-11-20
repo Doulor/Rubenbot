@@ -79,6 +79,30 @@ search:
   timeout_seconds: 10      # 单次搜索请求超时（秒）
   cooldown_seconds: 30     # 每会话两次真实搜索之间的冷却，冷却内只返回提示不发请求
 
+# 语音双向：听懂语音条（STT）与用语音回复（TTS）。
+# 转写没配 key 时语音消息只记 [语音] 占位；语音回复默认关闭，失败一律降级发文字。
+voice:
+  # ---- 入站语音条转写 ----
+  stt_provider: "siliconflow"       # siliconflow 或 openai_compatible（任意兼容 base_url）
+  stt_api_key: "${RUBENBOT_STT_KEY}"
+  stt_base_url: ""                  # 仅 openai_compatible 用，例如 https://host/v1；填了才启用
+  stt_model: "FunAudioLLM/SenseVoiceSmall"
+  stt_timeout_seconds: 30           # 单次转写请求超时（秒）
+  stt_max_seconds: 60               # 单条语音时长上限（秒），超过不转写
+  stt_max_bytes: 5242880            # 单条语音大小上限（字节，默认 5MB），超过不转写
+  # ---- 出站语音回复 ----
+  # off 从不发语音（默认）；reply_voice 对方发语音时用语音回；
+  # on_request 在 reply_voice 基础上，被明确要求「用语音说」时也发
+  tts_mode: "off"
+  tts_provider: "edge_tts"          # edge_tts（免 Key，子进程调用可选 CLI）或 siliconflow（CosyVoice2）
+  tts_api_key: ""                   # 硅基流动合成用；留空复用 stt_api_key
+  edge_tts_command: "edge-tts"      # 找不到命令时自动降级发文字
+  tts_voice: "zh-CN-XiaoxiaoNeural" # edge-tts 音色
+  tts_model: "FunAudioLLM/CosyVoice2-0.5B"
+  tts_siliconflow_voice: "FunAudioLLM/CosyVoice2-0.5B:alex"
+  tts_max_chars: 60                 # 正文超过这么多字不合成；被拆条的长回复一律发文字
+  tts_timeout_seconds: 30
+
 chat:
   bot_name: "Ruben"
   history_size: 30
@@ -164,6 +188,9 @@ adapters:
     capabilities:
       # 给消息贴表情（set_msg_emoji_like），默认开
       emoji_like: true
+      # 语音回复（record 段）。只在 voice.tts_mode 打开时才用；默认开，
+      # 关掉即语音回复一律改发文字
+      voice: true
       # 发 QQ 空间说说（send_qzone_msg），默认关：对外发布内容，需显式打开
       qzone: false
       # ---- QQ 空间互动（经 get_cookies 拿登录态后直调空间 Web 接口）----
@@ -190,6 +217,10 @@ adapters:
   #   allowed_chat_ids: []
   #   # getUpdates 的 offset 落盘位置：重启后不重复处理旧消息；留空则不落盘
   #   offset_file: "data/telegram_offset.json"
+  #   # 平台特有能力开关：语音回复（sendVoice / sendAudio）。只在 voice.tts_mode
+  #   # 打开时才用；写成 false 则语音回复一律改发文字
+  #   capabilities:
+  #     voice: true
   # QQ 官方机器人（q.qq.com 开放平台，与上面的 OneBot 通道完全独立）
   # 凭证在开放平台「开发设置」里拿；client_secret 支持 ${ENV_VAR} 展开
   # qq_official:
