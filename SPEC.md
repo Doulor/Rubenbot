@@ -235,7 +235,7 @@ SnowLuma 适配器（OneBot v11）：
 - `config_schema`：配置项声明（key/类型/默认/说明），供设置界面自动渲染表单（二期落地，一期先解析存下）
 - `hooks`：用到的钩子名列表（on_message / on_command / scheduled 等，与 loader 的 register(ctx) 对应）
 
-loader 加载时校验 manifest：缺失或字段不全的插件拒绝加载并在 WebUI 标「不合规」；现有 4 个插件（hello / privacy / emoji_react / qzone_post）一期全部补 manifest 迁移。
+loader 加载时校验 manifest：缺失或字段不全的插件拒绝加载并在 WebUI 标「不合规」；现有插件（hello / privacy / qzone_post）一期全部补 manifest 迁移；emoji_react 已于 2026-11-20 删除——贴表情改由适配器网关在模型思考中判断，不再用规则+概率插件。
 
 ### 分发：GitHub 索引仓库
 

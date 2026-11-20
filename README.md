@@ -175,7 +175,6 @@ bot 对每个人的好感度、以及自己当下的心情，都由确定性规�
 | `plugins/hello/` | 示例插件：`/hello` 命令 + `on_message` 钩子（默认关闭，需显式启用） |
 | `plugins/privacy/` | 内置插件：`/隐私` 命令（档位 / 自查 / 清空）与灰区询问投递（默认关闭，需显式启用） |
 | `plugins/qzone_post/` | 说说发布插件（命令 / 定时 / 概率触发）；自动互动开关默认关闭（默认不启用，需显式开启） |
-| `plugins/emoji_react/` | 贴表情反应插件：跟随回复 / 关键词触发（默认关闭，需显式启用） |
 | `data/SOUL.md` | 默认人格示例 |
 
 ---
@@ -377,7 +376,7 @@ plugins:
 | `llm` | 调用核心的大模型接口（会产生费用） | |
 | `network` | 向外部网络发起请求 | |
 
-带高风险权限的插件，安装确认框里会额外标红提示。框架自带的 4 个官方插件（hello / privacy / emoji_react / qzone_post）都已声明真实 manifest，可作参考。
+带高风险权限的插件，安装确认框里会额外标红提示。框架自带的 3 个官方插件（hello / privacy / qzone_post）都已声明真实 manifest，可作参考。
 
 在插件目录下新建 `plugins/<name>/plugin.py`，暴露 `register(ctx)`：
 
