@@ -1,0 +1,10 @@
+# 复制为同目录 config.yaml，或直接使用插件配置页。
+mode: on_mention
+cooldown_seconds: 60
+daily_limit: 100
+cache_ttl_seconds: 3600
+max_bytes: 1048576
+timeout_seconds: 6
+sites:
+  - bilibili
+  - generic
