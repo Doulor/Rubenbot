@@ -1,0 +1,429 @@
+{
+  "_comment": "OneBot v11 标准动作 + SnowLuma 扩展动作。risk: safe/sensitive/denied；cooldown_seconds 是 (动作,会话) 冷却默认值；proactive=false 表示只读、不耗每日预算。params 精确 schema 只给常用动作，其余用 free-form（null）。",
+  "actions": [
+    {
+      "name": "send_private_msg",
+      "summary": "给某人发私聊消息",
+      "risk": "safe",
+      "cooldown_seconds": 0,
+      "params": {
+        "user_id": {"type": "integer", "description": "对方的 QQ 号"},
+        "message": {"type": "string", "description": "消息内容；消息段数组也可以"},
+        "auto_escape": {"type": "boolean", "description": "是否不解析 CQ 码"}
+      },
+      "required": ["user_id", "message"]
+    },
+    {
+      "name": "send_group_msg",
+      "summary": "往群里发一条消息",
+      "risk": "safe",
+      "cooldown_seconds": 0,
+      "params": {
+        "group_id": {"type": "integer", "description": "群号"},
+        "message": {"type": "string", "description": "消息内容；消息段数组也可以"},
+        "auto_escape": {"type": "boolean", "description": "是否不解析 CQ 码"}
+      },
+      "required": ["group_id", "message"]
+    },
+    {
+      "name": "send_msg",
+      "summary": "按 message_type 自动选私聊或群聊发送",
+      "risk": "safe",
+      "cooldown_seconds": 0,
+      "params": {
+        "message_type": {"type": "string", "description": "private 或 group"},
+        "user_id": {"type": "integer", "description": "私聊时的对方 QQ 号"},
+        "group_id": {"type": "integer", "description": "群聊时的群号"},
+        "message": {"type": "string", "description": "消息内容"}
+      },
+      "required": ["message"]
+    },
+    {
+      "name": "delete_msg",
+      "summary": "撤回一条消息",
+      "risk": "sensitive",
+      "cooldown_seconds": 5,
+      "params": {
+        "message_id": {"type": "integer", "description": "要撤回的消息 id"}
+      },
+      "required": ["message_id"]
+    },
+    {
+      "name": "get_msg",
+      "summary": "按消息 id 取消息详情（发送者、内容、时间）",
+      "risk": "safe",
+      "params": {
+        "message_id": {"type": "integer", "description": "消息 id"}
+      },
+      "required": ["message_id"]
+    },
+    {
+      "name": "get_forward_msg",
+      "summary": "取合并转发消息的内容",
+      "risk": "safe",
+      "params": {
+        "id": {"type": "string", "description": "合并转发消息的 id"}
+      },
+      "required": ["id"]
+    },
+    {
+      "name": "send_like",
+      "summary": "给某人的资料卡点赞（拍一拍）",
+      "risk": "safe",
+      "cooldown_seconds": 300,
+      "params": {
+        "user_id": {"type": "integer", "description": "要点赞的 QQ 号"},
+        "times": {"type": "integer", "description": "点赞次数，默认 10，上限 20"}
+      },
+      "required": ["user_id"]
+    },
+    {
+      "name": "set_msg_emoji_like",
+      "summary": "给消息贴一个表情回应（SnowLuma 扩展）",
+      "risk": "safe",
+      "cooldown_seconds": 60,
+      "params": {
+        "message_id": {"type": "integer", "description": "要贴表情的消息 id"},
+        "emoji_id": {"type": "string", "description": "表情 id，常用 66（点赞）等"},
+        "set": {"type": "boolean", "description": "true 贴表情，false 取消"}
+      },
+      "required": ["message_id", "emoji_id"]
+    },
+    {
+      "name": "fetch_ptt_text",
+      "summary": "把一条语音消息转成文字（SnowLuma 扩展，走 QQ 原生转写）",
+      "risk": "safe",
+      "proactive": false,
+      "params": {
+        "message_id": {"type": "integer", "description": "语音消息的 id"}
+      },
+      "required": ["message_id"]
+    },
+    {
+      "name": "set_friend_add_request",
+      "summary": "处理好友申请（同意/拒绝）",
+      "risk": "sensitive",
+      "params": {
+        "flag": {"type": "string", "description": "申请事件里的 flag，原样带回"},
+        "approve": {"type": "boolean", "description": "true 同意，false 拒绝"},
+        "remark": {"type": "string", "description": "同意时给对方设置的备注"}
+      },
+      "required": ["flag", "approve"]
+    },
+    {
+      "name": "set_group_add_request",
+      "summary": "处理入群申请/邀请（同意/拒绝）",
+      "risk": "sensitive",
+      "params": {
+        "flag": {"type": "string", "description": "申请事件里的 flag，原样带回"},
+        "sub_type": {"type": "string", "description": "add（他人申请入群）或 invite（邀请 bot 入群）"},
+        "approve": {"type": "boolean", "description": "true 同意，false 拒绝"},
+        "reason": {"type": "string", "description": "拒绝理由"}
+      },
+      "required": ["flag", "sub_type", "approve"]
+    },
+    {
+      "name": "get_stranger_info",
+      "summary": "查一个陌生人的昵称等资料",
+      "risk": "safe",
+      "proactive": false,
+      "params": {
+        "user_id": {"type": "integer", "description": "QQ 号"},
+        "no_cache": {"type": "boolean", "description": "是否不用缓存"}
+      },
+      "required": ["user_id"]
+    },
+    {
+      "name": "get_friend_list",
+      "summary": "列出现有好友",
+      "risk": "safe",
+      "proactive": false,
+      "params": null
+    },
+    {
+      "name": "get_group_info",
+      "summary": "查一个群的名称、人数等信息",
+      "risk": "safe",
+      "proactive": false,
+      "params": {
+        "group_id": {"type": "integer", "description": "群号"},
+        "no_cache": {"type": "boolean", "description": "是否不用缓存"}
+      },
+      "required": ["group_id"]
+    },
+    {
+      "name": "get_group_list",
+      "summary": "列出 bot 所在的全部群",
+      "risk": "safe",
+      "proactive": false,
+      "params": null
+    },
+    {
+      "name": "get_group_member_info",
+      "summary": "查群里某个成员的资料（群名片、角色等）",
+      "risk": "safe",
+      "proactive": false,
+      "params": {
+        "group_id": {"type": "integer", "description": "群号"},
+        "user_id": {"type": "integer", "description": "成员 QQ 号"},
+        "no_cache": {"type": "boolean", "description": "是否不用缓存"}
+      },
+      "required": ["group_id", "user_id"]
+    },
+    {
+      "name": "get_group_member_list",
+      "summary": "列出群成员",
+      "risk": "safe",
+      "proactive": false,
+      "params": {
+        "group_id": {"type": "integer", "description": "群号"}
+      },
+      "required": ["group_id"]
+    },
+    {
+      "name": "get_group_honor_info",
+      "summary": "查群荣誉（龙王、群聊之火等）",
+      "risk": "safe",
+      "proactive": false,
+      "params": {
+        "group_id": {"type": "integer", "description": "群号"},
+        "type": {"type": "string", "description": "荣誉类型，如 talkative / performer"}
+      },
+      "required": ["group_id", "type"]
+    },
+    {
+      "name": "get_group_msg_history",
+      "summary": "拉取群聊历史消息（协议端扩展）",
+      "risk": "safe",
+      "proactive": false,
+      "params": {
+        "group_id": {"type": "integer", "description": "群号"},
+        "message_seq": {"type": "integer", "description": "从哪条消息往前拉，0 表示最新"},
+        "count": {"type": "integer", "description": "拉几条，默认 20"}
+      },
+      "required": ["group_id"]
+    },
+    {
+      "name": "set_group_kick",
+      "summary": "把某人踢出群",
+      "risk": "sensitive",
+      "params": {
+        "group_id": {"type": "integer", "description": "群号"},
+        "user_id": {"type": "integer", "description": "要踢的人"},
+        "reject_add_request": {"type": "boolean", "description": "是否拒绝他再次加群"}
+      },
+      "required": ["group_id", "user_id"]
+    },
+    {
+      "name": "set_group_ban",
+      "summary": "禁言群成员（duration=0 表示解除）",
+      "risk": "sensitive",
+      "params": {
+        "group_id": {"type": "integer", "description": "群号"},
+        "user_id": {"type": "integer", "description": "被禁言的人"},
+        "duration": {"type": "integer", "description": "禁言秒数，0 表示解除"}
+      },
+      "required": ["group_id", "user_id", "duration"]
+    },
+    {
+      "name": "set_group_whole_ban",
+      "summary": "开启/关闭全员禁言",
+      "risk": "sensitive",
+      "params": {
+        "group_id": {"type": "integer", "description": "群号"},
+        "enable": {"type": "boolean", "description": "true 全员禁言，false 解除"}
+      },
+      "required": ["group_id", "enable"]
+    },
+    {
+      "name": "set_group_admin",
+      "summary": "设置/取消群管理员",
+      "risk": "sensitive",
+      "params": {
+        "group_id": {"type": "integer", "description": "群号"},
+        "user_id": {"type": "integer", "description": "对象成员"},
+        "enable": {"type": "boolean", "description": "true 设为管理员，false 取消"}
+      },
+      "required": ["group_id", "user_id", "enable"]
+    },
+    {
+      "name": "set_group_card",
+      "summary": "改群名片（自己或别人）",
+      "risk": "safe",
+      "cooldown_seconds": 10,
+      "params": {
+        "group_id": {"type": "integer", "description": "群号"},
+        "user_id": {"type": "integer", "description": "成员 QQ 号"},
+        "card": {"type": "string", "description": "新群名片；空串表示清空"}
+      },
+      "required": ["group_id", "user_id", "card"]
+    },
+    {
+      "name": "set_group_name",
+      "summary": "改群名",
+      "risk": "sensitive",
+      "cooldown_seconds": 60,
+      "params": {
+        "group_id": {"type": "integer", "description": "群号"},
+        "group_name": {"type": "string", "description": "新群名"}
+      },
+      "required": ["group_id", "group_name"]
+    },
+    {
+      "name": "set_group_leave",
+      "summary": "退出群聊",
+      "risk": "sensitive",
+      "params": {
+        "group_id": {"type": "integer", "description": "群号"},
+        "is_dismiss": {"type": "boolean", "description": "是否解散群（一般不用）"}
+      },
+      "required": ["group_id"]
+    },
+    {
+      "name": "set_group_special_title",
+      "summary": "设置群成员专属头衔",
+      "risk": "safe",
+      "params": {
+        "group_id": {"type": "integer", "description": "群号"},
+        "user_id": {"type": "integer", "description": "成员 QQ 号"},
+        "special_title": {"type": "string", "description": "头衔文本"},
+        "duration": {"type": "integer", "description": "有效期秒数，-1 表示永久"}
+      },
+      "required": ["group_id", "user_id", "special_title"]
+    },
+    {
+      "name": "get_login_info",
+      "summary": "查 bot 自己的账号与昵称",
+      "risk": "safe",
+      "proactive": false,
+      "params": null
+    },
+    {
+      "name": "get_status",
+      "summary": "查协议端运行状态",
+      "risk": "safe",
+      "proactive": false,
+      "params": null
+    },
+    {
+      "name": "get_version_info",
+      "summary": "查协议端版本",
+      "risk": "safe",
+      "proactive": false,
+      "params": null
+    },
+    {
+      "name": "get_cookies",
+      "summary": "取指定域名的登录态 Cookie",
+      "risk": "sensitive",
+      "proactive": false,
+      "params": {
+        "domain": {"type": "string", "description": "域名，如 qzone.qq.com"}
+      },
+      "required": ["domain"]
+    },
+    {
+      "name": "get_csrf_token",
+      "summary": "取 CSRF token（一般随 get_cookies 一起用）",
+      "risk": "sensitive",
+      "proactive": false,
+      "params": null
+    },
+    {
+      "name": "can_send_image",
+      "summary": "检查当前是否能发图片",
+      "risk": "safe",
+      "proactive": false,
+      "params": null
+    },
+    {
+      "name": "can_send_record",
+      "summary": "检查当前是否能发语音",
+      "risk": "safe",
+      "proactive": false,
+      "params": null
+    },
+    {
+      "name": "get_image",
+      "summary": "取图片文件信息（路径/URL）",
+      "risk": "safe",
+      "proactive": false,
+      "params": {
+        "file": {"type": "string", "description": "图片文件名或 id"}
+      },
+      "required": ["file"]
+    },
+    {
+      "name": "get_record",
+      "summary": "取语音文件信息（路径/URL）",
+      "risk": "safe",
+      "proactive": false,
+      "params": {
+        "file": {"type": "string", "description": "语音文件名或 id"},
+        "out_format": {"type": "string", "description": "转码格式，如 mp3"}
+      },
+      "required": ["file"]
+    },
+    {
+      "name": "send_qzone_msg",
+      "summary": "发一条 QQ 空间说说（SnowLuma 扩展）",
+      "risk": "sensitive",
+      "cooldown_seconds": 600,
+      "params": {
+        "content": {"type": "string", "description": "说说正文"}
+      },
+      "required": ["content"]
+    },
+    {
+      "name": "set_group_portrait",
+      "summary": "设置群头像",
+      "risk": "safe",
+      "cooldown_seconds": 60,
+      "params": {
+        "group_id": {"type": "integer", "description": "群号"},
+        "file": {"type": "string", "description": "图片路径或 URL"}
+      },
+      "required": ["group_id", "file"]
+    },
+    {
+      "name": "set_group_anonymous",
+      "summary": "开启/关闭群匿名聊天",
+      "risk": "sensitive",
+      "params": {
+        "group_id": {"type": "integer", "description": "群号"},
+        "enable": {"type": "boolean", "description": "是否开启"}
+      },
+      "required": ["group_id", "enable"]
+    },
+    {
+      "name": "delete_friend",
+      "summary": "删除好友（账号破坏性操作，禁止）",
+      "risk": "denied",
+      "params": null
+    },
+    {
+      "name": "set_group_dismiss",
+      "summary": "解散群（账号破坏性操作，禁止）",
+      "risk": "denied",
+      "params": null
+    },
+    {
+      "name": "set_restart",
+      "summary": "重启协议端（破坏性操作，禁止）",
+      "risk": "denied",
+      "params": null
+    },
+    {
+      "name": "clean_cache",
+      "summary": "清理协议端缓存（破坏性操作，禁止）",
+      "risk": "denied",
+      "params": null
+    },
+    {
+      "name": "set_online_status",
+      "summary": "改在线状态（同类的账号状态改动，禁止）",
+      "risk": "denied",
+      "params": null
+    }
+  ]
+}

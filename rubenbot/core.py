@@ -29,6 +29,7 @@ from .adapters.base import (
     as_segment,
     render_segments,
 )
+from .adapters.platform import KIND_REQUEST, PlatformEvent
 from .config import Config
 from .decision import (
     BOT_SENDER_ID,
@@ -39,6 +40,9 @@ from .decision import (
     parse_generation_output,
 )
 from .emotion import EmotionEngine
+from .gateway.events import EventBatch, EventMerger, EventRouter, RouteDecision
+from .gateway.judge import EventJudge, EventVerdict, persona_line
+from .gateway.service import GATEWAY_GUIDE, GatewayService
 from .llm import LLMClient, LLMProtocol, ToolUnsupported, make_usage_recorder
 from .memory.consolidate import Consolidator
 from .memory.extract import MemoryExtractor, audience_for_chat
@@ -143,7 +147,7 @@ WEB_SEARCH_TOOL = {
 
 
 # 对外开放的工具名（工具循环里按名字分派）
-_TOOL_NAMES = frozenset({"recall", "web_search", "set_reminder"})
+_TOOL_NAMES = frozenset({"recall", "web_search", "set_reminder", "adapter_actions", "adapter_call"})
 
 # 搜索工具的说明只随工具开放：写进系统提示的「工具说明区」，风格与 recall 一致。
 # 实际能力清单在 API 的工具定义里，这里只提醒使用时机与分寸。
@@ -478,6 +482,15 @@ class RubenBot:
         self.voice: VoiceService | None = build_voice(config.voice)
         # 情绪与好感度：确定性规则，状态落库，只做背景注入与阈值微调
         self.emotion = EmotionEngine(store, config.emotion)
+        # 通用适配器网关（感知面的事件通道 + 行动面的接口网关）；默认关
+        self.gateway = GatewayService(store, config)
+        self.event_merger = EventMerger()
+        self.event_router = EventRouter(
+            config.gateway,
+            activity_fn=self._group_has_activity,
+            profile_fn=self._person_has_profile,
+        )
+        self.event_judge = EventJudge(llm, store, persona.text)
         self.adapters: dict[str, BaseAdapter] = {}
         self.plugins = plugins
         self.context = BotContext(
@@ -528,6 +541,8 @@ class RubenBot:
 
     def register_adapter(self, adapter: BaseAdapter) -> None:
         self.adapters[adapter.name] = adapter
+        # 事件通道：能解析 notice/request 的适配器把事件交给核心入口
+        adapter.set_platform_event_callback(self.handle_platform_event)
 
     def apply_config(self, config: Config, *, rebuild_llm: bool = True) -> None:
         """热应用新配置：后续消息立即使用新的 LLM、意愿、记忆与聊天参数。
@@ -572,6 +587,11 @@ class RubenBot:
                     pass
         # 情绪规则：参数换新，已落库的好感度/心情不受影响
         self.emotion.config = config.emotion
+        # 网关与事件路由：配置对象换新；冷却/预算状态落库，不受影响
+        self.gateway.config = config
+        self.gateway.gatekeeper.config = config
+        self.event_router.config = config.gateway
+        self.event_judge.persona_text = self.persona.text
         # 读取侧与审查口：配置/模型一起热换，索引缓存保留（配置里 TTL 会立即生效）
         self.memory_reader.config = config.memory
         self.memory_reader.llm = self.llm
@@ -608,6 +628,7 @@ class RubenBot:
         """人格文件重读后替换（路径不变时 WebUI 保存设置会顺带调用）。"""
         self.persona = persona
         self.context.persona = persona
+        self.event_judge.persona_text = persona.text
 
     async def run(self) -> None:
         """启动全部适配器与后台任务，直到 stop。"""
@@ -633,6 +654,11 @@ class RubenBot:
                 await self.flush_merger(all_rounds=True)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("退出前处理待合并消息失败：%s", exc)
+            # 事件通道的合并窗口也放出来：已到期的照常判断，未到期的只清掉
+            try:
+                await self.flush_event_batches()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("退出前处理待合并事件失败：%s", exc)
             for task in (self._bg_task, self._merge_task, self._scheduler_task, self._proactive_task):
                 if task is not None:
                     task.cancel()
@@ -706,7 +732,10 @@ class RubenBot:
         """合并窗口到期检查：每轮 sleep 到最近的截止时间，短窗口才有意义。"""
         while not self._stop.is_set():
             wait = self.merger.next_deadline()
-            timeout = 0.25 if wait is None else max(0.01, min(0.25, wait - time.time()))
+            event_wait = self.event_merger.next_deadline()
+            candidates = [value for value in (wait, event_wait) if value is not None]
+            nearest = min(candidates) if candidates else None
+            timeout = 0.25 if nearest is None else max(0.01, min(0.25, nearest - time.time()))
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=timeout)
             except asyncio.TimeoutError:
@@ -717,6 +746,10 @@ class RubenBot:
                 await self.flush_merger()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("放出合并消息异常：%s", exc)
+            try:
+                await self.flush_event_batches()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("放出合并事件异常：%s", exc)
 
     async def flush_merger(self, now: float | None = None, *, all_rounds: bool = False) -> None:
         """处理已到期的合并轮次；``all_rounds`` 时连未到期的一起处理（停机用）。"""
@@ -724,6 +757,228 @@ class RubenBot:
         rounds = self.merger.flush_all() if all_rounds else self.merger.pop_ready(now)
         for round_ in rounds:
             await self.process_round(round_)
+
+    # ------------------------------------------------------------------
+    # 事件通道（感知面第二、三层）
+    # ------------------------------------------------------------------
+
+    async def handle_platform_event(self, event: PlatformEvent) -> None:
+        """非消息事件入口：过滤自身 → 落库 → 路由 → 合并 → 快判。异常只记录。"""
+        try:
+            await self._handle_platform_event(event)
+        except Exception as exc:  # noqa: BLE001 - 事件处理失败不能带死主循环
+            logger.exception("处理平台事件异常：%s", exc)
+
+    async def _handle_platform_event(self, event: PlatformEvent, *, now: float | None = None) -> EventBatch | None:
+        """同步路径化的处理（测试直接调用）；``now`` 可注入。"""
+        now = time.time() if now is None else now
+        adapter = self.adapters.get(event.platform)
+        self_id = getattr(adapter, "self_id", None) if adapter is not None else None
+        # 自身引发的事件在入口过滤：自己戳自己、自己的操作回执等不自言自语
+        if event.self_generated(self_id):
+            logger.debug("忽略自身引发的平台事件：%s", event.description)
+            return None
+        route = self.event_router.route(event, now=now)
+        # 全部事件先落库（摘要进 platform_events，时间线进 events）
+        event_id = self._record_platform_event(event, route, now=now)
+        self._record_event_timeline(event, route, now=now)
+        # 申请类事件：pending 状态已由落库写入，这里补一条「红点」日志
+        if event.kind == KIND_REQUEST:
+            pending = self.store.count_pending_platform_events(kind=KIND_REQUEST)
+            logger.info("收到申请（未处理 %s 条）：%s", pending, event.description)
+        if not self.config.gateway.judge_events:
+            return None
+        if route.route == "record":
+            return None
+        batches = self.event_merger.add(event, route, now)
+        if batches:
+            # 有到期的批次：判断它们（含本次加入后到期的）
+            for ready in batches:
+                await self.judge_event_batch(ready, now=now)
+            return None
+        if route.quiet:
+            # 安静时段：只挂起记录，不当场动作；批次到期后由 flush 静默丢弃
+            logger.info("安静时段事件已记录（挂起）：%s", event.description)
+            return None
+        return None
+
+    async def flush_event_batches(self, now: float | None = None) -> None:
+        """放出到期的合并批次并快判；合并循环与停机时调用。"""
+        now = time.time() if now is None else now
+        for batch in self.event_merger.pop_ready(now):
+            if batch.quiet:
+                continue
+            try:
+                await self.judge_event_batch(batch, now=now)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("快判事件批次异常：%s", exc)
+
+    async def judge_event_batch(self, batch: EventBatch, *, now: float | None = None) -> EventVerdict | None:
+        """第三层：快判并执行结论；总是返回结论（失败按 ignore）。"""
+        now = time.time() if now is None else now
+        if not self.config.gateway.judge_events or batch.quiet:
+            return None
+        verdict = await self.event_judge.judge(batch)
+        first = batch.first
+        logger.info("事件快判 %s → %s（%s）", first.description[:40], verdict.verdict, verdict.reason[:60])
+        try:
+            await self.apply_event_verdict(batch, verdict, now=now)
+        except Exception as exc:  # noqa: BLE001 - 执行失败只记日志，不影响后续事件
+            logger.warning("执行事件结论失败：%s", exc)
+        return verdict
+
+    async def apply_event_verdict(self, batch: EventBatch, verdict: EventVerdict, *, now: float | None = None) -> None:
+        """执行快判结论：react / message / gateway / notify_owner / ignore。"""
+        now = time.time() if now is None else now
+        first = batch.first
+        payload = verdict.payload or {}
+        if verdict.verdict == "ignore":
+            return
+        if verdict.verdict == "react":
+            message_id = payload.get("message_id")
+            emoji_id = payload.get("emoji_id") or payload.get("emoji")
+            if message_id in (None, "") or emoji_id in (None, ""):
+                logger.info("react 结论缺少 message_id/emoji_id，已跳过")
+                return
+            text = await self.gateway.call(
+                self.adapters.get(first.platform),
+                "set_msg_emoji_like",
+                {"message_id": message_id, "emoji_id": str(emoji_id)},
+                chat_id=first.conversation_id,
+                chat_type=first.conversation_type,
+                source="event",
+                now=now,
+            )
+            logger.info("事件贴表情：%s", text[:80])
+            return
+        if verdict.verdict == "message":
+            text = str(payload.get("text") or "").strip()
+            if not text:
+                return
+            await self.send_event_message(first, text[:60], now=now)
+            return
+        if verdict.verdict == "gateway":
+            action = str(payload.get("action") or "").strip()
+            params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+            if not action:
+                return
+            text = await self.gateway.call(
+                self.adapters.get(first.platform),
+                action,
+                params,
+                chat_id=first.conversation_id,
+                chat_type=first.conversation_type,
+                source="event",
+                now=now,
+            )
+            logger.info("事件网关调用 %s：%s", action, text[:80])
+            return
+        if verdict.verdict == "notify_owner":
+            text = str(payload.get("text") or batch.description).strip()
+            await self.notify_owner(first, text, now=now)
+            return
+
+    async def send_event_message(self, event: PlatformEvent, text: str, *, now: float | None = None) -> None:
+        """事件结论里的「说一句话」：走现有发送通道，当作 bot 自己发的消息。"""
+        if not text:
+            return
+        synthetic = MessageEvent(
+            platform=event.platform,
+            chat_type=event.conversation_type,
+            chat_id=event.conversation_id,
+            sender_id=BOT_SENDER_ID,
+            sender_name=self.config.chat.bot_name,
+            text=text,
+        )
+        await self.send_reply(synthetic, text, now=now)
+
+    async def notify_owner(self, event: PlatformEvent, text: str, *, now: float | None = None) -> bool:
+        """通知主人：私聊第一个活跃会话。
+
+        核心层没有单独的主人账号配置（见 gateway.service.is_owner_chat 的注释），
+        一期退化为「发给最近一个私聊会话」；找不到可用的私聊会话时只落
+        pending + 日志（申请类事件的 pending 已在落库时写入），不假装通知成功。
+        """
+        now = time.time() if now is None else now
+        target = self._owner_private_chat(event.platform)
+        if target is None:
+            logger.info("没有可用的主人私聊会话，通知只落库：%s", text[:60])
+            return False
+        synthetic = MessageEvent(
+            platform=event.platform,
+            chat_type="private",
+            chat_id=target,
+            sender_id=BOT_SENDER_ID,
+            sender_name=self.config.chat.bot_name,
+            text=text,
+        )
+        await self.send_reply(synthetic, text[:200], now=now)
+        return True
+
+    def _owner_private_chat(self, platform: str) -> str | None:
+        """最近活跃的私聊会话（主人通知的退化目标）；没有返回 None。"""
+        try:
+            chats = self.store.list_chats(limit=100)
+        except Exception:  # noqa: BLE001 - 读不到会话只是通知不了
+            return None
+        for chat in chats:
+            if chat.get("chat_type") != "private":
+                continue
+            if platform and chat.get("platform") != platform:
+                continue
+            return str(chat.get("chat_id"))
+        return None
+
+    # ---- 探测函数（条件判用） ----
+
+    def _group_has_activity(self, platform: str, chat_id: str) -> bool:
+        """该群有没有 bot 活动记录：bot 在当前群里说过话（流水里有 bot 消息）。"""
+        if not chat_id:
+            return False
+        try:
+            history = self.store.recent_messages(chat_id, limit=50, platform=platform)
+        except Exception:  # noqa: BLE001
+            return False
+        return any(message.sender_id == BOT_SENDER_ID for message in history)
+
+    def _person_has_profile(self, platform: str, actor_id: str) -> bool:
+        """这个人在画像里存不存在。"""
+        if not actor_id:
+            return False
+        try:
+            profile = self.store.get_profile(make_person_id(platform, actor_id))
+        except Exception:  # noqa: BLE001
+            return False
+        if profile is None:
+            return False
+        return bool(profile.stable_lines or profile.status_lines)
+
+    def _record_platform_event(self, event: PlatformEvent, route: RouteDecision, *, now: float) -> int:
+        """落 platform_events 摘要；失败只记日志。"""
+        try:
+            return self.store.add_platform_event(event, route=route.route, now=now)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("落库平台事件失败：%s", exc)
+            return 0
+
+    def _record_event_timeline(self, event: PlatformEvent, route: RouteDecision, *, now: float) -> None:
+        """事件进记忆时间线：有 actor 就记在 actor 名下，否则记在 self 名下。"""
+        try:
+            person_id = (
+                make_person_id(event.platform, event.actor_id) if event.actor_id else "self"
+            )
+            self.store.add_event(
+                person_id,
+                event.description,
+                ts=now,
+                source_chat=f"{event.platform}:{event.conversation_id}",
+                audience=audience_for_chat(event.conversation_type, event.conversation_id),
+                salience=0.4 if route.judge else 0.2,
+                now=now,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("事件写入时间线失败：%s", exc)
+
 
     # ------------------------------------------------------------------
     # 定时任务与冷场开口
@@ -1453,6 +1708,14 @@ class RubenBot:
         # 工具使用指引：搜索配了 key 才写；没配时模型看不见这个工具，也不用提
         if self.searcher is not None:
             sections.append(_WEB_SEARCH_GUIDE)
+        # 网关只加一行指针：需要时先用 adapter_actions 查目录（不塞目录全文）
+        gateway_guide = self.gateway.guide(
+            self.adapters.get(event.platform),
+            chat_id=event.chat_id,
+            chat_type=event.chat_type,
+        )
+        if gateway_guide:
+            sections.append(gateway_guide)
         requirements = self._requirements_section(self._reply_target_section(event))
         if requirements:
             sections.append(requirements)
@@ -1556,11 +1819,23 @@ class RubenBot:
         chat_key = f"{event.platform}:{event.chat_id}" if event is not None else ""
         return await self.searcher.search(query, count, chat_key=chat_key)
 
-    def tool_definitions(self) -> list[dict[str, Any]]:
-        """当前开放的 LLM 工具：recall / set_reminder 看配置（见 chat_tools），搜索配了 key 才给。"""
+    def tool_definitions(self, event: MessageEvent | None = None) -> list[dict[str, Any]]:
+        """当前开放的 LLM 工具：recall / set_reminder 看配置（见 chat_tools），
+        搜索配了 key 才给；网关工具按开关、适配器目录与会话白名单注册。
+
+        ``event`` 为空时不给网关工具（拿不到会话就无法判断白名单）。
+        """
         tools = chat_tools(self.config)
         if self.searcher is not None:
             tools.append(WEB_SEARCH_TOOL)
+        if event is not None:
+            tools.extend(
+                self.gateway.tools(
+                    self.adapters.get(event.platform),
+                    chat_id=event.chat_id,
+                    chat_type=event.chat_type,
+                )
+            )
         return tools
 
     # ------------------------------------------------------------------
@@ -1651,7 +1926,7 @@ class RubenBot:
         ``task`` 只用于用量打标：单段直出是 ``chat``，两段式的第二段是
         ``gen_stage2``。
         """
-        if event is not None and self.tool_definitions():
+        if event is not None and self.tool_definitions(event):
             try:
                 reply = await self._generate_with_tools(messages, event, task=task)
             except ToolUnsupported as exc:
@@ -1685,7 +1960,7 @@ class RubenBot:
         max_rounds = max(0, int(self.config.memory.recall_tool_max_rounds))
         if max_rounds == 0:
             raise ToolUnsupported("工具循环已关闭")
-        tools = self.tool_definitions()
+        tools = self.tool_definitions(event)
         if not tools:
             raise ToolUnsupported("没有可用的工具")
         working: list[dict[str, Any]] = list(messages)
@@ -1740,7 +2015,7 @@ class RubenBot:
         return await self.llm.chat_with_tools(messages, tools, **kwargs)
 
     async def _tool_result_message(self, call: dict[str, Any], event: MessageEvent) -> dict[str, Any]:
-        """执行一次工具调用（recall / web_search / set_reminder），把结果包装成 tool 消息。"""
+        """执行一次工具调用（recall / web_search / set_reminder / 网关工具），把结果包装成 tool 消息。"""
         call_id = str(call.get("id") or "")
         function = call.get("function") or {}
         name = str(function.get("name") or "")
@@ -1751,6 +2026,9 @@ class RubenBot:
                 "content": f"没有名为 {name or '（空）'} 的工具。",
             }
         args = _parse_tool_arguments(function.get("arguments"))
+        if name in ("adapter_actions", "adapter_call"):
+            content = await self._gateway_tool(name, args, event)
+            return {"role": "tool", "tool_call_id": call_id, "content": content}
         if name == "set_reminder":
             try:
                 content = await self.set_reminder(args, event=event)
@@ -1787,6 +2065,30 @@ class RubenBot:
             logger.warning("recall 工具执行失败：%s", exc)
             content = f"回忆失败：{exc}"
         return {"role": "tool", "tool_call_id": call_id, "content": content}
+
+    async def _gateway_tool(self, name: str, args: dict[str, Any], event: MessageEvent) -> str:
+        """网关工具分派：目录查询（渐进披露）与执行；失败只回文本。"""
+        adapter = self.adapters.get(event.platform)
+        if name == "adapter_actions":
+            if adapter is None:
+                return "当前没有可用的适配器。"
+            action = str(args.get("action") or "").strip()
+            if action:
+                return self.gateway.describe_action(adapter, action)
+            keyword = str(args.get("keyword") or "").strip()
+            return self.gateway.list_actions(adapter, keyword=keyword)
+        action = str(args.get("action") or "").strip()
+        params = args.get("params")
+        if not isinstance(params, dict):
+            params = {}
+        return await self.gateway.call(
+            adapter,
+            action,
+            params,
+            chat_id=event.chat_id,
+            chat_type=event.chat_type,
+            source="model",
+        )
 
     async def set_reminder(
         self,

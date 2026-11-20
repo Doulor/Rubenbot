@@ -239,6 +239,60 @@ CREATE TABLE IF NOT EXISTS bot_mood (
     since      REAL NOT NULL DEFAULT 0,
     updated_at REAL NOT NULL DEFAULT 0
 );
+
+-- 平台事件（感知面）：notice / request 归一后的摘要；消息事件不进这里。
+-- pending=1 的申请类事件在未处理前可计数（WebUI 的「红点」）。
+CREATE TABLE IF NOT EXISTS platform_events (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    platform       TEXT NOT NULL,
+    kind           TEXT NOT NULL,                  -- notice / request
+    type           TEXT NOT NULL,
+    sub_type       TEXT NOT NULL DEFAULT '',
+    actor_id       TEXT NOT NULL DEFAULT '',
+    actor_name     TEXT NOT NULL DEFAULT '',
+    target_id      TEXT NOT NULL DEFAULT '',
+    conversation_type TEXT NOT NULL DEFAULT 'private',
+    conversation_id   TEXT NOT NULL DEFAULT '',
+    description    TEXT NOT NULL DEFAULT '',
+    raw            TEXT NOT NULL DEFAULT '{}',     -- 原始载荷摘要（JSON）
+    platform_event_id TEXT NOT NULL DEFAULT '',
+    pending        INTEGER NOT NULL DEFAULT 0,
+    route          TEXT NOT NULL DEFAULT 'record',  -- judge / conditional / record
+    verdict        TEXT NOT NULL DEFAULT '',        -- 快判结论（ignore/react/...）
+    created_at     REAL NOT NULL,
+    ts             REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_platform_events_created ON platform_events(created_at);
+CREATE INDEX IF NOT EXISTS idx_platform_events_pending ON platform_events(pending, kind);
+
+-- 网关审计：每次调用（含被拒绝）一行；sensitive 动作标红展示
+CREATE TABLE IF NOT EXISTS gateway_audit (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts           REAL NOT NULL,
+    source       TEXT NOT NULL DEFAULT 'model',     -- model / event / system
+    platform     TEXT NOT NULL DEFAULT '',
+    chat_id      TEXT NOT NULL DEFAULT '',
+    action       TEXT NOT NULL,
+    params       TEXT NOT NULL DEFAULT '{}',        -- 参数摘要（JSON，已截断）
+    ok           INTEGER NOT NULL DEFAULT 0,
+    result       TEXT NOT NULL DEFAULT '',
+    reject_reason TEXT NOT NULL DEFAULT '',
+    sensitive    INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_gateway_audit_ts ON gateway_audit(ts);
+CREATE INDEX IF NOT EXISTS idx_gateway_audit_action ON gateway_audit(action, ts);
+
+-- 网关冷却状态：四维冷却里需要跨重启保留的部分
+-- scope: conversation（动作×会话）/ object（动作×对象）/ budget（会话日预算）
+--        / global（全局日上限）/ backoff（动作连续失败退避）
+-- value 是 JSON：数字或时间戳数组，按 scope 的语义解析（见 gateway/gatekeeper.py）
+CREATE TABLE IF NOT EXISTS gateway_state (
+    scope     TEXT NOT NULL,
+    key       TEXT NOT NULL,
+    value     TEXT NOT NULL DEFAULT '0',
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (scope, key)
+);
 """
 
 
@@ -2375,6 +2429,225 @@ class MemoryStore:
             cur = self._conn.execute("DELETE FROM llm_usage WHERE ts < ?", (cutoff,))
             self._conn.commit()
         return cur.rowcount
+
+    # ------------------------------------------------------------------
+    # 平台事件（感知面）
+    # ------------------------------------------------------------------
+
+    def add_platform_event(
+        self,
+        event: Any,
+        *,
+        route: str = "record",
+        verdict: str = "",
+        now: float | None = None,
+    ) -> int:
+        """落一条平台事件摘要；``event`` 是 :class:`PlatformEvent`（鸭子类型即可）。"""
+        now = time.time() if now is None else now
+        ts = float(getattr(event, "ts", 0.0) or 0.0) or now
+        raw = getattr(event, "raw", {}) or {}
+        try:
+            raw_text = json.dumps(raw, ensure_ascii=False)
+        except (TypeError, ValueError):
+            raw_text = "{}"
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                INSERT INTO platform_events(platform, kind, type, sub_type, actor_id, actor_name,
+                                            target_id, conversation_type, conversation_id, description,
+                                            raw, platform_event_id, pending, route, verdict, created_at, ts)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(getattr(event, "platform", "")),
+                    str(getattr(event, "kind", "")),
+                    str(getattr(event, "type", "")),
+                    str(getattr(event, "sub_type", "")),
+                    str(getattr(event, "actor_id", "")),
+                    str(getattr(event, "actor_name", "")),
+                    str(getattr(event, "target_id", "")),
+                    str(getattr(event, "conversation_type", "private")),
+                    str(getattr(event, "conversation_id", "")),
+                    str(getattr(event, "description", "")),
+                    raw_text,
+                    str(getattr(event, "platform_event_id", "")),
+                    1 if getattr(event, "pending", False) else 0,
+                    str(route or "record"),
+                    str(verdict or ""),
+                    now,
+                    ts,
+                ),
+            )
+            self._conn.commit()
+        return int(cur.lastrowid)
+
+    def set_platform_event_verdict(self, event_id: int, verdict: str) -> None:
+        """回填快判结论（审计与排查用）。"""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE platform_events SET verdict = ? WHERE id = ?", (str(verdict or ""), int(event_id))
+            )
+            self._conn.commit()
+
+    def count_pending_platform_events(self, *, kind: str | None = None) -> int:
+        """未处理申请数（「红点」）。"""
+        sql = "SELECT COUNT(*) AS c FROM platform_events WHERE pending = 1"
+        params: list = []
+        if kind is not None:
+            sql += " AND kind = ?"
+            params.append(str(kind))
+        with self._lock:
+            row = self._conn.execute(sql, params).fetchone()
+        return int(row["c"] or 0)
+
+    def list_platform_events(
+        self,
+        *,
+        kind: str | None = None,
+        platform: str | None = None,
+        conversation_id: str | None = None,
+        pending: bool | None = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        """最近的平台事件，按入库时间倒序。"""
+        sql = "SELECT * FROM platform_events WHERE 1=1"
+        params: list = []
+        if kind is not None:
+            sql += " AND kind = ?"
+            params.append(str(kind))
+        if platform is not None:
+            sql += " AND platform = ?"
+            params.append(str(platform))
+        if conversation_id is not None:
+            sql += " AND conversation_id = ?"
+            params.append(str(conversation_id))
+        if pending is not None:
+            sql += " AND pending = ?"
+            params.append(1 if pending else 0)
+        sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    # ------------------------------------------------------------------
+    # 网关审计与状态（行动面）
+    # ------------------------------------------------------------------
+
+    def add_gateway_audit(
+        self,
+        *,
+        action: str,
+        source: str = "model",
+        platform: str = "",
+        chat_id: str = "",
+        params: dict | None = None,
+        ok: bool = False,
+        result: str = "",
+        reject_reason: str = "",
+        sensitive: bool = False,
+        now: float | None = None,
+    ) -> int:
+        """写一条网关审计；参数与结果都截断，避免库被大对象撑爆。"""
+        now = time.time() if now is None else now
+        try:
+            params_text = json.dumps(params or {}, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            params_text = "{}"
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                INSERT INTO gateway_audit(ts, source, platform, chat_id, action, params, ok,
+                                          result, reject_reason, sensitive)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    now,
+                    str(source or "model"),
+                    str(platform or ""),
+                    str(chat_id or ""),
+                    str(action or ""),
+                    params_text[:1000],
+                    1 if ok else 0,
+                    str(result or "")[:1000],
+                    str(reject_reason or "")[:500],
+                    1 if sensitive else 0,
+                ),
+            )
+            self._conn.commit()
+        return int(cur.lastrowid)
+
+    def list_gateway_audit(
+        self,
+        *,
+        action: str | None = None,
+        chat_id: str | None = None,
+        sensitive: bool | None = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        """最近的网关调用记录（含拒绝），按时间倒序。"""
+        sql = "SELECT * FROM gateway_audit WHERE 1=1"
+        params: list = []
+        if action is not None:
+            sql += " AND action = ?"
+            params.append(str(action))
+        if chat_id is not None:
+            sql += " AND chat_id = ?"
+            params.append(str(chat_id))
+        if sensitive is not None:
+            sql += " AND sensitive = ?"
+            params.append(1 if sensitive else 0)
+        sql += " ORDER BY ts DESC, id DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def count_gateway_audit(self, *, since: float, ok_only: bool = False) -> int:
+        sql = "SELECT COUNT(*) AS c FROM gateway_audit WHERE ts >= ?"
+        params: list = [float(since)]
+        if ok_only:
+            sql += " AND ok = 1"
+        with self._lock:
+            row = self._conn.execute(sql, params).fetchone()
+        return int(row["c"] or 0)
+
+    def get_gateway_state(self, scope: str, key: str) -> tuple[str, float] | None:
+        """读网关状态：``(value_json, updated_at)``；没有返回 None。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value, updated_at FROM gateway_state WHERE scope = ? AND key = ?",
+                (str(scope), str(key)),
+            ).fetchone()
+        if row is None:
+            return None
+        return str(row["value"]), float(row["updated_at"])
+
+    def set_gateway_state(
+        self, scope: str, key: str, value: Any, *, now: float | None = None
+    ) -> None:
+        """写网关状态；``value`` 可以是数字/列表/字典，序列化成 JSON 存。"""
+        now = time.time() if now is None else now
+        try:
+            text = json.dumps(value, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            text = "0"
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO gateway_state(scope, key, value, updated_at) VALUES(?, ?, ?, ?)
+                ON CONFLICT(scope, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                """,
+                (str(scope), str(key), text, now),
+            )
+            self._conn.commit()
+
+    def delete_gateway_state(self, scope: str, key: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM gateway_state WHERE scope = ? AND key = ?", (str(scope), str(key))
+            )
+            self._conn.commit()
 
 
 def make_person_id(platform: str, platform_uid: str) -> str:

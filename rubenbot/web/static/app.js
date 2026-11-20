@@ -2403,12 +2403,57 @@ async function renderLogs(view) {
         h("h2", {}, "运行日志"),
         h("span", { class: "hint" }, "进程内最近 1000 条，重启后清空")),
       toolbar,
-      content)
+      content),
+    auditCard()
   );
   await load();
   onPoll(3000, () => {
     if (following) load().catch(() => {});
   });
+}
+
+/**
+ * 网关调用审计（最小挂点）：只读列表，默认折叠在日志页底部。
+ * 前端整体重组在另一分支进行，这里只保留接口可用时的一张小卡片。
+ */
+function auditCard() {
+  const body = h("div", { class: "rows" }, h("div", { class: "log-empty" }, "加载中…"));
+  const load = async () => {
+    try {
+      const data = await api.get("/api/gateway/audit?limit=30");
+      if (!data.items.length) {
+        body.replaceChildren(h("div", { class: "log-empty" }, "还没有网关调用记录"));
+        return;
+      }
+      body.replaceChildren(
+        ...data.items.map((item) =>
+          h(
+            "div",
+            { class: "log-line" },
+            h("span", { class: "log-time" }, fmtClock(item.ts)),
+            h("span", { class: "log-level", dataset: { level: item.ok ? "INFO" : "WARNING" } },
+              item.ok ? "OK" : "拒绝"),
+            h("span", { class: "log-msg" },
+              h("b", {}, item.action),
+              item.sensitive ? h("span", { class: "tag warn" }, "敏感") : null,
+              `  ${item.reject_reason || item.result || ""}`)
+          )
+        )
+      );
+    } catch (err) {
+      if (err instanceof Unauthorized) return;
+      body.replaceChildren(h("div", { class: "log-empty" }, "审计接口暂不可用"));
+    }
+  };
+  load();
+  return h(
+    "details",
+    { class: "card advanced-yaml" },
+    h("summary", { class: "card-head" },
+      h("h2", {}, "网关调用审计"),
+      h("span", { class: "hint" }, "成功与拒绝都记录；敏感动作标红")),
+    h("div", { class: "card-body" }, body)
+  );
 }
 
 /* ------------------------------------------------------------------ */
@@ -3418,6 +3463,21 @@ async function renderSettings(view) {
     card("适配器", {
       hint: "连接参数改动需重启",
       body: adaptersEditor(draft, secrets),
+    }),
+    card("网关与事件通道", {
+      hint: "默认关闭：开启后模型可查/调平台接口，notice 与 request 事件也会进事件流",
+      body: fieldGrid(
+        [
+          { path: "gateway.enabled", label: "启用适配器网关", kind: "switch", hint: "关时模型看不见 adapter_actions / adapter_call" },
+          { path: "gateway.judge_events", label: "事件快判", kind: "switch", hint: "关时事件只落库；开时才让模型判断要不要动作" },
+          { path: "gateway.allow_sensitive", label: "允许敏感动作", kind: "switch", hint: "踢人/禁言/撤回/处理申请等；开启后每次调用都会标红审计" },
+          { path: "gateway.enabled_conversations", label: "允许的会话", kind: "list", wide: true, placeholder: "例如 snowluma:123456789", hint: "platform:chat_id；私聊会话恒可，群聊需在这里列出" },
+          { path: "gateway.quiet_hours", label: "安静时段", hint: "HH:MM-HH:MM；这段时间里非必判事件只记录，必判事件也只挂待办" },
+          { path: "gateway.daily_budget_per_conversation", label: "每会话每日额度", kind: "number", step: "1", min: 0, hint: "每个会话每天最多主动动作次数" },
+          { path: "gateway.global_daily_cap", label: "全局每日上限", kind: "number", step: "1", min: 0, hint: "所有会话合计的熔断线" },
+        ],
+        draft
+      ),
     }),
     card("WebUI 与高级", {
       hint: "监听地址与运行参数",
