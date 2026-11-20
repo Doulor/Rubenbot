@@ -89,3 +89,12 @@ def test_frontend_script_is_syntactically_valid():
         text=True,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_settings_menu_is_rendered_before_config_request():
+    """慢配置接口不能阻塞机器人/设置页的二级菜单和页头。"""
+    source = APP_JS.read_text(encoding="utf-8")
+    render_start = source.index("async function renderSettingsGroup")
+    menu_render = source.index("const menuHost = settingsMenuSkeleton", render_start)
+    config_request = source.index('const data = await api.get("/api/config")', render_start)
+    assert menu_render < config_request
