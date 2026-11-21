@@ -435,7 +435,7 @@ def test_guide_is_single_line_and_only_when_available():
 
 def make_bot(store: MemoryStore, llm, **gateway) -> tuple[RubenBot, ActionAdapter]:
     cfg = Config()
-    cfg.chat.type_speed = 0
+    cfg.reply.segment_delay_enabled = False
     cfg.decision.merge_window_seconds = 0
     gateway.setdefault("enabled_conversations", ["snowluma:g1"])
     cfg.gateway = GatewayConfig(**gateway)

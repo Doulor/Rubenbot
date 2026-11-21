@@ -614,10 +614,10 @@ def tool_call(call_id="c1", name="web_search", arguments=None):
 
 def make_bot(llm, *, search: SearchConfig | None = None) -> tuple[RubenBot, RecordingAdapter]:
     config = Config()
-    config.chat.split_delay_seconds = 0
+    config.reply.segment_delay_enabled = False
     config.decision.merge_window_seconds = 0
     config.decision.hard_merge_window_seconds = 0
-    config.chat.type_speed = 0
+    config.reply.segment_delay_enabled = False
     if search is not None:
         config.search = search
     store = MemoryStore(":memory:")

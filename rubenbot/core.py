@@ -68,6 +68,7 @@ from .persona import Persona, matches_identity_trigger
 from .plugins.loader import PluginManager
 from .search import WebSearcher, build_searcher, clamp_count
 from .proactive import ProactiveOpener, is_acceptable_opener
+from .reply_segments import split_segments
 from .reminder import REMINDER_TOOL, build_reminder_prompt, describe_fire_at, resolve_fire_at
 from .scheduler import Scheduler
 from .stickers import StickerStore
@@ -100,6 +101,15 @@ GUIDANCE_TASK_PROMPT = (
     "reason 是可选的短理由（几个字），会记进决策日志。"
     "严格限长：JSON 总长不超过 500 字。"
 )
+# 生成契约（两段式的第二段、单段旧路径共用）：放开条数，允许 1~3 段短句。
+# 段与段之间用换行分隔——发送端把换行当「另发一条」的硬边界。
+REPLY_SEGMENT_CONTRACT = (
+    "【这次的回复怎么写】一次回复写成 1~3 段短句，每段 5~20 个字量级，"
+    "段与段之间另起一行（用换行分隔，不要写在一起）。"
+    "接梗、附和、怼一句，一段就够；吐槽加补充、先反应再接话，这类天然两段。"
+    "别为了分段硬凑，也别把一句话掰成两条。不用序号、不写标题、不加解释。"
+)
+
 # recall 工具的定义（T2）。没配置搜索时只开放这一个工具，模型不用/失败就退化为单次生成。
 RECALL_TOOL = {
     "type": "function",
@@ -195,38 +205,8 @@ def chat_tools(config: Config) -> list[dict[str, Any]]:
 
 
 # ----------------------------------------------------------------------
-# 发送节奏与文本后处理（借鉴 MaiBot 研读 #2 的最小版）
+# 文本后处理（发送节奏与多段拆分见 reply_segments.py）
 # ----------------------------------------------------------------------
-
-# 打字时间估算：中文约 0.3s/字，其他字符约 0.15s/字，每条另加回车时间；
-# 单字消息乘 3；纯图片/表情条固定 1s。倍率与单条上限在调用处应用。
-_CJK_SECONDS = 0.3
-_OTHER_SECONDS = 0.15
-_ENTER_SECONDS = 0.3
-_SINGLE_CHAR_FACTOR = 3.0
-_STICKER_SECONDS = 1.0
-
-# 句子切分点；切分时必须避开括号、引号、URL、行内代码
-_SENTENCE_ENDS = frozenset("。！？!?…~～")
-# 成对符号：开 -> 关（ASCII 引号开闭同型）
-_BRACKET_PAIRS = {
-    "（": "）",
-    "(": ")",
-    "「": "」",
-    "『": "』",
-    "【": "】",
-    "《": "》",
-    "〈": "〉",
-    "[": "]",
-    "{": "}",
-    "“": "”",
-    "‘": "’",
-    '"': '"',
-}
-_URL_RE = re.compile(
-    r"https?://[^\s<>\"'（）()【】「」『』，。！？；：、]+",
-    re.IGNORECASE,
-)
 
 # 括号动作清理：只删「短、纯中文、命中动作/语气词」的括号内容。
 # 含数字/英文/符号（例如颜文字）、或拿不准的一律保留。
@@ -263,92 +243,6 @@ def _is_cjk(char: str) -> bool:
         or 0x3400 <= code <= 0x4DBF
         or 0xF900 <= code <= 0xFAFF
     )
-
-
-def estimate_typing_seconds(segments: Sequence[Any]) -> float:
-    """估算一条消息的原始打字时间（秒），不含全局倍率和单条上限。
-
-    只统计文本段的字符：中文 0.3s/字、其他非空白字符 0.15s/字，再加
-    0.3s 回车时间；整条只有一个字时乘以 3。没有文本（纯图片/表情）固定 1s。
-    """
-    normalized = [as_segment(segment) for segment in segments]
-    text = "".join(seg.render() for seg in normalized if seg.type == "text")
-    if not text.strip():
-        return _STICKER_SECONDS
-    chars = [ch for ch in text if not ch.isspace()]
-    cjk = sum(1 for ch in chars if _is_cjk(ch))
-    others = len(chars) - cjk
-    seconds = cjk * _CJK_SECONDS + others * _OTHER_SECONDS
-    if len(chars) == 1:
-        seconds *= _SINGLE_CHAR_FACTOR
-    return seconds + _ENTER_SECONDS
-
-
-def _find_closing(text: str, start: int, open_char: str, close_char: str) -> int:
-    """从 ``start`` 起找配对的结束符号下标；找不到返回 -1（按普通字符处理）。"""
-    depth = 1
-    index = start
-    while index < len(text):
-        char = text[index]
-        if open_char != close_char and char == open_char:
-            depth += 1
-        elif char == close_char:
-            depth -= 1
-            if depth == 0:
-                return index
-        index += 1
-    return -1
-
-
-def split_sentences(text: str) -> list[str]:
-    """按句末标点和换行切句，但不在括号、引号、URL、行内代码中间断开。
-
-    颜文字通常整体落在括号里（如 ``(≧▽≦)``）；``QAQ``、``OTZ`` 这类不含
-    句末标点的符号/字母串本身不会被切断。
-    """
-    parts: list[str] = []
-    buffer: list[str] = []
-    index = 0
-    length = len(text)
-
-    def flush() -> None:
-        piece = "".join(buffer).strip()
-        if piece:
-            parts.append(piece)
-        buffer.clear()
-
-    while index < length:
-        char = text[index]
-        # URL：整段跳过，避免在 ? ! 等处切断
-        if char in "hH":
-            match = _URL_RE.match(text, index)
-            if match:
-                buffer.append(match.group(0))
-                index = match.end()
-                continue
-        # 行内代码：`...`
-        if char == "`":
-            end = text.find("`", index + 1)
-            if end != -1:
-                buffer.append(text[index : end + 1])
-                index = end + 1
-                continue
-        # 括号/引号：整段保留到配对的结束符号
-        if char in _BRACKET_PAIRS:
-            end = _find_closing(text, index + 1, char, _BRACKET_PAIRS[char])
-            if end != -1:
-                buffer.append(text[index : end + 1])
-                index = end + 1
-                continue
-        buffer.append(char)
-        index += 1
-        if char in _SENTENCE_ENDS or char == "\n":
-            # 吃掉切分点后的空白（含连续换行），拼接回来时不丢内容
-            while index < length and text[index].isspace():
-                index += 1
-            flush()
-    flush()
-    return parts
 
 
 def strip_action_parens(text: str) -> str:
@@ -1417,7 +1311,11 @@ class RubenBot:
             correction = self.opener_guard.correction(key)
             if correction:
                 messages[0]["content"] += "\n\n" + correction
-        messages = [*messages, {"role": "system", "content": expression.prompt_block()}]
+        # 生成契约（代码侧）：允许 1~3 段短句，换行分段。旧路径（planner_gate
+        # 关闭）此前也被同一句「一句就够」掐死，这里一起放开。与表达决策书
+        # 合成最后一条系统消息，不额外多一条。
+        guidance = expression.prompt_block() + "\n" + REPLY_SEGMENT_CONTRACT
+        messages = [*messages, {"role": "system", "content": guidance}]
         task = "chat" if expression.source == "fragment" else "gen_stage2"
         for attempt in range(2):
             # 重写只改文字，不能再给工具，否则可能重复设提醒或执行平台动作。
@@ -2490,44 +2388,44 @@ class RubenBot:
         return f"已设好提醒：{describe_fire_at(fire_at, now)}提醒「{text}」。"
 
     def split_reply(self, reply: str) -> list[str]:
-        """按句/长度拆成 2~3 条短消息。
+        """把一条回复拆成要发送的若干段。
 
-        短回复（不超过一条上限）不拆；切句时避开括号、引号、颜文字、URL
-        与行内代码，不会从它们中间断开。贪心合并到接近 ``split_part_chars``。
+        生成契约用换行表示「另发一条」，这里一定按换行拆开；句内逗号/
+        顿号/分号/空格按总长度概率合并，让条数自然浮动而不是一刀切。
+        切点避开引号、括号（颜文字）、URL、行内代码与英文/数字词内部；
+        纯标点段丢弃，总条数以 ``reply.max_segments`` 为上限。
         """
         reply = clean_reply_patterns(strip_transcript_prefix(reply.strip()))
         if not reply:
             return []
-        max_parts = max(1, self.config.chat.split_max_parts)
-        limit = max(8, self.config.chat.split_part_chars)
-        if len(reply) <= limit or max_parts == 1:
-            return [reply]
-        sentences = split_sentences(reply) or [reply]
-        # 贪心合并到接近 limit，且不超过 max_parts
-        parts: list[str] = []
-        current = ""
-        for sentence in sentences:
-            if current and len(current) + len(sentence) > limit:
-                parts.append(current)
-                current = sentence
-            else:
-                current += sentence
-        if current:
-            parts.append(current)
-        if len(parts) > max_parts:
-            # 多余的并入最后一条，避免刷屏
-            parts = parts[: max_parts - 1] + ["".join(parts[max_parts - 1 :])]
-        return parts
+        return split_segments(
+            reply, max_segments=max(1, self.config.reply.max_segments), rng=self.rng,
+        )
 
-    def typing_delay(self, segments: list[Segment]) -> float:
-        """一条消息发出前的等待时间：按字符估算 × 全局倍率，再截到单条上限。
+    def segment_delay(self, segments: Sequence[Any]) -> float:
+        """相邻两段之间的等待时间（秒），按下一段的非空白字数估算。
 
-        倍率或上限配成 0 都表示不等待；第一条消息由调用方直接发出，不经过这里。
+        每字 ``reply.segment_delay_per_char_ms`` 毫秒，再截到
+        ``segment_delay_min_ms`` / ``segment_delay_max_ms``；开关关闭或
+        每字毫秒数为 0 时返回 0。第一段由调用方直接发出，不经过这里。
         """
-        raw = estimate_typing_seconds(segments)
-        speed = max(0.0, float(self.config.chat.type_speed))
-        cap = max(0.0, float(self.config.chat.type_delay_max_seconds))
-        return min(raw * speed, cap) if speed > 0 else 0.0
+        cfg = self.config.reply
+        if not cfg.segment_delay_enabled:
+            return 0.0
+        per_char = max(0.0, float(cfg.segment_delay_per_char_ms))
+        if per_char <= 0:
+            return 0.0
+        normalized = [as_segment(segment) for segment in segments]
+        text = "".join(seg.render() for seg in normalized if seg.type == "text")
+        chars = sum(1 for ch in text if not ch.isspace())
+        if chars == 0:
+            # 纯图片/表情条：按一次点击的固定停顿
+            raw = float(cfg.segment_delay_min_ms)
+        else:
+            raw = chars * per_char
+        low = max(0.0, float(cfg.segment_delay_min_ms))
+        high = max(low, float(cfg.segment_delay_max_ms))
+        return min(max(raw, low), high) / 1000.0
 
     async def try_sticker_reply(
         self, event: MessageEvent, expression: ExpressionDecision | None, *, proactive: bool, now: float,
@@ -2567,9 +2465,10 @@ class RubenBot:
     ) -> None:
         """拆条发送，并把 bot 自己的话写进流水（``processed=True``，不参与记忆抽取）。
 
-        ``reply`` 可以是纯文本（按句拆条），也可以是一组消息段：段列表原样
-        交给适配器，整条消息只发一次，不做二次拆分。多条之间有按字数估算
-        的打字停顿（第一条立即发）。
+        ``reply`` 可以是纯文本（换行分段 + 标点处概率合并），也可以是一组
+        消息段：段列表原样交给适配器，整条消息只发一次，不做二次拆分。
+        多条之间有按下一段字数估算的打字停顿（第一段立即发），可用
+        ``reply.segment_delay_enabled`` 关闭。
 
         ``addressed`` 表示这次发送由硬触发（@/回复/私聊）产生，会喂对话
         动量；拆条连发只记一次，不逐条刷新。
@@ -2611,7 +2510,7 @@ class RubenBot:
         sent_any = False
         for index, segments in enumerate(parts):
             if index > 0:
-                delay = self.typing_delay(segments)
+                delay = self.segment_delay(segments)
                 if delay > 0:
                     await asyncio.sleep(delay)
             text = render_segments(segments)

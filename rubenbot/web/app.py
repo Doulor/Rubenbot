@@ -1643,6 +1643,7 @@ def _save_message(applied: list[str], requires_restart: list[str]) -> str:
         "llm": "模型与接口",
         "memory": "记忆",
         "chat": "聊天与回复",
+        "reply": "回复形态（拆条）",
         "decision": "回复意愿",
         "computer": "操作电脑",
         "generation": "生成",

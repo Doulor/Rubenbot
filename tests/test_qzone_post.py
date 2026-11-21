@@ -55,7 +55,7 @@ def make_bot(tmp_path, plugin_yaml="", *, llm_replies=None, capability=None):
     config = Config()
     config.plugins.dir = str(root)
     config.plugins.enabled = ["qzone_post"]
-    config.chat.type_speed = 0
+    config.reply.segment_delay_enabled = False
     config.decision.merge_window_seconds = 0
     config.decision.hard_merge_window_seconds = 0
     manager = PluginManager(config, store)
@@ -124,7 +124,7 @@ def test_command_disabled_capability_reason_from_real_gate(tmp_path):
     config = Config()
     config.plugins.dir = str(root)
     config.plugins.enabled = ["qzone_post"]
-    config.chat.type_speed = 0
+    config.reply.segment_delay_enabled = False
     config.decision.merge_window_seconds = 0
     config.decision.hard_merge_window_seconds = 0
     manager = PluginManager(config, store)

@@ -40,7 +40,7 @@ class FixedRandom(random.Random):
 
 def make_config(**overrides) -> Config:
     config = Config()
-    config.chat.type_speed = 0
+    config.reply.segment_delay_enabled = False
     config.decision.merge_window_seconds = 0
     config.decision.hard_merge_window_seconds = 0
     config.proactive.enabled = True

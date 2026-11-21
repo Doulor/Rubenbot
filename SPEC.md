@@ -155,7 +155,7 @@ SnowLuma 适配器（OneBot v11）：
 - llm：base_url、api_key、chat_model、extract_model、consolidate_model（后两者缺省跟随 chat）
 - persona：人格文件路径（默认 `data/SOUL.md`，给一个默认 Ruben 人格示例）
 - memory：extract_every_n、inject_limit、consolidate_new_threshold、consolidate_interval_hours
-- chat：history_size、split_max_parts、拆条与历史上下文参数
+- chat：history_size、历史上下文参数；reply：多段回复的段数上限与段间打字延迟
 - decision：意愿系统参数（合并窗口、基础值/阈值、动量半衰期、发言占比抑制、冷却、否决标记、每群覆盖）
 - emotion：情绪与好感度的开关、各档增减幅度、每日上限、衰减比例与阈值微调表（见「情绪与好感度」）
 - plugins：插件目录、`enabled` 显式启用列表（留空即全部关闭）、命令前缀

@@ -309,11 +309,10 @@ WebUI 的「群组与意愿」可按名字或 ID 查会话；「记忆 → 画�
 | `chat` | `history_size` | 上下文带入的最近消息条数（只计真实消息，系统/工具条目不占窗口） |
 | | `history_ttl_hours` | 超过这个时间的旧消息不再拼进上下文 |
 | | `dedupe_ttl_seconds` | 入站去重窗口：同一平台消息 id 在此窗口内重复到达即丢弃（默认 300 秒，0 关闭） |
-| | `split_max_parts` `split_part_chars` `split_delay_seconds` | 长回复拆条策略 |
-| `chat` | `history_size` | 上下文带入的最近消息条数 |
-| | `split_max_parts` `split_part_chars` | 长回复拆条策略（按句拆，避开括号/引号/颜文字/URL） |
-| | `type_speed` `type_delay_max_seconds` | 按字数估算打字停顿的全局倍率 / 单条上限 |
 | | `strip_action_parens` | 发送前移除「（笑）」这类括号动作描写（默认关） |
+| `reply` | `max_segments` | 一条回复最多发成几段（默认 3；生成端用换行分 1~3 段短句） |
+| | `segment_delay_per_char_ms` `segment_delay_min_ms` `segment_delay_max_ms` | 段间打字延迟：按下一段字数 × 每字毫秒，再截到上下限（默认 60 / 150 / 1500 毫秒） |
+| | `segment_delay_enabled` | 段间延迟开关；关掉后连发（第一段始终立即发） |
 | `decision` | `merge_window_seconds` `hard_merge_window_seconds` | 消息合并窗口（普通 / 硬触发） |
 | | `batch_max_seconds` | 一批消息从首条起最多等多久（防无限续命） |
 | | `urgent_seconds` | 批里出现 @/回复 bot 时，截止时间提前到「首条 + 该值」 |

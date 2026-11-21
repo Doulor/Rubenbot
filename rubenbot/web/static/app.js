@@ -3965,16 +3965,17 @@ function settingsCardSpecs(draft, secrets, pluginsAvailable, groupIdentities = {
     },
     {
       // 拆条属于「回复形态」：这一段在 YAML 里仍属于 chat 段，但按语义归到表达页
-      path: "chat.split_max_parts",
-      node: card("长回复拆条", {
-        hint: "按句拆成多条发送，避免刷屏；属于回复形态，和生成策略放在一起",
+      path: "reply.max_segments",
+      node: card("回复分段", {
+        hint: "一次回复发成 1~3 段短句，段间留打字停顿；属于回复形态，和生成策略放在一起",
         body: fieldGrid(
           [
-            { path: "chat.split_max_parts", label: "最多拆成几条", kind: "number", step: "1", min: 1, hint: "长回复按句拆条，避免刷屏" },
-            { path: "chat.split_part_chars", label: "每段字数上限", kind: "number", step: "1", min: 8, hint: "超过就拆成下一条" },
+            { path: "reply.max_segments", label: "一条回复最多几段", kind: "number", step: "1", min: 1, max: 10, hint: "生成端按换行分成 1~3 段短句，这里兜住总数，避免刷屏" },
+            { path: "reply.segment_delay_enabled", label: "段间打字延迟", kind: "switch", hint: "第一段立即发，后续段按字数等一会再发；关掉后连发" },
+            { path: "reply.segment_delay_per_char_ms", label: "每字延迟（毫秒）", kind: "number", step: "10", min: 0, hint: "下一段有多少个非空白字符就等多少毫秒" },
+            { path: "reply.segment_delay_min_ms", label: "单次停顿下限（毫秒）", kind: "number", step: "50", min: 0, hint: "太短没有停顿感" },
+            { path: "reply.segment_delay_max_ms", label: "单次停顿上限（毫秒）", kind: "number", step: "100", min: 0, hint: "太长会拖慢整条回复" },
             { path: "chat.strip_action_parens", label: "剥离动作描写", kind: "switch", hint: "发送前去掉括号里的动作描写（如「（笑）」），默认关闭" },
-            { path: "chat.type_speed", label: "打字节奏倍率", kind: "number", step: "0.1", min: 0, hint: "中文字约 0.3 秒/字、其他字符约 0.15 秒/字，再乘这个倍率；0 表示两条之间不停顿" },
-            { path: "chat.type_delay_max_seconds", label: "单条打字停顿上限（秒）", kind: "number", step: "0.5", min: 0, hint: "长文也不会等太久；只影响多条之间的停顿" },
           ],
           draft
         ),

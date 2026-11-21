@@ -91,15 +91,14 @@ class FailingAdapter(RecordingAdapter):
 
 
 def test_all_parts_failed_feeds_no_momentum(config, store):
-    config.chat.split_part_chars = 10
-    config.chat.split_max_parts = 3
+    config.reply.max_segments = 3
     bot, _ = make_bot(config, store)
     adapter = FailingAdapter()
     bot.register_adapter(adapter)
     event = bot_group_event()
-    asyncio.run(bot.send_reply(event, "第一句话。第二句话。第三句话。", now=T0, addressed=True))
+    asyncio.run(bot.send_reply(event, "第一句话。\n第二句话。", now=T0, addressed=True))
     assert adapter.sent == []
-    assert adapter.attempts == 2  # 贪心合并后是两条
+    assert adapter.attempts == 2  # 换行分段：两条
     engine = bot.decision_engine
     assert engine.last_reply_at("recording:g1") is None
     assert engine.evaluate(event, now=T0 + 10).factors.momentum == 0.0
@@ -108,13 +107,12 @@ def test_all_parts_failed_feeds_no_momentum(config, store):
 
 
 def test_partial_send_still_feeds_momentum_once(config, store):
-    config.chat.split_part_chars = 10
-    config.chat.split_max_parts = 3
+    config.reply.max_segments = 3
     bot, _ = make_bot(config, store)
     adapter = FailingAdapter(fail_times=1)
     bot.register_adapter(adapter)
     event = bot_group_event()
-    asyncio.run(bot.send_reply(event, "第一句话。第二句话。第三句话。", now=T0, addressed=True))
+    asyncio.run(bot.send_reply(event, "第一句话。\n第二句话。", now=T0, addressed=True))
     assert len(adapter.sent) == 1  # 第一条失败，第二条发出
     engine = bot.decision_engine
     assert engine.last_reply_at("recording:g1") == T0

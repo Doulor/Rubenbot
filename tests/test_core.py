@@ -209,30 +209,28 @@ def test_split_short_reply_kept(config, store):
     assert bot.split_reply("好呀") == ["好呀"]
 
 
-def test_split_long_reply_into_parts(config, store):
-    config.chat.split_part_chars = 10
-    config.chat.split_max_parts = 3
-    bot, _ = make_bot(config, store, ScriptedLLM())
-    parts = bot.split_reply("第一句话。第二句话。第三句话。第四句话。第五句话。")
-    assert 2 <= len(parts) <= 3
-    assert all(parts)
-    assert "".join(parts) == "第一句话。第二句话。第三句话。第四句话。第五句话。"
+def test_split_newline_segments_into_parts(config, store):
+    """生成契约用换行分段：换行处一定拆成多条。"""
+    config.reply.max_segments = 3
+    bot, _ = make_bot(config, store, ScriptedLLM(), rng=random.Random(0))
+    parts = bot.split_reply("我卡得 PPT 一样\n卸载了 眼不见心不烦")
+    # 换行一定拆；段内空格处按长度概率合并，用固定种子钉住结果
+    assert parts[0] == "我卡得 PPT 一样"
+    assert "".join(parts).replace(" ", "") == "我卡得PPT一样卸载了眼不见心不烦"
 
 
-def test_split_respects_max_parts(config, store):
-    config.chat.split_part_chars = 5
-    config.chat.split_max_parts = 2
+def test_split_respects_max_segments(config, store):
+    config.reply.max_segments = 2
     bot, _ = make_bot(config, store, ScriptedLLM())
-    parts = bot.split_reply("一。二。三。四。五。六。")
+    parts = bot.split_reply("一\n二\n三\n四")
     assert len(parts) == 2
 
 
 def test_send_reply_sends_parts(config, store):
-    config.chat.split_part_chars = 10
-    config.chat.split_max_parts = 3
+    config.reply.max_segments = 3
     bot, adapter = make_bot(config, store, ScriptedLLM())
-    asyncio.run(bot.send_reply(private_event(), "第一句话。第二句话。第三句话。"))
-    assert len(adapter.sent) >= 2
+    asyncio.run(bot.send_reply(private_event(), "第一句话。\n第二句话。"))
+    assert len(adapter.sent) == 2
     assert all(chat_type == "private" for _, chat_type, _ in adapter.sent)
 
 

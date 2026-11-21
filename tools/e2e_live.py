@@ -144,8 +144,8 @@ async def instance(root, llm_cfg, scenario):
     cfg = Config.load(path)
     cfg.llm = llm_cfg
     cfg.chat.bot_name = '小测'
-    cfg.chat.type_speed = 0
-    cfg.chat.split_max_parts = 1
+    cfg.reply.segment_delay_enabled = False
+    cfg.reply.max_segments = 1
     cfg.decision.merge_window_seconds = cfg.decision.hard_merge_window_seconds = cfg.decision.urgent_seconds = 0
     cfg.memory.recall_tool_max_rounds = 4
     cfg.memory.recall_tool_enabled = False

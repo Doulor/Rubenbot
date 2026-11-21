@@ -1,4 +1,4 @@
-"""发送节奏与防抖上限（借鉴 MaiBot 研读 #2/#3 的最小版）。"""
+"""发送节奏、多段拆分与防抖上限（借鉴 MaiBot 研读 #2/#3 的最小版）。"""
 
 import asyncio
 
@@ -6,11 +6,9 @@ import pytest
 
 from rubenbot.adapters.base import MessageEvent, Segment
 from rubenbot.core import (
+    REPLY_SEGMENT_CONTRACT,
     RubenBot,
-    estimate_typing_seconds,
-    split_sentences,
     strip_action_parens,
-    strip_transcript_prefix,
     clean_reply_patterns,
 )
 from rubenbot.decision import MessageMerger
@@ -44,48 +42,43 @@ def group_event(text="你好呀", sender="u1", name="阿花") -> MessageEvent:
 
 
 # ----------------------------------------------------------------------
-# 打字时间估算
+# 段间打字延迟（按下一段字数估算）
 # ----------------------------------------------------------------------
 
 
-def test_typing_estimate_chinese_and_mixed():
-    # 4 个中文字 ×0.3 + 回车 0.3
-    assert estimate_typing_seconds([Segment.text("你好呀啊")]) == pytest.approx(1.5)
-    # 1 个中文字 ×0.3 + 4 个英文/数字字符 ×0.15 + 回车 0.3
-    assert estimate_typing_seconds([Segment.text("好 ok12")]) == pytest.approx(0.3 + 0.6 + 0.3)
-
-
-def test_typing_estimate_single_char_tripled():
-    # 单字：0.3 ×3 + 回车 0.3
-    assert estimate_typing_seconds([Segment.text("嗯")]) == pytest.approx(1.2)
-
-
-def test_typing_estimate_sticker_only():
-    assert estimate_typing_seconds([Segment.image("http://x/1.png")]) == pytest.approx(1.0)
-    # 文本段全是空白也按纯表情处理
-    assert estimate_typing_seconds([Segment.text("  ")]) == pytest.approx(1.0)
-
-
-def test_typing_delay_applies_speed_and_cap(config, store):
+def test_segment_delay_by_chars_with_bounds(config, store):
     bot, _ = make_bot(config, store)
-    config.chat.type_speed = 1.0
-    config.chat.type_delay_max_seconds = 4.0
-    assert bot.typing_delay([Segment.text("嗯")]) == pytest.approx(1.2)
-    # 超长文本截到单条上限
-    assert bot.typing_delay([Segment.text("字" * 100)]) == pytest.approx(4.0)
-    # 全局倍率
-    config.chat.type_speed = 0.5
-    assert bot.typing_delay([Segment.text("嗯")]) == pytest.approx(0.6)
-    # 倍率为 0 表示不等
-    config.chat.type_speed = 0
-    assert bot.typing_delay([Segment.text("嗯")]) == 0.0
+    config.reply.segment_delay_enabled = True
+    config.reply.segment_delay_per_char_ms = 60
+    config.reply.segment_delay_min_ms = 100
+    config.reply.segment_delay_max_ms = 1000
+    # 3 个非空白字 ×60ms，空白不计
+    assert bot.segment_delay([Segment.text(" 好的 呀 ")]) == pytest.approx(0.18)
+    # 一个字太短：抬到下限
+    assert bot.segment_delay([Segment.text("嗯")]) == pytest.approx(0.1)
+    # 长文截到上限
+    assert bot.segment_delay([Segment.text("字" * 100)]) == pytest.approx(1.0)
+    # 纯图片段按一次固定停顿（下限）
+    assert bot.segment_delay([Segment.image("http://x/1.png")]) == pytest.approx(0.1)
+
+
+def test_segment_delay_can_be_disabled(config, store):
+    bot, _ = make_bot(config, store)
+    config.reply.segment_delay_per_char_ms = 60
+    config.reply.segment_delay_enabled = False
+    assert bot.segment_delay([Segment.text("好的呀")]) == 0.0
+    config.reply.segment_delay_enabled = True
+    config.reply.segment_delay_per_char_ms = 0
+    assert bot.segment_delay([Segment.text("好的呀")]) == 0.0
 
 
 def test_send_reply_waits_between_parts(config, store, monkeypatch):
-    """第一条立即发，后续条之间按估算等待。"""
-    config.chat.split_part_chars = 10
-    config.chat.split_max_parts = 3
-    config.chat.type_speed = 1.0
+    """第一段立即发，后续段之间按下一段字数等待。"""
+    config.reply.max_segments = 3
+    config.reply.segment_delay_enabled = True
+    config.reply.segment_delay_per_char_ms = 100
+    config.reply.segment_delay_min_ms = 100
+    config.reply.segment_delay_max_ms = 5000
     sleeps: list[float] = []
 
     async def fake_sleep(seconds):
@@ -93,101 +86,39 @@ def test_send_reply_waits_between_parts(config, store, monkeypatch):
 
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
     bot, adapter = make_bot(config, store)
-    asyncio.run(bot.send_reply(group_event(), "第一句话。第二句话。第三句话。"))
-    assert len(adapter.sent) >= 2
-    # 每条之间正好一次停顿
-    assert len(sleeps) == len(adapter.sent) - 1
-    assert all(s > 0 for s in sleeps)
+    asyncio.run(bot.send_reply(group_event(), "第一段\n第二段\n第三段"))
+    assert len(adapter.sent) == 3
+    # 每条之间正好一次停顿，且按下一段长度
+    assert sleeps == pytest.approx([0.3, 0.3])
+
+
+def test_send_reply_no_sleep_when_delay_disabled(config, store, monkeypatch):
+    config.reply.segment_delay_enabled = False
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    bot, adapter = make_bot(config, store)
+    asyncio.run(bot.send_reply(group_event(), "第一段\n第二段"))
+    assert len(adapter.sent) == 2
+    assert sleeps == []
 
 
 # ----------------------------------------------------------------------
-# 断句保护
+# 断句保护（详细覆盖见 test_reply_segments.py）
 # ----------------------------------------------------------------------
-
-
-def test_split_sentences_keeps_bracketed_emoticon_whole():
-    text = "太好了（≧▽≦。笑死）我们走。"
-    parts = split_sentences(text)
-    assert parts == ["太好了（≧▽≦。笑死）我们走。"]
-
-
-def test_split_reply_does_not_break_emoticon(config, store):
-    config.chat.split_part_chars = 10
-    config.chat.split_max_parts = 3
-    bot, _ = make_bot(config, store)
-    reply = "好开心(≧▽≦)！周末一起去玩吧。"
-    parts = bot.split_reply(reply)
-    for part in parts:
-        # 括号必须成对，不能从颜文字中间切开
-        assert part.count("(") == part.count(")")
-    assert any("(≧▽≦)" in part for part in parts)
-    assert "".join(parts) == reply
-
-
-def test_split_reply_does_not_break_kaomoji_letters(config, store):
-    config.chat.split_part_chars = 12
-    config.chat.split_max_parts = 3
-    bot, _ = make_bot(config, store)
-    reply = "今天真的绝了QAQ！但是没关系OTZ。"
-    parts = bot.split_reply(reply)
-    assert any("QAQ" in part for part in parts)
-    assert any("OTZ" in part for part in parts)
-    assert "".join(parts) == reply
-
-
-def test_split_sentences_keeps_url_whole():
-    url = "https://example.com/a?b=1&c=2!d=3"
-    parts = split_sentences(f"看这个！{url}。好好玩。")
-    assert any(url in part for part in parts)
-    assert all("https://" not in part or url in part for part in parts)
-
-
-def test_split_sentences_keeps_inline_code_whole():
-    text = "试一下 `print('a。b')` 这句。好。"
-    parts = split_sentences(text)
-    assert parts == ["试一下 `print('a。b')` 这句。", "好。"]
-
-
-def test_split_sentences_keeps_quotes_whole():
-    text = "他说「快点。等一下」然后走了。"
-    assert split_sentences(text) == ["他说「快点。等一下」然后走了。"]
-
-
-def test_split_sentences_handles_unmatched_bracket():
-    # 找不到配对符号时按普通字符处理，不吞掉后面的内容
-    assert split_sentences("前面（没闭合。后面") == ["前面（没闭合。", "后面"]
 
 
 def test_short_reply_not_split_even_with_breaks(config, store):
-    config.chat.split_part_chars = 30
     bot, _ = make_bot(config, store)
     assert bot.split_reply("好。走。") == ["好。走。"]
 
 
-# ----------------------------------------------------------------------
-# 转录行前缀清洗（模型模仿历史格式的兜底）
-# ----------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "text, expected",
-    [
-        # 带时间戳和发言人前缀：剥掉
-        ("[10:00] [我] 刚才说到哪了", "刚才说到哪了"),
-        ("[9:05] [阿花] 在吗", "在吗"),
-        ("[10:00] [我]  两个空格也行", "两个空格也行"),
-        # 正常正文，没有前缀
-        ("我觉得挺好", "我觉得挺好"),
-        # 正文以时间开头但后面不是 [名字] 形式：不剥
-        ("[10:00] 开会了", "[10:00] 开会了"),
-        ("[10:00][我] 中间没空格？剥", "中间没空格？剥"),
-        # 只剥开头，正文中间同样样式不动
-        ("先说这个 [10:00] [我] 后面不动", "先说这个 [10:00] [我] 后面不动"),
-        ("", ""),
-    ],
-)
-def test_strip_transcript_prefix(text, expected):
-    assert strip_transcript_prefix(text) == expected
+def test_generation_contract_mentions_segments(config, store):
+    """生成端契约：一次回复 1~3 段，用换行分隔（代码侧，不改人设文件）。"""
+    assert "1~3 段" in REPLY_SEGMENT_CONTRACT and "换行" in REPLY_SEGMENT_CONTRACT
 
 
 def test_send_reply_strips_transcript_prefix(config, store):
@@ -211,7 +142,6 @@ def test_clean_reply_patterns_only_removes_high_confidence_formats(text, expecte
 
 
 def test_send_reply_cleans_patterns_before_splitting(config, store):
-    config.chat.split_part_chars = 10
     bot, adapter = make_bot(config, store)
     asyncio.run(bot.send_reply(group_event(), "**第一句。**\n\n第二句。"))
     assert "**" not in "".join(adapter.texts)

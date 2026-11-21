@@ -30,9 +30,11 @@ def test_config_defaults():
     assert cfg.decision.ratio_threshold == 0.2
     assert cfg.decision.veto_marker == "[不回复]"
     assert cfg.decision.groups == {}
-    assert cfg.chat.split_max_parts == 3
-    assert cfg.chat.type_speed == 1.0
-    assert cfg.chat.type_delay_max_seconds == 4.0
+    assert cfg.reply.max_segments == 3
+    assert cfg.reply.segment_delay_enabled is True
+    assert cfg.reply.segment_delay_per_char_ms == 60.0
+    assert cfg.reply.segment_delay_min_ms == 150.0
+    assert cfg.reply.segment_delay_max_ms == 1500.0
     assert cfg.chat.strip_action_parens is False
     assert cfg.enabled_adapters == []
 
