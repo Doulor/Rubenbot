@@ -48,7 +48,14 @@ from .emotion import EmotionEngine
 from .gateway.events import EventBatch, EventMerger, EventRouter, RouteDecision
 from .gateway.judge import EventJudge, EventVerdict, persona_line
 from .gateway.service import GATEWAY_GUIDE, GatewayService
-from .llm import LLMClient, LLMProtocol, ToolUnsupported, make_usage_recorder
+from .llm import (
+    LLMClient,
+    LLMProtocol,
+    ToolUnsupported,
+    make_usage_recorder,
+    normalize_dsml_message,
+    strip_dsml,
+)
 from .mcp_client import MCPManager
 from .memory.consolidate import Consolidator
 from .memory.extract import MemoryExtractor, audience_for_chat
@@ -389,6 +396,10 @@ def clean_reply_patterns(text: str) -> str:
         return text
     cleaned = text
     hits: list[str] = []
+    stripped = strip_dsml(cleaned)
+    if stripped != cleaned:
+        cleaned = stripped
+        hits.append("dsml")
     if "**" in cleaned:
         cleaned = cleaned.replace("**", "")
         hits.append("markdown_bold")
@@ -421,6 +432,8 @@ def _strip_segments_actions(segments: list[Segment]) -> list[Segment]:
             cleaned.append(segment)
             continue
         text = strip_action_parens(str(segment.data.get("text", "")))
+        # 段列表不经过 split_reply 的清洗，DSML 兜底要在这里再做一次
+        text = strip_dsml(text)
         if text:
             cleaned.append(Segment.text(text))
     return cleaned
@@ -2124,7 +2137,10 @@ class RubenBot:
         kwargs: dict[str, Any] = {"role": role, "tool_choice": tool_choice}
         if self._accepts_kwarg(self.llm.chat_with_tools, "task"):
             kwargs["task"] = task
-        return await self.llm.chat_with_tools(messages, tools, **kwargs)
+        message = await self.llm.chat_with_tools(messages, tools, **kwargs)
+        # LLMClient 已在客户端层转好；这里再兜一次，保证测试替身/其它实现
+        # 吐出的 DSML 文本调用同样走结构化执行通道。
+        return normalize_dsml_message(message)
 
     async def _tool_result_message(self, call: dict[str, Any], event: MessageEvent) -> dict[str, Any]:
         """分派内置和 MCP 工具，把结果或错误按调用 ID 回给模型。"""
@@ -2357,6 +2373,8 @@ class RubenBot:
         voice_mime = "audio/mpeg"
         if isinstance(reply, str):
             text_reply = strip_action_parens(reply) if strip_actions else reply
+            # DSML 兜底：split_reply 里也会清，这里提前清一次，保证语音路径同样干净
+            text_reply = strip_dsml(text_reply)
             parts: list[list[Segment]] = [[Segment.text(part)] for part in self.split_reply(text_reply)]
             if len(parts) == 1:
                 voice_audio, voice_mime = await self.synthesize_reply(event, text_reply)

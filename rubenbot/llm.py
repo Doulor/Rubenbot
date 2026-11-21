@@ -8,6 +8,11 @@
 可选的 ``usage_recorder`` 在每次调用尝试后回调一条用量记录；上游没给 usage
 时 token 记 ``None``（落库为 NULL），不猜不编。记录失败只记 debug，不影响主流程。
 测试里可以用任意实现了 ``complete`` 的假对象替换。
+
+另外负责把上游偶发吐在 ``content`` 里的 DSML 文本工具调用（形如
+``<...DSML... calls>`` 的标签块，竖线可能是全角）解析回与结构化调用相同
+的内部表示；解析失败只剥除文本并记 warning，绝不抛异常打断正常聊天。
+出站前再用 :func:`strip_dsml` 兜底剥除残留片段。
 """
 
 from __future__ import annotations
@@ -234,7 +239,8 @@ class LLMClient:
                     else:
                         content = choices[0].get("message", {}).get("content") or ""
                         await self._record_usage(task_name, model, data, started, ok=True)
-                        return content
+                        # 普通生成路径用不到工具，残留的 DSML 文本只剥不留
+                        return strip_dsml(content)
             if attempt >= self.config.max_retries:
                 break
             delay = retry_delay(attempt, self._retry_delays)
@@ -298,7 +304,10 @@ class LLMClient:
             await self._record_usage(task_name, model, data, started, ok=False)
             raise LLMError(f"LLM 响应缺少 choices: {str(data)[:300]}")
         await self._record_usage(task_name, model, data, started, ok=True)
-        return choices[0].get("message") or {}
+        message = choices[0].get("message") or {}
+        # 上游可能把工具调用写成 content 里的 DSML 文本；统一转成结构化 tool_calls，
+        # 让调用方走同一条执行通道（权限/审计/回喂都一样）。
+        return normalize_dsml_message(message)
 
     async def _record_usage(
         self,
@@ -374,3 +383,198 @@ def parse_json_payload(text: str) -> Any:
             except json.JSONDecodeError:
                 return None
     return None
+
+
+# ----------------------------------------------------------------------
+# DSML 文本工具调用
+# ----------------------------------------------------------------------
+# 上游（DeepSeek 系）有时不吐结构化 tool_calls，而是把调用写成 content 里的
+# 标签文本。标签的竖线可能是全角 ｜、数量也不固定，这里一律宽松匹配：
+#   <｜｜DSML｜｜ calls>      块边界
+#   <｜｜DSML｜｜ invoke ...> 一次工具调用
+#   <｜｜DSML｜｜ parameter ...> 一个参数
+_DSML_TAG_RE = re.compile(
+    r"<\s*(?P<closing>/?)\s*[|｜]*\s*DSML\s*[|｜]*\s*"
+    r"(?P<name>calls|invoke|parameter)\b(?P<attrs>[^<>]*)>",
+    re.IGNORECASE,
+)
+# 「疑似 DSML 痕迹」：只要看到这个词就不让原文漏到出站消息里。
+# 标签竖线可能是全角、也可能被拆条从中间切断，所以不依赖具体标签形态；
+# 大写 DSML 在正常中文聊天里几乎不会自然出现，按出现即处理。
+_DSML_HINT_RE = re.compile(r"DSML")
+_DSML_ATTR_RE = re.compile(r"(\w+)\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s\"'>]+))")
+
+
+def _dsml_attrs(raw: str) -> dict[str, str]:
+    """解析标签属性（``name="x" string="true"``）；容忍单/双/无引号。"""
+    attrs: dict[str, str] = {}
+    for match in _DSML_ATTR_RE.finditer(raw or ""):
+        value = next((group for group in match.groups()[1:] if group is not None), "")
+        attrs[match.group(1).lower()] = value
+    return attrs
+
+
+def _dsml_value(raw: str, attrs: dict[str, str]) -> Any:
+    """按 ``string`` 属性解释参数值：true 原样字符串，false 按 JSON 解析。
+
+    解析失败不抛异常：按原文字符串回传并记 warning，让工具层自己去报参数问题。
+    """
+    text = (raw or "").strip()
+    flag = str(attrs.get("string", "")).strip().lower()
+    if flag in ("true", "1", "yes"):
+        return text
+    if not text:
+        return ""
+    try:
+        return json.loads(text)
+    except (ValueError, RecursionError):
+        if flag in ("false", "0", "no"):
+            logger.warning("DSML 参数按 JSON 解析失败，按字符串回传：%r", text[:80])
+        return text
+
+
+def parse_dsml_calls(text: str) -> tuple[list[dict[str, Any]], str]:
+    """把 content 里的 DSML 文本调用解析成结构化 tool_calls。
+
+    返回 ``(调用列表, 块外正常文本)``。调用形如::
+
+        {"id": "dsml_call_1", "type": "function",
+         "function": {"name": "adapter_call", "arguments": '{"action": ...}'}}
+
+    一个 calls 块可含多个 invoke，全部转换；块内无法识别的部分丢弃。
+    没有闭合的 calls 块视为畸形：已完整闭合的 invoke 仍然保留，块尾文本丢弃。
+    本函数不抛异常。
+    """
+    calls: list[dict[str, Any]] = []
+    if not text or not _DSML_HINT_RE.search(text):
+        return calls, text
+
+    kept: list[str] = []
+    cursor = 0
+    inside = False
+    invoke: dict[str, Any] | None = None
+    param: dict[str, Any] | None = None
+
+    def flush_param(end: int) -> None:
+        nonlocal param
+        if param is None:
+            return
+        name = str(param.get("name") or "").strip()
+        if invoke is not None and name:
+            invoke["args"][name] = _dsml_value(text[param["start"] : end], param["attrs"])
+        elif not name:
+            logger.warning("DSML parameter 缺少 name，已忽略")
+        param = None
+
+    def flush_invoke() -> None:
+        nonlocal invoke
+        if invoke is None:
+            return
+        name = str(invoke.get("name") or "").strip()
+        if name:
+            calls.append(
+                {
+                    "id": f"dsml_call_{len(calls) + 1}",
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(invoke["args"], ensure_ascii=False),
+                    },
+                }
+            )
+        else:
+            logger.warning("DSML invoke 缺少 name，已忽略")
+        invoke = None
+
+    for match in _DSML_TAG_RE.finditer(text):
+        if not inside:
+            kept.append(text[cursor:match.start()])
+        cursor = match.end()
+        closing = bool(match.group("closing"))
+        name = match.group("name").lower()
+        attrs = _dsml_attrs(match.group("attrs"))
+        if name == "calls":
+            if closing:
+                if inside:
+                    flush_param(match.start())
+                    flush_invoke()
+                inside = False
+            else:
+                if inside:
+                    # 嵌套 calls：按新块处理，上一块的完成部分照常保留
+                    logger.warning("DSML calls 块嵌套，按新一轮处理")
+                    flush_param(match.start())
+                    flush_invoke()
+                inside = True
+        elif name == "invoke":
+            if not inside:
+                continue
+            flush_param(match.start())
+            flush_invoke()
+            if not closing:
+                invoke = {"name": str(attrs.get("name") or "").strip(), "args": {}}
+        elif name == "parameter":
+            if not inside or invoke is None:
+                continue
+            flush_param(match.start())
+            if not closing:
+                param = {
+                    "name": str(attrs.get("name") or "").strip(),
+                    "attrs": attrs,
+                    "start": match.end(),
+                }
+    if inside:
+        # 块没有闭合：块尾一律丢弃，宁可少说话也不让 DSML 文本漏出去
+        logger.warning("DSML calls 块没有闭合，块尾文本已丢弃")
+        flush_param(len(text))
+        flush_invoke()
+    else:
+        kept.append(text[cursor:])
+    return calls, "".join(kept)
+
+
+def strip_dsml(text: str) -> str:
+    """剥除回复里的任何 DSML 片段（含残缺/畸形块），出站前的最后一道闸。
+
+    没有 DSML 痕迹时原样返回；整条只有畸形 DSML 块时返回空串，交给调用方
+    走沉默/空回复路径。不抛异常。
+    """
+    if not text or not _DSML_HINT_RE.search(text):
+        return text
+    _calls, cleaned = parse_dsml_calls(text)
+    # 块外孤立的完整标签（如拆条后的 ``</... parameter>``）
+    cleaned = _DSML_TAG_RE.sub("", cleaned)
+    if _DSML_HINT_RE.search(cleaned):
+        # 残缺标签没法可靠判断边界：含 DSML 字样的整行丢弃，其余行照常保留
+        logger.warning("出站文本里有不完整的 DSML 残片，含残片的行已丢弃")
+        cleaned = "\n".join(
+            line for line in cleaned.splitlines() if not _DSML_HINT_RE.search(line)
+        )
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def normalize_dsml_message(message: dict[str, Any]) -> dict[str, Any]:
+    """把模型响应 message 里的 DSML 文本调用合并进结构化 ``tool_calls``。
+
+    - 解析出的调用追加到已有 ``tool_calls`` 后面（ID 用 ``dsml_call_N``）；
+    - ``content`` 只保留块外正常文本；
+    - 没有可解析的调用但存在 DSML 痕迹：只剥除并记 warning，不抛异常。
+    """
+    if not isinstance(message, dict):
+        return message
+    content = message.get("content")
+    if not isinstance(content, str) or not _DSML_HINT_RE.search(content):
+        return message
+    calls, cleaned = parse_dsml_calls(content)
+    cleaned = strip_dsml(cleaned) if _DSML_HINT_RE.search(cleaned) else cleaned
+    updated = dict(message)
+    updated["content"] = cleaned
+    if calls:
+        existing = list(message.get("tool_calls") or [])
+        updated["tool_calls"] = [*existing, *calls]
+        logger.info("从 content 中解析出 %s 个 DSML 工具调用", len(calls))
+    else:
+        logger.warning("content 里有 DSML 片段但没有可用调用，已剥除")
+    return updated
