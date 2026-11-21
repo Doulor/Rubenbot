@@ -185,7 +185,9 @@ decision:
   threshold_noise: 0.10       # 阈值附近的随机扰动幅度
   threshold_noise_band: 0.20  # 离阈值多近才摇骰子
 
-  momentum_bonus: 1.00        # 对话动量：bot 刚参与过这个会话时的加分
+  # 对话动量：被 @/回复触发的发言才算真参与，之后一两分钟内加分、按半衰期衰减；
+  # 主动开口不喂动量（防自激）。0.50 的量级目标是被点名后约两分钟内还够过阈值
+  momentum_bonus: 0.50
   momentum_half_life_seconds: 120  # 动量的半衰期
   relevance_bonus: 0.60       # 话题相关性：记忆检索命中时的最大加分
   relevance_scale: 8.0        # 检索分数归一化尺度

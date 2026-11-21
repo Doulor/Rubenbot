@@ -82,6 +82,7 @@ def test_group_base_alone_not_enough(config, store):
 def test_momentum_after_bot_replied(config, store):
     """bot 刚发过言（动量加成）且过了冷却，普通消息就有机会过线。"""
     config.decision.cooldown_seconds = 0
+    config.decision.momentum_bonus = 1.0  # 本用例测动量机制本身，钉住满值（默认已校准为 0.5）
     bot, _ = make_bot(config, store, ScriptedLLM(), rng=FixedRng(0.5))
     bot.decision_engine.note_reply("recording:g1", 1000.0)
     decision = bot.should_reply(group_event(), now=1005.0)
