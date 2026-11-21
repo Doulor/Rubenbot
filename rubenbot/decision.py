@@ -446,9 +446,20 @@ class DecisionEngine:
         if proactive:
             self._active_replies.setdefault(chat_key, []).append(now)
 
-    def note_bot_reply(self, chat_key: str, now: float, *, proactive: bool = False) -> None:
-        """记录真实出站 bot 消息，并启用活人感节奏闸门。"""
-        self.note_reply(chat_key, now, proactive=proactive, momentum=False)
+    def note_bot_reply(
+        self,
+        chat_key: str,
+        now: float,
+        *,
+        proactive: bool = False,
+        addressed: bool = False,
+    ) -> None:
+        """记录真实出站 bot 消息，并启用活人感节奏闸门。
+
+        ``addressed=True`` 表示这次发言是被点名/被回复触发的（真的在参与
+        对话），此时写入对话动量；主动发言不写，避免自激。
+        """
+        self.note_reply(chat_key, now, proactive=proactive, momentum=addressed)
         self._last_refractory_at[chat_key] = now
 
     def active_reply_count(self, chat_key: str, now: float) -> int:

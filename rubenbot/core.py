@@ -1333,7 +1333,12 @@ class RubenBot:
             return
 
         proactive = event.is_group and decision.hard_trigger is None
-        if await self.try_sticker_reply(event, expression, proactive=proactive, now=now):
+        # 被硬触发（@/回复/私聊）带出来的发言是真参与，喂对话动量；
+        # 主动开口（含评分过线）不算，防自激
+        addressed = decision.hard_trigger is not None
+        if await self.try_sticker_reply(
+            event, expression, proactive=proactive, now=now, addressed=addressed,
+        ):
             self._log_decision(event, decision, now, expression)
             return
         messages = [*messages, {"role": "system", "content": expression.prompt_block()}]
@@ -1370,6 +1375,7 @@ class RubenBot:
             reply,
             now=now,
             proactive=proactive,
+            addressed=addressed,
         )
         await self.sticker_behavior.on_after_reply(self.context, event, reply)
         if self.plugins is not None:
@@ -2301,6 +2307,7 @@ class RubenBot:
 
     async def try_sticker_reply(
         self, event: MessageEvent, expression: ExpressionDecision | None, *, proactive: bool, now: float,
+        addressed: bool = False,
     ) -> bool:
         """接梗或短附和时尝试只发表情；未发出就交还文字生成路径。"""
         if expression is None or expression.intent not in ("接梗", "短附和"):
@@ -2311,7 +2318,9 @@ class RubenBot:
             return False
         reply = "[表情]"
         self._record_bot_message(event, reply, None)
-        self.decision_engine.note_bot_reply(self.decision_engine.chat_key(event), now, proactive=proactive)
+        self.decision_engine.note_bot_reply(
+            self.decision_engine.chat_key(event), now, proactive=proactive, addressed=addressed,
+        )
         self.note_emotion_after_reply(event, now=now)
         if self.plugins is not None:
             try:
@@ -2327,12 +2336,16 @@ class RubenBot:
         *,
         now: float | None = None,
         proactive: bool = False,
+        addressed: bool = False,
     ) -> None:
         """拆条发送，并把 bot 自己的话写进流水（``processed=True``，不参与记忆抽取）。
 
         ``reply`` 可以是纯文本（按句拆条），也可以是一组消息段：段列表原样
         交给适配器，整条消息只发一次，不做二次拆分。多条之间有按字数估算
         的打字停顿（第一条立即发）。
+
+        ``addressed`` 表示这次发送由硬触发（@/回复/私聊）产生，会喂对话
+        动量；拆条连发只记一次，不逐条刷新。
         """
         adapter = self.adapters.get(event.platform)
         if adapter is None:
@@ -2363,7 +2376,7 @@ class RubenBot:
                 self._record_bot_message(event, text, sent_id)
                 self.decision_engine.note_bot_reply(
                     self.decision_engine.chat_key(event), time.time() if now is None else now,
-                    proactive=proactive,
+                    proactive=proactive, addressed=addressed,
                 )
                 return
         for index, segments in enumerate(parts):
@@ -2378,10 +2391,10 @@ class RubenBot:
                 logger.warning("发送失败（%s 第 %s 条）：%s", event.platform, index + 1, exc)
                 continue
             self._record_bot_message(event, text, message_id)
-        # 发言时间交给决策引擎：动量加成与发言后冷却都依赖它
+        # 发言时间交给决策引擎：动量加成与发言后冷却都依赖它（拆条只记一次）
         self.decision_engine.note_bot_reply(
             self.decision_engine.chat_key(event), time.time() if now is None else now,
-            proactive=proactive,
+            proactive=proactive, addressed=addressed,
         )
         # 情绪侧：刚说过话 = 有人理；群里热闹就兴奋一下
         self.note_emotion_after_reply(event, now=now)

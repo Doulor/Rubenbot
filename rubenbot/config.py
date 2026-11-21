@@ -319,7 +319,7 @@ class DecisionConfig:
     threshold: float = 0.85
     threshold_noise: float = 0.10
     threshold_noise_band: float = 0.20
-    momentum_bonus: float = 1.00
+    momentum_bonus: float = 0.50
     momentum_half_life_seconds: float = 120.0
     relevance_bonus: float = 0.60
     relevance_scale: float = 8.0

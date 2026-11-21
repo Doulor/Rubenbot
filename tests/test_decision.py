@@ -457,7 +457,7 @@ def test_noise_can_flip_near_threshold():
 
 
 def test_decision_log_text_contains_factors():
-    engine = make_engine(threshold=0.85, threshold_noise=0.0, cooldown_seconds=0.0)
+    engine = make_engine(threshold=0.85, threshold_noise=0.0, cooldown_seconds=0.0, momentum_bonus=1.0)
     engine.note_reply("test:g1", 100.0)
     decision = engine.evaluate(group_event(), now=110.0)
     text = decision.log_text()
