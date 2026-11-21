@@ -45,9 +45,10 @@ from .decision import (
 )
 from .expression import ExpressionDecision, choose_length_band, is_question, parse_plan, repetition_list
 from .emotion import EmotionEngine
+from .opener_guard import OpenerGuard
 from .gateway.events import EventBatch, EventMerger, EventRouter, RouteDecision
 from .gateway.judge import EventJudge, EventVerdict, persona_line
-from .gateway.service import GATEWAY_GUIDE, GatewayService
+from .gateway.service import GATEWAY_GUIDE, GatewayService, is_owner_chat
 from .llm import (
     LLMClient,
     LLMProtocol,
@@ -63,7 +64,7 @@ from .memory.gate import PrivacyGate
 from .memory.retrieve import MemoryReader, Retriever
 from .memory.store import MemoryStore, make_person_id
 from .memory.summary import RollingSummarizer, format_summary_block
-from .persona import Persona
+from .persona import Persona, matches_identity_trigger
 from .plugins.loader import PluginContext, PluginManager
 from .search import WebSearcher, build_searcher, clamp_count
 from .proactive import ProactiveOpener, is_acceptable_opener
@@ -75,6 +76,9 @@ from .voice import VOICE_PLACEHOLDER, VOICE_PREFIX, VoiceService, build_voice
 
 logger = logging.getLogger(__name__)
 
+# 护栏拦截原因（写进 decision_log 的 factors.guard，便于统计）
+_GUARD_REASONS = frozenset({"min_interval", "refractory", "proactive_window"})
+
 # 适配器异常后的重启退避（秒）
 ADAPTER_RESTART_MIN = 1.0
 ADAPTER_RESTART_MAX = 30.0
@@ -85,12 +89,15 @@ GUIDANCE_ROLE = "fast"
 GUIDANCE_TIMEOUT_CAP = 15.0
 GUIDANCE_TASK_PROMPT = (
     "你是回复前的表达决策器，不写正文。只输出一个 JSON 对象，不要 Markdown。"
-    "字段必须是 intent、length_band、increment、avoid_repetition。\n"
+    "字段必须是 speak、intent、length_band、increment、avoid_repetition，可选 reason。\n"
+    "speak 是这一轮要不要开口：按人格与行为风格判断，没有新东西可说就 false。"
+    "被点名、@、私聊时由系统兜底必回，这里仍可如实判断。\n"
     "intent 只能从：接梗、补充新信息、反驳、提问、短附和、沉默 中选；"
     "length_band 只能从：碎片、短句、展开 中选。"
     "碎片最多10字，短句11-25字，展开26-60字。"
-    "increment 必须用一句话写明这条比上文多什么；写不出就把 intent 改为沉默且 increment 置空。"
+    "increment 必须用一句话写明这条比上文多什么；写不出就把 intent 改为沉默、speak 置 false。"
     "avoid_repetition 是数组，列出最近三条 bot 已用观点或措辞，当前回复不要复述。"
+    "reason 是可选的短理由（几个字），会记进决策日志。"
     "严格限长：JSON 总长不超过 500 字。"
 )
 # recall 工具的定义（T2）。没配置搜索时只开放这一个工具，模型不用/失败就退化为单次生成。
@@ -598,6 +605,8 @@ class RubenBot:
         aliases = config.decision.aliases or [config.chat.bot_name]
         self.decision_engine = DecisionEngine(config.decision, aliases=aliases, rng=self.rng)
         self.last_decision: dict[str, ReplyDecision] = {}
+        # 开头反重复：只跟踪 bot 最近几条回复的开场模式，命中才临时纠偏一轮
+        self.opener_guard = OpenerGuard()
         # 启动时间与最近一次处理消息的时间，供 WebUI 概览使用
         self.started_at: float = time.time()
         self.last_message_at: float | None = None
@@ -1327,6 +1336,8 @@ class RubenBot:
             try:
                 await self._process_round_locked(round_, event)
             except Exception as exc:  # noqa: BLE001 - 单轮失败不能带死循环
+                # 这一轮的纠偏没兑现（异常中断），允许下一轮重新提醒
+                self.opener_guard.clear_pending(self.decision_engine.chat_key(event))
                 logger.exception("处理合并消息异常：%s", exc)
 
     async def _process_round_locked(self, round_: MergedRound, event: MessageEvent) -> None:
@@ -1347,7 +1358,11 @@ class RubenBot:
             self._log_decision(event, decision, now)
             return
 
-        messages = await self.build_context(event, now=now)
+        planner_gate = self.config.planner_gate
+        # 必回规则要在裁定之前算好：它既能覆盖 speak=false，也决定日志里的兜底字段
+        must = self.decision_engine.must_reply(event) if planner_gate else None
+        stage = "planner" if planner_gate else "legacy"
+        messages = await self.build_context(event, now=now, stage=stage)
         # 让模型知道「可以不接话」的出口
         marker = self.config.decision.veto_marker
         messages[0]["content"] += (
@@ -1360,11 +1375,19 @@ class RubenBot:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("插件 on_before_reply 异常：%s", exc)
 
-        expression = await self.plan_expression(messages, event, decision)
+        expression = await self.plan_expression(messages, event, decision, planned=planner_gate)
+        if planner_gate:
+            decision.hard_trigger = must
+        # stage1 的开口裁定：speak=false 且非必回 → 中止，不调 stage2
+        # （灰度回滚到旧路径时不做这项裁定，完全沿用旧 DecisionEngine 语义）
+        if planner_gate and expression.speak is False and not must:
+            decision.should_reply, decision.reason = False, "planner_silence"
+            self._log_decision(event, decision, now, expression, must=must)
+            return
         if expression.intent == "沉默":
             decision.should_reply = False
             decision.reason = "expression_silence"
-            self._log_decision(event, decision, now, expression)
+            self._log_decision(event, decision, now, expression, must=must)
             return
 
         proactive = event.is_group and decision.hard_trigger is None
@@ -1374,8 +1397,26 @@ class RubenBot:
         if await self.try_sticker_reply(
             event, expression, proactive=proactive, now=now, addressed=addressed,
         ):
-            self._log_decision(event, decision, now, expression)
+            self._log_decision(event, decision, now, expression, must=must)
             return
+        if planner_gate:
+            # 生成步换成人格 + 回复风格；场景/记忆/工具说明原样保留。
+            # 策划步的前缀按同一规则重新组装（确定性，正常必定一致）；万一
+            # 对不上（插件改过开头等），宁可不换也不能把场景段重复一遍。
+            planner_prompt = self.persona_system_prompt(event, stage="planner", now=now)
+            generator_prompt = self.persona_system_prompt(event, stage="generator", now=now)
+            if messages and str(messages[0].get("content") or "").startswith(planner_prompt):
+                messages = self._swap_persona_prefix(messages, planner_prompt, generator_prompt)
+            else:
+                logger.debug(
+                    "策划步人格前缀已变（插件注入？），生成步沿用当前系统提示：%s/%s",
+                    event.platform, event.chat_id,
+                )
+            # 开头反重复：同一开场模式连出太多次，下一轮临时纠偏一句
+            key = self.decision_engine.chat_key(event)
+            correction = self.opener_guard.correction(key)
+            if correction:
+                messages[0]["content"] += "\n\n" + correction
         messages = [*messages, {"role": "system", "content": expression.prompt_block()}]
         task = "chat" if expression.source == "fragment" else "gen_stage2"
         for attempt in range(2):
@@ -1400,8 +1441,10 @@ class RubenBot:
                 messages = [*messages, {"role": "assistant", "content": parsed.text}, {
                     "role": "system", "content": "刚才的草稿复述了对方。换一个新角度，或只回三个字以内。",
                 }]
-        self._log_decision(event, decision, now, expression)
+        self._log_decision(event, decision, now, expression, must=must)
         if not decision.should_reply:
+            # 没发出去：本轮纠偏没兑现，下轮可以继续提醒
+            self.opener_guard.clear_pending(self.decision_engine.chat_key(event))
             return
         reply = parsed.text
 
@@ -1412,6 +1455,7 @@ class RubenBot:
             proactive=proactive,
             addressed=addressed,
         )
+        self.opener_guard.note_reply(self.decision_engine.chat_key(event), reply)
         await self.sticker_behavior.on_after_reply(self.context, event, reply)
         if self.plugins is not None:
             try:
@@ -1425,6 +1469,8 @@ class RubenBot:
         decision: ReplyDecision,
         now: float,
         expression: ExpressionDecision | None = None,
+        *,
+        must: str | None = None,
     ) -> None:
         """把意愿与表达决策合并写入同一条 decision_log。"""
         factors = decision.factors
@@ -1441,6 +1487,18 @@ class RubenBot:
         } if factors is not None else {}
         if expression is not None:
             factor_data["expression_decision"] = expression.to_dict()
+            # 新路径的审计字段：策划步裁定与理由摘要（表结构不变，塞进 factors）
+            if expression.speak is not None or expression.reason:
+                factor_data["planner"] = {
+                    "speak": expression.speak,
+                    "reason": expression.reason,
+                }
+            if expression.speak is False and must:
+                # 裁定说不，但必回规则兜底：记一笔，仍然继续生成
+                factor_data["planner_override"] = must
+        # 新路径的护栏命中：reason 是护栏名时补一个字段，方便统计拦截率
+        if self.config.planner_gate and decision.reason in _GUARD_REASONS:
+            factor_data["guard"] = decision.reason
         try:
             self.store.add_decision_log(
                 platform=event.platform,
@@ -1643,8 +1701,30 @@ class RubenBot:
         return max((item.score for item in scored), default=0.0)
 
     def decide(self, event: MessageEvent, *, now: float | None = None) -> ReplyDecision:
-        """回复决策：硬触发直通，普通群消息走意愿评分。"""
+        """回复决策（查接口，不落库）。
+
+        - ``planner_gate=False``：旧路径，硬触发直通，普通群消息走意愿评分；
+        - ``planner_gate=True``：只做必回判定与廉价护栏；普通消息一律放行到
+          stage1，由表达决策单裁定。护栏命中时 ``reason`` 记
+          ``planned`` / ``min_interval`` / ``refractory`` / ``proactive_window``。
+        """
         now = time.time() if now is None else now
+        if not self.config.planner_gate:
+            return self._decide_legacy(event, now=now)
+        hard = self.decision_engine.must_reply(event)
+        guard = (
+            None
+            if hard
+            else self.decision_engine.guard(event, now=now, proactive=True)
+        )
+        if guard is not None:
+            guard.hard_trigger = None
+            return guard
+        return ReplyDecision(True, reason=hard or "planned", score=0.0, threshold=0.0,
+                             hard_trigger=hard)
+
+    def _decide_legacy(self, event: MessageEvent, *, now: float) -> ReplyDecision:
+        """旧 DecisionEngine 路径（灰色回滚用）：硬触发直通 + 动量/阈值评分。"""
         hard = self.decision_engine.is_hard_trigger(event)
         relevance = 0.0 if hard else self.topic_relevance(event)
         recent = ()
@@ -1828,14 +1908,26 @@ class RubenBot:
             ]
         )
 
-    async def build_context(self, event: MessageEvent, *, now: float | None = None) -> list[dict[str, str]]:
+    async def build_context(
+        self,
+        event: MessageEvent,
+        *,
+        now: float | None = None,
+        stage: str | None = None,
+    ) -> list[dict[str, str]]:
         """人格 + 记忆 + 本会话早期摘要 + 场景 + 上下文要求 + 最近历史。
 
         会话有滚动摘要时，历史部分换成「摘要块 + 摘要水位之后的原文」；
         没有摘要（或开关关闭）时和以前完全一致，直接带最近原文。
+
+        ``stage`` 决定人格按哪一步组装（planner / generator / single /
+        legacy）；不给时按总开关推断：新路径用 ``single``，旧路径用
+        ``legacy``（整份 SOUL）。
         """
         now = time.time() if now is None else now
-        persona_prompt = self.persona.system_prompt()
+        if stage is None:
+            stage = "single" if self.config.planner_gate else "legacy"
+        persona_prompt = self.persona_system_prompt(event, stage=stage, now=now)
         person_id = make_person_id(event.platform, event.sender_id)
         person = self.store.get_person(person_id)
         display = (person.display_name if person else "") or event.sender_name
@@ -1886,6 +1978,81 @@ class RubenBot:
         )
         messages.extend(self.render_history(history))
         return messages
+
+    @staticmethod
+    def _swap_persona_prefix(
+        messages: list[dict[str, str]], old_prefix: str, new_prefix: str
+    ) -> list[dict[str, str]]:
+        """把系统提示开头的人格段从 ``old_prefix`` 换成 ``new_prefix``。
+
+        场景、记忆、工具说明这些段两段共用；只换人格部分，避免同一份上下文
+        里叠两份人格，也不重复组装记忆。
+        """
+        if not messages:
+            return [{"role": "system", "content": new_prefix}]
+        head = messages[0]
+        content = head.get("content") if isinstance(head, dict) else ""
+        if not isinstance(content, str):
+            content = ""
+        if old_prefix and content.startswith(old_prefix):
+            rest = content[len(old_prefix):].lstrip("\n")
+            merged = new_prefix + ("\n\n" + rest if rest else "")
+        else:
+            # 前缀对不上：不要静默拼出「新人格 + 旧全文」（会叠两份人格）
+            return messages
+        return [{"role": "system", "content": merged}, *messages[1:]]
+
+    def _identity_triggered(self, event: MessageEvent) -> bool:
+        """最近若干条消息里是否碰到身份/生活事实类话题（identity.md 注入条件）。"""
+        planner = self.config.planner
+        triggers = planner.identity_triggers
+        if not triggers:
+            return False
+        window = max(1, int(planner.identity_window or 0))
+        texts = [event.text]
+        try:
+            history = self.store.recent_messages(
+                event.chat_id,
+                limit=window,
+                platform=event.platform,
+                real_only=True,
+            )
+            # bot 自己的发言也算「最近对话」：它刚提过身份，这轮继续注入不会跑偏
+            texts.extend(msg.text for msg in history if msg.text and msg.text != event.text)
+        except Exception as exc:  # noqa: BLE001 - 取不到历史只看本轮
+            logger.debug("读取身份触发窗口失败：%s", exc)
+        return matches_identity_trigger(texts, triggers)
+
+    def _is_owner_private(self, event: MessageEvent) -> bool:
+        """私聊主人：沿用网关的 owner 判定（私聊就是主人会话）。
+
+        群聊一律不算；私聊里只有当前会话的对方能私聊到 bot，本来就是
+        这台机器的主人。以后引入 ``owner_ids`` 时只需改这里与网关一处。
+        """
+        return is_owner_chat(self.config, event.platform, event.chat_id, event.chat_type)
+
+    def persona_system_prompt(
+        self,
+        event: MessageEvent,
+        *,
+        stage: str = "single",
+        now: float | None = None,
+    ) -> str:
+        """按阶段组装人格提示，并做 identity / owner 条件注入。
+
+        ``planner_gate=False`` 时退回旧行为：整份 SOUL 正文 + 说话示例
+        （五文件形态下整份 SOUL 等价于只有 ``persona.md``，行为风格与回复
+        风格都不带，回滚后行为回到灰度前的人格描述）。
+        """
+        if not self.config.planner_gate:
+            return self.persona.system_prompt(stage="legacy")
+        try:
+            identity = self._identity_triggered(event)
+        except Exception as exc:  # noqa: BLE001 - 触发判断失败只是少注入一次
+            logger.debug("身份触发判断失败：%s", exc)
+            identity = False
+        owner = self._is_owner_private(event)
+        return self.persona.system_prompt(stage=stage, identity=identity, owner=owner)
 
     def recent_window_texts(self, event: MessageEvent, *, now: float | None = None) -> list[str]:
         """取本轮消息窗口的文本（被提及者识别用），失败返回空列表。"""
@@ -1999,8 +2166,19 @@ class RubenBot:
     # ------------------------------------------------------------------
 
     async def plan_expression(
-        self, messages: list[dict[str, str]], event: MessageEvent, willingness: ReplyDecision
+        self,
+        messages: list[dict[str, str]],
+        event: MessageEvent,
+        willingness: ReplyDecision,
+        *,
+        planned: bool | None = None,
     ) -> ExpressionDecision:
+        """策划步：一次快速调用拿到长度档、增量与开口裁定。
+
+        ``planned`` 控制短附和快捷路径：新路径（planner_gate）下普通群消息
+        允许模型裁定开口，快捷路径不再无脑返回「短附和」，避免绕过
+        ``speak=false``；旧路径保持原来的快捷行为。
+        """
         casual = event.is_group and willingness.hard_trigger is None
         question = is_question(event.text)
         band = choose_length_band(
@@ -2010,7 +2188,13 @@ class RubenBot:
             event.chat_id, platform=event.platform, chat_type=event.chat_type,
             sender_id=BOT_SENDER_ID, limit=3,
         )]
-        if casual and not question and band == "碎片" and not self.config.generation.two_stage.enabled:
+        if planned is None:
+            planned = self.config.planner_gate
+        if (
+            casual and not question and band == "碎片"
+            and not self.config.generation.two_stage.enabled
+            and not planned
+        ):
             return ExpressionDecision("短附和", band, "", repetition_list(recent), "fragment")
         prompt = (GUIDANCE_TASK_PROMPT + f"\n本轮已掷档：{band}，不要改档。"
                   + "最近三条自己的发言：" + json.dumps([t[:160] for t in recent], ensure_ascii=False))
@@ -2027,7 +2211,9 @@ class RubenBot:
             logger.warning("表达决策书不可用，降级碎片：%s", exc)
             raw = ""
         if raw and raw.strip() and parse_generation_output(raw, self.config.decision.veto_marker).vetoed:
-            return ExpressionDecision("沉默", band, "", repetition_list(recent))
+            return ExpressionDecision("沉默", band, "", repetition_list(recent),
+                                      speak=False, reason="veto_marker")
+        # 短附和快捷路径没有问过模型，不冒充开口裁定（speak=None）
         return parse_plan(raw or "", band, recent)
 
     def guidance_timeout(self) -> float:
@@ -2357,6 +2543,8 @@ class RubenBot:
             return False
         reply = "[表情]"
         self._record_bot_message(event, reply, None)
+        # 表情条也是 bot 的一条真实回复：记账给开头反重复，卡片/纯图不算
+        self.opener_guard.note_reply(self.decision_engine.chat_key(event), reply)
         self.decision_engine.note_bot_reply(
             self.decision_engine.chat_key(event), now, proactive=proactive, addressed=addressed,
         )

@@ -78,6 +78,9 @@ def config() -> Config:
     # 单测默认关掉合并窗口，让 handle_event 同步处理完
     cfg.decision.merge_window_seconds = 0
     cfg.decision.hard_merge_window_seconds = 0
+    # 单元测试默认走旧路径（动量/阈值裁定 + 整份 SOUL）：新路径（策划步裁定）
+    # 是灰度上线的行为变化，相关的进程内用例各自显式打开 persona.planner_gate。
+    cfg.planner.planner_gate = False
     return cfg
 
 

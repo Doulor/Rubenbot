@@ -17,6 +17,8 @@ from urllib.parse import urlsplit
 
 import yaml
 
+from .persona import DEFAULT_IDENTITY_TRIGGERS
+
 logger = logging.getLogger(__name__)
 
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -328,9 +330,11 @@ class DecisionConfig:
     ratio_threshold: float = 0.20
     ratio_silence: float = 0.60
     ratio_penalty: float = 1.50
-    # 发言后冷却（软抑制）
+    # 发言后冷却（软抑制；planner_gate=true 时不再参与普通消息拦截）
     cooldown_seconds: float = 30.0
     cooldown_penalty: float = 0.60
+    # 新路径护栏：两次开口之间的最小间隔（普通消息；@/私聊等必回不受影响）
+    min_reply_interval_seconds: float = 20.0
     # 活人感节奏闸门：普通消息在不应期内直接不触发；窗口内主动发言封顶
     exclude_bot_momentum: bool = True
     refractory_enabled: bool = True
@@ -422,6 +426,25 @@ class GenerationConfig:
     """回复生成的策略配置。"""
 
     two_stage: TwoStageConfig = field(default_factory=TwoStageConfig)
+
+
+@dataclass
+class PlannerConfig:
+    """开口裁定与人格组装的总开关（灰度用）。
+
+    ``planner_gate`` 为 true 时，开口与否由 stage1 的表达决策单裁定，
+    :mod:`rubenbot.decision` 的动量/阈值降级为护栏，系统提示按策划步 /
+    生成步分别组装；为 false 时完全走旧路径（旧 DecisionEngine 裁定 +
+    整份 SOUL 拼装），方便一键回滚。
+    """
+
+    planner_gate: bool = True
+    # identity.md 的触发词：最近若干条消息任一命中就注入身份处理
+    identity_triggers: list[str] = field(
+        default_factory=lambda: list(DEFAULT_IDENTITY_TRIGGERS)
+    )
+    # 「最近若干条」里看多少条消息
+    identity_window: int = 6
 
 
 # 联网搜索支持的渠道；顺序只影响默认尝试顺序，不代表优先级
@@ -1028,6 +1051,9 @@ class Config:
     mcp: MCPConfig = field(default_factory=MCPConfig)
     computer: ComputerConfig = field(default_factory=ComputerConfig)
     persona_path: str = "data/SOUL.md"
+    # 五文件人设目录：默认为 persona_path 同级的 persona/；不存在时回退单文件
+    persona_dir: str = ""
+    planner: PlannerConfig = field(default_factory=PlannerConfig)
     persona_examples_path: str = "data/reply_examples.json"
     persona_examples_enabled: bool = True
     persona_examples_count: int = 5
@@ -1046,13 +1072,29 @@ class Config:
         return [name for name, opts in self.adapters.items() if opts is not None and opts is not False]
 
     def persona_example_options(self) -> dict[str, Any]:
-        """启动、热加载和只读预览共用的示例选项。"""
+        """启动、热加载和只读预览共用的示例选项。
+
+        ``persona_dir`` 与 SOUL 路径绑定；签名里去掉了它，比较两份配置时
+        单独按 ``persona.dir`` 处理。
+        """
         return {
             "examples_path": self.persona_examples_path,
             "examples_enabled": self.persona_examples_enabled,
             "examples_count": self.persona_examples_count,
             "examples_position": self.persona_examples_position,
         }
+
+    @property
+    def planner_gate(self) -> bool:
+        """``persona.planner_gate`` 总开关：true 走「模型裁定 + 护栏」新路径。"""
+        return self.planner.planner_gate
+
+    @property
+    def persona_directory(self) -> str:
+        """五文件人设目录（未显式配置时与 SOUL 文件同级）。"""
+        from .persona import persona_dir_for
+
+        return str(persona_dir_for(self.persona_path, self.persona_dir or None))
 
     def adapter_options(self, name: str) -> dict[str, Any]:
         """某个适配器的配置段；未配置或不是 dict 时返回空 dict。"""
@@ -1134,8 +1176,11 @@ class Config:
             persona = {"path": persona}
         elif not isinstance(persona, dict):
             persona = {}
+        planner = persona.get("planner") if isinstance(persona.get("planner"), dict) else {}
         basics = {
             "persona_path": persona.get("path", "data/SOUL.md"),
+            "persona_dir": str(persona.get("dir") or ""),
+            "planner": _load_planner(planner),
             "persona_examples_path": persona.get("examples_path", "data/reply_examples.json"),
             "persona_examples_enabled": persona.get("examples_enabled", True) is not False,
             "persona_examples_count": _safe_nonnegative_int(persona.get("examples_count", 5), 5),
@@ -1165,6 +1210,24 @@ class Config:
             computer=ComputerConfig.parse(data.get("computer", {})),
             **basics,
         )
+
+
+def _load_planner(data: dict[str, Any]) -> PlannerConfig:
+    """解析 ``persona.planner`` 段：宽松取值，写错回落默认。"""
+    default = PlannerConfig()
+    if not isinstance(data, dict):
+        return default
+    triggers = data.get("identity_triggers")
+    if isinstance(triggers, list):
+        cleaned = [str(item).strip() for item in triggers if isinstance(item, str) and item.strip()]
+        triggers = cleaned
+    else:
+        triggers = list(DEFAULT_IDENTITY_TRIGGERS)
+    return PlannerConfig(
+        planner_gate=data.get("planner_gate", default.planner_gate) is not False,
+        identity_triggers=triggers,
+        identity_window=max(0, _safe_nonnegative_int(data.get("identity_window", default.identity_window), default.identity_window)),
+    )
 
 
 def _load_reminder(data: dict[str, Any]) -> ReminderConfig:

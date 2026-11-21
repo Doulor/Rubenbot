@@ -366,7 +366,14 @@ def in_quiet_hours(now: float, ranges: Iterable[tuple[int, int]]) -> bool:
 
 
 class DecisionEngine:
-    """意愿评分引擎。状态只有「最近一次发言时间」，按会话记录。"""
+    """意愿评分引擎。状态只有「最近一次发言时间」，按会话记录。
+
+    ``planner_gate=True``（默认）时，动量/阈值/占比这套评分**不再拦截**普通
+    回复：开口与否交给 stage1 的表达决策单，这里只剩护栏
+    :meth:`guard`（最小发言间隔、不应期、主动发言窗口上限）与必回判定
+    :meth:`must_reply`。``planner_gate=False`` 时 :meth:`evaluate` 完全走旧
+    评分路径，作为灰度回滚手段。
+    """
 
     def __init__(
         self,
@@ -426,6 +433,10 @@ class DecisionEngine:
 
     # ---- 状态 ----
 
+    def min_reply_interval(self) -> float:
+        """新路径的最小发言间隔（秒）；0 表示关闭。"""
+        return max(0.0, float(getattr(self.config, "min_reply_interval_seconds", 0.0) or 0.0))
+
     @staticmethod
     def chat_key(event: MessageEvent) -> str:
         return f"{event.platform}:{event.chat_id}"
@@ -481,6 +492,62 @@ class DecisionEngine:
     def _quiet_ranges(self, settings: GroupDecisionConfig) -> list[tuple[int, int]]:
         # 每次现算（量很小），配置改了也能立即生效
         return parse_quiet_hours(settings.quiet_hours)
+
+    # ---- 护栏与必回（planner_gate 新路径） ----
+
+    def must_reply(self, event: MessageEvent) -> str | None:
+        """必回规则：被 @/点名/回复、私聊消息一律必回；返回原因或 None。
+
+        必回覆盖 stage1 的 ``speak=false``：模型可以说「不想接」，但被叫到
+        头上还装死就是事故。``private`` 覆盖现在「私聊必回」的语义（本项目
+        没有单独的主人账号配置；私聊主人也就是唯一能私聊到 bot 的人）。
+        """
+        if event.is_private:
+            return "private"
+        if event.mentions_bot:
+            return "mentioned"
+        if is_reply_to_bot(event):
+            return "reply_to_bot"
+        alias = self.match_alias(event.text)
+        if alias:
+            return f"name:{alias}"
+        return None
+
+    def guard(
+        self,
+        event: MessageEvent,
+        *,
+        now: float,
+        proactive: bool = False,
+    ) -> ReplyDecision | None:
+        """开口前的廉价护栏；返回 None 表示放行。
+
+        - **必回**：@/点名/私聊直接放行，不管间隔与不应期；
+        - **不应期**：``refractory_seconds``，仅拦普通消息（``proactive``）；
+        - **最小发言间隔**：这个会话刚说过话，间隔内普通消息不开口
+          （``min_reply_interval_seconds``，0 表示关闭；放在不应期之后，
+          两者同时命中时以更贴切的不应期为准）；
+        - **主动发言上限**：滚动窗口内主动发言到顶后拦下（防刷屏）。
+
+        这些都在 stage1 之前做，省下模型调用；不改变已记录的发言状态。
+        """
+        hard = self.must_reply(event)
+        if hard:
+            return None
+        chat_key = self.chat_key(event)
+        cfg = self.config
+        if cfg.refractory_enabled and cfg.refractory_seconds > 0 and proactive:
+            refractory_at = self._last_refractory_at.get(chat_key)
+            if refractory_at is not None and now - refractory_at < cfg.refractory_seconds:
+                return ReplyDecision(False, "refractory", 0.0, 0.0)
+        interval = self.min_reply_interval()
+        last = self._last_reply_at.get(chat_key)
+        if interval > 0 and last is not None and now - last < interval:
+            return ReplyDecision(False, "min_interval", 0.0, 0.0)
+        if proactive and cfg.proactive_window_enabled and cfg.proactive_window_limit >= 0:
+            if self.active_reply_count(chat_key, now) >= cfg.proactive_window_limit:
+                return ReplyDecision(False, "proactive_window", 0.0, 0.0)
+        return None
 
     # ---- 评分 ----
 

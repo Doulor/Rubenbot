@@ -2241,6 +2241,17 @@ button {
   overflow-wrap: anywhere;
 }
 
+/* 五文件人设：文件名切换条，窄屏允许换行 */
+.persona-files {
+  align-self: flex-start;
+  max-width: 100%;
+  flex-wrap: wrap;
+}
+
+.persona-files .tag {
+  margin-left: 6px;
+}
+
 .persona-meta-spacer {
   flex: 1;
 }
