@@ -123,7 +123,7 @@ def test_trigger_creates_summary_and_advances_cursor(store):
 
 def test_second_trigger_folds_into_existing_summary(store):
     config = make_config(trigger_after=5, keep_recent=2)
-    first_ids = add_messages(store, 8)
+    add_messages(store, 8)
     llm = ScriptedLLM({"summary": ["旧摘要：" + SUMMARY_TEXT, "新摘要：" + SUMMARY_TEXT]})
     summarizer = RollingSummarizer(llm, store, config.memory)
     asyncio.run(summarizer.summarize_chat("recording", "g1"))

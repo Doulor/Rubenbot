@@ -1303,6 +1303,7 @@ def test_interact_reply_skipped_when_llm_returns_empty(tmp_path):
     ]
 
     report = asyncio.run(plugin.run_interact(now=now))
+    assert report.replied == 0
 
     assert len(llm.calls) == 1
     assert cap.calls_of("qzone.reply") == []

@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from rubenbot.adapters.base import ActionNotSupported, BaseAdapter, Segment
+from rubenbot.adapters.base import BaseAdapter
 from rubenbot.config import Config, GatewayConfig
 from rubenbot.core import RubenBot
 from rubenbot.gateway.catalog import (

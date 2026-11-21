@@ -22,6 +22,9 @@ data/*.sqlite*
 *.log
 .claude-run*.log
 
+# 开发协作用的一次性简报（不入库）
+.claude-brief*.md
+
 # 编辑器
 .idea/
 .vscode/

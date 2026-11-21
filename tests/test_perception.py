@@ -6,7 +6,6 @@ import asyncio
 import json
 import time
 
-import pytest
 
 from rubenbot.adapters.platform import (
     KIND_NOTICE,
@@ -23,10 +22,9 @@ from rubenbot.gateway.events import (
     EventBatch,
     EventMerger,
     EventRouter,
-    MERGE_WINDOW_SECONDS,
     quiet_now,
 )
-from rubenbot.gateway.judge import EventJudge, EventVerdict
+from rubenbot.gateway.judge import EventJudge
 from rubenbot.memory.store import MemoryStore, ProfileLine, make_person_id
 from rubenbot.persona import Persona
 

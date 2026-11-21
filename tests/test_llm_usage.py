@@ -1,7 +1,6 @@
 """LLM 用量记录：落库/聚合、缺失 usage 记 NULL、重试与超时。"""
 
 import asyncio
-import json
 
 import httpx
 import pytest

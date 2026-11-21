@@ -13,7 +13,7 @@ from rubenbot.config import Config
 from rubenbot.core import RubenBot, chat_tools
 from rubenbot.memory.store import MemoryStore
 from rubenbot.persona import Persona
-from rubenbot.reminder import REMINDER_TOOL, describe_fire_at, resolve_fire_at
+from rubenbot.reminder import describe_fire_at, resolve_fire_at
 
 from conftest import RecordingAdapter, ScriptedLLM
 

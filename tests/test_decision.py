@@ -16,7 +16,6 @@ from rubenbot.decision import (
     BOT_SENDER_ID,
     DecisionEngine,
     MessageMerger,
-    ReplyDecision,
     in_quiet_hours,
     is_reply_to_bot,
     parse_generation_output,

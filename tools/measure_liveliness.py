@@ -12,7 +12,7 @@ import math
 import re
 import sqlite3
 from collections.abc import Iterable, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 
 BOT_SENDER_ID = "__bot__"

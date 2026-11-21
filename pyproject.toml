@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "rubenbot[webui]"]
+dev = ["pytest>=8", "ruff>=0.6", "rubenbot[webui]"]
 webui = ["fastapi>=0.110", "uvicorn>=0.29"]
 
 [project.scripts]
@@ -35,3 +35,14 @@ include = ["rubenbot*"]
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# 起步只开 pycodestyle（E）与 pyflakes（F），不引入风格流派之争
+select = ["E", "F"]
+# 长行不作为 lint 报错：中文注释和长字符串无法可靠折行，强行拆分只会更难读；
+# 需要排版时再单独引入格式化器，避免一次性大范围重排代码。
+ignore = ["E501"]

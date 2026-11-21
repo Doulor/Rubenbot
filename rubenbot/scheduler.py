@@ -22,7 +22,7 @@ import logging
 import time
 from typing import Awaitable, Callable
 
-from .memory.store import MemoryStore, ScheduledJob
+from .memory.store import MemoryStore
 
 logger = logging.getLogger(__name__)
 

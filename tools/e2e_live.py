@@ -32,15 +32,16 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))  # 共享虚拟环境可能 editable 安装的是另一个 worktree。
-from rubenbot.adapters.base import render_segments
-from rubenbot.adapters.console import ConsoleAdapter
-from rubenbot.config import Config, LLMConfig
-from rubenbot.core import RubenBot
-from rubenbot.llm import LLMClient, make_usage_recorder
-from rubenbot.memory.store import MemoryStore
-from rubenbot.persona import Persona
-from rubenbot.plugins.loader import PluginManager
-from tools import _e2e_computer, _e2e_dialog, _e2e_fixtures
+# 上面的 sys.path 注入必须先于项目内导入，因此这里只能放在顶部导入之后（E402）
+from rubenbot.adapters.base import render_segments  # noqa: E402
+from rubenbot.adapters.console import ConsoleAdapter  # noqa: E402
+from rubenbot.config import Config, LLMConfig  # noqa: E402
+from rubenbot.core import RubenBot  # noqa: E402
+from rubenbot.llm import LLMClient, make_usage_recorder  # noqa: E402
+from rubenbot.memory.store import MemoryStore  # noqa: E402
+from rubenbot.persona import Persona  # noqa: E402
+from rubenbot.plugins.loader import PluginManager  # noqa: E402
+from tools import _e2e_computer, _e2e_dialog, _e2e_fixtures  # noqa: E402
 
 MODEL = 'workbuddy-deepseek-v4.1-flash'
 REPORT = Path.home() / 'workspace/rubenbot-night/e2e-results.md'

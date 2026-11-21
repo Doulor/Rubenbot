@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -120,9 +121,6 @@ def write_manifest(directory, plugin_id: str | None = None, **overrides) -> Path
     loader 现在要求每个插件目录根部有 manifest.json，测试里临时造的插件
     目录统一用这个函数补上一份；不用关心的字段给默认值。
     """
-    import json
-    from pathlib import Path
-
     path = Path(directory)
     path.mkdir(parents=True, exist_ok=True)
     name = plugin_id or path.name

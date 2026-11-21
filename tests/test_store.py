@@ -4,7 +4,7 @@ import time
 
 import pytest
 
-from rubenbot.memory.store import Event, MemoryStore, ProfileLine
+from rubenbot.memory.store import MemoryStore, ProfileLine
 
 
 @pytest.fixture()

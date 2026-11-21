@@ -448,11 +448,11 @@ def describe_restart_fields(fields: list[str]) -> str:
         "webui.port": "WebUI 端口",
     }
     parts = []
-    for field in fields:
-        if field.startswith("adapters."):
-            parts.append(f"适配器 {field.split('.', 1)[1]}")
+    for name in fields:
+        if name.startswith("adapters."):
+            parts.append(f"适配器 {name.split('.', 1)[1]}")
         else:
-            parts.append(labels.get(field, field))
+            parts.append(labels.get(name, name))
     return "、".join(parts)
 
 

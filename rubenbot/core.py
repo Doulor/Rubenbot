@@ -46,8 +46,8 @@ from .decision import (
 from .expression import ExpressionDecision, choose_length_band, is_question, parse_plan, repetition_list
 from .emotion import EmotionEngine
 from .gateway.events import EventBatch, EventMerger, EventRouter, RouteDecision
-from .gateway.judge import EventJudge, EventVerdict, persona_line
-from .gateway.service import GATEWAY_GUIDE, GatewayService
+from .gateway.judge import EventJudge, EventVerdict
+from .gateway.service import GatewayService
 from .llm import (
     LLMClient,
     LLMProtocol,
@@ -64,7 +64,7 @@ from .memory.retrieve import MemoryReader, Retriever
 from .memory.store import MemoryStore, make_person_id
 from .memory.summary import RollingSummarizer, format_summary_block
 from .persona import Persona
-from .plugins.loader import PluginContext, PluginManager
+from .plugins.loader import PluginManager
 from .search import WebSearcher, build_searcher, clamp_count
 from .proactive import ProactiveOpener, is_acceptable_opener
 from .reminder import REMINDER_TOOL, build_reminder_prompt, describe_fire_at, resolve_fire_at
@@ -881,7 +881,7 @@ class RubenBot:
             return None
         route = self.event_router.route(event, now=now)
         # 全部事件先落库（摘要进 platform_events，时间线进 events）
-        event_id = self._record_platform_event(event, route, now=now)
+        self._record_platform_event(event, route, now=now)
         self._record_event_timeline(event, route, now=now)
         # 申请类事件：pending 状态已由落库写入，这里补一条「红点」日志
         if event.kind == KIND_REQUEST:

@@ -659,7 +659,7 @@ def test_backfill_counts_expired_failed_skipped(tmp_path):
     store = make_store(tmp_path)
     ref_only(store, url="https://cdn.example/gone.png")
     ref_only(store, url="https://cdn.example/boom.png")
-    no_source = ref_only(store, file="only-name.image")
+    ref_only(store, file="only-name.image")
 
     async def fetch(url):
         if "gone" in url:

@@ -62,7 +62,6 @@ from ..core import format_scene
 from ..decision import parse_quiet_hours
 from ..identity import IdentityService, avatar_url
 from ..emotion import EmotionEngine
-from ..memory.store import make_person_id
 from ..persona import DEFAULT_PERSONA, Persona, load_persona
 from ..stickers import KIND_PHOTO, KIND_STICKER
 from .auth import COOKIE_NAME, BindSecurityError, check_bind_security, mask_secret
