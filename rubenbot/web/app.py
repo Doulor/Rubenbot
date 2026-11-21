@@ -21,6 +21,8 @@
 - ``GET  /api/chats``           会话列表
 - ``GET  /api/chats/{id}/decision`` 群决策配置
 - ``PUT  /api/chats/{id}/decision`` 保存群决策配置（写 config.yaml）
+- ``GET  /api/chats/{id}/profile`` 群定位：手写备注 + 自归纳总结并排（附生效来源）
+- ``PUT  /api/chats/{id}/profile`` 保存手写群备注（立即生效）；``DELETE`` 清掉两份定位
 - ``GET  /api/decisions``       决策日志（可按 chat_id 过滤）
 - ``GET  /api/emotion``         当前心情 + 好感 Top5/Bottom3 + 最近变化流水（只读）
 - ``GET  /api/stickers``        表情库列表；``GET /api/stickers/{id}/image`` 取图片；``DELETE`` 删除
@@ -62,6 +64,7 @@ from ..core import format_scene
 from ..decision import parse_quiet_hours
 from ..identity import IdentityService, avatar_url
 from ..emotion import EmotionEngine
+from ..group_profile import MANUAL_NOTE_MAX_CHARS, resolve_profile_text
 from ..persona import (
     DEFAULT_PERSONA,
     PERSONA_FILES,
@@ -276,6 +279,49 @@ def _apply_groups(state, data: dict[str, Any]) -> None:
             bot.apply_config(config, rebuild_llm=False)
         except Exception as exc:  # noqa: BLE001 - 热应用失败不影响已写盘的配置
             logger.warning("群决策配置热应用失败：%s", exc)
+
+
+def _profile_platform(state, chat_id: str, platform: str = "", *, required: bool = False) -> str:
+    """群定位按 (platform, chat_id) 区分；没给平台时按本群唯一平台推断。
+
+    与「每群覆盖」同源：先看显式参数，再看该群号出现过的平台。
+    推断不出唯一平台时用空串，不跨平台猜测（宁可新建一份空记录）；
+    写操作要求能确定平台，否则拒绝，避免把备注存到一个取不回来的键上。
+    """
+    platform = str(platform or "").strip()
+    if platform:
+        return platform
+    platforms = state.store.group_platforms(chat_id)
+    if len(platforms) == 1:
+        return platforms[0]
+    if required:
+        raise ApiError(422, "无法确定这个群的平台，请在查询参数里指定 platform")
+    return ""
+
+
+def _group_profile_payload(state, platform: str, chat_id: str) -> dict[str, Any]:
+    """群定位的两份正文 + 生效来源，供 WebUI 并排展示。"""
+    config = state.config.memory.group_profile
+    profile = state.store.get_group_profile(platform, chat_id)
+    manual = (profile.manual_note if profile else "") or ""
+    auto = (profile.auto_summary if profile else "") or ""
+    # 注入时按 max_chars 截断；这里回显原文，另给生效正文的截断结果
+    source, effective = resolve_profile_text(profile, max_chars=config.max_chars)
+    return {
+        "platform": platform,
+        "chat_id": str(chat_id),
+        "manual_note": manual,
+        "manual_updated_at": profile.manual_updated_at if profile else 0.0,
+        "auto_summary": auto,
+        "auto_updated_at": profile.updated_at if profile else 0.0,
+        "manual_max_chars": MANUAL_NOTE_MAX_CHARS,
+        "auto_max_chars": config.max_chars,
+        "source": source,
+        "effective_text": effective,
+        "auto_enabled": config.enabled,
+        "update_interval_hours": config.update_interval_hours,
+        "min_messages": config.min_messages,
+    }
 
 
 def _write_plugin_enabled(state) -> None:
@@ -985,6 +1031,49 @@ def create_app(state: WebState):
         logger.info("WebUI 更新群 %s 的决策配置", chat_id,
                     extra={"platform": configured_group(chat_id)["platform"], "chat_type": "group", "chat_id": chat_id})
         return {"ok": True, **payload, "restart_required": False}
+
+    @app.get("/api/chats/{chat_id}/profile")
+    async def get_chat_profile(chat_id: str, request: Request, platform: str = ""):
+        """群定位：手写备注与自归纳总结并排返回，附最后更新时间。
+
+        WebUI 群详情页用它做左右对照；两份都空时明确给出 ``source = ""``。
+        """
+        require_session(request)
+        platform = _profile_platform(state, chat_id, platform)
+        return {"ok": True, **_group_profile_payload(state, platform, chat_id)}
+
+    @app.put("/api/chats/{chat_id}/profile")
+    async def put_chat_profile(chat_id: str, request: Request, platform: str = ""):
+        """保存手写群备注（空串或 ``clear`` 即清空）；保存后立即生效。"""
+        require_session(request)
+        body = await _json_body(request)
+        platform = _profile_platform(
+            state, chat_id, platform or str(body.get("platform") or ""), required=True
+        )
+        note = body.get("manual_note")
+        if note is None:
+            note = "" if body.get("clear") else None
+        if note is None:
+            raise ApiError(422, "缺少 manual_note 字段")
+        if not isinstance(note, str):
+            raise ApiError(422, "manual_note 必须是字符串")
+        note = note.strip()
+        if len(note) > MANUAL_NOTE_MAX_CHARS:
+            raise ApiError(422, f"群备注最多 {MANUAL_NOTE_MAX_CHARS} 字")
+        state.store.set_group_manual_note(platform, chat_id, note)
+        logger.info(
+            "WebUI 保存群 %s/%s 的群备注（%s 字）", platform, chat_id, len(note),
+            extra={"platform": platform, "chat_type": "group", "chat_id": chat_id},
+        )
+        return {"ok": True, **_group_profile_payload(state, platform, chat_id), "restart_required": False}
+
+    @app.delete("/api/chats/{chat_id}/profile")
+    async def delete_chat_profile(chat_id: str, request: Request, platform: str = ""):
+        """删群/退群时清掉两份定位（轻量做法，不保留孤儿数据）。"""
+        require_session(request)
+        platform = _profile_platform(state, chat_id, platform, required=True)
+        deleted = state.store.delete_group_profile(platform, chat_id)
+        return {"ok": True, "deleted": deleted}
 
     @app.get("/api/decisions")
     async def list_decisions(

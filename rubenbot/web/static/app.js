@@ -1896,9 +1896,13 @@ async function fillDetail(container, chat) {
   const chatId = String(chat.chat_id);
   container.replaceChildren(skeleton(2));
   const encoded = encodeURIComponent(chatId);
-  const [settings, decisions] = await Promise.all([
+  const platformQuery = chat.platform ? `?platform=${encodeURIComponent(chat.platform)}` : "";
+  const [settings, decisions, profile] = await Promise.all([
     chat.chat_type === "group" ? api.get(`/api/chats/${encoded}/decision`) : null,
     api.get(`/api/decisions?chat_id=${encoded}&platform=${encodeURIComponent(chat.platform)}&chat_type=${encodeURIComponent(chat.chat_type)}&limit=12`),
+    chat.chat_type === "group"
+      ? api.get(`/api/chats/${encoded}/profile${platformQuery}`).catch(() => null)
+      : null,
   ]);
 
   const decisionList = decisions.items.length
@@ -2046,6 +2050,7 @@ async function fillDetail(container, chat) {
     h(
       "div",
       { class: "grid", style: { gridTemplateColumns: "minmax(0, 1fr)", gap: "12px" } },
+      groupProfilePanel(profile, { encoded, platformQuery }),
       h(
         "div",
         { class: "notice good" },
@@ -2061,6 +2066,129 @@ async function fillDetail(container, chat) {
       h("div", { class: "field-label" }, "最近决策"),
       decisionList
     )
+  );
+}
+
+/** 群定位并排展示：左「手写群备注」可编辑、右「自归纳定位」只读。 */
+function groupProfilePanel(profile, { encoded, platformQuery = "" }) {
+  if (!profile || !profile.ok) {
+    return h("div", { class: "field-hint" }, "群定位暂时读不到；重新展开这个群即可再试。");
+  }
+  const note = h("textarea", {
+    class: "textarea",
+    rows: "4",
+    maxlength: String(profile.manual_max_chars || 2000),
+    placeholder: "这个群是什么群、你在这儿该怎么说话。留空则用右边的自归纳定位。",
+    "aria-label": "手写群备注",
+    value: profile.manual_note || "",
+  });
+  const noteHint = h("span", { class: "field-hint" });
+  function refreshNoteHint() {
+    const limit = Number(profile.auto_max_chars || 0);
+    const parts = [`最多 ${profile.manual_max_chars} 字`];
+    if (limit) parts.push(`注入时按 ${limit} 字上限截断`);
+    if (profile.manual_updated_at) parts.push(`上次保存：${fmtRelative(profile.manual_updated_at)}`);
+    noteHint.textContent = parts.join("；");
+  }
+  refreshNoteHint();
+  const stateLine = h("span", { class: "field-hint" });
+  function refreshState() {
+    const manual = note.value.trim();
+    const source = manual ? "manual" : profile.auto_summary ? "auto" : "";
+    stateLine.textContent = source === "manual"
+      ? "当前生效：手写群备注"
+      : source === "auto"
+      ? "当前生效：自归纳定位（手写备注为空）"
+      : "两份都空，暂不注入群定位";
+    stateLine.className = `field-hint ${source ? "" : "mutted"}`;
+  }
+  refreshState();
+  note.addEventListener("input", refreshState);
+
+  const saveButton = h("button", {
+    class: "btn btn-primary btn-sm",
+    type: "button",
+    onclick: async (event) => {
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        const saved = await api.put(`/api/chats/${encoded}/profile${platformQuery}`, {
+          manual_note: note.value,
+        });
+        // 生效来源以服务端裁剪后的结果为准，页面与注入看到同一份
+        profile.manual_note = saved.manual_note || "";
+        profile.source = saved.source || "";
+        profile.manual_updated_at = saved.manual_updated_at || 0;
+        note.value = profile.manual_note;
+        refreshNoteHint();
+        refreshState();
+        toast(profile.manual_note ? "群备注已保存，即时生效" : "群备注已清空，改用自归纳定位");
+      } catch (err) {
+        if (!(err instanceof Unauthorized)) toast(err.message || "保存失败", "error");
+      } finally {
+        button.disabled = false;
+      }
+    },
+  }, "保存");
+  const clearButton = h("button", {
+    class: "btn btn-sm btn-ghost",
+    type: "button",
+    onclick: async (event) => {
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        await api.put(`/api/chats/${encoded}/profile${platformQuery}`, { manual_note: "" });
+        note.value = "";
+        profile.manual_note = "";
+        profile.manual_updated_at = 0;
+        refreshNoteHint();
+        refreshState();
+        toast("群备注已清空，改用自归纳定位");
+      } catch (err) {
+        if (!(err instanceof Unauthorized)) toast(err.message || "清空失败", "error");
+      } finally {
+        button.disabled = false;
+      }
+    },
+  }, "清空");
+
+  const manualBody = h(
+    "div",
+    { class: "profile-column" },
+    h("div", { class: "profile-column-head" },
+      h("strong", {}, "手写群备注"),
+      h("span", { class: `tag ${profile.manual_note ? "accent" : "outline"}` },
+        profile.manual_note ? "已填写，优先注入" : "未填写，用自归纳版")),
+    note,
+    h("div", { class: "profile-actions" }, saveButton, clearButton),
+    stateLine,
+    noteHint
+  );
+
+  const autoText = (profile.auto_summary || "").trim();
+  const autoBody = h(
+    "div",
+    { class: "profile-column" },
+    h("div", { class: "profile-column-head" },
+      h("strong", {}, "自归纳群定位"),
+      h("span", { class: `tag ${autoText ? "outline" : ""}` }, autoText ? "只读" : "还没归纳")),
+    h("div", { class: `profile-readonly ${autoText ? "" : "is-empty"}` },
+      autoText || "后台任务还没给这个群归纳出定位；群消息攒够阈值或到了每日刷新点会自动更新。"),
+    h("div", { class: "field-hint" },
+      autoText
+        ? `最后更新：${fmtRelative(profile.auto_updated_at)} · 上限 ${profile.auto_max_chars} 字`
+        : profile.auto_enabled
+        ? "自归纳已开启"
+        : "自归纳已在设置里关闭，只用手写备注")
+  );
+
+  return h(
+    "section",
+    { class: "card profile-card" },
+    h("div", { class: "card-head" },
+      h("h2", {}, "群定位"),
+      h("span", { class: "hint" }, "手写优先；手写为空时用自归纳；两份都空则不注入")),
+    h("div", { class: "card-body" }, h("div", { class: "profile-compare" }, manualBody, autoBody))
   );
 }
 
@@ -3805,6 +3933,21 @@ function settingsCardSpecs(draft, secrets, pluginsAvailable, groupIdentities = {
             { path: "memory.rolling_summary.trigger_after", label: "触发条数", kind: "number", step: "1", min: 1, hint: "未摘要的原文超过这么多条时压缩一次" },
             { path: "memory.rolling_summary.keep_recent", label: "保留近期原文", kind: "number", step: "1", min: 0, hint: "始终不压缩的最新原文条数" },
             { path: "memory.rolling_summary.max_chars", label: "摘要上限（字）", kind: "number", step: "50", min: 100, hint: "五段式摘要的总长上限，更新时模型需在此取舍" },
+          ],
+          draft
+        ),
+      }),
+    },
+    {
+      path: "memory.group_profile.enabled",
+      node: card("群定位（分群提示词）", {
+        hint: "每群手写群备注 + 后台自归纳；手写优先，两份都空不注入",
+        body: fieldGrid(
+          [
+            { path: "memory.group_profile.enabled", label: "启用自归纳群定位", kind: "switch", hint: "关闭后不后台归纳，手写群备注仍照常注入" },
+            { path: "memory.group_profile.update_interval_hours", label: "刷新间隔（小时）", kind: "number", step: "1", min: 0.1, hint: "距上次归纳超过这么久，后台会刷新一次" },
+            { path: "memory.group_profile.min_messages", label: "触发消息数", kind: "number", step: "1", min: 1, hint: "水位之后的新群消息达到这么多条就归纳一次" },
+            { path: "memory.group_profile.max_chars", label: "定位长度上限（字）", kind: "number", step: "10", min: 50, hint: "注入与归纳的总长上限，超长截断" },
           ],
           draft
         ),

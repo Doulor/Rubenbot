@@ -575,6 +575,38 @@ def _validate_memory(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
     rolling = _section(section, "rolling_summary", v)
     if rolling is not None:
         out["rolling_summary"] = _validate_rolling_summary(rolling, v)
+    group_profile = _section(section, "group_profile", v)
+    if group_profile is not None:
+        out["group_profile"] = _validate_group_profile(group_profile, v)
+    return out
+
+
+def _validate_group_profile(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
+    """群定位的嵌套配置：自归纳开关、刷新频率与长度上限。"""
+    out: dict[str, Any] = {}
+    if "enabled" in section:
+        flag = v.boolean(section["enabled"], "memory.group_profile.enabled")
+        if flag is not None:
+            out["enabled"] = flag
+    for key, minimum in (
+        ("min_messages", 1),
+        ("max_chars", 50),
+        ("max_batch_messages", 1),
+    ):
+        if key in section:
+            number = v.number(
+                section[key], f"memory.group_profile.{key}", minimum=minimum, integer=True
+            )
+            if number is not None:
+                out[key] = int(number)
+    if "update_interval_hours" in section:
+        number = v.number(
+            section["update_interval_hours"],
+            "memory.group_profile.update_interval_hours",
+            minimum=0.1,
+        )
+        if number is not None:
+            out["update_interval_hours"] = float(number)
     return out
 
 

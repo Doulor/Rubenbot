@@ -165,6 +165,26 @@ class RollingSummaryConfig:
 
 
 @dataclass
+class GroupProfileConfig:
+    """群定位：手写群备注 + 后台自归纳的群定位总结。
+
+    只影响注入与后台维护，不参与收消息/裁定/生成三步的 LLM 调用。
+
+    - ``enabled``：自归纳总开关；关闭后只在后台不再更新自归纳，手写备注照常注入。
+    - ``update_interval_hours``：同一群距上次归纳超过这么久，后台任务才会重新归纳。
+    - ``min_messages``：水位之后的新群消息达到多少条才值得再归纳一次。
+    - ``max_chars``：自归纳定位的总长上限；超长由代码兜底截断，注入时也按它截。
+    """
+
+    enabled: bool = True
+    update_interval_hours: float = 24.0
+    min_messages: int = 50
+    max_chars: int = 300
+    # 后台任务单次最多喂给模型的原文条数（群积压多时分批，水位只推进到实际归纳的那条）
+    max_batch_messages: int = 200
+
+
+@dataclass
 class MemoryConfig:
     """记忆层参数。"""
 
@@ -228,6 +248,9 @@ class MemoryConfig:
 
     # ---- 会话滚动摘要（只压缩本会话的对话历史，与跨会话记忆无关）----
     rolling_summary: RollingSummaryConfig = field(default_factory=RollingSummaryConfig)
+
+    # ---- 群定位（手写群备注 + 自归纳群定位，后台更新，默认开）----
+    group_profile: GroupProfileConfig = field(default_factory=GroupProfileConfig)
 
 
 @dataclass
@@ -1334,7 +1357,10 @@ def _load_memory(data: dict[str, Any]) -> MemoryConfig:
     """
     if not isinstance(data, dict):
         return MemoryConfig()
-    plain = {k: v for k, v in data.items() if _has(MemoryConfig, k) and k != "rolling_summary"}
+    plain = {
+        k: v for k, v in data.items()
+        if _has(MemoryConfig, k) and k not in ("rolling_summary", "group_profile")
+    }
     config = MemoryConfig(**plain)
     raw = data.get("rolling_summary")
     if isinstance(raw, dict):
@@ -1344,6 +1370,29 @@ def _load_memory(data: dict[str, Any]) -> MemoryConfig:
             trigger_after=_as_int(raw.get("trigger_after"), default.trigger_after, minimum=1),
             keep_recent=_as_int(raw.get("keep_recent"), default.keep_recent, minimum=0),
             max_chars=_as_int(raw.get("max_chars"), default.max_chars, minimum=100),
+        )
+    group_profile = data.get("group_profile")
+    if isinstance(group_profile, dict):
+        default_group = GroupProfileConfig()
+        config.group_profile = GroupProfileConfig(
+            enabled=group_profile.get("enabled") is not False,
+            update_interval_hours=max(
+                0.1,
+                _as_float(
+                    group_profile.get("update_interval_hours"), default_group.update_interval_hours
+                ),
+            ),
+            min_messages=_as_int(
+                group_profile.get("min_messages"), default_group.min_messages, minimum=1
+            ),
+            max_chars=_as_int(
+                group_profile.get("max_chars"), default_group.max_chars, minimum=50
+            ),
+            max_batch_messages=_as_int(
+                group_profile.get("max_batch_messages"),
+                default_group.max_batch_messages,
+                minimum=1,
+            ),
         )
     return config
 

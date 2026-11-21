@@ -27,6 +27,7 @@ from .retrieve import (
 from .store import (
     ConversationSummary,
     Event,
+    GroupProfile,
     LogEntry,
     Memory,
     MemoryStore,
@@ -56,6 +57,7 @@ __all__ = [
     "ExtractedEvent",
     "ExtractedFact",
     "Extraction",
+    "GroupProfile",
     "LogEntry",
     "MemberIndex",
     "MemberRow",
