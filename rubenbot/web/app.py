@@ -926,6 +926,9 @@ def create_app(state: WebState):
             items.append({
                 "id": sticker.id,
                 "tags": list(sticker.tags),
+                "description": sticker.description,
+                "emotions": list(sticker.emotions),
+                "uses": sticker.uses,
                 "image_url": f"/api/stickers/{sticker.id}/image" if store.path_of(sticker) else None,
                 "created_at": sticker.created_at,
             })

@@ -690,7 +690,7 @@ def test_send_sticker_backfills_native_ref(config, store, tmp_path):
     from rubenbot.stickers import StickerStore
 
     stickers = StickerStore(tmp_path / "stickers")
-    registered = stickers.add(b"sticker-bytes", tags=["猫"])
+    registered = stickers.add(b"\x89PNG\r\n\x1a\nsticker-bytes", tags=["猫"])
     recorder = StickerRecorder(result={"message_id": 1, "file_id": "FILE_9"})
     bot = RubenBot(
         config, store, ScriptedLLM(), Persona("Ruben", "你是 Ruben"), stickers=stickers
@@ -716,7 +716,7 @@ def test_send_sticker_without_file_id_does_not_backfill(config, store, tmp_path)
     from rubenbot.stickers import StickerStore
 
     stickers = StickerStore(tmp_path / "stickers")
-    registered = stickers.add(b"sticker-bytes")
+    registered = stickers.add(b"\x89PNG\r\n\x1a\nsticker-bytes")
     recorder = StickerRecorder(result={"sent": True})
     bot = RubenBot(
         config, store, ScriptedLLM(), Persona("Ruben", "你是 Ruben"), stickers=stickers

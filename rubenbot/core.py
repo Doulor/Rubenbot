@@ -439,6 +439,17 @@ def _strip_segments_actions(segments: list[Segment]) -> list[Segment]:
     return cleaned
 
 
+def _sticker_emotion_hint(expression: ExpressionDecision | None) -> str:
+    """选表情用的情感提示：直接取表达决策书已算出的意图与增量点。
+
+    不另做一套情感分析；没有决策书时返回空串，选择逻辑会退回上下文原文。
+    """
+    if expression is None:
+        return ""
+    parts = [expression.intent, expression.increment]
+    return "：".join(part.strip() for part in parts if part and part.strip())
+
+
 def _log_identity(event: MessageEvent | PlatformEvent) -> dict[str, str]:
     """把日志关联到实际事件，不从日志文本或模型输出推断身份。"""
     if isinstance(event, PlatformEvent):
@@ -717,6 +728,12 @@ class RubenBot:
         try:
             # 首条消息也使用发现完毕的工具目录；离线服务仅等待首次尝试，不等待重连。
             await self.mcp.start()
+            # 存量表情补描述：没配 vision 角色时一条都不排（内部直接返回 0）
+            if self.config.stickers.enabled:
+                try:
+                    await self.sticker_behavior.reschedule_descriptions(self.context)
+                except Exception as exc:  # noqa: BLE001 - 描述补建失败不能拖住启动
+                    logger.warning("补建表情描述失败：%s", exc)
             tasks = [asyncio.create_task(self._run_adapter(adapter)) for adapter in self.adapters.values()]
             self._bg_task = asyncio.create_task(self._background_loop())
             self._merge_task = asyncio.create_task(self._merge_loop())
@@ -793,6 +810,11 @@ class RubenBot:
                 await self.voice.close()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("关闭语音客户端失败：%s", exc)
+        # 表情行为自建的 embedding 客户端；后台描述任务随事件循环结束
+        try:
+            await self.sticker_behavior.aclose()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("关闭表情客户端失败：%s", exc)
 
     async def _background_loop(self) -> None:
         """定期检查抽取与归纳；间隔每轮从配置现读，改设置后无需重启。"""
@@ -2330,6 +2352,7 @@ class RubenBot:
             return False
         if not await self.sticker_behavior.try_send(
             self.context, event, probability=self.config.stickers.nonverbal_probability,
+            emotion_hint=_sticker_emotion_hint(expression),
         ):
             return False
         reply = "[表情]"

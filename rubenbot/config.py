@@ -631,6 +631,9 @@ class StickerConfig:
 
     ``enabled`` 是总开关，默认关闭以保持升级后的零动作行为；只有打开后，
     ``collect`` 才会收集群聊表情，回复后才会按概率补发表情。
+
+    描述生成与语义检索都是「配了就启用」：视觉模型看 ``llm.models.vision``，
+    向量通道看这里的 ``embedding_*``；都没配时行为与旧版等价（标签匹配）。
     """
 
     enabled: bool = False
@@ -640,6 +643,15 @@ class StickerConfig:
     # 接梗/短附和时，只发一张表情包的概率；不满足条件时回落文字。
     nonverbal_probability: float = 0.30
     dir: str = "data/stickers"
+    # 单张表情图片的收集上限（字节）；超过或格式识别不了就不收本体
+    max_file_bytes: int = 8 * 1024 * 1024
+    # 描述 embedding 检索（OpenAI 兼容 /embeddings）。base_url 与 model
+    # 都填了才启用；没有时直接走 fast 角色文本选择。
+    embedding_base_url: str = ""
+    embedding_model: str = ""
+    embedding_api_key: str = ""
+    embedding_threshold: float = 0.3
+    embedding_refresh_seconds: float = 21600.0
 
     def __post_init__(self) -> None:
         self.enabled = self.enabled is True
@@ -654,6 +666,18 @@ class StickerConfig:
             self.cooldown_seconds = 300.0
         self.cooldown_seconds = max(0.0, float(self.cooldown_seconds))
         self.dir = str(self.dir or "").strip() or "data/stickers"
+        if isinstance(self.max_file_bytes, bool) or not isinstance(self.max_file_bytes, (int, float)) or self.max_file_bytes <= 0:
+            self.max_file_bytes = 8 * 1024 * 1024
+        self.max_file_bytes = int(self.max_file_bytes)
+        self.embedding_base_url = str(self.embedding_base_url or "").strip()
+        self.embedding_model = str(self.embedding_model or "").strip()
+        self.embedding_api_key = str(self.embedding_api_key or "").strip()
+        if isinstance(self.embedding_threshold, bool) or not isinstance(self.embedding_threshold, (int, float)):
+            self.embedding_threshold = 0.3
+        self.embedding_threshold = min(1.0, max(-1.0, float(self.embedding_threshold)))
+        if isinstance(self.embedding_refresh_seconds, bool) or not isinstance(self.embedding_refresh_seconds, (int, float)):
+            self.embedding_refresh_seconds = 21600.0
+        self.embedding_refresh_seconds = max(0.0, float(self.embedding_refresh_seconds))
 
 
 @dataclass
