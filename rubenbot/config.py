@@ -638,6 +638,9 @@ class StickerConfig:
 
     enabled: bool = False
     collect: bool = False
+    # 默认只收真表情（mface/贴纸/[动画表情]）；普通照片、截图被误收时
+    # 只属于噪声，打开这个开关才让它们进库（仍标记为 photo，不参与选图）。
+    collect_photos: bool = False
     send_probability: float = 0.15
     cooldown_seconds: float = 300.0
     # 接梗/短附和时，只发一张表情包的概率；不满足条件时回落文字。
@@ -656,6 +659,7 @@ class StickerConfig:
     def __post_init__(self) -> None:
         self.enabled = self.enabled is True
         self.collect = self.collect is True
+        self.collect_photos = self.collect_photos is True
         if isinstance(self.send_probability, bool) or not isinstance(self.send_probability, (int, float)):
             self.send_probability = 0.15
         self.send_probability = min(1.0, max(0.0, float(self.send_probability)))

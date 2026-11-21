@@ -1,7 +1,9 @@
 """核心表情包行为：收集群聊表情，按话题选图用于独立回复或文字后补发。
 
 收集时优先把图片本体落盘（base64 段或可下载的 URL），只有拿不到字节
-时才退化成纯原生引用条目。选图分两级：
+时才退化成纯原生引用条目。群里的普通图片（照片、截图）默认不收，只有
+配置 ``stickers.collect_photos`` 才入库；即便入库也标记为 ``photo``，
+永不参与选图。选图分两级：
 
 1. 语义检索（可选）：配置了 embedding 通道时，把每条表情的描述+情绪标签
    做成向量、缓存在 ``data/stickers/embeddings.json``，用上下文与情感提示
@@ -36,6 +38,7 @@ from .adapters.base import SEND_STICKER
 from .http_body import CompressedBodyError, read_compressed_body
 from .llm import parse_json_payload
 from .memory.retrieve import tokenize
+from .stickers import KIND_PHOTO, KIND_STICKER, infer_ref_kind
 
 logger = logging.getLogger(__name__)
 
@@ -149,7 +152,9 @@ class StickerBehavior:
                     logger.debug("表情包收集异常（跳过该段）：%s", sticker)
                     continue
                 if sticker is not None and getattr(sticker, "file", ""):
-                    self._schedule_description(runtime, store, sticker)
+                    # 普通图片不参与选图，没必要花视觉模型额度给它写描述
+                    if getattr(sticker, "kind", KIND_STICKER) == KIND_STICKER:
+                        self._schedule_description(runtime, store, sticker)
         except Exception as exc:  # noqa: BLE001
             logger.debug("表情包收集异常：%s", exc)
 
@@ -173,6 +178,16 @@ class StickerBehavior:
             native_ref = {"kind": kind, "data": payload}
         refs = {platform: native_ref} if platform else None
 
+        # 真表情与误收的普通图片分开：photo 默认不入库，只有显式打开
+        # stickers.collect_photos 才收（收进来也标记为 photo，永不参选）。
+        sticker_kind = infer_ref_kind(native_ref)
+        if sticker_kind == KIND_PHOTO and not getattr(self.config, "collect_photos", False):
+            logger.debug(
+                "跳过普通图片（默认只收表情；stickers.collect_photos 可放开）：%s",
+                payload.get("summary") or payload.get("file") or payload.get("url") or kind,
+            )
+            return None
+
         raw = _decode_base64(payload.get("base64"))
         if raw is None:
             raw = await self._download_image(_candidate_url(payload, native_ref))
@@ -185,6 +200,7 @@ class StickerBehavior:
             file_name=payload.get("filename") or payload.get("name") or None,
             mime_type=payload.get("mime_type") or payload.get("content_type") or None,
             max_file_bytes=self.max_file_bytes,
+            kind=sticker_kind,
         )
 
     async def _download_image(self, url: str) -> bytes | None:
@@ -336,9 +352,12 @@ class StickerBehavior:
         return last is not None and now - last < getattr(self.config, "cooldown_seconds", 300.0)
 
     async def _pick(self, runtime: Any, store: Any, event: Any, emotion_hint: str) -> Any:
-        """两级选择 + 标签回落；候选只取有本地文件的条目。"""
+        """两级选择 + 标签回落；候选只取有本地文件的真表情（photo 永不参选）。"""
         text = str(getattr(event, "text", "") or "")
-        candidates = [item for item in store.find_by_tags(None) if _has_local_file(store, item)]
+        candidates = [
+            item for item in store.find_by_tags(None, kind=KIND_STICKER)
+            if _has_local_file(store, item)
+        ]
         if not candidates:
             return None
         context = _context_text(runtime, event) or text
@@ -562,7 +581,7 @@ class StickerBehavior:
                 self._vision_skip_logged = True
             return 0
         targets = [
-            item.id for item in store.find_by_tags(None)
+            item.id for item in store.find_by_tags(None, kind=KIND_STICKER)
             if item.file and not item.description and item.id not in self._pending_descriptions
         ][:DESCRIBE_BACKFILL_BATCH]
         if not targets:
@@ -580,6 +599,10 @@ class StickerBehavior:
     async def _describe_batch(self, store: Any, sticker_ids: list[str], llm: Any) -> None:
         for sticker_id in sticker_ids:
             try:
+                item = store.get(sticker_id)
+                # 普通图片不参选，也不值得花视觉额度补描述
+                if item is not None and getattr(item, "kind", KIND_STICKER) != KIND_STICKER:
+                    continue
                 await self._build_description(store, sticker_id, llm)
             except asyncio.CancelledError:
                 raise

@@ -162,7 +162,7 @@ def test_collect_downloads_url_and_stores_file(tmp_path):
         seen.append(url)
         return JPG + b"downloaded"
 
-    segment = Segment("image", {"file": "a.jpg", "url": "https://cdn.example/a.jpg"})
+    segment = Segment("image", {"file": "a.jpg", "url": "https://cdn.example/a.jpg", "summary": "[动画表情]"})
     collect(behavior(store, downloader=downloader), Bot(store), segments=[segment])
     item = store.find_by_tags(None)[0]
     assert seen == ["https://cdn.example/a.jpg"]
@@ -176,7 +176,7 @@ def test_collect_download_failure_keeps_ref_only(tmp_path, caplog):
     async def broken(url, limit):
         raise RuntimeError("网络断了")
 
-    segment = Segment("image", {"url": "https://cdn.example/gone.jpg"})
+    segment = Segment("image", {"url": "https://cdn.example/gone.jpg", "summary": "[动画表情]"})
     with caplog.at_level("WARNING"):
         collect(behavior(store, downloader=broken), Bot(store), segments=[segment])
     item = store.find_by_tags(None)[0]
@@ -190,7 +190,7 @@ def test_collect_download_oversize_keeps_ref_only(tmp_path):
     async def huge(url, limit):
         return PNG + b"x" * (limit + 1)
 
-    segment = Segment("image", {"url": "https://cdn.example/huge.png"})
+    segment = Segment("image", {"url": "https://cdn.example/huge.png", "summary": "[动画表情]"})
     collect(behavior(store, downloader=huge), Bot(store), segments=[segment])
     assert store.find_by_tags(None)[0].file == ""
 
@@ -223,6 +223,7 @@ def test_collect_base64_first_skips_download(tmp_path):
     segment = Segment("image", {
         "base64": base64.b64encode(PNG + b"inline").decode(),
         "url": "https://cdn.example/a.png",
+        "summary": "[动画表情]",
     })
     collect(behavior(store, downloader=downloader), Bot(store), segments=[segment])
     assert seen == []
@@ -271,6 +272,7 @@ def test_description_skipped_without_vision_role(tmp_path, caplog):
     with caplog.at_level("INFO"):
         collect(behavior(store), bot, segments=[Segment("image", {
             "base64": base64.b64encode(PNG + b"x").decode(),
+            "summary": "[动画表情]",
         })])
     assert llm.calls == []
     assert store.find_by_tags(None)[0].description == ""
@@ -288,6 +290,7 @@ def test_description_written_back_when_vision_configured(tmp_path):
         b = behavior(store)
         await b.on_message(runtime(bot), event(segments=[Segment("image", {
             "base64": base64.b64encode(PNG + b"x").decode(),
+            "summary": "[动画表情]",
         })]))
         await asyncio.gather(*b._bg_tasks)
 
@@ -316,6 +319,7 @@ def test_description_failure_does_not_break_collection(tmp_path):
         b = behavior(store)
         await b.on_message(runtime(bot), event(segments=[Segment("image", {
             "base64": base64.b64encode(PNG + b"x").decode(),
+            "summary": "[动画表情]",
         })]))
         await asyncio.gather(*b._bg_tasks, return_exceptions=True)
 
@@ -913,8 +917,8 @@ def test_collect_one_bad_segment_does_not_block_others(tmp_path):
             return self.inner.find_by_tags(tags, **kwargs)
 
     flaky = FlakyStore(store)
-    bad = Segment("image", {"base64": base64.b64encode(PNG + b"bad").decode()})
-    good = Segment("image", {"base64": base64.b64encode(PNG + b"good").decode()})
+    bad = Segment("image", {"base64": base64.b64encode(PNG + b"bad").decode(), "summary": "[动画表情]"})
+    good = Segment("image", {"base64": base64.b64encode(PNG + b"good").decode(), "summary": "[动画表情]"})
     collect(behavior(flaky), Bot(flaky), segments=[bad, good])
     assert flaky.failed is True
     items = store.find_by_tags(None)

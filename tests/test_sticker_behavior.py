@@ -78,7 +78,11 @@ def event(text="你好", *, chat_id="g1", chat_type="group", segments=None):
 
 
 def image(raw=png(b"png-bytes")):
-    return Segment("image", {"base64": base64.b64encode(raw).decode(), "filename": "cat.png", "mime_type": "image/png"})
+    """群聊里的真表情图（摘要为「[动画表情]」，收集时按 sticker 入库）。"""
+    return Segment("image", {
+        "base64": base64.b64encode(raw).decode(), "filename": "cat.png",
+        "mime_type": "image/png", "summary": "[动画表情]",
+    })
 
 
 def make_behavior(store, **values):
@@ -158,7 +162,7 @@ def test_collect_deduplicates_and_merges_tags(tmp_path):
 def test_collect_reference_only_segment(tmp_path):
     store = StickerStore(tmp_path / "stickers")
     behavior = make_behavior(store)
-    segment = Segment("image", {"file": "a.jpg", "url": "https://cdn.example/a.jpg"})
+    segment = Segment("image", {"file": "a.jpg", "url": "https://cdn.example/a.jpg", "summary": "[动画表情]"})
     asyncio.run(behavior.on_message(runtime(Bot(store)), event("看图", segments=[segment])))
     item = store.find_by_tags(None)[0]
     assert item.file == "" and item.native_refs["snowluma"]["data"]["url"].startswith("https://")
