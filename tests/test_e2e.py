@@ -19,6 +19,8 @@ def build() -> tuple[RubenBot, ConsoleAdapter, ScriptedLLM]:
     config.decision.merge_window_seconds = 0  # 测试里不攒消息，逐条处理
     config.decision.hard_merge_window_seconds = 0
     config.decision.base = 0.0  # 群里默认不插话
+    # 端到端走旧裁定路径（意愿评分 + 整份 SOUL），与线上灰度前的行为一致
+    config.planner.planner_gate = False
     store = MemoryStore(":memory:")
     extract_payload = json.dumps(
         [

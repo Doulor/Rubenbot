@@ -167,6 +167,7 @@ def test_structured_config_covers_every_field(config):
             "ratio_penalty",
             "cooldown_seconds",
             "cooldown_penalty",
+            "min_reply_interval_seconds",
             "exclude_bot_momentum",
             "refractory_enabled",
             "refractory_seconds",

@@ -62,7 +62,14 @@ from ..core import format_scene
 from ..decision import parse_quiet_hours
 from ..identity import IdentityService, avatar_url
 from ..emotion import EmotionEngine
-from ..persona import DEFAULT_PERSONA, Persona, load_persona
+from ..persona import (
+    DEFAULT_PERSONA,
+    PERSONA_FILES,
+    Persona,
+    load_persona,
+    load_persona_parts,
+    personafile_path,
+)
 from ..stickers import KIND_PHOTO, KIND_STICKER
 from .auth import COOKIE_NAME, BindSecurityError, check_bind_security, mask_secret
 from .config_schema import (
@@ -334,14 +341,64 @@ def _persona_file_info(state: WebState) -> tuple[Path, bool, str, float | None]:
     return path, exists, text, mtime
 
 
+def _persona_dir(state: WebState) -> Path:
+    """五文件人设目录（配置优先，默认与 SOUL 同级）。"""
+    return Path(state.config.persona_directory)
+
+
+def _persona_files_payload(state: WebState) -> dict[str, Any]:
+    """五文件人设的逐文件视图：内容、是否存在、修改时间、字数。"""
+    directory = _persona_dir(state)
+    files: dict[str, Any] = {}
+    for name in PERSONA_FILES:
+        path = personafile_path(directory, name)
+        entry: dict[str, Any] = {
+            "name": name,
+            "path": str(path),
+            "exists": path.is_file(),
+            "text": "",
+            "chars": 0,
+            "mtime": None,
+        }
+        if path.is_file():
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError:
+                text = ""
+            entry.update(
+                text=text,
+                chars=len(text),
+                mtime=path.stat().st_mtime,
+            )
+        files[name] = entry
+    return {
+        "dir": str(directory),
+        "exists": (directory / "persona.md").is_file(),
+        "files": files,
+    }
+
+
 def _effective_persona(state: WebState, file_text: str, exists: bool):
     """当前实际生效的人格：运行中的 bot 持有对象优先，否则按文件内容构造。
 
     GET 是只读操作：文件不存在时直接按默认人格展示，不顺手创建文件。
+    五文件目录存在时按多文件形态构造（``persona.md`` 当人格正文），
+    与启动时 :func:`load_persona` 的判定保持一致。
     """
     persona = state.bot_persona()
     if persona is not None:
         return persona, "bot"
+    parts = load_persona_parts(_persona_dir(state))
+    if parts:
+        text = parts.get("persona", "") or DEFAULT_PERSONA
+        persona = Persona(
+            name=_extract_name_safe(text),
+            text=text,
+            parts=parts,
+            directory=str(_persona_dir(state)),
+            **state.config.persona_example_options(),
+        )
+        return persona, "file"
     text = file_text if exists else DEFAULT_PERSONA
     persona = Persona(name=_extract_name_safe(text), text=text, **state.config.persona_example_options())
     return persona, "file" if exists else "default"
@@ -351,12 +408,19 @@ def _persona_payload(state: WebState) -> dict[str, Any]:
     path, exists, file_text, mtime = _persona_file_info(state)
     persona, source = _effective_persona(state, file_text, exists)
     effective_text = persona.text
+    files_view = _persona_files_payload(state)
+    if persona.multi_file:
+        # 五文件形态：编辑区默认展示 persona.md，exists / mtime 也指这一份
+        persona_path = personafile_path(_persona_dir(state), "persona")
+        exists = persona_path.is_file()
+        file_text = persona.parts.get("persona", "")
+        mtime = persona_path.stat().st_mtime if exists else None
     # 文件还不存在时，编辑区预填默认人格（与启动时 load_persona 会写入的一致），
     # 免得用户面对一片空白不知道从哪改；exists 字段告诉前端这一点。
     editor_text = file_text if exists else effective_text
     return {
         "ok": True,
-        "path": str(path),
+        "path": str(persona_path if persona.multi_file else path),
         "exists": exists,
         "text": editor_text,
         "chars": len(editor_text),
@@ -368,6 +432,10 @@ def _persona_payload(state: WebState) -> dict[str, Any]:
         "effective_source": source,
         "hot_reload": state.bot_persona() is not None,
         "in_sync": editor_text == effective_text,
+        # 五文件人设：目录里的 persona.md 存在时按多文件形态生效
+        "multi_file": persona.multi_file,
+        "dir": files_view["dir"],
+        "files": files_view["files"],
     }
 
 
@@ -378,8 +446,8 @@ def _extract_name_safe(text: str) -> str:
     return _extract_name(text) if text.strip() else "Ruben"
 
 
-def _preview_prompt(persona) -> str:
-    """拼一次系统提示词示例：人格 + 场景行 + 空记忆（与 core.build_context 同构）。"""
+def _preview_with_prompt(prompt: str) -> str:
+    """把一段人格提示拼进示例上下文（与 core.build_context 同构：场景行 + 空记忆占位）。"""
     event = MessageEvent(
         platform="webui",
         chat_type="group",
@@ -388,19 +456,33 @@ def _preview_prompt(persona) -> str:
         sender_name="阿花",
         text="",
     )
-    sections = [persona.system_prompt(), "（这里会放检索到的记忆；示例里为空）", format_scene(event, "阿花")]
+    sections = [prompt, "（这里会放检索到的记忆；示例里为空）", format_scene(event, "阿花")]
     return "\n\n".join(sections)
 
 
-def _apply_persona(state: WebState, text: str) -> dict[str, Any]:
-    """写人格文件并热加载；返回给前端的落盘/生效信息。"""
-    backup = save_persona_text(state.config.persona_path, text)
-    persona = load_persona(state.config.persona_path, **state.config.persona_example_options())
+def _apply_persona(state: WebState, text: str, *, name: str = "persona") -> dict[str, Any]:
+    """写人格文件并热加载；返回给前端的落盘/生效信息。
+
+    ``name`` 是五文件人设里的文件名：目录已有 persona.md（多文件形态）时
+    按 ``name.md`` 保存；否则保持旧行为写 ``persona_path``（SOUL.md），
+    这样旧部署不带 ``file`` 参数的调用完全不变。
+    """
+    directory = _persona_dir(state)
+    multi = (directory / "persona.md").is_file()
+    target = personafile_path(directory, name) if multi else Path(state.config.persona_path)
+    backup = save_persona_text(target, text)
+    persona = load_persona(
+        state.config.persona_path,
+        persona_dir=state.config.persona_directory,
+        **state.config.persona_example_options(),
+    )
     applied = state.apply_persona(persona)
     return {
         "backup": str(backup) if backup else None,
         "applied": applied,
         "restart_required": not applied,
+        "file": name,
+        "saved_path": str(target),
         "message": (
             "已生效，无需重启。后续消息会直接使用新人设。"
             if applied
@@ -1269,29 +1351,51 @@ def create_app(state: WebState):
         require_session(request)
         body = await _json_body(request)
         text = str(body.get("text") or "")
+        file = str(body.get("file") or "persona")
+        if file not in PERSONA_FILES:
+            raise ApiError(422, f"未知的人格文件：{file}")
         if not text.strip():
             raise ApiError(422, "人格内容不能为空")
-        result = _apply_persona(state, text)
-        logger.info("WebUI 保存人格到 %s（%s）", state.config.persona_path, result["message"])
+        result = _apply_persona(state, text, name=file)
+        logger.info("WebUI 保存人格 %s 到 %s（%s）", file, result["saved_path"], result["message"])
         return {"ok": True, **result, "persona": _persona_payload(state)}
 
     @app.post("/api/persona/reset")
     async def reset_persona(request: Request):
         require_session(request)
-        result = _apply_persona(state, DEFAULT_PERSONA)
+        # 旧前端不带请求体；请求体可选，带 file 时只接受已存在的五文件名字
+        try:
+            body = await _json_body(request)
+        except ApiError:
+            body = {}
+        file = str(body.get("file") or "persona")
+        if file not in PERSONA_FILES:
+            raise ApiError(422, f"未知的人格文件：{file}")
+        directory = _persona_dir(state)
+        if (directory / "persona.md").is_file() and file != "persona":
+            raise ApiError(422, "五文件人设只支持重置 persona.md；其余文件请直接编辑")
+        result = _apply_persona(state, DEFAULT_PERSONA, name="persona")
         logger.info("WebUI 恢复默认人格（%s）", result["message"])
         return {"ok": True, **result, "persona": _persona_payload(state)}
 
     @app.get("/api/persona/preview")
     async def preview_persona(request: Request):
         require_session(request)
+        stage = request.query_params.get("stage") or "single"
+        if stage not in ("single", "planner", "generator", "legacy"):
+            raise ApiError(422, f"未知的组装阶段：{stage}")
         persona = state.bot_persona()
         if persona is None:
             path, exists, file_text, _ = _persona_file_info(state)
             persona, _source = _effective_persona(state, file_text, exists)
+        if persona.multi_file:
+            prompt = persona.system_prompt(stage=stage)
+        else:
+            prompt = persona.system_prompt()
         return {
             "ok": True,
-            "prompt": _preview_prompt(persona),
+            "prompt": _preview_with_prompt(prompt),
+            "stage": stage,
             "source": "bot" if state.bot_persona() is not None else "file",
         }
 

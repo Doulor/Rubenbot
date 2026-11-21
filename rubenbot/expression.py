@@ -11,6 +11,7 @@ BUDGETS = {"碎片": "≤10 字", "短句": "11–25 字", "展开": "26–60 �
 MAX_PLAN_CHARS = 500
 MAX_INCREMENT = 50
 MAX_EXCERPT = 40
+MAX_REASON = 60
 
 
 @dataclass(frozen=True)
@@ -20,6 +21,10 @@ class ExpressionDecision:
     increment: str
     avoid_repetition: tuple[str, ...]
     source: str = "fast"
+    # 策划步的开口裁定：None 表示没有裁定（旧路径 / 未返回该字段）
+    speak: bool | None = None
+    # 裁定理由摘要（进 decision_log 的 factors，便于审计）
+    reason: str = ""
 
     def prompt_block(self) -> str:
         return (
@@ -32,6 +37,21 @@ class ExpressionDecision:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+def coerce_speak(value: object) -> bool | None:
+    """把模型给的 speak 字段归一成布尔；认不出来返回 None（不给裁定）。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("true", "yes", "1", "说", "回", "开口"):
+            return True
+        if text in ("false", "no", "0", "不说", "不回", "沉默"):
+            return False
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return bool(value)
+    return None
 
 
 def choose_length_band(roll: float, *, mentioned_question: bool, casual_group: bool) -> str:
@@ -59,7 +79,11 @@ def repetition_list(recent: list[str], proposed: object = None) -> tuple[str, ..
 
 
 def parse_plan(raw: str, band: str, recent: list[str]) -> ExpressionDecision:
-    """非结构化输出不作指导；模型故障只允许保守的碎片呼应。"""
+    """非结构化输出不作指导；模型故障只允许保守的碎片呼应。
+
+    ``speak`` 是策划步的开口裁定：模型给了就照它的；只写 intent=沉默 也
+    视为不说；两样都没有时视为「没裁定」（None，交回调用方兜底）。
+    """
     try:
         data = json.loads(raw) if len(raw) <= MAX_PLAN_CHARS else None
     except ValueError:
@@ -73,5 +97,11 @@ def parse_plan(raw: str, band: str, recent: list[str]) -> ExpressionDecision:
         increment = ''
     if not increment and intent != '短附和':
         intent = '沉默'
+    speak = coerce_speak(data.get('speak'))
+    if speak is None:
+        speak = False if intent == '沉默' else True
+    reason = data.get('reason')
+    reason = ' '.join(reason.split())[:MAX_REASON] if isinstance(reason, str) else ''
     return ExpressionDecision(intent, '碎片' if intent == '短附和' else band, increment,
-                              repetition_list(recent, data.get('avoid_repetition')))
+                              repetition_list(recent, data.get('avoid_repetition')),
+                              speak=speak, reason=reason)

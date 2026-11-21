@@ -152,12 +152,13 @@ bot 对每个人的好感度、以及自己当下的心情，都由确定性规�
 | 路径 | 职责 |
 | --- | --- |
 | `rubenbot/config.py` | 读取 YAML 配置，展开 `${ENV_VAR}`，未知键忽略，缺文件走默认值 |
-| `rubenbot/persona.py` | 加载 SOUL.md 风格的 Markdown 人格；不存在时生成默认人格 |
+| `rubenbot/persona.py` | 加载人格：五文件目录（`data/persona/`）优先，缺目录时回退单文件 SOUL.md |
 | `rubenbot/llm.py` | OpenAI 兼容客户端；按角色（`chat` / `extract` / `consolidate` / `fast` / `summary` / `vision` 及自定义）选模型；408/429/5xx 指数退避重试；每次调用写用量表 |
 | `rubenbot/core.py` | 消息主循环、合并窗口调度、决策、上下文拼装、拆条发送、后台维护 |
 | `rubenbot/search.py` | 联网搜索渠道（Tavily / DeepSeek）、有序回退链、结果归一与紧凑注入、每会话冷却 |
 | `rubenbot/voice.py` | 语音双向：入站语音条转写（硅基流动 / OpenAI 兼容 / QQ 原生）、出站语音合成（自定义 OpenAI 兼容 TTS / 硅基流动） |
-| `rubenbot/decision.py` | 回复意愿系统：消息合并、硬触发、意愿评分、生成否决标记 |
+| `rubenbot/decision.py` | 回复意愿系统：消息合并、硬触发、开口护栏；旧版意愿评分保留给回滚开关 |
+| `rubenbot/opener_guard.py` | 开头反重复：按会话统计 bot 最近回复的开场模式，超标时给生成步临时注入一句纠偏 |
 | `rubenbot/scheduler.py` | 轻量调度器：每 10 秒扫一次到期的 `scheduled_jobs` 并执行 |
 | `rubenbot/reminder.py` | 提醒工具 `set_reminder`：参数解析、（延迟/绝对时间）到点文案 |
 | `rubenbot/proactive.py` | 冷场开口：条件矩阵、低意愿评分、生成内容过滤（默认关） |
@@ -286,6 +287,10 @@ WebUI 的「群组与意愿」可按名字或 ID 查会话；「记忆 → 画�
 | `models` | 可扩展的角色 → 模型映射（如 `fast` / `summary` / `vision`，未配的角色回退 `chat_model`），优先于上面两个旧字段 |
 | `timeout` `max_retries` | 单次请求超时（秒）与失败重试次数（408/429/5xx，间隔 1s / 3s） |
 | `persona` | `path` | 人格文件，默认 `data/SOUL.md` |
+| `decision` | `min_reply_interval_seconds` | 新路径护栏：同一会话两次开口的最小间隔（默认 20 秒，必回不受限） |
+| | `dir` | 五文件人设目录，默认取 `path` 同级的 `persona/`；目录里有 `persona.md` 就按五文件加载 |
+| | `planner.planner_gate` | 开口裁定交给策划步（默认 `true`）；设 `false` 回滚到旧的意愿评分 + 整份 SOUL |
+| | `planner.identity_triggers` `identity_window` | 身份话题触发词与回看条数（命中才注入 `identity.md`） |
 | `database_path` | — | SQLite 路径，默认 `data/rubenbot.db` |
 | `memory` | `extract_every_n` | 会话攒够多少条未抽取消息触发 |
 | | `extract_silence_seconds` | 会话静默多久后触发 |
@@ -558,6 +563,8 @@ WebUI 的「插件」分两页：「插件市场」在同一列表里发现、�
 - **第二阶段**：FastAPI + 单页 WebUI（概览 / 人设 / 记忆 / 人物 / 群组 / 插件 / 日志 / 设置），真实 SnowLuma 联调，embedding 检索融合。
 
 WebUI 的「人设」页可以直接编辑人格文件：保存时先写 `.bak` 备份，运行中的 bot 会立即热加载新人格，后续消息无需重启即可生效；「恢复默认」同样热加载。页面右侧只读展示当前实际生效的人格与系统提示词拼装预览，方便核对。
+
+人设支持五文件形态（`data/persona/`）：`persona.md` 常驻人格、`behavior.md` 策划步行为风格、`reply_style.md` 生成步回复风格（含对话样例）、`identity.md` 身份话题触发时注入、`owner.md` 仅私聊主人时注入。策划步 = persona + behavior（+条件注入），生成步 = persona + reply_style（+条件注入），单段生成三份都带；目录不存在时回退到单文件 SOUL.md 的旧行为。WebUI 人设页会列出这五个文件，按文件切换编辑并在保存时带上 `file` 参数。
 
 ## 许可
 

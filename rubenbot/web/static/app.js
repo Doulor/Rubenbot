@@ -917,16 +917,70 @@ async function renderLegacyPersona(view) {
  */
 async function personaNodes() {
   const data = await api.get("/api/persona");
+  // 五文件形态：目录里有 persona.md 时逐份编辑；否则仍是单个 SOUL 编辑器
+  const files = data.multi_file && data.files ? data.files : null;
+  const fileNames = files ? Object.keys(files) : [];
+  let currentFile = files ? (files.persona?.exists ? "persona" : fileNames[0]) : "persona";
+  const fileText = () => (files && files[currentFile] ? files[currentFile].text || "" : data.text);
+  // 每种人设文件的用途，显示在编辑区上方，避免改错文件
+  const FILE_HINTS = {
+    persona: "常驻人格：每一步都会带上",
+    behavior: "策划步：决定这轮开不开口",
+    reply_style: "生成步：决定怎么说话（含对话样例）",
+    identity: "身份话题被提及时才注入",
+    owner: "只在私聊主人时注入",
+  };
+  const fileHint = files
+    ? h("span", { class: "hint" }, FILE_HINTS[currentFile] || "")
+    : null;
 
   const editor = h("textarea", {
     class: "textarea code persona-editor",
     spellcheck: "false",
     "aria-label": "人格文件内容",
-    value: data.text,
+    value: fileText(),
     placeholder: "写一段自然的人格描述，比如「你是 Ruben，就是个来聊天的人…」",
   });
 
-  const pathLine = h("span", { class: "hint persona-path", title: data.path }, data.path);
+  const pathLine = h(
+    "span",
+    { class: "hint persona-path", title: data.path },
+    files ? data.dir : data.path
+  );
+  const fileTabs = files
+    ? h(
+        "div",
+        { class: "segmented persona-files", role: "tablist", "aria-label": "人设文件" },
+        ...fileNames.map((name) =>
+          h(
+            "button",
+            {
+              type: "button",
+              class: name === currentFile ? "active" : "",
+              role: "tab",
+              "aria-selected": name === currentFile ? "true" : "false",
+              title: files[name].path,
+              onclick: (event) => {
+                if (name === currentFile) return;
+                if (personaDirty.active) {
+                  confirmDialog({
+                    title: "放弃未保存的修改？",
+                    message: "切换文件会丢弃编辑区里还没保存的内容。",
+                    confirmText: "切换",
+                    danger: true,
+                    onConfirm: () => switchFile(name, event.currentTarget),
+                  });
+                  return;
+                }
+                switchFile(name, event.currentTarget);
+              },
+            },
+            `${name}.md`,
+            files[name].exists ? null : h("span", { class: "tag outline" }, "未创建")
+          )
+        )
+      )
+    : null;
   const dot = h("span", { class: "dirty-dot", title: "有未保存的修改", hidden: true });
   const dirtyNote = h("span", { class: "muted", style: { fontSize: "12px" }, hidden: true }, "有未保存的修改");
   const saveButton = h("button", { class: "btn btn-primary", type: "button" }, icon("check"), "保存并生效");
@@ -939,7 +993,24 @@ async function personaNodes() {
     const text = editor.value;
     stats.textContent = `${text.length} 字 · ${text.split("\n").length} 行`;
   };
-  const markDirty = () => setPersonaDirty(editor.value !== data.text, { dot, saveButton, note: dirtyNote });
+  const markDirty = () => setPersonaDirty(editor.value !== fileText(), { dot, saveButton, note: dirtyNote });
+  const switchFile = (name, button) => {
+    currentFile = name;
+    editor.value = fileText();
+    if (button) {
+      button.parentElement.querySelectorAll("button").forEach((item) => {
+        const active = item === button;
+        item.classList.toggle("active", active);
+        item.setAttribute("aria-selected", active ? "true" : "false");
+      });
+    }
+    pathLine.textContent = files ? files[name].path : data.path;
+    pathLine.title = pathLine.textContent;
+    if (fileHint) fileHint.textContent = FILE_HINTS[name] || "";
+    resetButton.hidden = name !== "persona";
+    setPersonaDirty(false, { dot, saveButton, note: dirtyNote });
+    updateStats();
+  };
 
   editor.addEventListener("input", () => {
     updateStats();
@@ -979,9 +1050,14 @@ async function personaNodes() {
     saveButton.disabled = true;
     saveButton.classList.add("busy");
     try {
-      const result = await api.put("/api/persona", { text: editor.value });
-      data.text = editor.value;
-      data.exists = true;
+      const result = await api.put("/api/persona", { text: editor.value, file: currentFile });
+      if (files && files[currentFile]) {
+        files[currentFile].text = editor.value;
+        files[currentFile].exists = true;
+      } else {
+        data.text = editor.value;
+        data.exists = true;
+      }
       setPersonaDirty(false, { dot, saveButton, note: dirtyNote });
       showNotice("good", result.message || "已生效，无需重启。");
       toast(result.applied ? "人设已保存并生效" : "人设已保存，下次启动生效");
@@ -1020,7 +1096,7 @@ async function personaNodes() {
       confirmText: "恢复默认",
       danger: true,
       onConfirm: async () => {
-        const result = await api.post("/api/persona/reset");
+        const result = await api.post("/api/persona/reset", { file: "persona" });
         setPersonaDirty(false);
         toast(result.applied ? "已恢复默认人格并生效" : "已恢复默认人格，下次启动生效");
         await renderRoute();
@@ -1037,11 +1113,13 @@ async function personaNodes() {
         "div",
         { class: "persona-meta" },
         pathLine,
-        data.exists ? null : h("span", { class: "tag outline" }, "文件尚未创建，保存后生成"),
+        fileHint,
+        !files && !data.exists ? h("span", { class: "tag outline" }, "文件尚未创建，保存后生成") : null,
         h("span", { class: "persona-meta-spacer" }),
         h("span", { class: "hint" }, data.mtime ? `修改于 ${fmtDateTime(data.mtime)}` : "—"),
         stats
       ),
+      fileTabs,
       editor,
       h(
         "div",
@@ -1073,8 +1151,9 @@ async function personaNodes() {
       api.get("/api/persona"),
       api.get("/api/persona/preview").catch(() => null),
     ]);
+    const editorText = files ? (files.persona?.text || "") : data.text;
     const drift =
-      current.effective_source !== "default" && current.effective !== data.text;
+      current.effective_source !== "default" && current.effective !== editorText;
     const tag =
       current.effective_source === "bot"
         ? h("span", { class: "tag good" }, icon("check"), "已生效")
@@ -4034,8 +4113,9 @@ function settingsCardSpecs(draft, secrets, pluginsAvailable, groupIdentities = {
             { path: "decision.ratio_threshold", label: "占比阈值", kind: "number", step: "0.01", min: 0, max: 1, hint: "bot 占比超过这个值开始减分" },
             { path: "decision.ratio_silence", label: "占比静默线", kind: "number", step: "0.01", min: 0, max: 1, hint: "占比到这个值直接静默" },
             { path: "decision.ratio_penalty", label: "占比最大减分", kind: "number", step: "0.1", min: 0, max: 10, hint: "占比超阈值时的最大减分" },
-            { path: "decision.cooldown_seconds", label: "软冷却（秒）", kind: "number", step: "1", min: 0, hint: "发言后这段时间内降低意愿" },
-            { path: "decision.cooldown_penalty", label: "冷却最大减分", kind: "number", step: "0.1", min: 0, max: 10, hint: "冷却期内最多减多少分" },
+            { path: "decision.cooldown_seconds", label: "软冷却（秒）", kind: "number", step: "1", min: 0, hint: "发言后这段时间内降低意愿（仅旧裁定路径）" },
+            { path: "decision.cooldown_penalty", label: "冷却最大减分", kind: "number", step: "0.1", min: 0, max: 10, hint: "冷却期内最多减多少分（仅旧裁定路径）" },
+            { path: "decision.min_reply_interval_seconds", label: "最小发言间隔（秒）", kind: "number", step: "1", min: 0, hint: "新路径护栏：刚说过话的间隔内不接普通消息；@/私聊不受限" },
             { path: "decision.exclude_bot_momentum", label: "bot 不计入自身动量", kind: "boolean", hint: "关闭后保留旧的动量来源语义" },
             { path: "decision.refractory_enabled", label: "启用发言不应期", kind: "boolean", hint: "普通消息在不应期内不触发；硬触发不受影响" },
             { path: "decision.refractory_seconds", label: "不应期（秒）", kind: "number", step: "1", min: 0, hint: "默认 45 秒" },

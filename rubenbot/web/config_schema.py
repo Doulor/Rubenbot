@@ -857,6 +857,7 @@ def _validate_decision(section: dict[str, Any], v: _Validator) -> dict[str, Any]
         "ratio_penalty": (0, 10),
         "cooldown_seconds": (0, None),
         "cooldown_penalty": (0, 10),
+        "min_reply_interval_seconds": (0, None),
         "refractory_seconds": (0, None),
         "proactive_window_seconds": (0, None),
     }
