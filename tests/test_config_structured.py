@@ -140,12 +140,15 @@ def test_structured_config_covers_every_field(config):
         "chat": [
             "bot_name",
             "history_size",
-            "split_max_parts",
-            "split_part_chars",
-            "type_speed",
-            "type_delay_max_seconds",
             "strip_action_parens",
             "history_ttl_hours",
+        ],
+        "reply": [
+            "max_segments",
+            "segment_delay_enabled",
+            "segment_delay_per_char_ms",
+            "segment_delay_min_ms",
+            "segment_delay_max_ms",
         ],
         "decision": [
             "merge_window_seconds",
@@ -269,8 +272,8 @@ def test_settings_layout_pages_and_groups():
 
 def test_settings_layout_prefix_resolution():
     """最长前缀优先：拆条字段归表达页，其余 chat.* 归聊天页。"""
-    assert resolve_page("chat.split_max_parts") == "expression"
-    assert resolve_page("chat.type_speed") == "expression"
+    assert resolve_page("reply.max_segments") == "expression"
+    assert resolve_page("chat.strip_action_parens") == "expression"
     assert resolve_page("chat.history_size") == "chat"
     assert resolve_page("chat.bot_name") == "chat"
     assert resolve_page("generation.two_stage.enabled") == "expression"
@@ -299,7 +302,8 @@ def test_settings_layout_api_exposes_rules(client):
 def test_structured_config_view_paths_unchanged(config):
     """分类只是展示层：字段路径集合不因归类改动。"""
     view = structured_config(config)
-    assert "chat.type_speed" in field_paths(view)
+    assert "reply.max_segments" in field_paths(view)
+    assert "reply.segment_delay_enabled" in field_paths(view)
     assert "chat.dedupe_ttl_seconds" in field_paths(view)
     assert "decision.batch_max_seconds" in field_paths(view)
     assert "emotion.affinity_baseline" in field_paths(view)
@@ -485,7 +489,7 @@ def test_put_structured_emotion_hot_applies(bot_state):
         ({"memory": {"inject_limit": -1}}, "memory.inject_limit"),
         ({"webui": {"port": 70000}}, "webui.port"),
         ({"log_level": "LOUD"}, "log_level"),
-        ({"chat": {"split_max_parts": 0}}, "chat.split_max_parts"),
+        ({"reply": {"max_segments": 0}}, "reply.max_segments"),
     ],
 )
 def test_validate_structured_rejects_bad_values(payload, field):

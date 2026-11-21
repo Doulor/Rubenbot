@@ -548,8 +548,7 @@ def test_send_reply_with_segments(config, store):
 
 
 def test_text_reply_still_split(config, store):
-    config.chat.split_part_chars = 10
-    config.chat.split_max_parts = 3
+    config.reply.max_segments = 3
     adapter = SegRecordingAdapter()
     bot = RubenBot(config, store, ScriptedLLM(), Persona("Ruben", "你是 Ruben"))
     bot.register_adapter(adapter)
@@ -561,8 +560,8 @@ def test_text_reply_still_split(config, store):
         sender_name="阿花",
         text="在吗",
     )
-    asyncio.run(bot.send_reply(event, "第一句话。第二句话。第三句话。"))
-    assert len(adapter.batches) >= 2
+    asyncio.run(bot.send_reply(event, "第一句话。\n第二句话。\n第三句话。"))
+    assert len(adapter.batches) == 3
     assert all(len(batch) == 1 and batch[0]["type"] == "text" for batch in adapter.batches)
 
 

@@ -50,7 +50,7 @@ def test_group_self_event_audience(config, store):
 
 
 def test_self_event_summary_is_truncated(config, store):
-    config.chat.split_max_parts = 1
+    config.reply.max_segments = 1
     config.memory.self_event_max_chars = 20
     long_reply = "这是一句非常长的话" * 10
     bot = make_bot(config, store, ScriptedLLM({"chat": [long_reply]}))

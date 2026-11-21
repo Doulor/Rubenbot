@@ -43,7 +43,7 @@ def make_bot(tmp_path: Path):
     config = Config()
     config.plugins.dir = str(root)
     config.plugins.enabled = ["privacy"]
-    config.chat.split_delay_seconds = 0
+    config.reply.segment_delay_enabled = False
     config.decision.merge_window_seconds = 0
     config.decision.hard_merge_window_seconds = 0
     manager = PluginManager(config, store)

@@ -76,7 +76,7 @@ def test_frontend_prefix_behavior():
     from rubenbot.web.config_schema import config_layout
 
     layout = json.loads(json.dumps(config_layout()))
-    pages = run_page_of(layout, ["chat.split_max_parts", "chat.bot_name", "chatty.foo", "persona"])
+    pages = run_page_of(layout, ["reply.max_segments", "chat.bot_name", "chatty.foo", "persona"])
     assert pages == ["expression", "chat", "", ""]
 
 

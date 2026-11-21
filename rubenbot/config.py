@@ -235,18 +235,42 @@ class ChatConfig:
     """对话与发送参数。"""
 
     history_size: int = 30
-    split_max_parts: int = 3
-    split_part_chars: int = 60
-    # 打字节奏：中文字 0.3s/字、其他字符 0.15s/字，每条另加 0.3s 回车时间；
-    # type_speed 是全局倍率（0 表示两条之间不停顿），单条上限防止长文等太久
-    type_speed: float = 1.0
-    type_delay_max_seconds: float = 4.0
     # 发送前是否移除括号里的动作描写（如「（笑）」）；默认关闭
     strip_action_parens: bool = False
     bot_name: str = "Ruben"
     history_ttl_hours: float = 12.0
     # 入站去重：同一平台消息 id 在这个时间窗内重复到达则丢弃；0 表示不去重
     dedupe_ttl_seconds: float = 300.0
+
+
+@dataclass
+class ReplyConfig:
+    """回复形态：一次回复拆成几段、段与段之间停多久。
+
+    生成端被要求用换行分隔 1~3 段短句，发送端按这里的规则断句并逐段发出。
+    打字延迟只作用于第二段起，第一段立即发；按下一段的非空白字数估算，
+    再截到上下限，量级克制。
+    """
+
+    # 一条回复最多发成几段（超出部分并回最后一段，避免刷屏）
+    max_segments: int = 3
+    # 段间打字延迟开关；关掉后所有段落连发，行为与拆分前一致
+    segment_delay_enabled: bool = True
+    # 每字毫秒数：下一段有多少个非空白字符就等多少毫秒
+    segment_delay_per_char_ms: float = 60.0
+    # 单次段间停顿的上下限（毫秒）：太短没有停顿感，太长拖慢整条回复
+    segment_delay_min_ms: float = 150.0
+    segment_delay_max_ms: float = 1500.0
+
+    def __post_init__(self) -> None:
+        """把配置里的字符串/非法值收敛成安全数值。"""
+        self.max_segments = max(1, _as_int(self.max_segments, 3, minimum=1))
+        self.segment_delay_enabled = self.segment_delay_enabled is not False
+        self.segment_delay_per_char_ms = max(
+            0.0, _as_float(self.segment_delay_per_char_ms, 60.0)
+        )
+        self.segment_delay_min_ms = max(0.0, _as_float(self.segment_delay_min_ms, 150.0))
+        self.segment_delay_max_ms = max(0.0, _as_float(self.segment_delay_max_ms, 1500.0))
 
 
 @dataclass
@@ -1038,6 +1062,7 @@ class Config:
     search: SearchConfig = field(default_factory=SearchConfig)
     voice: VoiceConfig = field(default_factory=VoiceConfig)
     chat: ChatConfig = field(default_factory=ChatConfig)
+    reply: ReplyConfig = field(default_factory=ReplyConfig)
     decision: DecisionConfig = field(default_factory=DecisionConfig)
     generation: GenerationConfig = field(default_factory=GenerationConfig)
     emotion: EmotionConfig = field(default_factory=EmotionConfig)
@@ -1159,6 +1184,7 @@ class Config:
             **{k: v for k, v in (data.get("voice") or {}).items() if _has(VoiceConfig, k)}
         )
         chat = ChatConfig(**{k: v for k, v in (data.get("chat") or {}).items() if _has(ChatConfig, k)})
+        reply = ReplyConfig(**{k: v for k, v in (data.get("reply") or {}).items() if _has(ReplyConfig, k)})
         decision = _load_decision(data.get("decision") or {})
         generation = _load_generation(data.get("generation") or {})
         emotion = _load_emotion(data.get("emotion") or {})
@@ -1196,6 +1222,7 @@ class Config:
             search=search,
             voice=voice,
             chat=chat,
+            reply=reply,
             decision=decision,
             generation=generation,
             emotion=emotion,

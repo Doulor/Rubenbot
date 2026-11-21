@@ -667,7 +667,6 @@ def test_no_voice_service_never_synthesizes(config, store):
 def test_long_reply_stays_text(config, store):
     enable_tts(config, "reply_voice")
     config.voice.tts_max_chars = 5
-    config.chat.split_part_chars = 60
     voice = FakeVoice()
     adapter = VoiceAdapter()
     bot, _ = make_bot(config, store, adapter=adapter, voice=voice)
@@ -680,11 +679,10 @@ def test_long_reply_stays_text(config, store):
 
 def test_split_reply_stays_text(config, store):
     enable_tts(config, "reply_voice")
-    config.chat.split_part_chars = 8
     voice = FakeVoice()
     adapter = VoiceAdapter()
     bot, _ = make_bot(config, store, adapter=adapter, voice=voice)
-    asyncio.run(bot.send_reply(voice_event(), "第一句话。第二句话。"))
+    asyncio.run(bot.send_reply(voice_event(), "第一句话。\n第二句话。"))
 
     # 被拆成多条：不合成语音，全部发文字（避免半句语音半句字）
     assert voice.synthesize_calls == []

@@ -84,7 +84,7 @@ def private_event(text="在吗") -> MessageEvent:
 def planner_config() -> Config:
     """新路径测试用的配置：让 handle_event 同步处理（不攒消息）。"""
     config = Config()
-    config.chat.type_speed = 0
+    config.reply.segment_delay_enabled = False
     config.decision.merge_window_seconds = 0
     config.decision.hard_merge_window_seconds = 0
     config.planner.planner_gate = True

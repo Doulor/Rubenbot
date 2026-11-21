@@ -441,7 +441,7 @@ def test_end_to_end_via_host_message_loop(tmp_path):
     config = Config()
     config.plugins.dir = str(root)
     config.plugins.enabled = ["music"]
-    config.chat.type_speed = 0
+    config.reply.segment_delay_enabled = False
     config.decision.merge_window_seconds = 0
     config.decision.hard_merge_window_seconds = 0
     manager = PluginManager(config, MemoryStore(":memory:"))

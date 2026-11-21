@@ -5,7 +5,12 @@
 
 ## [Unreleased]
 
-暂无。
+### Changed
+
+- 回复多段化：生成契约放开到 1~3 段短句（换行分段），发送端改用规则断句 +
+  按长度概率合并，段间按字数加打字延迟；新增 `reply` 配置段
+  （`max_segments` / `segment_delay_*`），移除 `chat.split_max_parts`、
+  `chat.split_part_chars`、`chat.type_speed`、`chat.type_delay_max_seconds`。
 
 ## [0.1.0] - 2026-11-22
 

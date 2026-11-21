@@ -61,7 +61,7 @@ def reminder_call(arguments, call_id="r1"):
 
 def make_bot(store, llm, *, reminder_enabled=True) -> tuple[RubenBot, RecordingAdapter]:
     config = Config()
-    config.chat.type_speed = 0
+    config.reply.segment_delay_enabled = False
     config.decision.merge_window_seconds = 0
     config.decision.hard_merge_window_seconds = 0
     config.memory.recall_tool_enabled = False

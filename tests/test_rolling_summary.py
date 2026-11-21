@@ -27,7 +27,7 @@ from conftest import RecordingAdapter, ScriptedLLM
 
 def make_config(*, enabled=True, trigger_after=5, keep_recent=2, max_chars=800) -> Config:
     cfg = Config()
-    cfg.chat.type_speed = 0
+    cfg.reply.segment_delay_enabled = False
     cfg.decision.merge_window_seconds = 0
     cfg.decision.hard_merge_window_seconds = 0
     cfg.memory.rolling_summary.enabled = enabled

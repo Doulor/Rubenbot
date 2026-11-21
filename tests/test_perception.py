@@ -306,7 +306,7 @@ def make_bot(config: Config, store: MemoryStore, llm) -> tuple[RubenBot, Recordi
 
 def gateway_config(*, judge=False, quiet="") -> Config:
     cfg = Config()
-    cfg.chat.type_speed = 0
+    cfg.reply.segment_delay_enabled = False
     cfg.decision.merge_window_seconds = 0
     cfg.decision.hard_merge_window_seconds = 0
     cfg.gateway = GatewayConfig(enabled=False, judge_events=judge, quiet_hours=quiet)

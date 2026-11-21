@@ -112,16 +112,13 @@ SETTINGS_GROUPS: tuple[dict[str, Any], ...] = (
 # - 按配置段（YAML 顶层键）的语义归属，不按字段在字典里的物理位置切碎；
 # - 只有「回复形态」是例外：拆条、打字节奏、动作描写剥离虽然物理上在
 #   ``chat`` 段，但描述的是回复长什么样，统一归到「表达」页，其余 ``chat.*``
-#   留在「聊天」页。新增字段时先看语义，默认跟随所在段。
+#   留在「聊天」页；``reply`` 段整段都是回复形态，同样归「表达」。新增字段时
+#   先看语义，默认跟随所在段。
 _SETTINGS_PAGE_RULES: tuple[tuple[str, str], ...] = (
     # ---- 机器人 ----
     # 表达：生成策略 + 回复形态（拆条 / 打字节奏 / 动作描写）
     ("generation", "expression"),
-    ("chat.split_max_parts", "expression"),
-    ("chat.split_part_chars", "expression"),
-    ("chat.split_delay_seconds", "expression"),
-    ("chat.type_speed", "expression"),
-    ("chat.type_delay_max_seconds", "expression"),
+    ("reply", "expression"),
     ("chat.strip_action_parens", "expression"),
     # 聊天：上下文、入站去重、说话时机（回复意愿 / 动量 / 冷却 / 每群覆盖）
     ("chat", "chat"),
@@ -170,7 +167,8 @@ def config_layout() -> dict[str, Any]:
 def resolve_page(path: str) -> str | None:
     """字段路径归属的二级页面 id；没有规则覆盖时返回 ``None``。
 
-    前缀最长优先：``chat.split_max_parts`` 归表达页，其余 ``chat.*`` 归聊天页。
+    前缀最长优先：``chat.strip_action_parens`` 归表达页，其余 ``chat.*`` 归聊天页；
+    ``reply.*`` 整段（拆条与段间停顿）也归表达页。
     """
     best: tuple[str, str] | None = None
     for prefix, page in _SETTINGS_PAGE_RULES:
@@ -271,6 +269,7 @@ def structured_config(config: Config) -> dict[str, Any]:
         "computer": asdict(config.computer),
         "voice": {**voice, "stt_api_key": "", "tts_api_key": ""},
         "chat": asdict(config.chat),
+        "reply": asdict(config.reply),
         "decision": decision,
         "generation": asdict(config.generation),
         "reminder": asdict(config.reminder),
@@ -740,16 +739,46 @@ def _validate_chat(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
         value = v.text(section["bot_name"], "chat.bot_name", max_len=60)
         if value is not None:
             out["bot_name"] = value
-    for key, minimum in (("history_size", 1), ("split_max_parts", 1), ("split_part_chars", 8)):
+    for key, minimum in (("history_size", 1),):
         if key in section:
             number = v.number(section[key], f"chat.{key}", minimum=minimum, integer=True)
             if number is not None:
                 out[key] = int(number)
-    for key in ("split_delay_seconds", "history_ttl_hours"):
+    for key in ("history_ttl_hours",):
         if key in section:
             number = v.number(section[key], f"chat.{key}", minimum=0)
             if number is not None:
                 out[key] = float(number)
+    return out
+
+
+def _validate_reply(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
+    """回复形态：最多几段、段间延迟开关与每字毫秒数/上下限。"""
+    out: dict[str, Any] = {}
+    if "max_segments" in section:
+        number = v.number(
+            section["max_segments"], "reply.max_segments", minimum=1, maximum=10, integer=True
+        )
+        if number is not None:
+            out["max_segments"] = int(number)
+    if "segment_delay_enabled" in section:
+        flag = v.boolean(section["segment_delay_enabled"], "reply.segment_delay_enabled")
+        if flag is not None:
+            out["segment_delay_enabled"] = flag
+    for key, maximum in (
+        ("segment_delay_per_char_ms", 5000),
+        ("segment_delay_min_ms", 60000),
+        ("segment_delay_max_ms", 60000),
+    ):
+        if key in section:
+            number = v.number(section[key], f"reply.{key}", minimum=0, maximum=maximum)
+            if number is not None:
+                out[key] = float(number)
+    # 上限不能低于下限：表单两个框独立提交，这里统一兜住
+    low = out.get("segment_delay_min_ms")
+    high = out.get("segment_delay_max_ms")
+    if low is not None and high is not None and high < low:
+        v.fail("reply.segment_delay_max_ms", "不能小于最小停顿")
     return out
 
 
@@ -1219,6 +1248,9 @@ def validate_structured(payload: dict[str, Any]) -> dict[str, Any]:
     chat = _section(payload, "chat", v)
     if chat is not None:
         update["chat"] = _validate_chat(chat, v)
+    reply = _section(payload, "reply", v)
+    if reply is not None:
+        update["reply"] = _validate_reply(reply, v)
     decision = _section(payload, "decision", v)
     if decision is not None:
         update["decision"] = _validate_decision(decision, v)

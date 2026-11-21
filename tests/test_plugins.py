@@ -164,7 +164,7 @@ def make_bot(plugin_dir: Path, replies=None) -> tuple[RubenBot, RecordingAdapter
     config = Config()
     config.plugins.dir = str(plugin_dir)
     config.plugins.enabled = ["demo"]
-    config.chat.type_speed = 0
+    config.reply.segment_delay_enabled = False
     config.decision.merge_window_seconds = 0
     config.decision.hard_merge_window_seconds = 0
     manager = PluginManager(config, store)
@@ -311,7 +311,7 @@ def test_plugin_can_call_capability(lifecycle_dir):
     config = Config()
     config.plugins.dir = str(lifecycle_dir)
     config.plugins.enabled = ["life"]
-    config.chat.type_speed = 0
+    config.reply.segment_delay_enabled = False
     manager = PluginManager(config, store)
     manager.load_all()
 

@@ -15,7 +15,7 @@ from conftest import ScriptedLLM
 
 def build() -> tuple[RubenBot, ConsoleAdapter, ScriptedLLM]:
     config = Config()
-    config.chat.type_speed = 0
+    config.reply.segment_delay_enabled = False
     config.decision.merge_window_seconds = 0  # 测试里不攒消息，逐条处理
     config.decision.hard_merge_window_seconds = 0
     config.decision.base = 0.0  # 群里默认不插话
