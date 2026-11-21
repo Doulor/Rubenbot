@@ -7,9 +7,14 @@ _last_momentum_at 再无人写，线上动量恒为 0、bot 不被 @ 永不开�
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
+from conftest import RecordingAdapter
 from test_decision import group_event, make_engine
+from test_send_pacing import group_event as bot_group_event
+from test_send_pacing import make_bot
 
 T0 = 1_000_000.0  # 任意时刻（沿用 test_decision 的显式时间约定）
 
@@ -61,3 +66,56 @@ def test_refractory_still_blocks_right_after_reply():
     blocked = engine.evaluate(group_event(), now=T0 + 30, relevance=4.0)
     assert not blocked.should_reply
     assert blocked.reason == "refractory"
+
+
+# ----------------------------------------------------------------------
+# 发送失败不记发言：分条全发失败时，动量/不应期/最后发言时间都不应被写
+# （Orange 复核发现：旧 send_reply 在循环后无条件调 note_bot_reply，
+# 失败的发送同样喂动量，还会把不应期刷掉、让 bot 误以为自己说过话。）
+# ----------------------------------------------------------------------
+
+
+class FailingAdapter(RecordingAdapter):
+    """前 ``fail_times`` 次发送抛错，之后正常记录。"""
+
+    def __init__(self, fail_times: int = 999):
+        super().__init__()
+        self.fail_times = fail_times
+        self.attempts = 0
+
+    async def send(self, chat_id, segments, *, chat_type="group"):
+        self.attempts += 1
+        if self.attempts <= self.fail_times:
+            raise RuntimeError("模拟发送失败")
+        return await super().send(chat_id, segments, chat_type=chat_type)
+
+
+def test_all_parts_failed_feeds_no_momentum(config, store):
+    config.chat.split_part_chars = 10
+    config.chat.split_max_parts = 3
+    bot, _ = make_bot(config, store)
+    adapter = FailingAdapter()
+    bot.register_adapter(adapter)
+    event = bot_group_event()
+    asyncio.run(bot.send_reply(event, "第一句话。第二句话。第三句话。", now=T0, addressed=True))
+    assert adapter.sent == []
+    assert adapter.attempts == 2  # 贪心合并后是两条
+    engine = bot.decision_engine
+    assert engine.last_reply_at("recording:g1") is None
+    assert engine.evaluate(event, now=T0 + 10).factors.momentum == 0.0
+    # 不应期也没被刷：同一时刻的评估不应以 refractory 拒绝
+    assert engine.evaluate(event, now=T0 + 10, relevance=4.0).reason != "refractory"
+
+
+def test_partial_send_still_feeds_momentum_once(config, store):
+    config.chat.split_part_chars = 10
+    config.chat.split_max_parts = 3
+    bot, _ = make_bot(config, store)
+    adapter = FailingAdapter(fail_times=1)
+    bot.register_adapter(adapter)
+    event = bot_group_event()
+    asyncio.run(bot.send_reply(event, "第一句话。第二句话。第三句话。", now=T0, addressed=True))
+    assert len(adapter.sent) == 1  # 第一条失败，第二条发出
+    engine = bot.decision_engine
+    assert engine.last_reply_at("recording:g1") == T0
+    assert engine.evaluate(event, now=T0 + 10).factors.momentum > 0.0

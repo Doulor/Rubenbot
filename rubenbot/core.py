@@ -2420,6 +2420,7 @@ class RubenBot:
                     proactive=proactive, addressed=addressed,
                 )
                 return
+        sent_any = False
         for index, segments in enumerate(parts):
             if index > 0:
                 delay = self.typing_delay(segments)
@@ -2431,7 +2432,12 @@ class RubenBot:
             except Exception as exc:  # noqa: BLE001 - 一条发失败不影响后续
                 logger.warning("发送失败（%s 第 %s 条）：%s", event.platform, index + 1, exc)
                 continue
+            sent_any = True
             self._record_bot_message(event, text, message_id)
+        if not sent_any:
+            # 全部分条都发失败：当作没说过话——不喂动量、不进不应期、不记情绪
+            logger.warning("发送全部失败（%s），不记本次发言", event.platform)
+            return
         # 发言时间交给决策引擎：动量加成与发言后冷却都依赖它（拆条只记一次）
         self.decision_engine.note_bot_reply(
             self.decision_engine.chat_key(event), time.time() if now is None else now,
