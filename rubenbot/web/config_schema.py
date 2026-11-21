@@ -286,6 +286,7 @@ def structured_config(config: Config) -> dict[str, Any]:
         "stickers": {
             "enabled": config.stickers.enabled,
             "collect": config.stickers.collect,
+            "collect_photos": config.stickers.collect_photos,
             "send_probability": config.stickers.send_probability,
             "nonverbal_probability": config.stickers.nonverbal_probability,
             "cooldown_seconds": config.stickers.cooldown_seconds,
@@ -1000,7 +1001,7 @@ def _validate_proactive(section: dict[str, Any], v: _Validator) -> dict[str, Any
 
 def _validate_stickers(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
     out: dict[str, Any] = {}
-    for key in ("enabled", "collect"):
+    for key in ("enabled", "collect", "collect_photos"):
         if key in section:
             value = v.boolean(section[key], f"stickers.{key}")
             if value is not None:

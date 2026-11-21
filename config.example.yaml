@@ -295,6 +295,9 @@ stickers:
   # 核心表情包行为默认关闭；打开 enabled 后以下设置才生效。
   enabled: false
   collect: false
+  # 默认只收真表情（mface / 贴纸 / 摘要为「[动画表情]」的图片）；普通照片、
+  # 截图被误收时是噪声，打开这个开关才收（入库仍标记为 photo，永不参与选图）。
+  collect_photos: false
   send_probability: 0.15  # 文字回复后补发的概率
   # 接梗或短附和时只发一张表情的概率；库空、冷却中、发送失败时照常回文字。
   nonverbal_probability: 0.30

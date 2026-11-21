@@ -64,6 +64,7 @@ from ..identity import IdentityService, avatar_url
 from ..emotion import EmotionEngine
 from ..memory.store import make_person_id
 from ..persona import DEFAULT_PERSONA, Persona, load_persona
+from ..stickers import KIND_PHOTO, KIND_STICKER
 from .auth import COOKIE_NAME, BindSecurityError, check_bind_security, mask_secret
 from .config_schema import (
     ConfigValidationError,
@@ -918,13 +919,22 @@ def create_app(state: WebState):
         return {"ok": True, "items": [decision_payload(row) for row in rows]}
 
     @app.get("/api/stickers")
-    async def list_stickers(request: Request):
+    async def list_stickers(request: Request, include_photos: str = "0"):
+        """表情库列表：默认只返回真表情；``?include_photos=1`` 连普通图片一起返回。
+
+        ``photo_count`` 是被隔离的普通图片条数，前端据此提示「另有 N 条
+        普通图片已隔离」；每条带 ``kind``（sticker / photo）。
+        """
         require_session(request)
         store = state.sticker_store()
+        with_photos = str(include_photos).lower() in ("1", "true", "yes")
         items = []
         for sticker in store.find_by_tags(None):
+            if not with_photos and sticker.kind != KIND_STICKER:
+                continue
             items.append({
                 "id": sticker.id,
+                "kind": sticker.kind,
                 "tags": list(sticker.tags),
                 "description": sticker.description,
                 "emotions": list(sticker.emotions),
@@ -932,7 +942,8 @@ def create_app(state: WebState):
                 "image_url": f"/api/stickers/{sticker.id}/image" if store.path_of(sticker) else None,
                 "created_at": sticker.created_at,
             })
-        return {"ok": True, "items": items}
+        photo_count = len(store.find_by_tags(None, kind=KIND_PHOTO))
+        return {"ok": True, "items": items, "photo_count": photo_count}
 
     @app.get("/api/stickers/{sticker_id}/image")
     async def sticker_image(sticker_id: str, request: Request):

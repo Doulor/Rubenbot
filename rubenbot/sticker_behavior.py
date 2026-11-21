@@ -1,7 +1,9 @@
 """核心表情包行为：收集群聊表情，按话题选图用于独立回复或文字后补发。
 
 收集时优先把图片本体落盘（base64 段或可下载的 URL），只有拿不到字节
-时才退化成纯原生引用条目。选图分两级：
+时才退化成纯原生引用条目。群里的普通图片（照片、截图）默认不收，只有
+配置 ``stickers.collect_photos`` 才入库；即便入库也标记为 ``photo``，
+永不参与选图。选图分两级：
 
 1. 语义检索（可选）：配置了 embedding 通道时，把每条表情的描述+情绪标签
    做成向量、缓存在 ``data/stickers/embeddings.json``，用上下文与情感提示
@@ -36,6 +38,7 @@ from .adapters.base import SEND_STICKER
 from .http_body import CompressedBodyError, read_compressed_body
 from .llm import parse_json_payload
 from .memory.retrieve import tokenize
+from .stickers import KIND_PHOTO, KIND_STICKER, infer_ref_kind
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +106,9 @@ class StickerBehavior:
         self._bg_tasks: set[asyncio.Task] = set()
         self._pending_descriptions: set[str] = set()
         self._vision_skip_logged = False
+        self._vision_broken = False
+        self._last_runtime: Any = None
+        self._describe_attempted: set[str] = set()
         self._embedding_cache: dict[str, Any] | None = None
 
     @property
@@ -149,7 +155,9 @@ class StickerBehavior:
                     logger.debug("表情包收集异常（跳过该段）：%s", sticker)
                     continue
                 if sticker is not None and getattr(sticker, "file", ""):
-                    self._schedule_description(runtime, store, sticker)
+                    # 普通图片不参与选图，没必要花视觉模型额度给它写描述
+                    if getattr(sticker, "kind", KIND_STICKER) == KIND_STICKER:
+                        self._schedule_description(runtime, store, sticker)
         except Exception as exc:  # noqa: BLE001
             logger.debug("表情包收集异常：%s", exc)
 
@@ -173,6 +181,16 @@ class StickerBehavior:
             native_ref = {"kind": kind, "data": payload}
         refs = {platform: native_ref} if platform else None
 
+        # 真表情与误收的普通图片分开：photo 默认不入库，只有显式打开
+        # stickers.collect_photos 才收（收进来也标记为 photo，永不参选）。
+        sticker_kind = infer_ref_kind(native_ref)
+        if sticker_kind == KIND_PHOTO and not getattr(self.config, "collect_photos", False):
+            logger.debug(
+                "跳过普通图片（默认只收表情；stickers.collect_photos 可放开）：%s",
+                payload.get("summary") or payload.get("file") or payload.get("url") or kind,
+            )
+            return None
+
         raw = _decode_base64(payload.get("base64"))
         if raw is None:
             raw = await self._download_image(_candidate_url(payload, native_ref))
@@ -185,6 +203,7 @@ class StickerBehavior:
             file_name=payload.get("filename") or payload.get("name") or None,
             mime_type=payload.get("mime_type") or payload.get("content_type") or None,
             max_file_bytes=self.max_file_bytes,
+            kind=sticker_kind,
         )
 
     async def _download_image(self, url: str) -> bytes | None:
@@ -208,18 +227,21 @@ class StickerBehavior:
         return int(value)
 
     # ------------------------------------------------------------------
-    # 描述生成（配置了 vision 角色才跑）
+    # 描述生成（vision 角色走框架回退链，默认落到 chat 模型）
     # ------------------------------------------------------------------
 
     def _schedule_description(self, runtime: Any, store: Any, sticker: Any) -> None:
         """存本体成功后后台生成描述；没配视觉模型只记一次 info。"""
         if getattr(sticker, "description", ""):
             return
+        self._last_runtime = runtime
         llm = _resolve_llm(runtime)
-        if llm is None or not _vision_configured(runtime, llm):
+        if llm is None:
             if not self._vision_skip_logged:
-                logger.info("未配置 vision 角色，跳过表情包描述生成")
+                logger.info("无 LLM 客户端，跳过表情包描述生成")
                 self._vision_skip_logged = True
+            return
+        if self._vision_broken:
             return
         sticker_id = str(getattr(sticker, "id", "") or "")
         if not sticker_id or sticker_id in self._pending_descriptions:
@@ -241,7 +263,8 @@ class StickerBehavior:
         except asyncio.CancelledError:
             pass
         except Exception as exc:  # noqa: BLE001 - 后台描述失败不影响收集
-            logger.warning("表情包描述生成失败（%s）：%s", sticker_id, exc)
+            self._vision_broken = True
+            logger.warning("表情包描述生成失败（%s）：%s，本进程内暂停描述生成", sticker_id, exc)
 
     async def _build_description(self, store: Any, sticker_id: str, llm: Any) -> None:
         sticker = store.get(sticker_id)
@@ -336,9 +359,12 @@ class StickerBehavior:
         return last is not None and now - last < getattr(self.config, "cooldown_seconds", 300.0)
 
     async def _pick(self, runtime: Any, store: Any, event: Any, emotion_hint: str) -> Any:
-        """两级选择 + 标签回落；候选只取有本地文件的条目。"""
+        """两级选择 + 标签回落；候选只取有本地文件的真表情（photo 永不参选）。"""
         text = str(getattr(event, "text", "") or "")
-        candidates = [item for item in store.find_by_tags(None) if _has_local_file(store, item)]
+        candidates = [
+            item for item in store.find_by_tags(None, kind=KIND_STICKER)
+            if _has_local_file(store, item)
+        ]
         if not candidates:
             return None
         context = _context_text(runtime, event) or text
@@ -549,51 +575,84 @@ class StickerBehavior:
         """给缺描述的存量条目补后台描述任务，返回排上的条数。
 
         启动时调用。只排一小批（``DESCRIBE_BACKFILL_BATCH``）并串行执行，
-        避免一次性对上百张表情并发打视觉模型；没配 vision 角色时一条都
-        不排、也不发请求。
+        避免一次性对上百张表情并发打视觉模型；一批补完自动续排下一批。
+        vision 角色按框架回退链落到 chat 模型，不要求单独配置；生成连续
+        失败会熔断，本进程内不再排。
         """
         store = self.store
         if store is None:
             return 0
+        self._last_runtime = runtime
         llm = _resolve_llm(runtime)
-        if llm is None or not _vision_configured(runtime, llm):
+        if llm is None:
             if not self._vision_skip_logged:
-                logger.info("未配置 vision 角色，跳过表情包描述生成")
+                logger.info("无 LLM 客户端，跳过表情包描述生成")
                 self._vision_skip_logged = True
             return 0
-        targets = [
-            item.id for item in store.find_by_tags(None)
-            if item.file and not item.description and item.id not in self._pending_descriptions
-        ][:DESCRIBE_BACKFILL_BATCH]
+        if self._vision_broken:
+            return 0
+        targets = self._describe_targets(store)
         if not targets:
             return 0
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return 0
-        self._pending_descriptions.update(targets)
-        task = loop.create_task(self._describe_batch(store, targets, llm))
+        task = loop.create_task(self._backfill_chain(store, targets, llm))
         self._bg_tasks.add(task)
-        task.add_done_callback(lambda finished: self._finish_batch(finished, targets))
+        task.add_done_callback(self._finish_chain)
         return len(targets)
 
-    async def _describe_batch(self, store: Any, sticker_ids: list[str], llm: Any) -> None:
-        for sticker_id in sticker_ids:
-            try:
-                await self._build_description(store, sticker_id, llm)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - 单条失败继续下一条
-                logger.warning("表情包描述生成失败（%s）：%s", sticker_id, exc)
+    def _describe_targets(self, store: Any) -> list[str]:
+        return [
+            item.id for item in store.find_by_tags(None, kind=KIND_STICKER)
+            if item.file and not item.description
+            and item.id not in self._pending_descriptions
+            and item.id not in self._describe_attempted
+        ][:DESCRIBE_BACKFILL_BATCH]
 
-    def _finish_batch(self, task: asyncio.Task, sticker_ids: list[str]) -> None:
+    async def _backfill_chain(self, store: Any, targets: list[str], llm: Any) -> None:
+        """串行一批批补描述，直到没有新目标或熔断；全程一个任务内完成。"""
+        batch = targets
+        while batch:
+            self._pending_descriptions.update(batch)
+            try:
+                await self._describe_batch(store, batch, llm)
+            finally:
+                self._pending_descriptions.difference_update(batch)
+            if self._vision_broken:
+                break
+            batch = self._describe_targets(store)
+
+    def _finish_chain(self, task: asyncio.Task) -> None:
         self._bg_tasks.discard(task)
-        self._pending_descriptions.difference_update(sticker_ids)
         try:
             task.result()
         except asyncio.CancelledError:
             pass
+        except Exception as exc:  # noqa: BLE001 - 后台补描述失败不影响主流程
+            logger.warning("表情包存量补描述异常结束：%s", exc)
 
+    async def _describe_batch(self, store: Any, sticker_ids: list[str], llm: Any) -> None:
+        failures = 0
+        for sticker_id in sticker_ids:
+            self._describe_attempted.add(sticker_id)
+            try:
+                item = store.get(sticker_id)
+                # 普通图片不参选，也不值得花视觉额度补描述
+                if item is not None and getattr(item, "kind", KIND_STICKER) != KIND_STICKER:
+                    continue
+                await self._build_description(store, sticker_id, llm)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - 单条失败继续下一条
+                failures += 1
+                logger.warning("表情包描述生成失败（%s）：%s", sticker_id, exc)
+                if failures >= 2:
+                    # 连续失败多半是模型不支持视觉：熔断，别把整批额度烧完
+                    self._vision_broken = True
+                    logger.warning("描述生成连续失败，本进程内暂停描述生成")
+                    break
 
 def _has_local_file(store: Any, sticker: Any) -> bool:
     try:
@@ -717,17 +776,6 @@ async def _public_url(url: str) -> bool:
         address.is_global and not address.is_multicast and not address.is_reserved
         for address in addresses
     )
-
-
-def _vision_configured(runtime: Any, llm: Any) -> bool:
-    config = getattr(runtime, "config", None)
-    llm_config = getattr(config, "llm", None)
-    models = getattr(llm_config, "models", None)
-    if isinstance(models, Mapping) and str(models.get("vision") or "").strip():
-        return True
-    # 兼容自定义 LLM 实现：自带 model_for 时看这个角色是否被单独指定
-    model_for = getattr(getattr(llm, "config", None), "models", None)
-    return isinstance(model_for, Mapping) and bool(str(model_for.get("vision") or "").strip())
 
 
 def _resolve_llm(runtime: Any) -> Any:

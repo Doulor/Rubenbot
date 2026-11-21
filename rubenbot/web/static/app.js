@@ -3998,7 +3998,8 @@ function settingsCardSpecs(draft, secrets, pluginsAvailable, groupIdentities = {
         hint: "核心功能默认关闭；保存后立即生效",
         body: fieldGrid([
           { path: "stickers.enabled", label: "启用表情包行为", kind: "switch", hint: "关闭时不收集、不发表情，也不会创建表情库" },
-          { path: "stickers.collect", label: "收集群聊表情", kind: "switch", hint: "把群里的图片、贴纸和商城表情去重后存入表情库" },
+          { path: "stickers.collect", label: "收集群聊表情", kind: "switch", hint: "把群里的贴纸和商城表情去重后存入表情库" },
+          { path: "stickers.collect_photos", label: "连普通图片一起收", kind: "switch", hint: "照片、截图默认跳过；打开后仍标记为图片，永不参与发表情" },
           { path: "stickers.send_probability", label: "回复后补发概率", kind: "number", step: "0.01", min: 0, max: 1, hint: "每次正常回复后补发表情的概率（0–1）" },
           { path: "stickers.nonverbal_probability", label: "只发表情概率", kind: "number", step: "0.01", min: 0, max: 1, hint: "接梗或短附和时只发一张表情、不发文字的概率（0–1）" },
           { path: "stickers.cooldown_seconds", label: "会话冷却（秒）", kind: "number", step: "1", min: 0, hint: "同一平台会话两次尝试发表情的最短间隔，两种方式共用" },
@@ -4196,8 +4197,22 @@ function stickerLibraryCard() {
     try {
       const data = await api.get("/api/stickers");
       const items = data.items || [];
+      const photoCount = Number(data.photo_count) || 0;
+      // 被隔离的普通图片只报个数量；磁贴区本身只列真表情
+      const isolated = photoCount > 0
+        ? h("p", {
+            class: "sticker-isolated-note",
+            style: { gridColumn: "1 / -1", margin: "0", color: "var(--muted)", fontSize: "12px" },
+          }, `另有 ${photoCount} 条普通图片已隔离`)
+        : null;
       if (!items.length) {
-        box.replaceChildren(emptyState("image", "表情库还是空的", "打开收集后，群聊里的图片和贴纸会自动入库。"));
+        // 只有被隔离的普通图片时，不说「库是空的」，免得与计数小字打架
+        box.replaceChildren(...[isolated,
+          emptyState(
+            "image",
+            photoCount > 0 ? "还没有可用的表情" : "表情库还是空的",
+            photoCount > 0 ? "被隔离的普通图片不会参与发表情。" : "打开收集后，群聊里的表情会自动入库。"
+          )].filter(Boolean));
         return;
       }
       const tiles = items.map((item) => {
@@ -4220,11 +4235,38 @@ function stickerLibraryCard() {
         const image = item.image_url
           ? h("img", { src: item.image_url, alt: (item.tags || []).join("、") || "表情" })
           : h("div", { class: "sticker-missing" }, "无图片");
+        const description = String(item.description || "").trim();
+        const emotions = Array.isArray(item.emotions) ? item.emotions.filter(Boolean).slice(0, 3) : [];
+        // 先描述（一行截断），再最多 3 个情绪芯片；都空时只显示标签
+        const detail = [];
+        if (description) {
+          // 一行截断，完整描述挂在 title 上
+          detail.push(h("p", {
+            class: "sticker-desc",
+            title: description,
+            style: {
+              margin: "0", overflow: "hidden", display: "-webkit-box",
+              webkitLineClamp: "1", webkitBoxOrient: "vertical", color: "var(--text-soft)",
+            },
+          }, description));
+        }
+        if (emotions.length) {
+          detail.push(h("div", { class: "sticker-emotions", style: { display: "flex", flexWrap: "wrap", gap: "4px" } },
+            ...emotions.map((name) => h("span", {
+              class: "tag accent", style: { height: "20px", padding: "0 8px", fontSize: "11px" },
+            }, name))));
+        }
         return h("article", { class: "sticker-tile" }, image,
-          h("div", { class: "sticker-tile-foot" },
-            h("span", {}, (item.tags || []).join("、") || "未分类"), remove));
+          h("div", {
+            class: "sticker-tile-foot",
+            style: { flexDirection: "column", alignItems: "stretch", gap: "6px" },
+          },
+            detail.length ? h("div", { class: "sticker-detail", style: { display: "flex", flexDirection: "column", gap: "6px", minWidth: "0" } }, ...detail) : null,
+            h("div", { class: "sticker-tile-row", style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px" } },
+              h("span", { class: "sticker-tags", style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: "0" } },
+                (item.tags || []).join("、") || "未分类"), remove)));
       });
-      box.replaceChildren(...tiles);
+      box.replaceChildren(...[isolated, ...tiles].filter(Boolean));
     } catch (err) {
       if (!(err instanceof Unauthorized)) box.replaceChildren(emptyState("warning", "表情库读取失败", err.message));
     }

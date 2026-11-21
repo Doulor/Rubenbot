@@ -4,12 +4,17 @@
 
 - ``files/``：图片本体，文件名取内容哈希前 16 位 + 文件头嗅探出的扩展名
 - ``index.json``：每条表情的元信息（id / 文件 / 标签 / 各平台原生引用 /
-  内容哈希 / 视觉描述 / 情绪标签 / 使用次数）
+  内容哈希 / 种类 / 视觉描述 / 情绪标签 / 使用次数）
 
 去重按内容哈希：同一张图不管从哪条消息收集来，都只入库一次；重复收集时
-把新标签与新的平台原生引用并进已有记录。拿不到图片字节（例如只有平台侧
-消息段引用）时，用引用的稳定序列化结果充当哈希，同样能去重；之后若拿到
-字节（回填工具 / 重新出现），会挂到同一条记录上补本体，id 不变。
+把新标签、新的平台原生引用与使用次数并进已有记录，保留最早的 id 与
+created_at。拿不到图片字节（例如只有平台侧消息段引用）时，用引用的稳定
+序列化结果充当哈希，同样能去重；之后若拿到字节（回填工具 / 重新出现），
+会挂到同一条记录上补本体，id 不变。
+
+``kind`` 区分真表情与普通图片：``mface`` / ``sticker`` 段、摘要含「表情」
+的图片是 ``sticker``；其余普通 image 段（照片、截图）是 ``photo``。旧索引
+没有该字段时按原生引用里的段类型与 ``summary`` 现场推导，读出来不会丢。
 
 图片本体只收文件头能嗅探成 jpg/png/gif/webp 的字节，超过
 ``max_file_bytes`` 的不收——群聊里什么字节都可能混进来。
@@ -48,6 +53,15 @@ DEFAULT_STICKER_DIR = "data/stickers"
 # 图片本体收集上限；超过就不收，避免把群聊里的大图塞进表情库
 DEFAULT_MAX_FILE_BYTES = 8 * 1024 * 1024
 
+# 表情真伪分类：群聊里真正的表情（mface/贴纸/[动画表情]）与误收的
+# 普通图片（照片、截图）分开存，后者永不参与选图。
+KIND_STICKER = "sticker"
+KIND_PHOTO = "photo"
+STICKER_KINDS = frozenset({KIND_STICKER, KIND_PHOTO})
+
+# 原生引用里能判定「这是表情」的段类型
+_STICKER_REF_KINDS = frozenset({"mface", "sticker"})
+
 # 文件头 -> 扩展名。只认表情包常见的四种格式；识别不了的不入库。
 _IMAGE_HEADERS: tuple[tuple[bytes, str], ...] = (
     (b"\xff\xd8\xff", ".jpg"),
@@ -81,6 +95,39 @@ def _clean_tag(value: Any) -> str:
     return str(value or "").strip().lower()
 
 
+def infer_ref_kind(native_ref: Mapping[str, Any] | None) -> str:
+    """按单个平台原生引用判定种类：有表情信号为 ``sticker``，否则 ``photo``。"""
+    if not isinstance(native_ref, Mapping):
+        return KIND_PHOTO
+    ref_kind = str(native_ref.get("kind") or "").strip().lower()
+    if ref_kind in _STICKER_REF_KINDS:
+        return KIND_STICKER
+    data = native_ref.get("data")
+    if isinstance(data, Mapping) and "表情" in str(data.get("summary") or ""):
+        return KIND_STICKER
+    return KIND_PHOTO
+
+
+def infer_kind(native_refs: Mapping[str, Any] | None) -> str:
+    """按平台原生引用判定条目种类；拿不到信号时按表情处理。
+
+    - 段类型是 ``mface`` / ``sticker``：一定是表情；
+    - 图片段 ``summary`` 里带「表情」（如 ``[动画表情]``）：表情；
+    - 其余图片段（``[图片]`` / 普通照片）：``photo``；
+    - 完全没有原生引用（旧库直接入库的条目）保持 ``sticker``，不误隔离。
+    """
+    refs = native_refs if isinstance(native_refs, Mapping) else {}
+    if not refs:
+        return KIND_STICKER
+    kinds = (infer_ref_kind(raw) for raw in refs.values())
+    return KIND_STICKER if KIND_STICKER in kinds else KIND_PHOTO
+
+
+def _merge_kinds(left: str, right: str) -> str:
+    """合并两条同内容记录的种类：任一方是表情就按表情算。"""
+    return KIND_STICKER if KIND_STICKER in (left, right) else KIND_PHOTO
+
+
 @dataclass(frozen=True)
 class Sticker:
     """表情库里的一条记录。"""
@@ -96,6 +143,8 @@ class Sticker:
     emotions: tuple[str, ...] = ()
     # 成功发出的次数（选择时作为偏好参考，WebUI 只读展示）
     uses: int = 0
+    # sticker = 真表情；photo = 误收的普通图片（照片/截图），永不参选
+    kind: str = KIND_STICKER
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -108,6 +157,7 @@ class Sticker:
             "description": self.description,
             "emotions": list(self.emotions),
             "uses": self.uses,
+            "kind": self.kind,
         }
 
     @classmethod
@@ -117,16 +167,22 @@ class Sticker:
         uses = raw_uses if isinstance(raw_uses, int) and not isinstance(raw_uses, bool) else 0
         raw_emotions = data.get("emotions")
         raw_emotions = raw_emotions if isinstance(raw_emotions, (list, tuple)) else ()
+        clean_refs = dict(refs) if isinstance(refs, Mapping) else {}
+        kind = str(data.get("kind") or "").strip().lower()
+        if kind not in STICKER_KINDS:
+            # 旧索引没有 kind：按原生引用的段类型与 summary 现场推导
+            kind = infer_kind(clean_refs)
         return cls(
             id=str(data.get("id") or ""),
             file=str(data.get("file") or ""),
             tags=tuple(_clean_tag(tag) for tag in (data.get("tags") or []) if _clean_tag(tag)),
-            native_refs=dict(refs) if isinstance(refs, Mapping) else {},
+            native_refs=clean_refs,
             content_hash=str(data.get("content_hash") or ""),
             created_at=float(data.get("created_at") or 0.0),
             description=str(data.get("description") or "").strip(),
             emotions=tuple(tag for tag in (_clean_tag(item) for item in raw_emotions) if tag),
             uses=max(0, uses),
+            kind=kind,
         )
 
 
@@ -154,8 +210,9 @@ class StickerStore:
         mime_type: str | None = None,
         now: float | None = None,
         max_file_bytes: int | None = DEFAULT_MAX_FILE_BYTES,
+        kind: str | None = None,
     ) -> Sticker:
-        """入库一张表情，按内容哈希去重；重复时合并标签与原生引用。
+        """入库一张表情，按内容哈希去重；重复时合并标签、原生引用与种类。
 
         ``data`` 为图片本体；纯引用条目（只有平台侧引用、没有字节）允许
         ``data=None``，此时 ``file`` 为空。两者都没有时抛 ``ValueError``。
@@ -166,12 +223,16 @@ class StickerStore:
         才拿到字节，会把本体重挂到原记录上，不新建重复条目。
         ``file_name`` / ``mime_type`` 只作兼容保留：扩展名一律以文件头
         嗅探结果为准，不信群聊里这两项自报的格式。
+
+        ``kind`` 不传时按原生引用的段类型与 ``summary`` 推导（见
+        :func:`infer_kind`）；重复收集合并时任一方是表情就按表情算。
         """
         refs = {
             _clean_platform(platform): ref
             for platform, ref in (native_refs or {}).items()
             if _clean_platform(platform)
         }
+        incoming_kind = kind if kind in STICKER_KINDS else infer_kind(refs)
         payload = _prepare_image(data, max_file_bytes)
         if data is not None and payload is None:
             if not refs:
@@ -193,25 +254,15 @@ class StickerStore:
                 # 之前只存了引用、现在拿到字节：挂到原记录上，id 保持稳定
                 existing = self._find_ref_only(refs)
             if existing is not None:
-                merged_tags = _merge_tags(existing.tags, tags)
-                merged_refs = {**refs, **existing.native_refs}
-                file = existing.file
-                content_hash = existing.content_hash
-                if payload is not None and not file:
-                    file = self._write_file(payload[0], payload[1], digest)
-                    content_hash = digest
-                if (merged_tags != existing.tags or merged_refs != existing.native_refs
-                        or file != existing.file or content_hash != existing.content_hash):
-                    existing = replace(
-                        existing,
-                        file=file,
-                        tags=merged_tags,
-                        native_refs=merged_refs,
-                        content_hash=content_hash,
-                    )
-                    self._stickers[existing.id] = existing
+                # 与 add 的去重语义保持一致：同内容的收集只并进旧条目
+                merged = self._combine(
+                    existing, tags=tags, refs=refs, kind=incoming_kind,
+                    payload=payload, digest=digest,
+                )
+                if merged != existing:
+                    self._stickers[existing.id] = merged
                     self._save()
-                return existing
+                return merged
 
             relative = ""
             if payload is not None:
@@ -223,6 +274,7 @@ class StickerStore:
                 native_refs=refs,
                 content_hash=digest,
                 created_at=time.time() if now is None else now,
+                kind=incoming_kind,
             )
             self._stickers[sticker_id] = sticker
             self._save()
@@ -305,14 +357,19 @@ class StickerStore:
         tags: Iterable[Any] | None = None,
         *,
         limit: int | None = None,
+        kind: str | None = None,
     ) -> list[Sticker]:
         """按标签找表情（命中任意一个即可）。
 
-        ``tags`` 为空或 None 表示全量；``limit`` 限制返回条数（按入库顺序）。
+        ``tags`` 为空或 None 表示全量；``kind`` 传 ``"sticker"`` /
+        ``"photo"`` 时只返回该种类（选图只传 ``"sticker"``）。
+        ``limit`` 限制返回条数（按入库顺序）。
         """
         wanted = {_clean_tag(tag) for tag in (tags or []) if _clean_tag(tag)}
         with self._lock:
             items = list(self._stickers.values())
+        if kind in STICKER_KINDS:
+            items = [item for item in items if item.kind == kind]
         if wanted:
             items = [item for item in items if wanted & set(item.tags)]
         if limit is not None and limit >= 0:
@@ -320,7 +377,11 @@ class StickerStore:
         return items
 
     def record_native_ref(self, sticker_id: str, platform: str, ref: Any) -> bool:
-        """回填平台原生引用（如 Telegram 返回的 file_id）；表情不存在返回 False。"""
+        """回填平台原生引用（如 Telegram 返回的 file_id）；表情不存在返回 False。
+
+        回填的原生引用若带来更强的种类信号（如 ``mface``），同步升级
+        ``kind``，避免误收的图片一直留在隔离区。
+        """
         platform = _clean_platform(platform)
         if not platform or ref in (None, ""):
             return False
@@ -329,9 +390,60 @@ class StickerStore:
             if existing is None:
                 return False
             refs = {**existing.native_refs, platform: ref}
-            self._stickers[existing.id] = replace(existing, native_refs=refs)
+            kind = _merge_kinds(existing.kind, infer_kind({platform: ref}))
+            self._stickers[existing.id] = replace(existing, native_refs=refs, kind=kind)
             self._save()
             return True
+
+    def merge(self, sticker_ids: Iterable[str], *, keep: str | None = None) -> Sticker | None:
+        """把多条同内容记录并成一条；返回保留的记录，没有可合并时返回 None。
+
+        保留条目默认取最早 created_at 的那条（同时间按 id 最小），也可用
+        ``keep`` 指定。合并规则与 :meth:`add` 的去重一致：tags 并集、
+        ``native_refs`` 按平台合并（保留条目的引用优先）、uses 相加、
+        种类任一方是表情即算表情；描述沿用保留条目的，空的才用对方的。
+        被并条目的图片文件不删——按内容哈希命名，保留条目指向同一文件；
+        万一指向别的文件也留着，不碰磁盘。
+
+        供 ``tools/dedupe_stickers.py`` 修存量重复。
+        """
+        wanted = {str(item or "").strip() for item in sticker_ids} - {""}
+        with self._lock:
+            group = [self._stickers[key] for key in wanted if key in self._stickers]
+            if len(group) < 2:
+                return group[0] if group else None
+            keeper = self._stickers.get(str(keep or "").strip())
+            if keeper is None or keeper not in group:
+                keeper = min(group, key=lambda item: (item.created_at, item.id))
+            others = [item for item in group if item.id != keeper.id]
+            tags = keeper.tags
+            refs = dict(keeper.native_refs)
+            kind = keeper.kind
+            uses = keeper.uses
+            file = keeper.file
+            content_hash = keeper.content_hash
+            description = keeper.description
+            emotions = keeper.emotions
+            for item in others:
+                tags = _merge_tags(tags, item.tags)
+                refs = {**item.native_refs, **refs}
+                kind = _merge_kinds(kind, item.kind)
+                uses += item.uses
+                emotions = _merge_tags(emotions, item.emotions)
+                description = description or item.description
+                if not file and item.file:
+                    file = item.file
+                    content_hash = content_hash or item.content_hash
+            merged = replace(
+                keeper, tags=tags, native_refs=refs, kind=kind,
+                uses=uses, file=file, content_hash=content_hash,
+                description=description, emotions=emotions,
+            )
+            self._stickers[merged.id] = merged
+            for item in others:
+                self._stickers.pop(item.id, None)
+            self._save()
+            return merged
 
     def delete(self, sticker_id: str) -> bool:
         """删除一条表情及其图片本体；不存在时返回 False。"""
@@ -415,6 +527,38 @@ class StickerStore:
                 return item
         return None
 
+    def _combine(
+        self,
+        existing: Sticker,
+        *,
+        tags: Iterable[Any],
+        refs: Mapping[str, Any],
+        kind: str,
+        payload: tuple[bytes, str] | None,
+        digest: str,
+    ) -> Sticker:
+        """把一次收集的字段并进已有条目（tags 并集、引用按平台、kind 取强、补本体）。"""
+        merged_tags = _merge_tags(existing.tags, tags)
+        merged_refs = {**refs, **existing.native_refs}
+        merged_kind = _merge_kinds(existing.kind, kind)
+        file = existing.file
+        content_hash = existing.content_hash
+        if payload is not None and not file:
+            file = self._write_file(payload[0], payload[1], digest)
+            content_hash = digest
+        if (merged_tags == existing.tags and merged_refs == existing.native_refs
+                and file == existing.file and content_hash == existing.content_hash
+                and merged_kind == existing.kind):
+            return existing
+        return replace(
+            existing,
+            file=file,
+            tags=merged_tags,
+            native_refs=merged_refs,
+            content_hash=content_hash,
+            kind=merged_kind,
+        )
+
     def _find_ref_only(self, refs: Mapping[str, Any]) -> Sticker | None:
         """找与这组平台引用匹配的纯引用条目（补本体时沿用原 id）。"""
         for item in self._stickers.values():
@@ -497,7 +641,12 @@ def _prepare_image(data: bytes | None, max_bytes: int | None) -> tuple[bytes, st
 __all__ = [
     "DEFAULT_MAX_FILE_BYTES",
     "DEFAULT_STICKER_DIR",
+    "KIND_PHOTO",
+    "KIND_STICKER",
+    "STICKER_KINDS",
     "Sticker",
     "StickerStore",
+    "infer_kind",
+    "infer_ref_kind",
     "sniff_image_suffix",
 ]
