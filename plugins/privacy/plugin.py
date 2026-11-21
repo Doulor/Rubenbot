@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any
 
 from rubenbot.adapters.base import Segment
 from rubenbot.memory.store import VALID_PRIVACY_MODES, make_person_id

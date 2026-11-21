@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from rubenbot.adapters.base import MessageEvent, Segment
+from rubenbot.adapters.base import MessageEvent
 from rubenbot.config import Config
 from rubenbot.core import RubenBot
 from rubenbot.memory.store import MemoryStore
@@ -334,7 +334,6 @@ def test_plugin_can_call_capability(lifecycle_dir):
 def test_plugin_capability_without_bot_fails_gracefully(lifecycle_dir):
     manager = make_manager(lifecycle_dir, enabled=["life"])
     manager.load_all()
-    ctx = manager.plugins["life"].commands["publish"]
 
     async def scenario():
         # 直接取插件注册时闭包里的 ctx 不便，改为从 manager 重建一个上下文

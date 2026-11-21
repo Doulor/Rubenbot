@@ -100,7 +100,6 @@ def test_empty_model_output_keeps_old_profile(store):
 
 def test_contradiction_replaces_line_and_logs(store):
     events = seed_events(store, summaries=("TA 说下个月搬去北京",))
-    distiller = ProfileDistiller(FakeLLM(), store, MemoryConfig())
     # 先放一个旧画像（直接经 store，模拟上一轮提炼结果）
     first_event = events[0].id
     store.save_profile(

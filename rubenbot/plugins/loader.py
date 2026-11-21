@@ -33,7 +33,7 @@ import logging
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Callable
 
 from ..adapters.base import MessageEvent, Segment
 from .manifest import Manifest, ManifestError, load_manifest

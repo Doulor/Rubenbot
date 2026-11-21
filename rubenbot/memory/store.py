@@ -1347,7 +1347,7 @@ class MemoryStore:
                         )
                         line_no += 1
                 if log_reason:
-                    log = self._insert_profile_log(person_id, old, stable_text, status_text, log_reason, now)
+                    self._insert_profile_log(person_id, old, stable_text, status_text, log_reason, now)
                 self._conn.commit()
             except Exception:
                 self._conn.rollback()

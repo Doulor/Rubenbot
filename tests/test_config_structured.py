@@ -941,7 +941,6 @@ def test_legacy_text_mode_still_works(client, config_path):
 
 
 def test_hot_apply_updates_decision_engine_and_model(bot_state):
-    config = bot_state.config
     bot = bot_state.bot
     assert bot.decision_engine.config.threshold == 0.85
 

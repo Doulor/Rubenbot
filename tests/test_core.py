@@ -6,7 +6,6 @@ import random
 import re
 import time
 
-import pytest
 
 from rubenbot.adapters.base import MessageEvent, Segment
 from rubenbot.adapters.console import ConsoleAdapter

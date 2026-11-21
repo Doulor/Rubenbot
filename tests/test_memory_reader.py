@@ -266,7 +266,7 @@ def test_timeline_mismatch_not_injected(store):
 def test_facts_only_true_hits_and_distilled_skipped(store):
     person_id = seed_person(store, "u1", "阿花", stable=["TA 是一名后端工程师"])
     hit = store.add_memory(person_id, "TA 喜欢喝美式咖啡", audience="private", now=NOW)
-    other = store.add_memory(person_id, "TA 的表弟在加拿大", audience="private", now=NOW)
+    store.add_memory(person_id, "TA 的表弟在加拿大", audience="private", now=NOW)
     # 把「美式咖啡」这条提炼进了画像 → 不再注入
     store.save_profile(
         person_id,
@@ -318,7 +318,6 @@ def test_budget_cuts_facts_then_timeline_keeps_profile(store):
     text = block.render()
     assert "后端工程师" in text  # 画像核心不动
     # 事实先被砍，剩下的里事实条数应当少于时间线
-    sections = dict(block.sections)
     fact_lines = [line for title, lines in block.sections if title.startswith("你记得的事") for line in lines]
     assert len(fact_lines) <= 1
 

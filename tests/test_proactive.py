@@ -11,7 +11,6 @@ import time
 
 import pytest
 
-from rubenbot.adapters.base import MessageEvent
 from rubenbot.config import Config
 from rubenbot.core import RubenBot
 from rubenbot.memory.store import MemoryStore

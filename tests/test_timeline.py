@@ -35,11 +35,11 @@ def test_week_digest_created_and_children_marked(store):
     ts_a = NOW - 20 * DAY
     ts_b = ts_a + 3600
     assert week_key(ts_a) == week_key(ts_b)
-    a = store.add_event(
+    store.add_event(
         "console:u1", "TA 周一去了图书馆", ts=ts_a, source_chat="console:g1",
         audience="group:g1", salience=0.3,
     )
-    b = store.add_event(
+    store.add_event(
         "console:u1", "TA 周三看了电影", ts=ts_b, source_chat="console:g1",
         audience="group:g1", salience=0.8, sensitivity="high",
     )

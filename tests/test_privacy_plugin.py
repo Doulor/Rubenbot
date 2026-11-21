@@ -1,10 +1,8 @@
 """privacy 插件：/隐私 命令、待询问投递、答复解析与落裁定、清空。"""
 
 import asyncio
-import time
 from pathlib import Path
 
-import pytest
 
 from rubenbot.adapters.base import MessageEvent
 from rubenbot.config import Config
@@ -13,7 +11,7 @@ from rubenbot.memory.store import MemoryStore, ProfileLine
 from rubenbot.persona import Persona
 from rubenbot.plugins.loader import PluginManager
 
-from conftest import RecordingAdapter, ScriptedLLM, write_manifest
+from conftest import RecordingAdapter, ScriptedLLM
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent / "plugins"
 NOW = 1_795_000_000.0
@@ -220,7 +218,7 @@ def test_pending_ask_only_one_per_private_turn(tmp_path):
 def test_pending_ask_answer_allow(tmp_path):
     bot, adapter, store = make_bot(tmp_path)
     store.upsert_person("recording", "u1", "阿花", now=NOW)
-    ask = store.add_pending_ask("recording:u1", "health@group", "可以提到吗？")
+    store.add_pending_ask("recording:u1", "health@group", "可以提到吗？")
     asyncio.run(bot.handle_event(private("在吗")))
     asyncio.run(bot.handle_event(private("可以")))
     assert adapter.texts[-1].startswith("好，记住了")

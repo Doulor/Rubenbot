@@ -1,7 +1,6 @@
 """自我时间线：bot 发出的每条消息在发送成功后记一条 self 事件。"""
 
 import asyncio
-import time
 
 from rubenbot.adapters.base import MessageEvent
 

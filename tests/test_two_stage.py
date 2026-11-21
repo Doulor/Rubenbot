@@ -242,7 +242,6 @@ def usage_rows(store):
 def test_usage_records_both_stages(config, store):
     def handler(request):
         body = json.loads(request.content)
-        text = " ".join(m["content"] for m in body["messages"])
         content = json.dumps({"intent": "提问", "increment": "问具体累在哪里"}) if body.get("response_format") else "好呀"
         return httpx.Response(
             200,
