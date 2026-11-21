@@ -53,14 +53,14 @@ from typing import Any
 
 import yaml
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from ..adapters.base import MessageEvent
 from ..config import Config, GroupDecisionConfig, is_loopback_host
 from ..core import format_scene
 from ..decision import parse_quiet_hours
-from ..identity import IdentityService
+from ..identity import IdentityService, avatar_url
 from ..emotion import EmotionEngine
 from ..memory.store import make_person_id
 from ..persona import DEFAULT_PERSONA, Persona, load_persona
@@ -1289,6 +1289,45 @@ def create_app(state: WebState):
     @app.get("/", include_in_schema=False)
     async def index():
         return FileResponse(STATIC_DIR / "index.html", media_type="text/html")
+
+    # 浏览器图标：跳到 bot 当前登录 QQ 的头像（腾讯 qlogo 外部接口现取），
+    # 解析不到账号时回退内置 favicon.svg。解析结果缓存 1 小时，避免每次
+    # 取图标都打协议端。
+    _bot_avatar_cache: dict[str, Any] = {"uid": "", "expires": 0.0}
+
+    async def _bot_avatar_target() -> str:
+        now = time.time()
+        cached = _bot_avatar_cache["uid"]
+        if cached and now < _bot_avatar_cache["expires"]:
+            return avatar_url("snowluma", cached)
+        uid = ""
+        adapters_cfg = getattr(state.config, "adapters", {}) or {}
+        snow_cfg = adapters_cfg.get("snowluma") if isinstance(adapters_cfg, dict) else None
+        if isinstance(snow_cfg, dict):
+            uid = str(snow_cfg.get("self_id") or "").strip()
+        bot = state.bot
+        adapter = (getattr(bot, "adapters", {}) or {}).get("snowluma") if bot is not None else None
+        if not uid and adapter is not None:
+            uid = str(getattr(adapter, "self_id", "") or "").strip()
+        if not uid and adapter is not None and hasattr(adapter, "call_api"):
+            try:
+                payload = await adapter.call_api("get_login_info", {})
+                uid = str((payload.get("data") or {}).get("user_id") or "").strip()
+            except Exception:  # noqa: BLE001 - 取不到就回退默认图标，不影响页面
+                logger.debug("获取 bot 登录信息失败，图标回退默认", exc_info=True)
+        url = avatar_url("snowluma", uid) if uid else ""
+        if url:
+            _bot_avatar_cache.update(uid=uid, expires=now + 3600)
+            return url
+        return "/static/favicon.svg"
+
+    @app.get("/bot-avatar", include_in_schema=False)
+    async def bot_avatar():
+        return RedirectResponse(
+            await _bot_avatar_target(),
+            status_code=302,
+            headers={"Cache-Control": "public, max-age=3600"},
+        )
 
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
