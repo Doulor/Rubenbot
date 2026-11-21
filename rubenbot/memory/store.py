@@ -207,6 +207,20 @@ CREATE TABLE IF NOT EXISTS conversation_summaries (
     updated_at           REAL NOT NULL
 );
 
+-- 群定位：每群两份并存——手写在 WebUI 填的群备注、后台按聊天内容归纳的
+-- 群定位总结。注入时手写优先；两份都空就不注入。归纳水位沿用消息 id，
+-- 只作为后台任务的增量依据，不参与上下文组装。
+CREATE TABLE IF NOT EXISTS group_profiles (
+    platform        TEXT NOT NULL,
+    chat_id         TEXT NOT NULL,
+    manual_note     TEXT NOT NULL DEFAULT '',     -- 手写群备注（可空）
+    auto_summary    TEXT NOT NULL DEFAULT '',     -- 自归纳群定位（只读展示）
+    covered_until_msg_id INTEGER NOT NULL DEFAULT 0,
+    updated_at      REAL NOT NULL DEFAULT 0,      -- 自归纳最后更新时间
+    manual_updated_at REAL NOT NULL DEFAULT 0,    -- 手写最后保存时间
+    PRIMARY KEY(platform, chat_id)
+);
+
 -- 定时任务：一期只支持一次性时间点（提醒）；进程重启后 pending 任务继续生效
 CREATE TABLE IF NOT EXISTS scheduled_jobs (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -477,6 +491,24 @@ class ConversationSummary:
     summary: str = ""
     covered_until_msg_id: int = 0
     updated_at: float = 0.0
+
+
+@dataclass
+class GroupProfile:
+    """某个群的定位：手写群备注与自归纳群定位并存。
+
+    ``manual_note`` 由用户在 WebUI 手写，空串表示未填写；``auto_summary``
+    由后台任务按聊天内容归纳，只读展示。注入优先级见
+    :mod:`rubenbot.group_profile`。
+    """
+
+    platform: str
+    chat_id: str
+    manual_note: str = ""
+    auto_summary: str = ""
+    covered_until_msg_id: int = 0
+    updated_at: float = 0.0  # auto_summary 最后一次更新时间
+    manual_updated_at: float = 0.0
 
 
 @dataclass
@@ -1825,6 +1857,81 @@ class MemoryStore:
         with self._lock:
             row = self._conn.execute(sql, params).fetchone()
         return int(row["c"])
+
+    # ------------------------------------------------------------------
+    # group_profiles（每群一份手写备注 + 一份自归纳定位）
+    # ------------------------------------------------------------------
+
+    def get_group_profile(self, platform: str, chat_id: str) -> GroupProfile | None:
+        """取某个群的定位；新群没有记录时返回 None（不写脏数据）。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM group_profiles WHERE platform = ? AND chat_id = ?",
+                (str(platform), str(chat_id)),
+            ).fetchone()
+        return GroupProfile(**dict(row)) if row else None
+
+    def set_group_manual_note(
+        self, platform: str, chat_id: str, note: str, *, now: float | None = None
+    ) -> GroupProfile:
+        """保存手写群备注；空串等于清空。只动手写列，不碰自归纳。"""
+        now = time.time() if now is None else now
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO group_profiles(platform, chat_id, manual_note, manual_updated_at)
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(platform, chat_id) DO UPDATE SET
+                    manual_note = excluded.manual_note,
+                    manual_updated_at = excluded.manual_updated_at
+                """,
+                (str(platform), str(chat_id), note or "", now),
+            )
+            self._conn.commit()
+        return self.get_group_profile(platform, chat_id) or GroupProfile(
+            platform=str(platform), chat_id=str(chat_id), manual_note=note or "", manual_updated_at=now
+        )
+
+    def set_group_auto_summary(
+        self,
+        platform: str,
+        chat_id: str,
+        summary: str,
+        covered_until_msg_id: int,
+        *,
+        now: float | None = None,
+    ) -> None:
+        """写入自归纳定位与水位；只动自归纳列，手写备注原样保留。"""
+        now = time.time() if now is None else now
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO group_profiles(platform, chat_id, auto_summary, covered_until_msg_id, updated_at)
+                VALUES(?, ?, ?, ?, ?)
+                ON CONFLICT(platform, chat_id) DO UPDATE SET
+                    auto_summary = excluded.auto_summary,
+                    covered_until_msg_id = excluded.covered_until_msg_id,
+                    updated_at = excluded.updated_at
+                """,
+                (str(platform), str(chat_id), summary or "", int(covered_until_msg_id), now),
+            )
+            self._conn.commit()
+
+    def delete_group_profile(self, platform: str, chat_id: str) -> bool:
+        """删群/退群时清掉两份定位（轻量做法：随清理接口顺手删除）。"""
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM group_profiles WHERE platform = ? AND chat_id = ?",
+                (str(platform), str(chat_id)),
+            )
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    def list_group_profiles(self) -> list[GroupProfile]:
+        """所有有过定位数据的群（供后台任务与 WebUI 列表使用）。"""
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM group_profiles ORDER BY updated_at DESC").fetchall()
+        return [GroupProfile(**dict(row)) for row in rows]
 
     @staticmethod
     def _row_to_raw(row: sqlite3.Row) -> RawMessage:

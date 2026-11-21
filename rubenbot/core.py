@@ -45,6 +45,7 @@ from .decision import (
 )
 from .expression import ExpressionDecision, choose_length_band, is_question, parse_plan, repetition_list
 from .emotion import EmotionEngine
+from .group_profile import GroupProfileSummarizer, active_profile_block
 from .opener_guard import OpenerGuard
 from .gateway.events import EventBatch, EventMerger, EventRouter, RouteDecision
 from .gateway.judge import EventJudge, EventVerdict
@@ -364,6 +365,8 @@ def format_scene(event: MessageEvent, display: str) -> str:
     """拼装场景说明行。
 
     独立成函数，WebUI 的人设预览要用同一段文案，避免两处漂移。
+    群定位（手写备注 / 自归纳）不在这里拼：那段要读库，由
+    :meth:`RubenBot.group_profile_text` 单独追加。
     """
     if event.is_private:
         return (
@@ -443,6 +446,8 @@ class RubenBot:
         self.consolidator = Consolidator(llm, store, config.memory)
         # 会话滚动摘要：只压缩本会话的历史，与跨会话记忆各管各的
         self.summarizer = RollingSummarizer(llm, store, config.memory)
+        # 群定位：手写备注即时生效；自归纳只在后台维护任务里更新
+        self.group_profiles = GroupProfileSummarizer(llm, store, config.memory.group_profile)
         # 联网搜索（LLM 工具）：没配 api_key 时为 None，工具不开放
         self.searcher: WebSearcher | None = build_searcher(config.search)
         # MCP 连接与适配器一样，按启动时的配置建连，重启后才切换。
@@ -555,6 +560,8 @@ class RubenBot:
         self.consolidator.llm = self.llm
         self.summarizer.config = config.memory
         self.summarizer.llm = self.llm
+        self.group_profiles.config = config.memory.group_profile
+        self.group_profiles.llm = self.llm
         # 搜索：配置变了就换成新的搜索器（冷却状态在内存里，换配置时重置；
         # 旧客户端的连接交给事件循环在后台关掉）
         if config.search != old_search_config:
@@ -1094,6 +1101,18 @@ class RubenBot:
         recent = self.store.recent_messages(chat_id, limit=12, platform=platform, real_only=True)
         summary = self.summarizer.active_summary(platform, chat_id)
         block = format_summary_block(summary.summary) if summary is not None else ""
+        # 冷场开口也是群聊生成，同样带上这个群的定位（只读库，不调模型）
+        group_event = MessageEvent(
+            platform=platform,
+            chat_type="group",
+            chat_id=chat_id,
+            sender_id=BOT_SENDER_ID,
+            sender_name=self.config.chat.bot_name,
+            text="",
+        )
+        profile_block = self.group_profile_text(group_event)
+        if profile_block:
+            block = "\n\n".join(part for part in (block, profile_block) if part)
         messages = self.opener.build_prompt(
             persona=self.persona.system_prompt(),
             bot_name=self.config.chat.bot_name,
@@ -1131,7 +1150,7 @@ class RubenBot:
         return True
 
     async def run_maintenance(self, *, now: float | None = None, force_extract: bool = False) -> None:
-        """抽取 + 归纳的一次检查；两个环节互不影响。"""
+        """抽取 + 归纳 + 摘要 + 群定位的一次检查；各环节互不影响。"""
         now = time.time() if now is None else now
         try:
             await self.extractor.maybe_extract(now=now, force=force_extract)
@@ -1146,6 +1165,11 @@ class RubenBot:
             await self.summarizer.maybe_summarize(now=now)
         except Exception as exc:  # noqa: BLE001
             logger.warning("会话摘要异常：%s", exc)
+        # 群定位：只在后台归纳，收消息/裁定/生成三步的模型调用次数不受影响
+        try:
+            await self.group_profiles.maybe_update(now=now)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("群定位归纳异常：%s", exc)
         self._trim_usage(now)
 
     def _trim_usage(self, now: float) -> None:
@@ -1717,6 +1741,20 @@ class RubenBot:
             logger.warning("组装情绪状态失败：%s", exc)
             return ""
 
+    def group_profile_text(self, event: MessageEvent) -> str:
+        """群定位背景块：手写备注优先，其次自归纳；私聊或两份都空时为空。
+
+        只读 SQLite，不触发任何模型调用——后台归纳走 ``run_maintenance``。
+        """
+        if event.is_private:
+            return ""
+        return active_profile_block(
+            self.store,
+            event.platform,
+            event.chat_id,
+            max_chars=self.config.memory.group_profile.max_chars,
+        )
+
     # ------------------------------------------------------------------
     # 上下文拼装
     # ------------------------------------------------------------------
@@ -1838,6 +1876,10 @@ class RubenBot:
         emotion_text = self.emotion_text(event, now=now)
         if emotion_text:
             sections.append(emotion_text)
+        # 群定位：手写备注优先，其次自归纳；私聊不注入。只读库，不调模型。
+        group_profile_text = self.group_profile_text(event)
+        if group_profile_text:
+            sections.append(group_profile_text)
         # 本会话的早期对话压缩：只补对话历史，不涉及跨会话记忆
         summary = self.summarizer.active_summary(event.platform, event.chat_id)
         covered_until = 0

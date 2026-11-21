@@ -253,7 +253,7 @@ ConsoleAdapter 的输入格式：
 
 群聊里普通消息默认只拿 `decision.base`（0.10）的基础意愿，单靠它过不了阈值；被 @ / 被回复 / 叫到名字（`Ruben`）时必回。想调试时可以在配置里临时调高 `decision.base` / `decision.threshold`。插件默认全部关闭，想试 `/hello` 请在 WebUI 的「插件市场」页启用 `hello`，或在配置里写 `plugins.enabled: ["hello"]`。
 
-WebUI 的「群组与意愿」可按名字或 ID 查会话；「记忆 → 画像与时间线」选定人物后，可查看画像和事件来源。SnowLuma 的群名与成员名缓存在 SQLite，群名片按群区分；群卡和人物档案的「刷新名称」可重新取名，平台离线时保留旧资料。QQ 头像由浏览器直接请求 `qlogo.cn`（会向该域名发送对应的 QQ 号或群号），bot 不下载或存储图片。其他平台以及加载失败的头像使用名字首字色块。
+WebUI 的「群组与意愿」可按名字或 ID 查会话，每个群展开后有「群定位」：左边手写群备注可编辑、保存即生效，右边是后台按这个群聊内容自归纳的定位（只读、标最后更新时间）；注入时手写优先，手写为空才用自归纳，两份都空就不注入，私聊不注入。「记忆 → 画像与时间线」选定人物后，可查看画像和事件来源。SnowLuma 的群名与成员名缓存在 SQLite，群名片按群区分；群卡和人物档案的「刷新名称」可重新取名，平台离线时保留旧资料。QQ 头像由浏览器直接请求 `qlogo.cn`（会向该域名发送对应的 QQ 号或群号），bot 不下载或存储图片。其他平台以及加载失败的头像使用名字首字色块。
 
 ### 4. 测试
 
@@ -306,6 +306,7 @@ WebUI 的「群组与意愿」可按名字或 ID 查会话；「记忆 → 画�
 | | `gate_confidence_threshold` `gate_ask_high_sensitivity` | 分寸审查的置信度下限与灰区询问开关 |
 | | `recall_tool_enabled` `recall_tool_max_rounds` | recall 工具循环开关与轮数（模型不支持时自动退化） |
 | | `rolling_summary` | 会话滚动摘要（默认开）：`enabled` / `trigger_after`（未摘要原文超过多少条触发，默认 60）/ `keep_recent`（始终保留的最新原文条数，默认 30）/ `max_chars`（五段式摘要总长上限，默认 800）；摘要用 `summary` 角色生成，未配置时回退 chat |
+| | `group_profile` | 群定位（默认开）：`enabled`（后台自归纳开关；手写备注不受影响）/ `update_interval_hours`（每群刷新间隔，默认 24）/ `min_messages`（水位后新消息达到多少条才归纳，默认 50）/ `max_chars`（注入与归纳的总长上限，默认 300）/ `max_batch_messages`（单次归纳最多喂多少条原文）。手写备注在 WebUI 群详情填写，存 SQLite，不入 YAML |
 | `chat` | `history_size` | 上下文带入的最近消息条数（只计真实消息，系统/工具条目不占窗口） |
 | | `history_ttl_hours` | 超过这个时间的旧消息不再拼进上下文 |
 | | `dedupe_ttl_seconds` | 入站去重窗口：同一平台消息 id 在此窗口内重复到达即丢弃（默认 300 秒，0 关闭） |
