@@ -47,6 +47,7 @@ SECRET_PATHS = (
     "voice.stt_api_key",
     "voice.tts_api_key",
     "adapters.snowluma.access_token",
+    "stickers.embedding_api_key",
     "webui.password",
 )
 
@@ -288,6 +289,11 @@ def structured_config(config: Config) -> dict[str, Any]:
             "send_probability": config.stickers.send_probability,
             "nonverbal_probability": config.stickers.nonverbal_probability,
             "cooldown_seconds": config.stickers.cooldown_seconds,
+            "embedding_base_url": config.stickers.embedding_base_url,
+            "embedding_model": config.stickers.embedding_model,
+            "embedding_api_key": "",
+            "embedding_threshold": config.stickers.embedding_threshold,
+            "embedding_refresh_seconds": config.stickers.embedding_refresh_seconds,
         },
         "plugins": {
             "dir": config.plugins.dir,
@@ -315,6 +321,7 @@ def structured_config(config: Config) -> dict[str, Any]:
             "voice.stt_api_key": bool(stt_key),
             "voice.tts_api_key": bool(tts_key),
             "adapters.snowluma.access_token": bool(access_token),
+            "stickers.embedding_api_key": bool(config.stickers.embedding_api_key),
             "webui.password": bool(password),
         },
     }
@@ -1007,6 +1014,26 @@ def _validate_stickers(section: dict[str, Any], v: _Validator) -> dict[str, Any]
         value = v.number(section["cooldown_seconds"], "stickers.cooldown_seconds", minimum=0)
         if value is not None:
             out["cooldown_seconds"] = float(value)
+    # 语义检索：留空即不启用（走 fast 角色文本选择 + 标签回落）
+    for key in ("embedding_base_url", "embedding_model"):
+        if key in section:
+            value = v.text(section[key], f"stickers.{key}", allow_empty=True)
+            if value is not None:
+                out[key] = value
+    if "embedding_api_key" in section:
+        # 与其他密钥字段一致：空值 / 脱敏占位符表示保留原值
+        copied = {"embedding_api_key": section["embedding_api_key"]}
+        _prune_secret(copied, "embedding_api_key")
+        if "embedding_api_key" in copied:
+            out["embedding_api_key"] = str(copied["embedding_api_key"]).strip()
+    if "embedding_threshold" in section:
+        value = v.number(section["embedding_threshold"], "stickers.embedding_threshold", minimum=-1, maximum=1)
+        if value is not None:
+            out["embedding_threshold"] = float(value)
+    if "embedding_refresh_seconds" in section:
+        value = v.number(section["embedding_refresh_seconds"], "stickers.embedding_refresh_seconds", minimum=0)
+        if value is not None:
+            out["embedding_refresh_seconds"] = float(value)
     return out
 
 

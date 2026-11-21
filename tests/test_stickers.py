@@ -6,6 +6,13 @@ import json
 
 from rubenbot.stickers import StickerStore
 
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+
+def png(payload: bytes = b"x") -> bytes:
+    """造一份文件头合法的假 PNG；存储层如今按文件头嗅探格式。"""
+    return PNG_MAGIC + payload
+
 
 def make_store(tmp_path) -> StickerStore:
     return StickerStore(tmp_path / "stickers")
@@ -14,7 +21,7 @@ def make_store(tmp_path) -> StickerStore:
 def test_add_writes_file_and_index(tmp_path):
     store = make_store(tmp_path)
     sticker = store.add(
-        b"\x89PNG-fake",
+        png(b"fake"),
         tags=["开心", "开心", " 猫 "],
         native_refs={"snowluma": {"kind": "mface", "data": {"emoji_id": "1"}}},
         file_name="cat.png",
@@ -25,7 +32,7 @@ def test_add_writes_file_and_index(tmp_path):
     assert sticker.content_hash
     assert sticker.created_at == 1234.0
     path = store.path_of(sticker)
-    assert path is not None and path.read_bytes() == b"\x89PNG-fake"
+    assert path is not None and path.read_bytes() == png(b"fake")
     assert path.suffix == ".png"
     # 索引落盘，重新打开能读回来
     index = json.loads((tmp_path / "stickers" / "index.json").read_text(encoding="utf-8"))
@@ -39,8 +46,8 @@ def test_add_writes_file_and_index(tmp_path):
 
 def test_add_dedupes_by_content_hash_and_merges_tags(tmp_path):
     store = make_store(tmp_path)
-    first = store.add(b"same-bytes", tags=["a"])
-    second = store.add(b"same-bytes", tags=["b", "a"])
+    first = store.add(png(b"same-bytes"), tags=["a"])
+    second = store.add(png(b"same-bytes"), tags=["b", "a"])
     assert first.id == second.id
     assert second.tags == ("a", "b")
     # 不重复写文件、不重复建记录
@@ -50,8 +57,8 @@ def test_add_dedupes_by_content_hash_and_merges_tags(tmp_path):
 
 def test_dedupe_merges_new_platform_refs(tmp_path):
     store = make_store(tmp_path)
-    store.add(b"same-bytes", native_refs={"snowluma": {"emoji_id": "1"}})
-    merged = store.add(b"same-bytes", native_refs={"telegram": {"file_id": "abc"}})
+    store.add(png(b"same-bytes"), native_refs={"snowluma": {"emoji_id": "1"}})
+    merged = store.add(png(b"same-bytes"), native_refs={"telegram": {"file_id": "abc"}})
     assert merged.native_refs == {
         "snowluma": {"emoji_id": "1"},
         "telegram": {"file_id": "abc"},
@@ -77,9 +84,9 @@ def test_ref_only_entry_without_bytes(tmp_path):
 
 def test_find_by_tags_and_limit(tmp_path):
     store = make_store(tmp_path)
-    happy = store.add(b"1", tags=["开心"])
-    store.add(b"2", tags=["难过"])
-    store.add(b"3", tags=["开心", "猫"])
+    happy = store.add(png(b"1"), tags=["开心"])
+    store.add(png(b"2"), tags=["难过"])
+    store.add(png(b"3"), tags=["开心", "猫"])
     assert {item.id for item in store.find_by_tags(["猫"])} == {store.find_by_tags(["猫"])[0].id}
     assert len(store.find_by_tags(["开心"])) == 2
     assert {item.id for item in store.find_by_tags(["开心", "难过"])} == {
@@ -91,7 +98,7 @@ def test_find_by_tags_and_limit(tmp_path):
 
 def test_record_native_ref(tmp_path):
     store = make_store(tmp_path)
-    sticker = store.add(b"x", tags=["a"])
+    sticker = store.add(png(b"x"), tags=["a"])
     assert store.record_native_ref(sticker.id, "telegram", {"file_id": "F1"}) is True
     got = store.get(sticker.id)
     assert got is not None and got.native_refs["telegram"] == {"file_id": "F1"}
@@ -103,7 +110,7 @@ def test_record_native_ref(tmp_path):
 
 def test_reference_shape(tmp_path):
     store = make_store(tmp_path)
-    sticker = store.add(b"x", tags=["a"], native_refs={"telegram": {"file_id": "F"}})
+    sticker = store.add(png(b"x"), tags=["a"], native_refs={"telegram": {"file_id": "F"}})
     ref = store.reference(sticker)
     assert ref["id"] == sticker.id
     assert ref["tags"] == ["a"]
@@ -113,7 +120,7 @@ def test_reference_shape(tmp_path):
 
 def test_delete_removes_index_and_file(tmp_path):
     store = make_store(tmp_path)
-    sticker = store.add(b"delete-me", file_name="x.png")
+    sticker = store.add(png(b"delete-me"), file_name="x.png")
     path = store.path_of(sticker)
     assert path is not None and path.exists()
     assert store.delete(sticker.id) is True

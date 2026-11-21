@@ -19,6 +19,13 @@ from rubenbot.persona import Persona
 from rubenbot.sticker_behavior import StickerBehavior
 from rubenbot.stickers import StickerStore
 
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+
+def png(payload: bytes = b"x") -> bytes:
+    """造一份文件头合法的假 PNG；存储层如今按文件头嗅探格式。"""
+    return PNG_MAGIC + payload
+
 
 class Adapter:
     def __init__(self, name="snowluma", capabilities=("send_sticker",)):
@@ -70,15 +77,23 @@ def event(text="你好", *, chat_id="g1", chat_type="group", segments=None):
     )
 
 
-def image(raw=b"png-bytes"):
+def image(raw=png(b"png-bytes")):
     return Segment("image", {"base64": base64.b64encode(raw).decode(), "filename": "cat.png", "mime_type": "image/png"})
 
 
 def make_behavior(store, **values):
+    downloader = values.pop("downloader", _no_download)
     cfg = SimpleNamespace(enabled=True, collect=True, send_probability=1.0, cooldown_seconds=300.0)
     for key, value in values.items():
         setattr(cfg, key, value)
-    return StickerBehavior(cfg, store_getter=lambda: store, rng=FixedRng(), clock=Clock())
+    # 默认不碰网络：真正的下载行为由专门用例注入假下载器
+    return StickerBehavior(
+        cfg, store_getter=lambda: store, rng=FixedRng(), clock=Clock(), downloader=downloader,
+    )
+
+
+async def _no_download(url, limit):
+    return None
 
 
 def runtime(bot):
@@ -175,7 +190,7 @@ def test_collect_store_error_isolated(tmp_path):
 
 def test_send_probability_and_cooldown(tmp_path):
     store = StickerStore(tmp_path / "stickers")
-    store.add(b"one", tags=["猫"])
+    store.add(png(b"one"), tags=["猫"])
     bot = Bot(store)
     clock = Clock()
     behavior = StickerBehavior(SimpleNamespace(enabled=True, collect=False, send_probability=1.0, cooldown_seconds=300), store_getter=lambda: store, rng=FixedRng(), clock=clock)
@@ -190,7 +205,7 @@ def test_send_probability_and_cooldown(tmp_path):
 
 def test_send_probability_miss(tmp_path):
     store = StickerStore(tmp_path / "stickers")
-    store.add(b"one")
+    store.add(png(b"one"))
     behavior = make_behavior(store, send_probability=0.15)
     behavior.rng = FixedRng(0.9)
     bot = Bot(store)
@@ -200,7 +215,7 @@ def test_send_probability_miss(tmp_path):
 
 def test_cooldown_is_per_chat(tmp_path):
     store = StickerStore(tmp_path / "stickers")
-    store.add(b"one")
+    store.add(png(b"one"))
     bot = Bot(store)
     behavior = make_behavior(store)
     asyncio.run(behavior.on_after_reply(runtime(bot), event(chat_id="g1"), "嗯"))
@@ -210,8 +225,8 @@ def test_cooldown_is_per_chat(tmp_path):
 
 def test_topic_match_is_preferred(tmp_path):
     store = StickerStore(tmp_path / "stickers")
-    store.add(b"cat", tags=["猫猫"])
-    store.add(b"dog", tags=["狗狗"])
+    store.add(png(b"cat"), tags=["猫猫"])
+    store.add(png(b"dog"), tags=["狗狗"])
     bot = Bot(store)
     asyncio.run(make_behavior(store).on_after_reply(runtime(bot), event("猫猫在干嘛"), "在看猫"))
     assert bot.calls[0][2]["sticker"]["tags"] == ["猫猫"]
@@ -219,7 +234,7 @@ def test_topic_match_is_preferred(tmp_path):
 
 def test_send_falls_back_to_any(tmp_path):
     store = StickerStore(tmp_path / "stickers")
-    added = store.add(b"cat", tags=["猫猫"])
+    added = store.add(png(b"cat"), tags=["猫猫"])
     bot = Bot(store)
     asyncio.run(make_behavior(store).on_after_reply(runtime(bot), event("天气不错"), "是啊"))
     assert bot.calls[0][2]["sticker"]["id"] == added.id
@@ -234,7 +249,7 @@ def test_empty_store_skips(tmp_path):
 
 def test_without_capability_skips(tmp_path):
     store = StickerStore(tmp_path / "stickers")
-    store.add(b"one")
+    store.add(png(b"one"))
     bot = Bot(store, [Adapter(capabilities=())])
     asyncio.run(make_behavior(store).on_after_reply(runtime(bot), event(), "嗯"))
     assert bot.calls == []
@@ -242,7 +257,7 @@ def test_without_capability_skips(tmp_path):
 
 def test_capability_config_disabled_skips(tmp_path):
     store = StickerStore(tmp_path / "stickers")
-    store.add(b"one")
+    store.add(png(b"one"))
     config = Config.from_dict({"adapters": {"snowluma": {"capabilities": {"sticker": False}}}})
     bot = Bot(store, config=config)
     asyncio.run(make_behavior(store).on_after_reply(runtime(bot), event(), "嗯"))
@@ -251,7 +266,7 @@ def test_capability_config_disabled_skips(tmp_path):
 
 def test_send_failure_still_marks_cooldown(tmp_path):
     store = StickerStore(tmp_path / "stickers")
-    store.add(b"one")
+    store.add(png(b"one"))
     bot = Bot(store, result=(False, "平台失败"))
     behavior = make_behavior(store)
     rt = runtime(bot)
@@ -262,7 +277,7 @@ def test_send_failure_still_marks_cooldown(tmp_path):
 
 def test_send_exception_isolated(tmp_path):
     store = StickerStore(tmp_path / "stickers")
-    store.add(b"one")
+    store.add(png(b"one"))
     bot = Bot(store, raises=RuntimeError("能力炸了"))
     asyncio.run(make_behavior(store).on_after_reply(runtime(bot), event(), "嗯"))
     assert len(bot.calls) == 1
@@ -270,7 +285,7 @@ def test_send_exception_isolated(tmp_path):
 
 def test_without_bot_channel_skips(tmp_path):
     store = StickerStore(tmp_path / "stickers")
-    store.add(b"one")
+    store.add(png(b"one"))
     asyncio.run(make_behavior(store).on_after_reply(SimpleNamespace(), event(), "嗯"))
 
 
@@ -288,7 +303,7 @@ def test_nonverbal_probability_config(value, expected):
 
 def test_unknown_platform_never_uses_another_adapter(tmp_path):
     store = StickerStore(tmp_path / "stickers")
-    store.add(b"one")
+    store.add(png(b"one"))
     bot = Bot(store, [Adapter(name="another")])
     asyncio.run(make_behavior(store).on_after_reply(runtime(bot), event(), "嗯"))
     assert not bot.calls
@@ -320,8 +335,8 @@ def bot_messages(store):
 @pytest.mark.parametrize("intent,proactive", [("接梗", True), ("短附和", False)])
 def test_sticker_reply_records_success_once(config, store, tmp_path, intent, proactive):
     bot, adapter = sticker_bot(config, store, tmp_path)
-    bot.stickers.add(b"dog", tags=["狗狗"])
-    tagged = bot.stickers.add(b"cat", tags=["猫猫"])
+    bot.stickers.add(png(b"dog"), tags=["狗狗"])
+    tagged = bot.stickers.add(png(b"cat"), tags=["猫猫"])
     bot.plugins = SimpleNamespace(run_after_reply=AsyncMock(side_effect=RuntimeError("插件故障")))
     incoming = event("猫猫")
     decision = ExpressionDecision(intent, "碎片", "接梗", ())
@@ -346,7 +361,7 @@ def test_sticker_reply_records_success_once(config, store, tmp_path, intent, pro
 def test_sticker_reply_fallback_does_not_count_as_speech(config, store, tmp_path, scenario):
     bot, adapter = sticker_bot(config, store, tmp_path)
     if scenario not in ("disabled", "empty"):
-        bot.stickers.add(b"cat")
+        bot.stickers.add(png(b"cat"))
     if scenario == "disabled":
         config.stickers.enabled = False
     elif scenario == "miss":
@@ -372,7 +387,7 @@ def test_sticker_reply_fallback_does_not_count_as_speech(config, store, tmp_path
 def test_nonverbal_reply_through_handle_event(config, store, tmp_path, scenario):
     bot, adapter = sticker_bot(config, store, tmp_path, intent="提问" if scenario == "other_intent" else "接梗")
     if scenario != "empty":
-        bot.stickers.add(b"cat", tags=["猫猫"])
+        bot.stickers.add(png(b"cat"), tags=["猫猫"])
     if scenario == "disabled":
         config.stickers.enabled = False
     if scenario == "failed":
