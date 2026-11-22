@@ -32,6 +32,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
@@ -52,6 +53,17 @@ from .base import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _hide_bot_urls(record: logging.LogRecord) -> bool:
+    """httpx 的 INFO 请求日志含完整 URL；Bot API 把凭据放在路径而非请求头。"""
+    args = record.args
+    return not (isinstance(args, tuple) and any(
+        isinstance(arg, httpx.URL) and re.search(r"/bot[^/]+/", arg.path) for arg in args
+    ))
+
+
+logging.getLogger("httpx").addFilter(_hide_bot_urls)
 
 DEFAULT_API_BASE = "https://api.telegram.org"
 DEFAULT_OFFSET_FILE = "data/telegram_offset.json"
@@ -426,10 +438,35 @@ class TelegramAdapter(BaseAdapter):
         data: dict[str, Any] = {
             "native_ref": {"kind": "sticker", "file_id": str(file_id)},
         }
-        for key in ("emoji", "set_name", "width", "height", "file_size"):
+        for key in ("emoji", "set_name", "width", "height", "file_size", "is_animated", "is_video"):
             if sticker.get(key) is not None:
                 data[key] = sticker[key]
         return Segment("sticker", data)
+
+    async def resolve_image_source(self, segment: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        """静态贴纸按需取图；带 token 的下载地址不离开适配器。"""
+        seg = as_segment(segment)
+        data = seg.data
+        if seg.type != "sticker" or data.get("is_animated") or data.get("is_video"):
+            return None
+        ref = data.get("native_ref")
+        if not isinstance(ref, Mapping) or ref.get("kind") != "sticker":
+            return None
+        file_id = ref.get("file_id")
+        if not isinstance(file_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,512}", file_id):
+            return None
+        try:
+            result = await self._call("getFile", {"file_id": file_id})
+            path = result.get("file_path") if isinstance(result, Mapping) else None
+            if not isinstance(path, str) or not path.lower().endswith((".webp", ".png")):
+                return None
+            raw = await self._download_file(path)
+        except (ValueError, RuntimeError, httpx.HTTPError) as exc:
+            logger.debug("下载 Telegram 静态贴纸失败：%s", type(exc).__name__)
+            return None
+        if not raw:
+            return None
+        return {"base64": base64.b64encode(raw).decode("ascii"), "mime_type": mimetypes.guess_type(path)[0]}
 
     async def _photo_segment(self, photo: Mapping[str, Any]) -> Segment | None:
         """最大尺寸的 PhotoSize -> image 段（下载后以 base64 保存）。"""
@@ -449,20 +486,26 @@ class TelegramAdapter(BaseAdapter):
                     data["base64"] = base64.b64encode(raw).decode("ascii")
                     data["mime_type"] = mimetypes.guess_type(str(file_path))[0] or "image/jpeg"
             except Exception as exc:  # noqa: BLE001 - 下载失败仍保留图片段占位
-                logger.warning("下载 Telegram 图片失败（file_id=%s）：%s", file_id, exc)
+                logger.warning("下载 Telegram 图片失败：%s", type(exc).__name__)
         if not data:
             return None
         return Segment("image", data)
 
     async def _download_file(self, file_path: str) -> bytes:
+        if not re.fullmatch(r"(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*", file_path):
+            raise ValueError("需要 Bot API 返回的相对文件路径")
         client = await self._get_client()
-        url = f"{self.api_base}/file/bot{self.bot_token}/{file_path.lstrip('/')}"
-        resp = await client.get(url)
-        resp.raise_for_status()
-        content = resp.content
-        if len(content) > MAX_PHOTO_BYTES:
-            raise ValueError(f"图片过大（{len(content)} 字节）")
-        return content
+        url = f"{self.api_base}/file/bot{self.bot_token}/{file_path}"
+        async with client.stream("GET", url, headers={"Accept-Encoding": "identity"}, follow_redirects=False) as resp:
+            resp.raise_for_status()
+            if resp.headers.get("content-encoding", "identity").lower() != "identity":
+                raise ValueError("不支持压缩的图片响应")
+            content = bytearray()
+            async for chunk in resp.aiter_bytes():
+                if len(chunk) > MAX_PHOTO_BYTES - len(content):
+                    raise ValueError("图片过大")
+                content.extend(chunk)
+        return bytes(content)
 
     async def _voice_segment(self, voice: Mapping[str, Any]) -> Segment | None:
         """语音条 -> record 段；下载失败时只留 file_id/duration 占位。

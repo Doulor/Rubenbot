@@ -210,13 +210,18 @@ def test_identity_refresh_requires_session(locked_client):
     assert locked_client.post("/api/identities/refresh", json={"platform": "snowluma"}).status_code == 401
 
 
-def test_health_open_without_auth(client):
+def test_health_open_without_auth(client, state):
+    from types import SimpleNamespace
+
+    counts = dict(success=5, failed=3, timeout=1)
+    state.bot = SimpleNamespace(sticker_behavior=SimpleNamespace(visual_counts=counts))
     response = client.get("/api/health")
     assert response.status_code == 200
     data = response.json()
     assert data["ok"] is True
     assert data["auth_required"] is False
     assert data["loopback_only"] is True
+    assert data["vision"] == counts
 
 
 def test_api_requires_session_when_password_set(locked_client):

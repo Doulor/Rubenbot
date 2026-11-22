@@ -102,8 +102,8 @@ def test_inbound_string_cq_codes():
     event = parse_onebot_event(
         group_payload(message=message, raw_message=message)
     )
-    assert event.text == "@10000 你好"
-    assert [segment["type"] for segment in event.segments] == ["at", "text"]
+    assert event.text == "@10000 你好[表情]"
+    assert [segment["type"] for segment in event.segments] == ["at", "text", "face"]
 
 
 def test_inbound_mface_is_normalized_to_sticker():
