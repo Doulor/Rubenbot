@@ -81,6 +81,8 @@ class MergedRound:
     hard: bool = False
     # 批次里出现过 @/回复 bot 的消息；一旦为真，截止时间不再延后
     urgent: bool = False
+    # 有真机操作资格的群消息不与其他发送者共用工具轮。
+    isolated_sender: bool = False
 
     @property
     def key(self) -> tuple[str, str, str]:
@@ -185,6 +187,7 @@ class MessageMerger:
         *,
         hard: bool = False,
         urgent: bool = False,
+        isolate_sender: bool = False,
     ) -> list[MergedRound]:
         """加入一条消息，返回此刻应当处理的轮次（按时间先后）。
 
@@ -194,8 +197,11 @@ class MessageMerger:
         key = (event.platform, event.chat_type, event.chat_id)
 
         round_ = self._pending.get(key)
-        if round_ is not None and round_.deadline <= now:
-            # 已到期封口的旧批次：先放出，新消息另起一批（不再续命）
+        if round_ is not None and (round_.deadline <= now or (
+            (round_.isolated_sender and event.sender_id != round_.sender_id)
+            or (isolate_sender and any(item.sender_id != event.sender_id for item in round_.events))
+        )):
+            # 到期或跨越授权边界就封口；不能把访客的任务拼给机主。
             ready.append(self._pending.pop(key))
             round_ = None
         if round_ is None:
@@ -208,6 +214,7 @@ class MessageMerger:
                 first_at=now,
             )
             self._pending[key] = round_
+        round_.isolated_sender |= isolate_sender
         round_.events.append(event)
         round_.last_at = now
         round_.hard = round_.hard or hard

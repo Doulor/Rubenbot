@@ -47,12 +47,12 @@ def test_form_round_trip_preserves_omissions_and_clears_list(web):
     assert view["structured"]["computer"] == asdict(state.config.computer)
     assert view["structured"]["computer"]["whitelist"] == ["telegram:123"]
     response = client.put("/api/config", json={"config": {"computer": {
-        "enabled": True, "command_timeout_seconds": "20", "sandbox_quota_mb": "25", "output_limit_bytes": "4096",
+        "enabled": True, "max_task_rounds": "5", "command_timeout_seconds": "20", "sandbox_quota_mb": "25", "output_limit_bytes": "4096",
     }}})
     assert response.status_code == 200, response.text
     assert response.json()["applied"] == ["computer"]
     expected = {"enabled": True, "whitelist": ["telegram:123"], "command_timeout_seconds": 20,
-                "sandbox_quota_mb": 25, "output_limit_bytes": 4096}
+                "sandbox_quota_mb": 25, "output_limit_bytes": 4096, "max_task_rounds": 5}
     assert asdict(Config.load(state.config_path).computer) == expected
     assert response.json()["structured"]["computer"] == expected
     assert client.put("/api/config", json={"config": {"computer": {"whitelist": []}}}).status_code == 200
@@ -63,7 +63,7 @@ def test_form_round_trip_preserves_omissions_and_clears_list(web):
 @pytest.mark.parametrize(("field", "value"), [
     ("enabled", "true"), ("whitelist", None), ("whitelist", ["telegram:*"]),
     ("whitelist", ["telegram:${ACCOUNT}"]), ("whitelist", ["123"]),
-    ("output_limit_bytes", 31), ("command_timeout_seconds", True), ("sandbox_quota_mb", 10241),
+    ("max_task_rounds", 0), ("max_task_rounds", 17), ("output_limit_bytes", 31), ("command_timeout_seconds", True), ("sandbox_quota_mb", 10241),
 ])
 def test_invalid_authorization_and_limits_never_written(web, monkeypatch, field, value):
     client, state = web

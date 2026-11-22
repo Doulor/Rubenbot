@@ -88,13 +88,12 @@ def test_model_round_trip_rechecks_sender_after_whitelist_change(bot, tmp_path):
                 return {'tool_calls': [{'id': 'late', 'type': 'function', 'function': {
                     'name': 'write_file', 'arguments': json.dumps({'path': str(target), 'content': 'test'}),
                 }}]}
-            assert messages[-1]['tool_call_id'] == 'late' and '操作失败' in messages[-1]['content']
-            assert '访客沙盒' in description
-            return {'content': '权限已经撤销。'}
+            pytest.fail('已拒绝的操作不再交给模型生成回执')
 
     bot.llm = Model()
-    reply = asyncio.run(bot.generate([{'role': 'user', 'content': '写一份报告'}], event=OWNER))
-    assert reply == '权限已经撤销。' and not target.exists()
+    reply = asyncio.run(bot.generate([{'role': 'user', 'content': '写一份报告'}], event=replace(OWNER, chat_type='private')))
+    assert reply == '' and not target.exists()
+    assert '访客沙盒' in definitions(bot, OWNER)['write_file']['description']
     assert bot.store.recent_computer_actions()[0]['context'] == 'sandbox'
 
 

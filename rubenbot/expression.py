@@ -6,6 +6,7 @@ import json
 import re
 from dataclasses import asdict, dataclass
 
+COMPUTER_INTENT = '操作电脑'
 INTENTS = ("接梗", "补充新信息", "反驳", "提问", "短附和", "表情回应", "沉默")
 BUDGETS = {"碎片": "≤10 字", "短句": "11–25 字", "展开": "26–60 字"}
 MAX_PLAN_CHARS = 500
@@ -44,6 +45,7 @@ class ExpressionDecision:
     capabilities: tuple[str, ...] = ()
     # 缺报、非法值或策划失败都没有提供依据，不能默认为常识。
     basis: str = "guess"
+    deliver_file: bool = False
 
     def prompt_block(self) -> str:
         uncertainty = "没把握就明说不确定，不把推测写成事实。" if self.basis == "guess" else ""
@@ -99,14 +101,23 @@ def repetition_list(recent: list[str], proposed: object = None) -> tuple[str, ..
     return tuple(result)
 
 
-def parse_plan(raw: str, band: str, recent: list[str], notes: tuple[CapabilityNote, ...] = ()) -> ExpressionDecision:
+def parse_plan(raw: str, band: str, recent: list[str], notes: tuple[CapabilityNote, ...] = (),
+               *, computer_route: bool = False) -> ExpressionDecision:
     """非结构化输出不作指导；模型故障只允许保守的碎片呼应。
 
     ``speak`` 是策划步的开口裁定：模型给了就照它的；只写 intent=沉默 也
     视为不说；两样都没有时视为「没裁定」（None，交回调用方兜底）。
     """
     try:
-        data = json.loads(raw) if len(raw) <= MAX_PLAN_CHARS else None
+        text = raw.strip()
+        # 部分兼容中转即使请求 JSON 也会包一层 Markdown；缺尾或截断仍算无裁定。
+        if text.startswith('```'):
+            match = re.match(r'```(?:json)?\s*(.*?)\s*```', text, re.S | re.I)
+            text = match[1] if match else ''
+        # 裁定后偶尔夹一行聊天正文，不执行、不采用，只解析首个完整 JSON 对象。
+        data, end = json.JSONDecoder().raw_decode(text[:MAX_PLAN_CHARS + 1])
+        if end > MAX_PLAN_CHARS:
+            data = None
     except ValueError:
         data = None
     if not isinstance(data, dict):
@@ -119,6 +130,9 @@ def parse_plan(raw: str, band: str, recent: list[str], notes: tuple[CapabilityNo
     # 有些旧裁定用空意图表示「看过就划走」；明确的 false 仍是有效裁定。
     if speak is False and intent in (None, ''):
         intent = '沉默'
+    if intent == COMPUTER_INTENT and computer_route and speak is not False:
+        return ExpressionDecision(COMPUTER_INTENT, band, '', repetition_list(recent), speak=True, basis=basis,
+                                  deliver_file=data.get('deliver_file') is True)
     if intent not in INTENTS:
         return ExpressionDecision("短附和", "碎片", "", repetition_list(recent), "fallback")
     increment = data.get('increment')

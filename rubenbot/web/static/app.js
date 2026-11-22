@@ -3993,6 +3993,7 @@ function settingsCardSpecs(draft, secrets, pluginsAvailable) {
           { path: "computer.enabled", label: "启用电脑工具", kind: "switch", wide: true },
           { path: "computer.whitelist", label: "真机白名单", kind: "list", wide: true,
             placeholder: "平台:发送者账号", hint: "完整匹配账号，不按昵称、群号或私聊授权。默认仅有本地终端账号 console:console:me；移除所有账号后无人可操作真机。" },
+          { path: "computer.max_task_rounds", label: "机主操作最多轮数", kind: "number", step: "1", min: 1, max: 16 },
           { path: "computer.sandbox_quota_mb", label: "每位访客的容量（MiB）", kind: "number", step: "1", min: 1, max: 10240 },
           { path: "computer.command_timeout_seconds", label: "命令超时（秒）", kind: "number", step: "1", min: 1, max: 600 },
           { path: "computer.output_limit_bytes", label: "输出上限（字节）", kind: "number", step: "1", min: 32, max: 1048576 },

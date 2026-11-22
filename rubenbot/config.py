@@ -1106,6 +1106,7 @@ def _load_mcp(data: Any) -> MCPConfig:
 
 
 COMPUTER_LIMITS = {
+    "max_task_rounds": (1, 16),
     "sandbox_quota_mb": (1, 10240),
     "command_timeout_seconds": (1, 600),
     "output_limit_bytes": (32, 1048576),
@@ -1118,6 +1119,7 @@ class ComputerConfig:
 
     enabled: bool = False
     whitelist: list[str] = field(default_factory=lambda: ["console:console:me"])
+    max_task_rounds: int = 4
     sandbox_quota_mb: int = 100
     command_timeout_seconds: int = 60
     output_limit_bytes: int = 32768
