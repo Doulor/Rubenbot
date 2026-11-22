@@ -28,6 +28,7 @@ import httpx
 import yaml
 
 from rubenbot.adapters.base import Segment
+from rubenbot.expression import CapabilityNote
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +210,16 @@ class MusicPlayer:
         self.clock = clock or time.monotonic
         # (平台, 点歌人) -> 上次点歌时间
         self._last_played_at: dict[tuple[str, str], float] = {}
+        self._verified_adapter: dict[tuple[str, str], Any] = {}
+
+    def capability_note(self, event, adapter) -> CapabilityNote | None:
+        route = (event.platform, event.chat_type)
+        last = self._last_played_at.get((event.platform, event.sender_id))
+        if (self._verified_adapter.get(route) is not adapter or not self.config.triggers
+                or (last is not None and self.clock() - last < self.config.cooldown_seconds)):
+            return None
+        return CapabilityNote('点歌', '我能按歌名分享歌曲。',
+                              f'有人想听一首歌时，可以让对方发「{self.config.triggers[0]} 歌名」，收到的是音乐卡片或歌曲链接。')
 
     # ------------------------------------------------------------------
     # 钩子
@@ -248,6 +259,8 @@ class MusicPlayer:
                 return False
         # 先记冷却再请求：接口挂了也不在冷却期内反复打它
         self._last_played_at[key] = now
+        route = (event.platform, event.chat_type)
+        self._verified_adapter.pop(route, None)
 
         try:
             song = await self.search(keyword)
@@ -262,7 +275,10 @@ class MusicPlayer:
             await self._reply(runtime, event, f"没找到《{keyword}》，换个关键词试试")
             return False
 
-        await self._send_song(runtime, event, song)
+        adapter = _adapter_for(runtime, event)
+        if adapter is not None:
+            await self._send_song(adapter, event, song)
+            self._verified_adapter[route] = adapter
         return False
 
     async def aclose(self) -> None:
@@ -301,11 +317,7 @@ class MusicPlayer:
     # 发送
     # ------------------------------------------------------------------
 
-    async def _send_song(self, runtime, event, song: Song) -> None:
-        adapter = _adapter_for(runtime, event)
-        if adapter is None:
-            logger.debug("music：没有平台 %s 的适配器，发不出去", getattr(event, "platform", ""))
-            return
+    async def _send_song(self, adapter, event, song: Song) -> None:
         if getattr(adapter, "name", "") == "snowluma":
             # OneBot v11 音乐卡片：type=netease + 歌曲 id，由协议端渲染成音乐分享
             segment = Segment("music", {"type": self.config.source, "id": song.song_id})
@@ -365,6 +377,7 @@ def register(ctx) -> None:
     ctx.extras["music"] = player
     ctx.on_message(player.on_message)
     ctx.on_stop(player.aclose)
+    ctx.capability_note(player.capability_note)
     logger.debug(
         "music 已注册（冷却 %.0fs，音源 %s）",
         player.config.cooldown_seconds,

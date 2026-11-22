@@ -120,7 +120,8 @@ def test_old_database_is_migrated(tmp_path):
         old = store.recent_messages("g1")[0]
         assert old.text == "老消息"
         assert old.platform_msg_id == ""
-        assert old.reply_to_id == ""
+        assert old.reply_to_id == old.reply_sender_id == ""
+        assert old.mentions == {}
 
         # 迁移后仍能正常写入新列、按 id 去重查询
         store.add_raw_message(
@@ -154,10 +155,12 @@ def test_fresh_database_has_new_columns(store):
 # ----------------------------------------------------------------------
 
 
-def _add(store, text, *, sender="u1", name="阿花", msg_id=None, reply_to="", ts=100.0, bot=False, chat_id="g1"):
+def _add(store, text, *, sender="u1", name="阿花", msg_id=None, reply_to="", ts=100.0, bot=False,
+         chat_id="g1", chat_type="group"):
     return store.add_raw_message(
         platform="recording",
         chat_id=chat_id,
+        chat_type=chat_type,
         sender_id=BOT_SENDER_ID if bot else sender,
         sender_name="Ruben" if bot else name,
         text=text,
@@ -224,7 +227,7 @@ def test_render_history_quote_fallback_when_target_missing(config, store):
 def test_build_context_reply_target_in_requirements(config, store):
     """回复目标的正文截断约 300 字进上下文要求区，不整段重复。"""
     long_text = "起" + "某" * 400
-    _add(store, long_text, sender="u2", name="阿草", msg_id="m1", ts=100.0, chat_id="u1")
+    _add(store, long_text, sender="u2", name="阿草", msg_id="m1", ts=100.0, chat_id="u1", chat_type="private")
     bot, _ = make_bot(config, store, ScriptedLLM({"chat": ["嗯"]}))
     asyncio.run(bot.handle_event(event("你刚说的这个", msg_id="m2", reply_to="m1", chat_type="private", chat_id="u1")))
 
@@ -276,7 +279,7 @@ def test_build_context_uses_real_message_window(config, store):
     _add(store, "最近的真实消息", sender="u3", name="阿草", msg_id="m1", ts=now - 5)
 
     bot, _ = make_bot(config, store, ScriptedLLM({"chat": ["嗯"]}))
-    asyncio.run(bot.handle_event(event("在吗", msg_id="m2", chat_type="private", chat_id="g1")))
+    asyncio.run(bot.handle_event(event("在吗", msg_id="m2", chat_type="group", chat_id="g1", mentions=True)))
 
     messages = bot.llm.chat_messages[0]
     contents = [m["content"] for m in messages]

@@ -111,6 +111,28 @@ def test_exact_platform_sender_selects_host_not_group_or_name(bot, tmp_path):
     assert not is_host(ComputerConfig(whitelist=[]), console)
 
 
+def test_capability_notes_follow_verified_account_and_current_permission(bot):
+    class ToolModel(ScriptedLLM):
+        async def chat_with_tools(self, *args, **kwargs):
+            raise AssertionError('列索引不能调用模型')
+
+    bot.llm = ToolModel()
+    def directory(event):
+        return next((n.summary for n in bot.capability_notes(event) if n.title == '查看目录'), '')
+
+    assert directory(OWNER) == directory(GUEST) == ''
+    call(bot, OWNER, 'list_dir', {'path': '.'})
+    assert '真机' in directory(OWNER) and directory(GUEST) == ''
+    call(bot, GUEST, 'list_dir', {})
+    assert '访客工作区' in directory(GUEST) and '真机' not in directory(GUEST)
+    bot.config.computer.whitelist.clear()
+    assert directory(OWNER) == ''
+    call(bot, GUEST, 'list_dir', {'path': '../not-allowed'})
+    assert directory(GUEST) == ''
+    bot.config.computer.enabled = False
+    assert directory(OWNER) == directory(GUEST) == ''
+
+
 def test_attachment_stays_in_sender_workspace_and_current_chat(bot, tmp_path):
     adapter = bot.adapters['recording']
     args = {'path': 'result.txt', 'content': '独属于访客'}

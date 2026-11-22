@@ -35,7 +35,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from ..adapters.base import MessageEvent, Segment
+from ..adapters.base import BaseAdapter, MessageEvent, Segment
+from ..expression import CapabilityNote
 from .manifest import Manifest, ManifestError, load_manifest
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,8 @@ class Plugin:
     before_reply_hooks: list[MessageHook] = field(default_factory=list)
     after_reply_hooks: list[MessageHook] = field(default_factory=list)
     commands: dict[str, Command] = field(default_factory=dict)
+    # 随行为注册、随插件停用；返回 None 表示当前线路未验通或本轮不可用。
+    capability_notes: list[Callable[[MessageEvent, BaseAdapter], CapabilityNote | None]] = field(default_factory=list)
     # 插件停用/卸载时的清理回调（关闭后台任务等）
     stop_hooks: list[Callable[[], Any]] = field(default_factory=list)
     # 插件启用时的启动回调（拉起后台任务等）
@@ -143,6 +146,10 @@ class PluginContext:
         except Exception as exc:  # noqa: BLE001 - 能力失败不能拖垮插件
             logger.warning("插件调用能力 %s 异常：%s", name, exc)
             return False, str(exc) or exc.__class__.__name__
+
+    def capability_note(self, describe: Callable[[MessageEvent, BaseAdapter], CapabilityNote | None]) -> None:
+        """登记一个无副作用的本轮能力说明，不代替行为钩子的注册或鉴权。"""
+        self.plugin.capability_notes.append(describe)
 
     def on_message(self, handler: MessageHook) -> MessageHook:
         self.plugin.message_hooks.append(handler)
@@ -416,6 +423,7 @@ class PluginManager:
         plugin.before_reply_hooks.clear()
         plugin.after_reply_hooks.clear()
         plugin.commands.clear()
+        plugin.capability_notes.clear()
         plugin.start_hooks.clear()
         plugin.stop_hooks.clear()
         register(PluginContext(plugin, self))
@@ -426,6 +434,19 @@ class PluginManager:
     # ------------------------------------------------------------------
     # 分发
     # ------------------------------------------------------------------
+
+    def capability_notes(self, event: MessageEvent, adapter: BaseAdapter) -> list[CapabilityNote]:
+        notes = []
+        for plugin in self.enabled_plugins:
+            if plugin.loaded:
+                for describe in plugin.capability_notes:
+                    try:
+                        note = describe(event, adapter)
+                        if isinstance(note, CapabilityNote):
+                            notes.append(note)
+                    except Exception as exc:
+                        logger.warning("插件 %s 的能力说明不可用：%s", plugin.name, exc)
+        return notes
 
     async def run_message_hooks(self, ctx, event: MessageEvent) -> bool:
         """返回 False 表示某插件拦截了这条消息。"""

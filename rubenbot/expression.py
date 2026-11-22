@@ -15,6 +15,22 @@ MAX_REASON = 60
 
 
 @dataclass(frozen=True)
+class CapabilityNote:
+    """索引只给标题和自述；策划步选中标题，生成步才读到对应情境说明。"""
+
+    title: str
+    summary: str
+    detail: str
+
+
+def capability_index(notes: tuple[CapabilityNote, ...]) -> str:
+    if not notes:
+        return ''
+    return ('\n【这轮我能做的事】\n' + '\n'.join(f'〔{n.title}〕{n.summary}' for n in notes)
+            + '\n需要哪项的具体说明，就把标题列入 JSON 的 capabilities 数组；不用可省略。')
+
+
+@dataclass(frozen=True)
 class ExpressionDecision:
     intent: str
     length_band: str
@@ -25,13 +41,18 @@ class ExpressionDecision:
     speak: bool | None = None
     # 裁定理由摘要（进 decision_log 的 factors，便于审计）
     reason: str = ""
+    capabilities: tuple[str, ...] = ()
+    # 缺报、非法值或策划失败都没有提供依据，不能默认为常识。
+    basis: str = "guess"
 
     def prompt_block(self) -> str:
+        uncertainty = "没把握就明说不确定，不把推测写成事实。" if self.basis == "guess" else ""
         return (
-            "【表达决策书·内部回复指导】只发正文，不要复述这份指导。\n"
+            "【表达决策书·内部回复指导】发出去的只有聊天正文。\n"
+            f"依据：{self.basis}。{uncertainty}只有 ledger 或 settled 有对应记录才可说自己的动作、所有物或经历。\n"
             f"意图：{self.intent}；长度档：{self.length_band}（{BUDGETS[self.length_band]}）。\n"
-            f"增量点：{self.increment or '无，不展开'}\n"
-            "禁复述清单（不要重复这些观点和措辞）："
+            f"这次想接的那一点：{self.increment or '简短回应'}\n"
+            "已经说过的部分（背景）："
             + json.dumps(self.avoid_repetition, ensure_ascii=False)
         )
 
@@ -78,7 +99,7 @@ def repetition_list(recent: list[str], proposed: object = None) -> tuple[str, ..
     return tuple(result)
 
 
-def parse_plan(raw: str, band: str, recent: list[str]) -> ExpressionDecision:
+def parse_plan(raw: str, band: str, recent: list[str], notes: tuple[CapabilityNote, ...] = ()) -> ExpressionDecision:
     """非结构化输出不作指导；模型故障只允许保守的碎片呼应。
 
     ``speak`` 是策划步的开口裁定：模型给了就照它的；只写 intent=沉默 也
@@ -88,20 +109,30 @@ def parse_plan(raw: str, band: str, recent: list[str]) -> ExpressionDecision:
         data = json.loads(raw) if len(raw) <= MAX_PLAN_CHARS else None
     except ValueError:
         data = None
-    if not isinstance(data, dict) or data.get('intent') not in INTENTS:
+    if not isinstance(data, dict):
         return ExpressionDecision("短附和", "碎片", "", repetition_list(recent), "fallback")
-    intent = data['intent']
+    basis = data.get('basis')
+    if basis not in ('ledger', 'settled', 'common', 'guess'):
+        basis = 'guess'
+    speak = coerce_speak(data.get('speak'))
+    intent = data.get('intent')
+    # 有些旧裁定用空意图表示「看过就划走」；明确的 false 仍是有效裁定。
+    if speak is False and intent in (None, ''):
+        intent = '沉默'
+    if intent not in INTENTS:
+        return ExpressionDecision("短附和", "碎片", "", repetition_list(recent), "fallback")
     increment = data.get('increment')
     increment = ' '.join(increment.split())[:MAX_INCREMENT] if isinstance(increment, str) else ''
     if increment.strip('。.!！ ') in ('无', '没有', '无增量', '没有新信息', '无新信息'):
         increment = ''
     if not increment and intent != '短附和':
         intent = '沉默'
-    speak = coerce_speak(data.get('speak'))
     if speak is None:
         speak = False if intent == '沉默' else True
     reason = data.get('reason')
     reason = ' '.join(reason.split())[:MAX_REASON] if isinstance(reason, str) else ''
     return ExpressionDecision(intent, '碎片' if intent == '短附和' else band, increment,
                               repetition_list(recent, data.get('avoid_repetition')),
-                              speak=speak, reason=reason)
+                              basis=basis, speak=speak, reason=reason,
+                              capabilities=tuple(n.title for n in notes if isinstance(data.get('capabilities'), list)
+                                                 and n.title in data['capabilities']))

@@ -152,6 +152,16 @@ def test_newline_reply_sent_as_multiple_messages(config, store):
     assert bot_texts == ["确实", "不过这也太离谱了"]
 
 
+def test_continued_thought_keeps_its_pauses_and_order(config, store):
+    # 用一个因果相接的三段样本回放发送链；真实模型是否写得连贯另做对照评估。
+    parts = ["我还以为赶得上末班车", "结果跑到门口", "刚好看它开走"]
+    llm = ScriptedLLM({"chat": ["\n".join(parts)]})
+    bot, adapter = make_bot(config, store, llm)
+    asyncio.run(bot.handle_event(private_event("昨天怎么回去的")))
+    assert REPLY_SEGMENT_CONTRACT in llm.chat_messages[0][-1]["content"]
+    assert adapter.texts == parts
+
+
 def test_max_segments_one_sends_single_message(config, store):
     config.reply.max_segments = 1
     bot, adapter = make_bot(config, store, ScriptedLLM({"chat": ["一\n二"]}))
@@ -168,9 +178,9 @@ def test_reply_config_defaults():
     reply = Config().reply
     assert reply.max_segments == 3
     assert reply.segment_delay_enabled is True
-    assert reply.segment_delay_per_char_ms == 60
-    assert reply.segment_delay_min_ms == 150
-    assert reply.segment_delay_max_ms == 1500
+    assert reply.segment_delay_per_char_ms == 130
+    assert reply.segment_delay_min_ms == 1500
+    assert reply.segment_delay_max_ms == 4000
 
 
 def test_reply_config_from_raw():

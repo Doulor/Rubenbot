@@ -15,7 +15,10 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Iterable, Mapping
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Iterable, Mapping
+
+if TYPE_CHECKING:
+    from ..memory.entities import FamiliarityTag
 
 from .platform import PlatformEvent
 
@@ -144,6 +147,15 @@ def text_segments(text: str) -> list[Segment]:
     return [Segment.text(text)]
 
 
+def segment_mentions(segments: Iterable[Segment], self_id: str | None = None) -> dict[str, str]:
+    """从统一 @ 段取目标，不把正文里的 @ 字样当平台寻址。"""
+    targets = {}
+    for segment in segments:
+        if segment.type == "at" and (uid := str(segment.data.get("qq") or "")):
+            targets["__bot__" if uid == self_id else uid] = str(segment.data.get("name") or "")
+    return targets
+
+
 @dataclass
 class MessageEvent:
     """统一事件模型。
@@ -167,6 +179,23 @@ class MessageEvent:
     segments: list[Segment] = field(default_factory=list)
     platform_msg_id: str | None = None
     chat_name: str = ""  # 仅用于展示，不作为会话或授权标识
+    # 仅由本地摄入层填写，不能把平台 raw 里的同名字段当作账本证据。
+    familiarity: tuple[FamiliarityTag, ...] = ()
+    # 只保存协议明确给出的目标（账号 -> 当时的显示名）；__bot__ 表示自己。
+    mentions: dict[str, str] = field(default_factory=dict)
+    reply_sender_id: str = ""
+    # 本地流水主键，用于把本批消息与此前历史分开。
+    raw_message_id: int | None = field(default=None, init=False)
+
+    def __post_init__(self) -> None:
+        if not self.mentions:
+            self.mentions = segment_mentions(self.segments)
+        # 适配器若只给出“已点到 bot”而没有可展开的消息段，仍保留一个
+        # 结构化目标；否则历史/策划步会把它误当成无指向的普通发言。
+        if self.is_group and self.mentions_bot and not self.reply_to_id:
+            self.mentions.setdefault("__bot__", "")
+        if "__bot__" in self.mentions:
+            self.mentions_bot = True
 
     @property
     def is_private(self) -> bool:

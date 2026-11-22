@@ -1001,7 +1001,10 @@ class _FakeClient:
     async def __aexit__(self, *exc):
         return False
 
-    def stream(self, method, url, headers=None):
+    def stream(self, method, url, headers=None, extensions=None):
+        assert str(url.host) == "1.1.1.1"
+        assert headers[b"Host"] == b"cdn.example" and extensions["sni_hostname"] == "cdn.example"
+        url = str(url.copy_with(host="cdn.example"))
         _FakeClient.requests.append(url)
         return _FakeStream(_FakeClient.responses[url])
 
@@ -1013,10 +1016,10 @@ def _patch_default_download(monkeypatch, responses):
     _FakeClient.requests = []
     monkeypatch.setattr(sticker_behavior.httpx, "AsyncClient", _FakeClient)
 
-    async def allow(url):
-        return True
+    async def pin(url):
+        return url.copy_with(host="1.1.1.1")
 
-    monkeypatch.setattr(sticker_behavior, "_public_url", allow)
+    monkeypatch.setattr(sticker_behavior, "pinned_public_url", pin)
     return sticker_behavior
 
 

@@ -165,7 +165,8 @@ def test_history_and_memory_in_context(config, store):
     llm = ScriptedLLM({"chat": ["坂本龙一啊，我也喜欢"]})
     bot, _ = make_bot(config, store, llm)
     # 先放一条历史消息
-    store.add_raw_message(platform="recording", chat_id="u1", sender_id="u2", sender_name="阿草", text="今天听歌吗")
+    store.add_raw_message(platform="recording", chat_type="private", chat_id="u1",
+                          sender_id="u1", sender_name="阿草", text="今天听歌吗")
     asyncio.run(bot.handle_event(private_event("最近在听坂本龙一")))
 
     messages = llm.chat_messages[0]
@@ -292,8 +293,8 @@ def test_merge_window_combines_burst(config, store):
     assert any("今天遇到件事" in c for c in contents)
 
 
-def test_merge_window_other_sender_releases_round(config, store):
-    """别人插话时，前一个人攒的那轮立即处理。"""
+def test_merge_window_other_sender_joins_round(config, store):
+    """别人插话时，整批一并裁定，不把两人的话算给同一人。"""
     config.decision.merge_window_seconds = 4.0
     config.decision.base = 10.0
     llm = ScriptedLLM({"chat": ["收到"]})
@@ -301,8 +302,9 @@ def test_merge_window_other_sender_releases_round(config, store):
     asyncio.run(bot.handle_event(group_event("我先说", sender="u1")))
     assert adapter.sent == []
     event = group_event("我也来", sender="u2")
-    # 事件内部用真实时钟记录，这里直接驱动一次：u2 到达后 u1 的轮次应已放出
     asyncio.run(bot._handle_event(event))
+    assert not llm.calls
+    asyncio.run(bot.flush_merger(all_rounds=True))
     assert adapter.texts == ["收到"]
     assert len(llm.chat_messages) == 1
     assert any("我先说" in m["content"] for m in llm.chat_messages[0])
@@ -325,7 +327,7 @@ def test_prompt_tells_model_veto_marker(config, store):
     asyncio.run(bot.handle_event(private_event("在吗")))
     system = llm.chat_messages[0][0]["content"]
     assert marker in system
-    assert "没必要接话" in system
+    assert f"如果你只是默默看着，整条回复就是 {marker}" in system
 
 
 def test_topic_relevance_from_memories(config, store):
@@ -477,8 +479,9 @@ def test_llm_client_records_usage_with_task_labels(config, store):
 
     # 私聊必回 → chat 任务
     asyncio.run(bot.handle_event(private_event("在吗")))
-    # 抽取任务
-    store.add_raw_message(platform="recording", chat_id="u1", sender_id="u1", sender_name="阿花", text="我住在杭州")
+    # 同一私聊批次只花一次抽取费用；同号群聊是另一批，不混作同一会话。
+    store.add_raw_message(platform="recording", chat_type="private", chat_id="u1", sender_id="u1",
+                          sender_name="阿花", text="我住在杭州")
     asyncio.run(bot.extractor.maybe_extract(force=True))
     asyncio.run(client.close())
 

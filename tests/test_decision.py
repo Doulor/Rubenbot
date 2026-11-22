@@ -103,15 +103,14 @@ def test_merger_merges_same_sender_within_window():
     assert len(merger) == 0
 
 
-def test_merger_other_sender_flushes_previous_round():
-    merger = MessageMerger(window=4.0)
+def test_merger_other_sender_extends_conversation_silence():
+    merger = MessageMerger()
     merger.add(group_event("我先说", sender="u1"), 100.0)
-    # u2 插话，u1 那轮立刻放出（不必等 4 秒），u2 自己开始攒
-    ready = merger.add(group_event("我也来", sender="u2"), 101.0)
-    assert [r.sender_id for r in ready] == ["u1"]
-    assert merger.pop_ready(104.0) == []
-    ready = merger.pop_ready(105.0)
-    assert [r.text for r in ready] == ["我也来"]
+    assert merger.add(group_event("我也来", sender="u2"), 101.0) == []
+    assert merger.pop_ready(103.49) == []
+    batch, = merger.pop_ready(103.5)
+    assert [e.sender_id for e in batch.events] == ["u1", "u2"]
+    assert batch.primary_sender == "u2"
 
 
 def test_merger_hard_message_has_short_window():

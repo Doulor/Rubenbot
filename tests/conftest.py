@@ -81,6 +81,8 @@ def config() -> Config:
     cfg.decision.hard_merge_window_seconds = 0
     # 单元测试默认走旧路径（动量/阈值裁定 + 整份 SOUL）：新路径（策划步裁定）
     # 是灰度上线的行为变化，相关的进程内用例各自显式打开 persona.planner_gate。
+    # 只测裁定本身，不让查看掷点随机跳过本用例。
+    cfg.attention.talk_value = 1.0
     cfg.planner.planner_gate = False
     return cfg
 

@@ -6,7 +6,7 @@
   <title>RubenBot 控制台</title>
   <link rel="icon" href="/bot-avatar">
   <link rel="stylesheet" href="/static/fonts.css?v=1120">
-  <link rel="stylesheet" href="/static/styles.css?v=1122">
+  <link rel="stylesheet" href="/static/styles.css?v=1124">
   <script data-cfasync="false">
     // 尽早定主题，避免首帧闪白/闪暗
     (function () {
@@ -39,6 +39,7 @@
     <symbol id="i-restore" viewBox="0 0 256 256" fill="currentColor"><path d="M224,128a96,96,0,0,1-94.71,96H128A95.38,95.38,0,0,1,62.1,197.8a8,8,0,0,1,11-11.63A80,80,0,1,0,71.43,71.39a3.07,3.07,0,0,1-.26.25L44.59,96H72a8,8,0,0,1,0,16H24a8,8,0,0,1-8-8V56a8,8,0,0,1,16,0V85.8L60.25,60A96,96,0,0,1,224,128Z"/></symbol>
     <symbol id="i-caret" viewBox="0 0 256 256" fill="currentColor"><path d="M181.66,133.66l-80,80a8,8,0,0,1-11.32-11.32L164.69,128,90.34,53.66a8,8,0,0,1,11.32-11.32l80,80A8,8,0,0,1,181.66,133.66Z"/></symbol>
     <symbol id="i-close" viewBox="0 0 256 256" fill="currentColor"><path d="M205.66,194.34a8,8,0,0,1-11.32,11.32L128,139.31,61.66,205.66a8,8,0,0,1-11.32-11.32L116.69,128,50.34,61.66A8,8,0,0,1,61.66,50.34L128,116.69l66.34-66.35a8,8,0,0,1,11.32,11.32L139.31,128Z"/></symbol>
+    <symbol id="i-menu" viewBox="0 0 256 256" fill="currentColor"><path d="M40,128a8,8,0,0,1,8-8H208a8,8,0,0,1,0,16H48A8,8,0,0,1,40,128Zm8-56H208a8,8,0,0,0,0-16H48a8,8,0,0,0,0,16Zm160,112H48a8,8,0,0,0,0,16H208a8,8,0,0,0,0-16Z"/></symbol>
     <symbol id="i-check" viewBox="0 0 256 256" fill="currentColor"><path d="M229.66,77.66l-128,128a8,8,0,0,1-11.32,0l-56-56a8,8,0,0,1,11.32-11.32L96,188.69,218.34,66.34a8,8,0,0,1,11.32,11.32Z"/></symbol>
     <symbol id="i-warning" viewBox="0 0 256 256" fill="currentColor"><path d="M128,24A104,104,0,1,0,232,128,104.11,104.11,0,0,0,128,24Zm0,192a88,88,0,1,1,88-88A88.1,88.1,0,0,1,128,216Zm-8-80V80a8,8,0,0,1,16,0v56a8,8,0,0,1-16,0Zm20,36a12,12,0,1,1-12-12A12,12,0,0,1,140,172Z"/></symbol>
     <symbol id="i-refresh" viewBox="0 0 256 256" fill="currentColor"><path d="M240,56v48a8,8,0,0,1-8,8H184a8,8,0,0,1,0-16H211.4L184.81,71.64l-.25-.24a80,80,0,1,0-1.67,114.78,8,8,0,0,1,11,11.63A95.44,95.44,0,0,1,128,224h-1.32A96,96,0,1,1,195.75,60L224,85.8V56a8,8,0,1,1,16,0Z"/></symbol>
@@ -79,6 +80,51 @@
       </div>
     </aside>
 
+    <!-- 768px 以下：顶栏只负责入口与当前页标题，完整导航复用桌面侧栏并以抽屉呈现。 -->
+    <header class="mobile-topbar" aria-label="移动端工具栏">
+      <button class="icon-button mobile-menu-button" id="mobile-menu-button" type="button" aria-label="打开导航菜单" aria-controls="mobile-drawer" aria-expanded="false">
+        <svg class="icon"><use href="#i-menu"/></svg>
+      </button>
+      <strong class="mobile-page-title" id="mobile-page-title">概览</strong>
+      <span class="mobile-topbar-spacer" aria-hidden="true"></span>
+    </header>
+    <div class="mobile-drawer-layer" id="mobile-drawer-layer" hidden>
+      <button class="mobile-scrim" id="mobile-scrim" type="button" aria-label="关闭导航菜单"></button>
+      <aside class="mobile-drawer" id="mobile-drawer" aria-label="移动端主导航" aria-hidden="true">
+        <div class="mobile-drawer-head">
+          <div class="brand">
+            <div class="brand-mark" aria-hidden="true"><img src="/bot-avatar" alt=""></div>
+            <div class="brand-text">
+              <span class="brand-name">RubenBot</span>
+              <span class="brand-sub">控制台</span>
+            </div>
+          </div>
+          <button class="icon-button mobile-drawer-close" id="mobile-drawer-close" type="button" aria-label="关闭导航菜单">
+            <svg class="icon"><use href="#i-close"/></svg>
+          </button>
+        </div>
+        <nav class="nav" aria-label="主导航">
+          <a class="nav-item" href="#/overview" data-page="overview"><svg class="icon"><use href="#i-overview"/></svg><span>概览</span></a>
+          <a class="nav-item" href="#/bot/persona" data-page="bot"><svg class="icon"><use href="#i-persona"/></svg><span>机器人</span></a>
+          <a class="nav-item" href="#/memory" data-page="memory"><svg class="icon"><use href="#i-memory"/></svg><span>记忆</span></a>
+          <a class="nav-item" href="#/people" data-page="people"><svg class="icon"><use href="#i-people"/></svg><span>人物</span></a>
+          <a class="nav-item" href="#/groups" data-page="groups"><svg class="icon"><use href="#i-groups"/></svg><span>群组与意愿</span></a>
+          <a class="nav-item" href="#/plugins" data-page="plugins"><svg class="icon"><use href="#i-plugins"/></svg><span>插件</span></a>
+          <a class="nav-item" href="#/logs" data-page="logs"><svg class="icon"><use href="#i-logs"/></svg><span>日志</span></a>
+          <a class="nav-item" href="#/settings" data-page="settings"><svg class="icon"><use href="#i-settings"/></svg><span>设置</span></a>
+        </nav>
+        <div class="sidebar-foot">
+          <div class="status-pill" id="mobile-sidebar-status">
+            <span class="live-dot" data-state="idle"></span>
+            <span id="mobile-sidebar-status-text">连接中</span>
+          </div>
+          <button class="icon-button theme-toggle" id="mobile-theme-toggle" type="button" aria-label="切换明暗主题" title="切换明暗主题">
+            <svg class="icon"><use href="#i-sun"/></svg>
+          </button>
+        </div>
+      </aside>
+    </div>
+
     <main class="main" id="main">
       <header class="page-head">
         <div>
@@ -111,6 +157,6 @@
   <dialog class="dialog" id="dialog"></dialog>
 
   <script data-cfasync="false" src="/static/motion.js?v=1121"></script>
-  <script data-cfasync="false" src="/static/app.js?v=1121"></script>
+  <script data-cfasync="false" src="/static/app.js?v=1124"></script>
 </body>
 </html>

@@ -80,6 +80,30 @@ def test_frontend_prefix_behavior():
     assert pages == ["expression", "chat", "", ""]
 
 
+def test_attention_card_defines_two_number_inputs():
+    """页面归属规则不渲染控件；两个字段还得进入配置卡的可编辑网格。"""
+    from rubenbot.web.config_schema import config_layout
+
+    source = APP_JS.read_text(encoding="utf-8")
+    # 无浏览器也能跑真实卡片清单：用字段定义代替 DOM 节点，其他专用编辑器不参与。
+    start = source.index("function settingsCardSpecs(")
+    cards = source[start : source.index("\n}", start) + 2]
+    script = cards + _extract_function("pageOf") + """
+const card = (_, spec) => spec, fieldGrid = defs => defs;
+const h = () => null, groupsEditor = h, pluginEditor = h, modelsEditor = h,
+      adaptersEditor = h, mcpServerEditor = h, mapEditor = h;
+const LOG_LEVELS = [], MOOD_NAMES = [];
+const fields = settingsCardSpecs({}, {}, []).filter(c => pageOf(LAYOUT, c.path) === 'expression')
+  .flatMap(c => c.node.body).filter(f => f?.path?.startsWith('attention.'));
+console.log(JSON.stringify(fields));
+""".replace("LAYOUT", json.dumps(config_layout()))
+    result = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True)
+    fields = {field["path"]: field for field in json.loads(result.stdout)}
+    assert set(fields) == {"attention.talk_value", "attention.engaged_window_seconds"}
+    assert all(field["kind"] == "number" for field in fields.values())
+    assert "不是回复概率" in fields["attention.talk_value"]["hint"]
+
+
 def test_frontend_script_is_syntactically_valid():
     """整份 app.js 能被 node 解析（没有构建链，语法错误只能靠这一步抓）。"""
     result = subprocess.run(

@@ -4,7 +4,7 @@
  * - 明色是暖奶油底，暗色是暖深棕底；卡片靠 tonal（色调深浅）与分层投影区分，不靠描边。
  * - 大圆角卡片（30px），内嵌子卡 20px，输入框 16px，交互元素一律药丸形。
  * - 强调色、发光阴影、圆角全部走变量；换种子色只改 --seed 一处。
- * - 侧栏选中态是药丸形色调填充；移动端侧栏收成底部悬浮 dock。
+ * - 侧栏选中态是药丸形色调填充；移动端改为顶栏唤出的抽屉导航。
  *
  * 兼容钩子：所有旧类名 / id 保持不变，app.js 的行为不依赖这里的视觉规则。
  */
@@ -414,6 +414,11 @@ button {
 
 /* ---------------- 主区 ---------------- */
 
+.mobile-topbar,
+.mobile-drawer-layer {
+  display: none;
+}
+
 .main {
   min-width: 0;
   padding: 24px clamp(16px, 3.2vw, 40px) 48px;
@@ -426,7 +431,23 @@ button {
   align-items: flex-end;
   justify-content: space-between;
   gap: 16px;
-  flex-wrap: wrap;
+}
+
+/* 初始页名和接口返回的二级页名共用同一组行盒，正文起点不随文案移动。 */
+.page-head > :first-child {
+  min-width: 0;
+  flex: 1;
+}
+
+.page-actions:empty {
+  display: none;
+}
+
+.page-title,
+.page-sub {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .page-title {
@@ -450,11 +471,12 @@ button {
 }
 
 .view {
+  --view-gap: 16px;
   max-width: var(--content-max);
   margin: 0 auto;
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: var(--view-gap);
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -674,6 +696,13 @@ button {
   font-style: normal;
   color: var(--accent-text);
   font-weight: 600;
+}
+
+/* 极窄屏上一张磁贴不足以放下一整行备注，加载前后都预留两行。 */
+@media (max-width: 360px) {
+  .grid-kpi .kpi-note {
+    min-height: 2lh;
+  }
 }
 
 /* ---------------- 列表 / 表格 ---------------- */
@@ -1201,6 +1230,39 @@ button {
 
 .skeleton-row:first-child {
   border-top: 0;
+}
+
+/* 整页只由实页容器决定列数与内距；多个区块跟 .view 取同一间距。 */
+.route-page,
+.sk-sections {
+  display: flex;
+  flex-direction: column;
+  gap: var(--view-gap);
+  min-width: 0;
+}
+
+.sk-sections {
+  pointer-events: none;
+}
+
+.sk-bar {
+  display: block;
+  max-width: 100%;
+}
+
+/* 首屏有多块占位，使用静态色块，避免在手机上同时重绘几十条扫光。 */
+.route-skeleton .skeleton {
+  background: var(--surface-sunk);
+  animation: none;
+}
+
+.route-skeleton .notice {
+  background: var(--card-fill);
+}
+
+.sk-market {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 14px;
 }
 
 /* ---------------- 记忆 / 人物 ---------------- */
@@ -2612,89 +2674,150 @@ button {
   overflow: hidden;
 }
 
-/* ---------------- 窄屏：侧栏变底部悬浮 dock ---------------- */
+/* ---------------- 窄屏：顶栏 + FlClash 式抽屉 ---------------- */
 
-@media (max-width: 840px) {
+@media (max-width: 768px) {
   .app {
     grid-template-columns: minmax(0, 1fr);
+    /* 剩余视口高度只分配给正文，避免短页把顶栏拉高。 */
+    grid-template-rows: auto 1fr;
   }
 
   .sidebar {
-    position: fixed;
-    left: 14px;
-    right: 14px;
-    bottom: 14px;
-    top: auto;
-    z-index: 40;
-    height: auto;
-    flex-direction: row;
+    display: none;
+  }
+
+  .mobile-topbar {
+    position: sticky;
+    top: 0;
+    z-index: 30;
+    display: flex;
     align-items: center;
-    gap: 6px;
-    padding: 8px 10px;
-    border-radius: 26px;
-    background: color-mix(in srgb, var(--surface) 90%, transparent);
+    gap: 10px;
+    min-height: 64px;
+    padding: 10px 16px;
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    border-bottom: 1px solid var(--hairline);
     backdrop-filter: blur(18px) saturate(140%);
     -webkit-backdrop-filter: blur(18px) saturate(140%);
-    box-shadow: var(--shadow-pop);
-    overflow-x: auto;
-    overflow-y: hidden;
-    scrollbar-width: none;
   }
 
-  .sidebar::-webkit-scrollbar {
-    display: none;
-  }
-
-  .brand {
-    display: none;
-  }
-
-  .nav {
-    flex-direction: row;
-    gap: 0;
-    flex: 1;
-    min-width: 0;
-  }
-
-  /* 8 个导航项在 dock 里等分，图标居中；不再横向滚动 */
-  .nav-item {
-    flex: 1 1 0;
-    min-width: 0;
-    padding: 0;
-    justify-content: center;
-    min-height: 44px;
-    white-space: nowrap;
-  }
-
-  .nav-item span {
-    display: none;
-  }
-
-  .nav-item .icon {
-    width: 21px;
-    height: 21px;
-  }
-
-  .sidebar-foot {
-    margin-top: 0;
-    margin-left: 0;
-    border-top: 0;
-    padding: 0;
+  .mobile-menu-button,
+  .mobile-drawer-close {
     flex: none;
-    gap: 2px;
+    width: 42px;
+    height: 42px;
   }
 
-  /* dock 里不再塞运行状态（英雄卡里已有），只留主题开关 */
-  .status-pill {
-    display: none;
+  .mobile-page-title {
+    font-size: 17px;
+    letter-spacing: -0.015em;
+  }
+
+  .mobile-topbar-spacer {
+    flex: 1;
+  }
+
+  .mobile-drawer-layer {
+    position: fixed;
+    inset: 0;
+    z-index: 80;
+    display: block;
+    pointer-events: none;
+  }
+
+  .mobile-drawer-layer.is-open {
+    pointer-events: auto;
+  }
+
+  .mobile-scrim {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    border: 0;
+    padding: 0;
+    background: var(--scrim);
+    opacity: 0;
+    transition: opacity 340ms cubic-bezier(0.32, 0.72, 0, 1);
+    cursor: pointer;
+  }
+
+  .mobile-drawer-layer.is-open .mobile-scrim {
+    opacity: 1;
+  }
+
+  .mobile-drawer {
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: min(86vw, 320px);
+    display: flex;
+    flex-direction: column;
+    padding: 16px 12px 14px;
+    background: var(--sidebar);
+    box-shadow: var(--shadow-pop);
+    transform: translateX(-100%);
+    transition: transform 340ms cubic-bezier(0.32, 0.72, 0, 1);
+    will-change: transform;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+
+  .mobile-drawer-layer.is-open .mobile-drawer {
+    transform: translateX(0);
+  }
+
+  .mobile-drawer-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 0 0 16px 10px;
+  }
+
+  .mobile-drawer-head .brand {
+    display: flex;
+    padding: 6px 0;
+  }
+
+  .mobile-drawer .nav {
+    flex-direction: column;
+  }
+
+  .mobile-drawer .nav-item {
+    min-height: 48px;
+    padding: 0 16px;
+  }
+
+  .mobile-drawer .nav-item span {
+    display: inline;
+  }
+
+  .mobile-drawer .sidebar-foot {
+    margin-top: auto;
+  }
+
+  body.mobile-drawer-open {
+    overflow: hidden;
+    touch-action: none;
   }
 
   .main {
-    padding: 22px 16px 120px;
+    padding: 18px 16px 48px;
+  }
+
+  .page-head {
+    margin-top: 2px;
   }
 
   .page-title {
     font-size: 25px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mobile-scrim,
+  .mobile-drawer {
+    transition-duration: 0.01ms;
   }
 }
 

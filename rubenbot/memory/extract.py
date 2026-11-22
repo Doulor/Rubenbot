@@ -21,6 +21,7 @@ from datetime import datetime, timedelta
 
 from ..llm import LLMProtocol, parse_json_payload
 from ..memory.retrieve import audience_for_chat, jaccard, normalize
+from ..memory.entities import EntityCandidate, EntityLedger
 from ..memory.store import (
     VALID_SENSITIVITY,
     VALID_STABILITY,
@@ -64,11 +65,17 @@ facts 以「TA」作主语，避免「我」。facts 的 category 取
 identity / preference / habit / relationship / experience / promise 之一；
 scope 为 global（长期有效）或 group（只在当前会话有意义）。
 
+三、entities（会话里的专名账）：只填原话或图片视觉描述中逐字出现的站名、人名、项目名、梗。
+- name 是专名原文；gloss 是同一会话原文/视觉描述中已有的一句解释，不能推断；没有解释就留空
+- gloss_msg_id 是提供 gloss 的消息 id；message_ids 是出现该实体的消息 id 列表；aliases 只填同一消息与 name 共现的原文别名
+- 图片只有在已有视觉描述明确写出专名或解释时才登记，不根据图片内容猜测
+
 严格输出 JSON 对象：
 {"facts": [{"content": "...", "category": "identity", "scope": "global",
             "stability": "stable", "expires_in_days": 0, "sensitivity": "normal"}],
- "events": [{"summary": "...", "time_hint": "", "salience": 0.4, "sensitivity": "normal"}]}
-没有内容就输出 {"facts": [], "events": []}。
+ "events": [{"summary": "...", "time_hint": "", "salience": 0.4, "sensitivity": "normal"}],
+ "entities": [{"name": "...", "gloss": "", "gloss_msg_id": "", "message_ids": [], "aliases": []}]}
+没有内容就输出 {"facts": [], "events": [], "entities": []}。
 """
 
 
@@ -95,6 +102,7 @@ class ExtractedEvent:
 class Extraction:
     facts: list[ExtractedFact] = field(default_factory=list)
     events: list[ExtractedEvent] = field(default_factory=list)
+    entities: list[EntityCandidate] = field(default_factory=list)
 
 
 @dataclass
@@ -194,7 +202,7 @@ class MemoryExtractor:
         now = time.time() if now is None else now
         person_id = make_person_id(sender.platform, sender.sender_id)
         messages = self.store.pending_messages(
-            sender.platform, sender.chat_id, sender.sender_id, limit=self.config.extract_window
+            sender.platform, sender.chat_id, sender.sender_id, limit=self.config.extract_window, chat_type=sender.chat_type
         )
         if not messages:
             return ExtractResult(person_id=person_id)
@@ -259,8 +267,16 @@ class MemoryExtractor:
             )
             added_events.append(event.summary)
 
-        # 无论有没有新内容，这批消息都算处理过，避免反复请求模型
-        self.store.mark_processed([m.id for m in messages])
+        # 实体结果随原有抽取返回；旧版数组或没有候选时既有存储语义不变。
+        if sender.chat_type == "group":
+            ledger = EntityLedger(self.store)
+            for message in messages:
+                ledger.observe_message(platform=sender.platform, chat_id=sender.chat_id,
+                                       message=message, candidates=extraction.entities)
+            # 同批里刚学到的新名也覆盖其它逐字提及；按消息幂等。
+            for message in messages:
+                ledger.record_known_mentions(platform=sender.platform, chat_id=sender.chat_id, message=message)
+        self.store.mark_extraction_snapshot(messages)
         return ExtractResult(
             person_id=person_id,
             added=added,
@@ -302,14 +318,16 @@ class MemoryExtractor:
 
     async def _ask_model(self, sender: PendingSender, messages: list[RawMessage]) -> Extraction:
         transcript = "\n".join(
-            f"[{format_ts(m.ts)}] [{m.sender_name or m.sender_id}] {m.text}" for m in messages
+            f"[id={m.id};平台id={m.platform_msg_id or '-'}] [{format_ts(m.ts)}] [{m.sender_name or m.sender_id}] {m.text}"
+            + (f" [图片视觉描述：{m.visual_text}]" if m.visual_text else "")
+            for m in messages
         )
         user_prompt = (
             f"平台：{sender.platform}\n"
             f"会话：{sender.chat_id}（{'私聊' if sender.chat_type == 'private' else '群聊'}）\n"
             f"要了解的人：{sender.sender_name or sender.sender_id}（id={sender.sender_id}）\n\n"
             f"TA 最近说的话：\n{transcript}\n\n"
-            "请只针对这个人，分别输出 facts 与 events，JSON 对象格式。"
+            "请只针对这个人，分别输出 facts、events 与 entities，JSON 对象格式。实体必须逐字有原话或视觉描述证据。"
         )
         raw = await self.llm.complete(
             [
@@ -353,9 +371,11 @@ def parse_extraction(raw: str) -> Extraction:
         return Extraction()
     facts_data = data.get("facts") or data.get("memories") or []
     events_data = data.get("events") or []
+    entities_data = data.get("entities") or []
     return Extraction(
         facts=_parse_facts(facts_data if isinstance(facts_data, list) else []),
         events=_parse_events(events_data if isinstance(events_data, list) else []),
+        entities=_parse_entities(entities_data if isinstance(entities_data, list) else []),
     )
 
 
@@ -423,6 +443,33 @@ def _parse_events(data: list) -> list[ExtractedEvent]:
             )
         )
     return events
+
+
+def _parse_entities(data: list) -> list[EntityCandidate]:
+    """只解析实体候选的事实字段，证据真实性由 EntityLedger 再核验。"""
+    entities: list[EntityCandidate] = []
+    for item in data:
+        if isinstance(item, str):
+            item = {"name": item}
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or item.get("canonical_name") or "").strip()
+        if not name or len(name) > 120:
+            continue
+        def _strings(value) -> tuple[str, ...]:
+            if isinstance(value, str):
+                value = [value]
+            if not isinstance(value, (list, tuple)):
+                return ()
+            return tuple(str(part).strip() for part in value if str(part).strip())
+        entities.append(EntityCandidate(
+            name=name,
+            gloss=str(item.get("gloss") or "").strip()[:500],
+            gloss_msg_id=str(item.get("gloss_msg_id") or "").strip(),
+            message_ids=_strings(item.get("message_ids") or item.get("message_id")),
+            aliases=_strings(item.get("aliases")),
+        ))
+    return entities
 
 
 def _parse_days(value) -> int | None:

@@ -11,7 +11,7 @@ from .adapters.base import BaseAdapter, CapabilityNotSupported, MessageEvent
 from .computer_exec import ComputerContext
 from .computer_fetch import fetch_url
 from .config import ComputerConfig
-from .memory.store import MemoryStore, make_person_id
+from .memory.store import MemoryStore, RawMessage, make_person_id
 
 # 定义与执行共用同一份参数表；拒绝模型额外提交上下文或收件人。
 _TOOLS = {
@@ -27,7 +27,7 @@ _SAFE_PLATFORM = re.compile(r"[a-zA-Z0-9_-]+")
 _SAFE_ID = re.compile(r"[\w:.@-]{1,200}")
 
 
-def is_host(config: ComputerConfig, event: MessageEvent | None) -> bool:
+def is_host(config: ComputerConfig, event: MessageEvent | RawMessage | None) -> bool:
     return bool(event and _SAFE_PLATFORM.fullmatch(event.platform) and event.sender_id
                 and make_person_id(event.platform, event.sender_id) in config.whitelist)
 

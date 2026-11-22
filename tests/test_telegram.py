@@ -321,6 +321,8 @@ def test_parse_mentions_via_entity():
     assert mentioned.mentions_bot is True
     assert mentioned.text == f"😀 @{BOT_USERNAME} 在吗"
     assert other.mentions_bot is False
+    assert other.mentions == {"@someone_else": "@someone_else"}
+    assert set(mentioned.mentions) == {"__bot__"}
 
 
 def test_parse_text_mention_entity_points_to_bot():
@@ -375,6 +377,9 @@ def test_parse_reply_to_bot_sets_mentions_and_reply_id():
     assert event.reply_to_id == "77"
     assert event.mentions_bot is True
     assert event.raw["reply_to_bot"] is True
+    assert event.reply_sender_id == "__bot__"
+    assert event.mentions == {}  # 引用不是 @
+    assert event.platform_msg_id is not None
 
 
 def test_parse_photo_downloads_largest_size():

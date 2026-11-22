@@ -364,6 +364,21 @@ class ChatConfig:
 
 
 @dataclass
+class AttentionConfig:
+    """群聊消息送去评估的概率，不是最终回复概率。"""
+
+    talk_value: float = 0.75
+    engaged_window_seconds: float = 120.0
+
+    def __post_init__(self) -> None:
+        for key, maximum in (("talk_value", 1.0), ("engaged_window_seconds", math.inf)):
+            raw = getattr(self, key)
+            default = getattr(type(self), key)
+            value = default if isinstance(raw, bool) else _as_float(raw, default)
+            setattr(self, key, min(maximum, max(0.0, value)) if math.isfinite(value) else default)
+
+
+@dataclass
 class ReplyConfig:
     """回复形态：一次回复拆成几段、段与段之间停多久。
 
@@ -377,20 +392,20 @@ class ReplyConfig:
     # 段间打字延迟开关；关掉后所有段落连发，行为与拆分前一致
     segment_delay_enabled: bool = True
     # 每字毫秒数：下一段有多少个非空白字符就等多少毫秒
-    segment_delay_per_char_ms: float = 60.0
+    segment_delay_per_char_ms: float = 130.0
     # 单次段间停顿的上下限（毫秒）：太短没有停顿感，太长拖慢整条回复
-    segment_delay_min_ms: float = 150.0
-    segment_delay_max_ms: float = 1500.0
+    segment_delay_min_ms: float = 1500.0
+    segment_delay_max_ms: float = 4000.0
 
     def __post_init__(self) -> None:
         """把配置里的字符串/非法值收敛成安全数值。"""
         self.max_segments = max(1, _as_int(self.max_segments, 3, minimum=1))
         self.segment_delay_enabled = self.segment_delay_enabled is not False
         self.segment_delay_per_char_ms = max(
-            0.0, _as_float(self.segment_delay_per_char_ms, 60.0)
+            0.0, _as_float(self.segment_delay_per_char_ms, 130.0)
         )
-        self.segment_delay_min_ms = max(0.0, _as_float(self.segment_delay_min_ms, 150.0))
-        self.segment_delay_max_ms = max(0.0, _as_float(self.segment_delay_max_ms, 1500.0))
+        self.segment_delay_min_ms = max(0.0, _as_float(self.segment_delay_min_ms, 1500.0))
+        self.segment_delay_max_ms = max(0.0, _as_float(self.segment_delay_max_ms, 4000.0))
 
 
 @dataclass
@@ -450,8 +465,8 @@ class GroupDecisionConfig:
 class DecisionConfig:
     """回复意愿系统参数（见 SPEC「回复决策」）。"""
 
-    # 消息合并窗口：普通消息攒 4 秒；硬触发走短窗口，0 表示立即处理
-    merge_window_seconds: float = 4.0
+    # 消息合并窗口：群聊静默 2.5 秒；硬触发走短窗口，0 表示立即处理
+    merge_window_seconds: float = 2.5
     hard_merge_window_seconds: float = 1.0
     # 整批上限：从首条消息算起最多等这么久就放出；0 表示不设上限
     batch_max_seconds: float = 10.0
@@ -914,7 +929,7 @@ class WebUIConfig:
     port: int = 8765
     password: str = ""
     # 登录会话有效期（小时）
-    session_hours: float = 72.0
+    session_hours: float = 720.0
 
 
 @dataclass
@@ -1183,6 +1198,7 @@ class Config:
     voice: VoiceConfig = field(default_factory=VoiceConfig)
     chat: ChatConfig = field(default_factory=ChatConfig)
     reply: ReplyConfig = field(default_factory=ReplyConfig)
+    attention: AttentionConfig = field(default_factory=AttentionConfig)
     decision: DecisionConfig = field(default_factory=DecisionConfig)
     generation: GenerationConfig = field(default_factory=GenerationConfig)
     emotion: EmotionConfig = field(default_factory=EmotionConfig)
@@ -1305,6 +1321,9 @@ class Config:
         )
         chat = ChatConfig(**{k: v for k, v in (data.get("chat") or {}).items() if _has(ChatConfig, k)})
         reply = ReplyConfig(**{k: v for k, v in (data.get("reply") or {}).items() if _has(ReplyConfig, k)})
+        attention = data.get("attention")
+        if not isinstance(attention, dict):
+            attention = {}
         decision = _load_decision(data.get("decision") or {})
         generation = _load_generation(data.get("generation") or {})
         emotion = _load_emotion(data.get("emotion") or {})
@@ -1343,6 +1362,7 @@ class Config:
             voice=voice,
             chat=chat,
             reply=reply,
+            attention=AttentionConfig(**{k: v for k, v in attention.items() if _has(AttentionConfig, k)}),
             decision=decision,
             generation=generation,
             emotion=emotion,

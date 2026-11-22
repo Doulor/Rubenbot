@@ -14,6 +14,7 @@ class TestNode {
     this.dataset = {};
     this.style = {};
     this.value = '';
+    this.hidden = false;
   }
   append(...children) {
     for (const child of children) {
@@ -39,6 +40,18 @@ class TestNode {
     if (key === 'class') this.className = String(value);
   }
   getAttribute(key) { return this.attributes.get(key) ?? null; }
+  matches(selector) {
+    if (selector.startsWith('.')) return this.className.split(/\s+/).includes(selector.slice(1));
+    if (selector.startsWith('#')) return this.getAttribute('id') === selector.slice(1);
+    return this.tagName === selector.toUpperCase();
+  }
+  querySelector(selector) { return this.walk().slice(1).find(node => node.matches(selector)) ?? null; }
+  closest(selectors) {
+    for (let node = this; node; node = node.parentNode) {
+      if (selectors.split(',').some(selector => node.matches(selector.trim()))) return node;
+    }
+    return null;
+  }
   walk() { return [this, ...this.childNodes.flatMap(node => node.walk())]; }
   addEventListener(key, fn) {
     if (!this.listeners.has(key)) this.listeners.set(key, []);

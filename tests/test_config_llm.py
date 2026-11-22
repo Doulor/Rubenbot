@@ -22,7 +22,7 @@ def test_config_defaults():
     assert cfg.llm.model_for("consolidate") == cfg.llm.chat_model
     assert cfg.memory.extract_every_n == 30
     assert cfg.memory.inject_limit == 20
-    assert cfg.decision.merge_window_seconds == 4.0
+    assert cfg.decision.merge_window_seconds == 2.5
     assert cfg.decision.hard_merge_window_seconds == 1.0
     assert cfg.decision.batch_max_seconds == 10.0
     assert cfg.decision.urgent_seconds == 2.0
@@ -32,11 +32,21 @@ def test_config_defaults():
     assert cfg.decision.groups == {}
     assert cfg.reply.max_segments == 3
     assert cfg.reply.segment_delay_enabled is True
-    assert cfg.reply.segment_delay_per_char_ms == 60.0
-    assert cfg.reply.segment_delay_min_ms == 150.0
-    assert cfg.reply.segment_delay_max_ms == 1500.0
+    assert cfg.reply.segment_delay_per_char_ms == 130.0
+    assert cfg.reply.segment_delay_min_ms == 1500.0
+    assert cfg.reply.segment_delay_max_ms == 4000.0
     assert cfg.chat.strip_action_parens is False
     assert cfg.enabled_adapters == []
+
+
+def test_attention_defaults_and_overrides():
+    attention = Config().attention
+    assert attention.talk_value == 0.75
+    assert attention.engaged_window_seconds == 120
+    for probability in (0, 0.35, 1):
+        attention = Config.from_raw({"attention": {"talk_value": probability, "engaged_window_seconds": 0}}).attention
+        assert attention.talk_value == probability
+        assert attention.engaged_window_seconds == 0
 
 
 def test_config_from_dict_and_env(tmp_path, monkeypatch):
