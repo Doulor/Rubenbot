@@ -26,7 +26,7 @@ from typing import Any
 from ..config import (
     COMPUTER_LIMITS, DEFAULT_MODEL_STRATEGY, MODEL_STRATEGIES, SEARCH_PROVIDERS,
     STT_PROVIDERS, TTS_MODES, TTS_PROVIDERS,
-    ComputerConfig, Config, MCPConfig, MCPServerConfig,
+    ComputerConfig, Config, MCPConfig, MCPServerConfig, PrivacyConfig,
 )
 from ..decision import parse_quiet_hours
 
@@ -136,6 +136,7 @@ _SETTINGS_PAGE_RULES: tuple[tuple[str, str], ...] = (
     ("chat", "chat"),
     ("decision", "chat"),
     ("memory", "memory"),
+    ("privacy", "memory"),
     ("emotion", "emotion"),
     ("voice", "voice"),
     ("stickers", "emoji"),
@@ -279,6 +280,7 @@ def structured_config(config: Config) -> dict[str, Any]:
         "persona": {"path": config.persona_path, **config.persona_example_options()},
         "database_path": config.database_path,
         "memory": asdict(config.memory),
+        "privacy": asdict(config.privacy),
         "search": search,
         "mcp": mcp_form(config.mcp),
         "computer": asdict(config.computer),
@@ -642,6 +644,7 @@ def _validate_memory(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
         "profile_inject_max_chars": 120,
         "inject_budget_tokens": 0,
         "timeline_hit_limit": 1,
+        "timeline_max_chars": 0,
         "self_inject_limit": 0,
         "recall_tool_max_rounds": 0,
     }
@@ -658,6 +661,7 @@ def _validate_memory(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
         "index_active_days": (0.1, None),
         "index_ttl_seconds": (0, None),
         "cross_session_hours": (0.1, None),
+        "timeline_recent_hours": (0, None),
         "self_inject_hours": (0.1, None),
         "gate_confidence_threshold": (0, 1),
     }
@@ -1360,6 +1364,12 @@ def validate_structured(payload: dict[str, Any]) -> dict[str, Any]:
     memory = _section(payload, "memory", v)
     if memory is not None:
         update["memory"] = _validate_memory(memory, v)
+    privacy = _section(payload, "privacy", v)
+    if privacy is not None and "enabled" in privacy:
+        try:
+            update["privacy"] = asdict(PrivacyConfig.parse(privacy))
+        except ValueError:
+            v.fail("privacy.enabled", "必须是开关（true/false）")
     search = _section(payload, "search", v)
     if search is not None:
         update["search"] = _validate_search(search, v)

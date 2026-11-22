@@ -277,6 +277,7 @@ def test_disabled_engine_changes_nothing(store):
 
 
 def test_norecord_person_is_ignored(store):
+    store.privacy_enabled = True
     store.upsert_person("recording", "u2", "阿草")
     store.set_privacy_mode("recording:u2", "norecord", now=NOW)
     engine = EmotionEngine(store, EmotionConfig(), now_fn=lambda: NOW)

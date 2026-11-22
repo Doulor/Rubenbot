@@ -197,6 +197,8 @@ def test_interval_path_publishes_with_topic(tmp_path):
         text="那你还来水群",
         ts=now + 0.1,
     )
+    store.add_raw_message(platform='recording', chat_type='private', chat_id='g1',
+                          sender_id='u3', text='同号私聊不是群热点', ts=now + 0.2)
     plugin = manager.extras["qzone_post"]
 
     ok, _ = asyncio.run(plugin.publish_scheduled(now=now + 1))
@@ -205,6 +207,10 @@ def test_interval_path_publishes_with_topic(tmp_path):
     # 群聊热点被当作题材喂给模型
     topic_message = llm.calls[0]["messages"][1]["content"]
     assert "今天加班到十点" in topic_message
+    assert '同号私聊不是群热点' not in topic_message
+    store.privacy_enabled = True
+    store.add_memory('recording:u3', '封存的线索', sensitivity='sealed', audience='private')
+    assert plugin._recent_topic(now=now + 1) == ''
 
 
 def test_interval_path_generation_failure_skips_publish(tmp_path):

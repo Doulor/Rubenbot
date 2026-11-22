@@ -92,8 +92,8 @@ def test_frontend_prefix_behavior():
     assert pages == ["expression", "chat", "", ""]
 
 
-def test_attention_card_defines_two_number_inputs():
-    """页面归属规则不渲染控件；两个字段还得进入配置卡的可编辑网格。"""
+def card_fields(page: str, prefix: str) -> dict:
+    """返回指定页面的实际卡片字段定义，而不只检查归属规则。"""
     from rubenbot.web.config_schema import config_layout
 
     source = APP_JS.read_text(encoding="utf-8")
@@ -105,12 +105,24 @@ const card = (_, spec) => spec, fieldGrid = defs => defs;
 const h = () => null, groupsEditor = h, pluginEditor = h, modelsEditor = h,
       adaptersEditor = h, mcpServerEditor = h, mapEditor = h;
 const LOG_LEVELS = [], MOOD_NAMES = [], MODEL_POOL_STRATEGIES = [], MODEL_POOL_STRATEGY_LABELS = {};
-const fields = settingsCardSpecs({}, {}, []).filter(c => pageOf(LAYOUT, c.path) === 'expression')
-  .flatMap(c => c.node.body).filter(f => f?.path?.startsWith('attention.'));
+const [layout, page, prefix] = JSON.parse(process.argv[1]);
+const fields = settingsCardSpecs({}, {}, []).filter(c => pageOf(layout, c.path) === page)
+  .flatMap(c => c.node.body).filter(f => f?.path?.startsWith(prefix));
 console.log(JSON.stringify(fields));
-""".replace("LAYOUT", json.dumps(config_layout()))
-    result = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True)
-    fields = {field["path"]: field for field in json.loads(result.stdout)}
+"""
+    args = json.dumps([config_layout(), page, prefix])
+    result = subprocess.run(["node", "-e", script, args], capture_output=True, text=True, check=True)
+    return {field["path"]: field for field in json.loads(result.stdout)}
+
+
+def test_memory_card_defines_privacy_switch():
+    field = card_fields("memory", "privacy.")["privacy.enabled"]
+    assert field["kind"] == "switch"
+    assert "开启后启用保密封存与跨场合审查，默认关" in field["hint"]
+
+
+def test_attention_card_defines_two_number_inputs():
+    fields = card_fields("expression", "attention.")
     assert set(fields) == {"attention.talk_value", "attention.engaged_window_seconds"}
     assert all(field["kind"] == "number" for field in fields.values())
     assert "不是回复概率" in fields["attention.talk_value"]["hint"]

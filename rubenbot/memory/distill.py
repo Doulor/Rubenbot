@@ -25,7 +25,7 @@ import time
 from dataclasses import dataclass, field
 
 from ..llm import LLMProtocol, parse_json_payload
-from ..memory.gate import OWNER_AUDIENCE
+from ..privacy.gate import OWNER_AUDIENCE
 from ..memory.retrieve import jaccard
 from ..memory.store import Event, Memory, MemoryStore, Profile, ProfileLine
 

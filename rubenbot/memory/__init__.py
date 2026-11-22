@@ -10,7 +10,7 @@ from .extract import (
     MemoryExtractor,
     parse_extraction,
 )
-from .gate import PrivacyGate, ReviewItem
+from ..privacy.gate import PrivacyGate, ReviewItem
 from .retrieve import (
     MemberIndex,
     MemberRow,
@@ -45,7 +45,9 @@ from .summary import (
     SummaryResult,
     format_summary_block,
 )
-from .timeline import CompressResult, TimelineCompressor
+from .timeline import (
+    CompressResult, TimelineCompressor, TimelineEntry, read_timeline, recent_timeline, search_timeline,
+)
 
 __all__ = [
     "CompressResult",
@@ -81,6 +83,10 @@ __all__ = [
     "SUMMARY_BLOCK_TITLE",
     "SummaryResult",
     "TimelineCompressor",
+    "TimelineEntry",
+    "read_timeline",
+    "recent_timeline",
+    "search_timeline",
     "audience_for_chat",
     "estimate_tokens",
     "format_relative_time",

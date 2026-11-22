@@ -70,8 +70,10 @@ def test_merged_round_keeps_first_label_and_only_generator_gets_quote(config, st
     bot, _ = bot_for(config, store, llm)
 
     async def scenario():
-        await bot._record(event("星驰是" + gloss), 1)  # 旧到不在近期上下文中
+        await bot._record(event("星驰是" + gloss), 1)
         await bot.extractor.extract_sender(store.pending_senders()[0], now=2)
+        # 单验实体账的分阶段披露：尚存的旧流水按新规格也能由独立查账通道送给策划。
+        assert store.trim_raw(0) == 1
         bot.merger.window = bot.merger.hard_window = 30
         first = event("星驰", "panda")
         await bot.handle_event(first)

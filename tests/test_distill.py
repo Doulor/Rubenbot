@@ -184,6 +184,7 @@ def test_evidence_can_come_from_new_facts(store):
 
 
 def test_norecord_person_is_skipped(store):
+    store.privacy_enabled = True
     store.set_privacy_mode("console:u1", "norecord")
     seed_events(store)
     llm = FakeLLM(proposal(stable=[{"text": "TA 喜欢户外活动", "evidence": ["event:1"]}]))

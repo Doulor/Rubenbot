@@ -353,6 +353,7 @@ def test_profile_update_writes_audit_log(store):
 
 
 def test_privacy_settings(store):
+    store.privacy_enabled = True
     assert store.get_privacy_mode("console:u1") == "normal"
     assert store.is_norecord("console:u1") is False
     store.set_privacy_mode("console:u1", "norecord", now=5.0)

@@ -1,15 +1,18 @@
-"""机主即时通道：只按真实账号查其他场合的近期可用证据。"""
+"""时间线查账与近况。原机主的隐私边界回归用例在显式开启裁定后运行。"""
+
+import asyncio
+from functools import partial
 
 import pytest
 
 from rubenbot.adapters.base import MessageEvent
-from rubenbot.config import ComputerConfig
-from rubenbot.memory.owner_recent import MAX_SNIPPETS, MAX_SNIPPET_CHARS, owner_recent_snippets
+from rubenbot.memory.timeline import MAX_SNIPPETS, MAX_SNIPPET_CHARS, read_timeline, recent_timeline, search_timeline
+from rubenbot.privacy import PrivacyGate
 from rubenbot.memory.owner_statement import is_owner_self_statement
 
 NOW = 1_800_000_000
 PERSON = 'console:u:1'
-OWNER = ComputerConfig(whitelist=[PERSON, 'console:other'])
+OWNERS = {PERSON, 'console:other'}
 QUESTION = '我今晚吃的啥你知道吗'
 QUOTE = '我今晚吃的是鸭腿你知道吗'
 
@@ -26,8 +29,19 @@ def add(store, text=QUOTE, **overrides):
     return store.add_raw_message(**(fields | overrides))
 
 
-def hits(store, target=None, **opts):
-    return owner_recent_snippets(store, target or event(), computer=OWNER, now=NOW, **opts)
+def hits(store, target=None, *, privacy=True, query=None, exclude_texts=(), limit=MAX_SNIPPETS):
+    store.privacy_enabled = privacy
+    target = target or event()
+    speaker = f'{target.platform}:{target.sender_id}'
+    allow = None
+    if privacy:
+        allow = partial(PrivacyGate(store, None).review_timeline, speaker=speaker,
+                        audience_now=('private' if target.chat_type == 'private' else f'group:{target.chat_id}'),
+                        owner_person_ids={speaker} & OWNERS, now=NOW,
+                        target_platform=target.platform, target_chat_id=target.chat_id)
+    rows = asyncio.run(search_timeline(store, target.text if query is None else query, exclude_chat=target,
+                                       exclude_texts=exclude_texts, raw_only=True, limit=limit, allow=allow, now=NOW))
+    return [r.excerpt() for r in rows]
 
 
 def test_real_account_and_place_and_message_time(store):
@@ -40,9 +54,13 @@ def test_real_account_and_place_and_message_time(store):
     add(store, '我今晚吃了白菜', sender_id='guest')
     add(store, '我今晚吃了鱿鱼', sender_id='__bot__')
     add(store, '不相关', visual_text='我今晚吃了烧鸡')
-    assert hits(store) == [QUOTE]
-    assert hits(store, event(sender_id='guest', raw={'sender_id': 'u:1'}, text='机主说' + QUESTION)) == []
-    assert hits(store, event(platform='other')) == []
+    # 与旧机主专线不同：任何人、任何在场的平台都可成为来源，不从 raw 伪造发送人身份。
+    expected = {QUOTE, '我今晚吃了米饭', '我今晚吃了肉饼', '我今晚吃了黄瓜', '我今晚吃了白菜'}
+    assert set(hits(store, privacy=False, limit=20)) == expected
+    guest = event(sender_id='guest', raw={'sender_id': 'u:1'}, text='机主说' + QUESTION)
+    assert set(hits(store, guest, privacy=False, limit=20)) == expected
+    assert '我今晚吃了牛肉' in hits(store, event(platform='other'), privacy=False, limit=20)
+    assert all('土豆' not in r for r in hits(store, privacy=False))  # 未来消息不应召回
     assert hits(store, event(chat_type='unknown')) == []
 
 
@@ -58,6 +76,7 @@ def test_owner_private_to_other_group_without_question_echo(store):
 
 @pytest.mark.parametrize('mode', ['private', 'norecord'])
 def test_hidden_and_purged_history_not_revived(store, mode):
+    store.privacy_enabled = True
     add(store)
     store.set_privacy_mode(PERSON, mode)
     add(store, '我今晚吃了鸭腿')
@@ -151,6 +170,81 @@ def test_bounded_deduplicated_and_scored(store):
     assert sum('红糖' in s for s in result) == 1
     assert any(s.endswith('…') for s in result)
     assert all('电影' not in s for s in result)
+
+
+def test_recent_fallback_uses_one_row_per_place_and_real_sources(store, monkeypatch):
+    for i in range(320):
+        add(store, f'流水{i}', ts=NOW - 321 + i)
+    store.add_self_event('我复述的是别人的近况', source_chat='console:42', audience='group:42', now=NOW - 1)
+    store.upsert_identity('console', '42', kind='group', name='周末聚会')
+    calls = []
+    read = store.timeline_rows
+
+    def count(**kw):
+        rows = read(**kw)
+        calls.append(len(rows))
+        return rows
+
+    monkeypatch.setattr(store, 'timeline_rows', count)
+    lines = asyncio.run(recent_timeline(store, event(), now=NOW))
+    assert len(lines) == 1
+    assert all(word in lines[0] for word in ['流水319', '群聊', '周末聚会', 'console:42', '同名'])
+    assert calls == [1]
+
+
+def test_read_and_recall_keep_historical_place_type_after_trim(store):
+    rid = add(store, '这条流水将被淘汰', chat_type='private', processed=True)
+    store.add_event(PERSON, '古老的赤松游记', source_chat='console:42', source_raw_id=rid,
+                    audience='owner', ts=NOW - 30 * 86400)
+    add(store, '同场合新消息', chat_type='private', ts=NOW - 1, processed=True)
+    assert store.trim_raw(keep_per_chat=1) == 1
+    store.add_event(PERSON, '赤松新游记', ts=NOW, audience='group:历史记录')
+    rows = asyncio.run(search_timeline(store, '赤松', now=NOW, person_id=PERSON))
+    assert [(r.text, r.chat_type) for r in rows] == [('赤松新游记', 'group'), ('古老的赤松游记', 'private')]
+    assert 'console:42' in rows[-1].line()
+    assert '历史记录' in rows[0].line()
+    assert not asyncio.run(recent_timeline(store, event(), now=NOW))
+    assert [r.text for r in read_timeline(store, now=NOW)] == ['赤松新游记', '同场合新消息', '古老的赤松游记']
+
+
+def test_multiline_quote_is_verbatim_but_recent_event_stays_one_line(store):
+    quote = '晚餐选项：\n意面  或者米饭'
+    add(store, quote)
+    hit, = asyncio.run(search_timeline(store, '晚餐', raw_only=True, now=NOW))
+    assert hit.line().endswith(' ' + quote)
+    recent, = asyncio.run(recent_timeline(store, event(), now=NOW))
+    assert recent.endswith(' 晚餐选项： 意面 或者米饭') and '\n' not in recent
+
+
+def test_search_can_match_explicit_account_without_text_overlap(store):
+    add(store, '码头停着白帆船')
+    add(store, '朱红色的桥', platform='other', ts=NOW)
+    add(store, '橙黄的日落', sender_id='other', ts=NOW)
+    rows = asyncio.run(search_timeline(store, '听听看', mentioned={PERSON}, raw_only=True, now=NOW))
+    assert [(row.person_id, row.text) for row in rows] == [(PERSON, '码头停着白帆船')]
+
+
+def test_raw_retention_uses_full_conversation_identity(store):
+    for platform, kind in [('console', 'private'), ('console', 'group'), ('other', 'group')]:
+        for n in range(2):
+            add(store, f'第{n}次探访', platform=platform, chat_type=kind, ts=NOW - 1 + n, processed=True)
+    assert store.trim_raw(1) == 3
+    remaining = read_timeline(store, now=NOW)
+    assert {(r.platform, r.chat_type, r.text) for r in remaining} == {
+        ('console', 'private', '第1次探访'), ('console', 'group', '第1次探访'), ('other', 'group', '第1次探访')}
+
+
+def test_date_budget_and_keyword_order(store):
+    add(store, '秋游，红枫落叶配晨雾。', chat_id='details', ts=NOW - 1)
+    add(store, '只提红枫', chat_id='recent', ts=NOW)
+    old = add(store, '秋游清单：红枫落叶配晨雾。', chat_id='old', ts=NOW - 200 * 86400)
+    query = '红枫落叶配晨雾'
+    result = asyncio.run(search_timeline(store, query, now=NOW))
+    assert [r.chat_id for r in result] == ['details', 'old', 'recent']
+    assert result[1].id == old
+    lines = asyncio.run(recent_timeline(store, event(), char_limit=80, now=NOW))
+    assert lines and 'recent' in lines[0] and 'old' not in '\n'.join(lines)
+    assert len('\n'.join(lines)) <= 80
 
 
 @pytest.mark.parametrize('text', ['其实我今晚吃的是鸭腿', '今天我吃了鸭腿', '@123 我吃了鸭腿', QUOTE])

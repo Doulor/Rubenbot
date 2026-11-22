@@ -86,3 +86,47 @@ def test_upgrade_is_idempotent(tmp_path):
         assert loaded.sensitivity == "high"
     finally:
         store.close()
+
+
+def test_old_allow_is_not_migrated_as_explicit_consent(tmp_path):
+    path = tmp_path / "old-rulings.sqlite"
+    with sqlite3.connect(path) as conn:
+        conn.executescript("""
+            CREATE TABLE rulings (id INTEGER PRIMARY KEY, person_id TEXT, key TEXT,
+                verdict TEXT, created_at REAL, UNIQUE(person_id, key));
+            INSERT INTO rulings VALUES(1, 'console:u1', 'habit@group', 'allow', 10);
+        """)
+    store = MemoryStore(path)
+    try:
+        ruling = store.get_ruling('console:u1', 'habit@group')
+        assert (ruling.verdict, ruling.source) == ('allow', 'unknown')
+    finally:
+        store.close()
+
+
+def test_old_owner_events_keep_place_after_raw_expires(tmp_path):
+    """旧的 owner 是受众，不是场合；只能用证据补群/私类型，不能看号码猜。"""
+    from rubenbot.memory import read_timeline
+
+    path = tmp_path / "old-events.sqlite"
+    store = MemoryStore(path)
+    try:
+        for chat_type in ("private", "group"):
+            rid = store.add_raw_message(platform="qq", chat_type=chat_type, chat_id="42", sender_id="42",
+                                        text=chat_type, ts=20, processed=True)
+            store.add_event("qq:42", chat_type, source_chat="qq:42", source_raw_id=rid,
+                            audience="owner", ts=20)
+        store.add_event("qq:42", "无流水", source_chat="qq:42", audience="owner", ts=12)
+    finally:
+        store.close()
+    with sqlite3.connect(path) as conn:
+        conn.execute("ALTER TABLE events DROP COLUMN source_chat_type")
+    store = MemoryStore(path)
+    try:
+        store.trim_raw(0)
+        rows = read_timeline(store, now=30)
+        assert [(r.text, r.chat_type) for r in rows] == [
+            ("group", "group"), ("private", "private"), ("无流水", "unknown"),
+        ]
+    finally:
+        store.close()

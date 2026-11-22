@@ -330,6 +330,9 @@ class MemoryConfig:
     inject_budget_tokens: int = 1200
     # 每个被提及者最多带几条相关时间线片段
     timeline_hit_limit: int = 6
+    # 「最近发生的事」回看的小时数与整段字符预算；任一个为 0 即省略这层
+    timeline_recent_hours: float = 24.0
+    timeline_max_chars: int = 1800
     # 私聊跨会话摘要回看的小时数
     cross_session_hours: float = 24.0
     # 自我注入：回看本会话里 bot 自己最近说过/做过的事
@@ -348,6 +351,22 @@ class MemoryConfig:
 
     # ---- 群定位（手写群备注 + 自归纳群定位，后台更新，默认开）----
     group_profile: GroupProfileConfig = field(default_factory=GroupProfileConfig)
+
+
+@dataclass
+class PrivacyConfig:
+    """跨场合隐私审查；默认不启用，拒绝有歧义的开关值。"""
+
+    enabled: bool = False
+
+    @classmethod
+    def parse(cls, raw: Any) -> "PrivacyConfig":
+        if not isinstance(raw, dict):
+            raise ValueError("privacy: 应为对象")
+        enabled = raw.get("enabled", False)
+        if not isinstance(enabled, bool):
+            raise ValueError("privacy.enabled: 应为布尔值")
+        return cls(enabled=enabled)
 
 
 @dataclass
@@ -1194,6 +1213,7 @@ class ComputerConfig:
 class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
+    privacy: PrivacyConfig = field(default_factory=PrivacyConfig)
     search: SearchConfig = field(default_factory=SearchConfig)
     voice: VoiceConfig = field(default_factory=VoiceConfig)
     chat: ChatConfig = field(default_factory=ChatConfig)
@@ -1358,6 +1378,7 @@ class Config:
         return cls(
             llm=llm,
             memory=memory,
+            privacy=PrivacyConfig.parse(data.get("privacy", {})),
             search=search,
             voice=voice,
             chat=chat,
@@ -1479,6 +1500,11 @@ def _load_memory(data: dict[str, Any]) -> MemoryConfig:
         if _has(MemoryConfig, k) and k not in ("rolling_summary", "group_profile")
     }
     config = MemoryConfig(**plain)
+    hours = config.timeline_recent_hours
+    if type(hours) not in (int, float) or not math.isfinite(hours) or hours < 0:
+        raise ValueError("memory.timeline_recent_hours: 应为非负有限数值")
+    if type(config.timeline_max_chars) is not int or config.timeline_max_chars < 0:
+        raise ValueError("memory.timeline_max_chars: 应为非负整数")
     raw = data.get("rolling_summary")
     if isinstance(raw, dict):
         default = RollingSummaryConfig()

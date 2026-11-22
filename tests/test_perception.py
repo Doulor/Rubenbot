@@ -331,6 +331,27 @@ def test_event_stored_and_pending_counted(store):
     assert store.list_events(person_id=make_person_id("snowluma", "22222"))
 
 
+def test_platform_event_not_recorded_for_norecord_actor(store):
+    cfg = gateway_config()
+    cfg.privacy.enabled = True
+    bot, _ = make_bot(cfg, store, ScriptedLLM())
+    actor = make_person_id("snowluma", "22222")
+    store.set_privacy_mode(actor, "norecord")
+    event = parse_onebot_platform_event(friend_request())
+    run(bot._handle_platform_event(event))
+    assert not store.list_platform_events()
+    assert not store.list_events(person_id=actor)
+
+    # 不影响其他账号；关闭模块后也不再按该发起人的档位拦截。
+    run(bot._handle_platform_event(parse_onebot_platform_event(friend_request(user_id=33333))))
+    assert len(store.list_platform_events()) == 1
+    cfg.privacy.enabled = False
+    bot, _ = make_bot(cfg, store, ScriptedLLM())
+    run(bot._handle_platform_event(event))
+    assert len(store.list_platform_events()) == 2
+    assert len(store.list_events(person_id=actor)) == 1
+
+
 def test_event_self_generated_filtered(store):
     cfg = gateway_config()
     bot, _ = make_bot(cfg, store, ScriptedLLM())

@@ -114,6 +114,19 @@ def test_auto_summary_used_when_manual_empty():
     assert "氛围：热闹" in block
 
 
+def test_group_summary_cannot_revive_purged_source(store):
+    class PurgeDuringSummary:
+        async def complete(self, *args, **kwargs):
+            store.purge_person('recording:u1')
+            return '来自刚清空的原话'
+
+    add_messages(store, 2)
+    settings = make_config(enabled=True, min_messages=1).memory.group_profile
+    summarizer = GroupProfileSummarizer(PurgeDuringSummary(), store, settings)
+    assert asyncio.run(summarizer.update_chat('recording', 'g1')) is None
+    assert not store.get_group_profile('recording', 'g1')
+
+
 def test_no_profile_no_injection(store):
     assert resolve_profile_text(None, max_chars=300) == ("", "")
     assert active_profile_block(store, "recording", "g1", max_chars=300) == ""

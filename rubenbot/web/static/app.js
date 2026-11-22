@@ -4085,6 +4085,7 @@ function groupName(key) {
   return {
     llm: "模型与接口",
     memory: "记忆",
+    privacy: "跨场合隐私保护",
     chat: "聊天与回复",
     decision: "回复意愿",
     attention: "群聊回复时机",
@@ -4324,6 +4325,9 @@ function settingsCardSpecs(draft, secrets, pluginsAvailable, groupIdentities = {
             { path: "memory.profile_inject_max_chars", label: "说话人画像上限（字）", kind: "number", step: "20", min: 120, hint: "画像核心不参与预算裁剪" },
             { path: "memory.inject_budget_tokens", label: "注入预算（token）", kind: "number", step: "100", min: 0, hint: "超出后先砍事实、再砍时间线，画像核心不动" },
             { path: "memory.timeline_hit_limit", label: "每人相关旧事条数", kind: "number", step: "1", min: 1 },
+            { path: "memory.timeline_recent_hours", label: "近期事件窗口（小时）", kind: "number", step: "any", min: 0, hint: "只补其他会话的近况，默认回看 24 小时" },
+            { path: "memory.timeline_max_chars", label: "近期事件总字数", kind: "number", step: "1", min: 0, hint: "按时间从新到旧保留，默认最多 1800 字" },
+            { path: "privacy.enabled", label: "跨场合隐私保护", kind: "switch", hint: "开启后启用保密封存与跨场合审查，默认关。关闭时私聊和群聊的记忆可以互相引用。" },
             { path: "memory.cross_session_hours", label: "跨会话回看（小时）", kind: "number", step: "1", min: 0.1, hint: "私聊跨会话摘要回看的小时数" },
             { path: "memory.self_inject_hours", label: "自我回看（小时）", kind: "number", step: "1", min: 0.1, hint: "回看本会话里 bot 自己最近说过/做过的事" },
             { path: "memory.self_inject_limit", label: "自我注入条数", kind: "number", step: "1", min: 0 },

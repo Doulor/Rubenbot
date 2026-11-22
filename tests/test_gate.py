@@ -6,7 +6,7 @@ import json
 import pytest
 
 from rubenbot.config import MemoryConfig
-from rubenbot.memory.gate import PrivacyGate, ReviewItem, ruling_key
+from rubenbot.privacy.gate import PrivacyGate, ReviewItem, ruling_key
 from rubenbot.memory.store import MemoryStore
 
 NOW = 1_795_000_000.0
@@ -35,7 +35,7 @@ def verdicts(*entries) -> str:
 
 @pytest.fixture()
 def store():
-    s = MemoryStore(":memory:")
+    s = MemoryStore(":memory:", privacy_enabled=True)
     s.upsert_person("console", "u1", "阿花")
     s.upsert_person("console", "u2", "阿草")
     yield s
@@ -103,7 +103,7 @@ def test_private_mode_withholds_cross_site(store):
 def test_private_mode_whitelist_allow(store):
     store.set_privacy_mode("console:u1", "private")
     key = ruling_key(item(audience="private"), "group:g9")
-    store.set_ruling("console:u1", key, "allow", now=NOW)
+    store.set_ruling("console:u1", key, "allow", source="explicit", now=NOW)
     gate = PrivacyGate(store, FakeGateLLM(), MemoryConfig())
     allowed, withheld = run(gate, [item(audience="private")])
     assert len(allowed) == 1 and withheld == []
@@ -122,7 +122,7 @@ def test_norecord_has_no_data(store):
 
 
 def test_sealed_never_crosses(store):
-    store.set_ruling("console:u1", ruling_key(item(audience="private"), "group:g9"), "allow", now=NOW)
+    store.set_ruling("console:u1", ruling_key(item(audience="private"), "group:g9"), "allow", source="explicit", now=NOW)
     gate = PrivacyGate(store, FakeGateLLM(), MemoryConfig())
     allowed, withheld = run(gate, [item(audience="private", sensitivity="sealed")])
     assert allowed == [] and withheld and "封存" in withheld[0].withhold_reason
@@ -162,6 +162,24 @@ def test_ruling_cache_avoids_second_model_call(store):
     llm.raises = AssertionError("命中缓存不该再调模型")
     second = run(gate, [item(audience="private")])
     assert len(second[0]) == 1
+
+
+def test_model_allow_is_not_consent_to_high_sensitivity_or_private_mode(store):
+    llm = FakeGateLLM(verdicts({"id": 0, "verdict": "allow", "confidence": 1}))
+    gate = PrivacyGate(store, llm)
+    ordinary = item(audience="group:g1", text="我在练字", subject="fact", category="habit")
+    sensitive = item(audience="group:g1", text="我最近在吃药", subject="fact", category="habit", sensitivity="high")
+    assert run(gate, [ordinary]) == ([ordinary], [])
+    key = ruling_key(ordinary, "group:g9")
+    assert store.get_ruling(ordinary.person_id, key).source == "model"
+    assert run(gate, [sensitive]) == ([], [sensitive])
+    ask, = store.list_pending_asks(ordinary.person_id)
+    store.set_privacy_mode(ordinary.person_id, "private")
+    assert run(gate, [ordinary]) == ([], [ordinary])
+    store.answer_pending_ask(ask.id, "allow")
+    assert store.get_ruling(ordinary.person_id, key).source == "explicit"
+    assert run(gate, [sensitive]) == ([sensitive], [])
+    assert len(llm.calls) == 1
 
 
 def test_ruling_deny_kept(store):
@@ -280,7 +298,38 @@ def test_owner_audience_is_not_a_privacy_override(store, mode, sensitivity, ruli
     gate = PrivacyGate(store, llm, MemoryConfig())
     store.set_privacy_mode(candidate.person_id, mode)
     if ruling:
-        store.set_ruling(candidate.person_id, ruling_key(candidate, "group:g1"), ruling)
+        store.set_ruling(candidate.person_id, ruling_key(candidate, "group:g1"), ruling, source="explicit")
     yes, no = asyncio.run(gate.review([candidate], audience_now="group:g1", owner_person_ids={candidate.person_id}))
     assert (candidate in yes) == allowed and (candidate in no) != allowed
     assert not llm.calls
+
+
+def test_unclassified_owner_quotes_are_reviewed_individually_before_group(store):
+    llm = FakeGateLLM(verdicts({"id": 0, "verdict": "allow", "confidence": 1}),
+                      verdicts({"id": 0, "verdict": "deny", "confidence": 1}))
+    gate = PrivacyGate(store, llm)
+
+    def review(subject, text):
+        candidate = item(audience="owner", kind="raw", subject=subject, text=text)
+        return asyncio.run(gate.review([candidate], audience_now="group:g9", for_chat=True,
+                                       owner_person_ids={candidate.person_id}))[0]
+
+    assert review("raw:1", "夜市的素面卖完了")
+    assert not review("raw:2", "登记档案里的代号是小鹿")
+    assert not review("raw:3", "我的身份证号是测试编号甲")
+    assert len(llm.calls) == 2  # 已知身份信号按高敏扣下，不让模型解禁。
+
+
+@pytest.mark.parametrize("candidate, audience, speaker", [
+    (item(audience="group:g1", sensitivity="sealed"), "private", "console:u1"),
+    (item(audience="private", person_id="self"), "group:g1", "console:u2"),
+    (item(audience="group:g1", sensitivity="high", origin="other:g1"), "group:g1", "console:u2"),
+    (item(audience="group:g1", sensitivity="high"), "private", "console:u2"),
+    (item(audience="", sensitivity="high"), "group:g1", "console:u2"),
+])
+def test_chat_gate_withholds_sensitive_crossings(store, candidate, audience, speaker):
+    gate = PrivacyGate(store, FakeGateLLM(raises=AssertionError("不得靠模型解除硬限制")))
+    allowed, withheld = asyncio.run(gate.review([candidate], audience_now=audience, speaker=speaker,
+                                               for_chat=True, target_platform="console"))
+    assert not allowed and withheld == [candidate]
+    assert not gate.llm.calls

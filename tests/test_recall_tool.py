@@ -53,8 +53,9 @@ def tool_call(call_id="c1", name="recall", arguments=None):
     }
 
 
-def make_bot(store, llm, *, recall_enabled=True, reminder_enabled=False) -> tuple[RubenBot, RecordingAdapter]:
+def make_bot(store, llm, *, recall_enabled=True, reminder_enabled=False, privacy=False) -> tuple[RubenBot, RecordingAdapter]:
     config = Config()
+    config.privacy.enabled = privacy
     config.reply.segment_delay_enabled = False
     config.decision.merge_window_seconds = 0
     config.decision.hard_merge_window_seconds = 0
@@ -105,8 +106,9 @@ def test_tool_loop_calls_recall_and_answers(store):
     assert tool_message["tool_call_id"] == "c1"
 
 
-def test_tool_result_respects_gate(store):
-    """工具查到的私聊来源记忆，在群里发起时要被审查口扣下。"""
+@pytest.mark.parametrize('privacy', [True, False])
+def test_tool_result_respects_gate(store, privacy):
+    """同一条私聊事实，开启时跨场合扣下，关闭时可查。"""
     store.add_memory("recording:u1", "TA 去看心理医生了", audience="private", now=1_795_000_000.0)
     llm = ToolLLM(
         [
@@ -115,13 +117,32 @@ def test_tool_result_respects_gate(store):
         ]
     )
     # 直接调 recall，模拟群聊场景（事件给群聊）
-    bot, _ = make_bot(store, llm)
+    bot, _ = make_bot(store, llm, privacy=privacy)
     event = MessageEvent(
         platform="recording", chat_type="group", chat_id="g9",
         sender_id="u2", sender_name="阿草", text="阿花最近怎么样",
     )
     content = asyncio.run(bot.recall("阿花", "心理", event=event))
-    assert "心理医生" not in content
+    assert ("心理医生" in content) is not privacy
+
+
+def test_tool_searches_old_raw_timeline_without_a_person(store):
+    """超过一年仍可按话题查，显式 24h 才限时；从真正的工具分派读结果。"""
+    import time
+
+    quote = '老舰队的观测站选在海平山。'
+    store.add_raw_message(platform='recording', chat_type='group', chat_id='g8', sender_id='u9',
+                          sender_name='小鹭', text=quote, ts=time.time() - 390 * 86400)
+    llm = ToolLLM([
+        {'tool_calls': [tool_call('old', arguments={'topic': '观测站'}),
+                        tool_call('new', arguments={'topic': '观测站', 'time_range': '24h'})]},
+        {'content': '查到了'},
+    ])
+    bot, _ = make_bot(store, llm)
+    asyncio.run(bot.handle_event(private('旧观测站在哪？')))
+    results = {m['tool_call_id']: m['content'] for m in llm.last_tool_messages if m['role'] == 'tool'}
+    assert all(part in results['old'] for part in [quote, 'g8', '小鹭'])
+    assert quote not in results['new']
 
 
 def test_tool_unsupported_falls_back(store):

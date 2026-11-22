@@ -83,7 +83,7 @@ class ProactiveOpener:
 
     def last_message_at(self, store: MemoryStore, platform: str, chat_id: str) -> float | None:
         """该群最近一条**真实**消息的时间（bot 自己说的话也算，毕竟群里不冷）。"""
-        recent = store.recent_messages(chat_id, limit=1, platform=platform, real_only=True)
+        recent = store.recent_messages(chat_id, limit=1, platform=platform, chat_type="group", real_only=True)
         return recent[-1].ts if recent else None
 
     def opened_today(self, platform: str, chat_id: str, now: float) -> int:

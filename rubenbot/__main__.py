@@ -90,7 +90,7 @@ def build_adapters(config: Config):
 
 
 def build_bot(config: Config) -> tuple[RubenBot, LLMClient, MemoryStore]:
-    store = MemoryStore(config.database_path)
+    store = MemoryStore(config.database_path, privacy_enabled=config.privacy.enabled)
     llm = LLMClient(config.llm, usage_recorder=make_usage_recorder(store))
     persona = load_persona(
         config.persona_path,
@@ -199,7 +199,7 @@ def main(argv: list[str] | None = None) -> int:
         from .web.server import run_webui_standalone
         from .web.state import WebState
 
-        store = MemoryStore(config.database_path)
+        store = MemoryStore(config.database_path, privacy_enabled=config.privacy.enabled)
         state = WebState(
             config=config,
             store=store,
