@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.6", "rubenbot[webui]"]
+dev = ["pytest>=8", "pytest-timeout>=2.3", "ruff>=0.6", "rubenbot[webui]"]
 webui = ["fastapi>=0.110", "uvicorn>=0.29"]
 
 [project.scripts]
