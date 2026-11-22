@@ -74,7 +74,7 @@ class MergedRound:
         与插件拿原始段都依赖它；``raw["has_voice"]`` 是同一信息的快速标记。
         """
         last = self.events[-1]
-        reply_to = next((e.reply_to_id for e in reversed(self.events) if e.reply_to_id), None)
+        reply = next((e for e in reversed(self.events) if e.reply_to_id), None)
         raw = dict(last.raw or {})
         raw["merged_count"] = len(self.events)
         segments = [segment for event in self.events for segment in (event.segments or [])]
@@ -90,8 +90,10 @@ class MergedRound:
             sender_id=last.sender_id,
             sender_name=last.sender_name,
             text=self.text,
-            reply_to_id=reply_to,
-            mentions_bot=any(e.mentions_bot for e in self.events),
+            reply_to_id=reply.reply_to_id if reply else None,
+            reply_sender_id=reply.reply_sender_id if reply else "",
+            mentions={uid: name for e in self.events for uid, name in e.mentions.items()},
+            mentions_bot=any(e.mentions_bot or is_reply_to_bot(e) for e in self.events),
             raw=raw,
             segments=segments,
             familiarity=tuple({tag.entity: tag for e in self.events for tag in e.familiarity}.values()),
@@ -288,6 +290,8 @@ def is_reply_to_bot(event: MessageEvent) -> bool:
     """被回复到 bot：适配器通常已置位 mentions_bot，这里看 raw 兜底。"""
     if not event.reply_to_id:
         return False
+    if event.reply_sender_id:
+        return event.reply_sender_id == "__bot__"
     raw = event.raw if isinstance(event.raw, dict) else {}
     bot_ids = raw.get("bot_message_ids")
     if bot_ids:
@@ -427,10 +431,11 @@ class DecisionEngine:
             return "mentioned"
         if is_reply_to_bot(event):
             return "reply_to_bot"
+        # 有明确收件人时，正文里的名字也可能只是话题；把这种情况留给策划判断。
+        if any(uid != "all" for uid in event.mentions) or event.reply_sender_id:
+            return None
         alias = self.match_alias(event.text)
-        if alias:
-            return f"name:{alias}"
-        return None
+        return f"name:{alias}" if alias else None
 
     # ---- 状态 ----
 
@@ -503,16 +508,7 @@ class DecisionEngine:
         头上还装死就是事故。``private`` 覆盖现在「私聊必回」的语义（本项目
         没有单独的主人账号配置；私聊主人也就是唯一能私聊到 bot 的人）。
         """
-        if event.is_private:
-            return "private"
-        if event.mentions_bot:
-            return "mentioned"
-        if is_reply_to_bot(event):
-            return "reply_to_bot"
-        alias = self.match_alias(event.text)
-        if alias:
-            return f"name:{alias}"
-        return None
+        return self.is_hard_trigger(event)
 
     def guard(
         self,

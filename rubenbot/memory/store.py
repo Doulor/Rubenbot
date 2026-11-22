@@ -159,7 +159,9 @@ CREATE TABLE IF NOT EXISTS raw_messages (
     entity_blocked INTEGER NOT NULL DEFAULT 0,
     -- 平台消息 id 与它引用的消息 id（入站/出站都记，用于引用解析与自我时间线）
     platform_msg_id TEXT NOT NULL DEFAULT '',
-    reply_to_id     TEXT NOT NULL DEFAULT ''
+    reply_to_id     TEXT NOT NULL DEFAULT '',
+    reply_sender_id TEXT NOT NULL DEFAULT '',
+    mentions        TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_raw_chat ON raw_messages(chat_id, ts);
 CREATE INDEX IF NOT EXISTS idx_raw_pending ON raw_messages(processed, sender_id);
@@ -505,6 +507,8 @@ class RawMessage:
     platform_msg_id: str = ""
     reply_to_id: str = ""
     visual_text: str = ""
+    mentions: dict[str, str] = field(default_factory=dict)
+    reply_sender_id: str = ""
 
 
 @dataclass
@@ -1778,6 +1782,8 @@ class MemoryStore:
         processed: bool = False,
         platform_msg_id: str = "",
         reply_to_id: str = "",
+        reply_sender_id: str = "",
+        mentions: dict[str, str] | None = None,
         visual_text: str = "",
     ) -> int:
         ts = time.time() if ts is None else ts
@@ -1786,8 +1792,9 @@ class MemoryStore:
             cur = self._conn.execute(
                 """
                 INSERT INTO raw_messages(platform, chat_id, chat_type, sender_id, sender_name, text, ts, processed,
-                                         visual_text, entity_blocked, platform_msg_id, reply_to_id)
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                         visual_text, entity_blocked, platform_msg_id, reply_to_id,
+                                         reply_sender_id, mentions)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     platform,
@@ -1802,6 +1809,8 @@ class MemoryStore:
                     int(blocked),
                     str(platform_msg_id or ""),
                     str(reply_to_id or ""),
+                    str(reply_sender_id or ""),
+                    json.dumps(mentions or {}, ensure_ascii=False, separators=(",", ":")),
                 ),
             )
             self._conn.commit()
@@ -1814,6 +1823,7 @@ class MemoryStore:
         *,
         since: float | None = None,
         chat_id: str | None = None,
+        chat_type: str | None = None,
     ) -> bool:
         """平台消息 id 是否已在流水里（入站去重用）；``since`` 限定时间窗。"""
         if not platform_msg_id:
@@ -1826,6 +1836,9 @@ class MemoryStore:
         if chat_id is not None:
             sql += " AND chat_id = ?"
             params.append(str(chat_id))
+        if chat_type is not None:
+            sql += " AND chat_type = ?"
+            params.append(chat_type)
         sql += " LIMIT 1"
         with self._lock:
             row = self._conn.execute(sql, params).fetchone()
@@ -1843,6 +1856,7 @@ class MemoryStore:
         platform_msg_id: str,
         *,
         chat_id: str | None = None,
+        chat_type: str | None = None,
     ) -> RawMessage | None:
         """按平台消息 id 反查流水里的一条消息（引用解析用）。"""
         if not platform_msg_id:
@@ -1852,6 +1866,9 @@ class MemoryStore:
         if chat_id is not None:
             sql += " AND chat_id = ?"
             params.append(str(chat_id))
+        if chat_type is not None:
+            sql += " AND chat_type = ?"
+            params.append(chat_type)
         sql += " ORDER BY id DESC LIMIT 1"
         with self._lock:
             row = self._conn.execute(sql, params).fetchone()
@@ -2167,7 +2184,9 @@ class MemoryStore:
             ts=row["ts"],
             platform_msg_id=row["platform_msg_id"] or "",
             reply_to_id=row["reply_to_id"] or "",
+            reply_sender_id=row["reply_sender_id"] if "reply_sender_id" in row.keys() else "",
             visual_text=row["visual_text"] if "visual_text" in row.keys() else "",
+            mentions=_decode_mentions(row["mentions"] if "mentions" in row.keys() else "{}"),
         )
 
     def active_senders(
@@ -3112,10 +3131,25 @@ def make_person_id(platform: str, platform_uid: str) -> str:
     return f"{platform}:{platform_uid}"
 
 
+def _decode_mentions(value: Any) -> dict[str, str]:
+    """把流水中的 @ 目标 JSON 安全还原；坏数据按无目标处理。"""
+    if not value:
+        return {}
+    try:
+        decoded = json.loads(value) if isinstance(value, str) else value
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    if not isinstance(decoded, dict):
+        return {}
+    return {str(key): str(name or "") for key, name in decoded.items() if key not in (None, "")}
+
+
 # 旧库升级：raw_messages 后加的列（列名 -> 列定义）
 _RAW_MESSAGE_MIGRATIONS: dict[str, str] = {
     "platform_msg_id": "TEXT NOT NULL DEFAULT ''",
     "reply_to_id": "TEXT NOT NULL DEFAULT ''",
+    "reply_sender_id": "TEXT NOT NULL DEFAULT ''",
+    "mentions": "TEXT NOT NULL DEFAULT '{}'",
     "visual_text": "TEXT NOT NULL DEFAULT ''",
     "entity_blocked": "INTEGER NOT NULL DEFAULT 0",
 }

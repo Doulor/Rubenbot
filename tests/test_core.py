@@ -165,7 +165,8 @@ def test_history_and_memory_in_context(config, store):
     llm = ScriptedLLM({"chat": ["坂本龙一啊，我也喜欢"]})
     bot, _ = make_bot(config, store, llm)
     # 先放一条历史消息
-    store.add_raw_message(platform="recording", chat_id="u1", sender_id="u2", sender_name="阿草", text="今天听歌吗")
+    store.add_raw_message(platform="recording", chat_type="private", chat_id="u1",
+                          sender_id="u1", sender_name="阿草", text="今天听歌吗")
     asyncio.run(bot.handle_event(private_event("最近在听坂本龙一")))
 
     messages = llm.chat_messages[0]

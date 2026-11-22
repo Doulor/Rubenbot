@@ -370,6 +370,8 @@ class TelegramAdapter(BaseAdapter):
             str(reply_from.get("id")) == self.bot_id
         )
 
+        reply_sender = str(reply_from.get("id") or "") if isinstance(reply_from, Mapping) else ""
+        mentions = self._mention_targets(message)
         return MessageEvent(
             platform=self.name,
             chat_type=chat_type,
@@ -379,7 +381,10 @@ class TelegramAdapter(BaseAdapter):
             chat_name=str(chat.get("title") or ""),
             text=render_segments(segments),
             reply_to_id=str(reply_to_id) if reply_to_id is not None else None,
-            mentions_bot=self._mentions_bot(message) or reply_to_bot,
+            platform_msg_id=str(message["message_id"]) if "message_id" in message else None,
+            reply_sender_id="__bot__" if reply_to_bot else reply_sender,
+            mentions=mentions,
+            mentions_bot="__bot__" in mentions or reply_to_bot,
             raw={
                 **dict(message),
                 "reply_to_bot": reply_to_bot,
@@ -388,28 +393,30 @@ class TelegramAdapter(BaseAdapter):
             segments=segments,
         )
 
-    def _mentions_bot(self, message: Mapping[str, Any]) -> bool:
-        """文本 / 图片说明的 entities 里是否 @ 到 bot，或 text_mention 指向 bot。"""
+    def _mention_targets(self, message: Mapping[str, Any]) -> dict[str, str]:
+        """文本 / 图片说明里的结构化提及；普通 mention 只给用户名，不猜账号。"""
         text = message.get("text")
         entities = message.get("entities")
         if not isinstance(text, str):
             text = message.get("caption")
             entities = message.get("caption_entities")
+        targets = {}
         if not isinstance(text, str) or not isinstance(entities, list):
-            return False
+            return targets
         for entity in entities:
             if not isinstance(entity, Mapping):
                 continue
             kind = entity.get("type")
             if kind == "text_mention":
                 user = entity.get("user")
-                if self.bot_id and isinstance(user, Mapping) and str(user.get("id")) == self.bot_id:
-                    return True
-            elif kind == "mention" and self.bot_username:
-                fragment = _entity_text(text, entity.get("offset"), entity.get("length"))
-                if fragment and fragment.lstrip("@").lower() == self.bot_username.lower():
-                    return True
-        return False
+                if isinstance(user, Mapping) and (uid := str(user.get("id") or "")):
+                    targets["__bot__" if uid == self.bot_id else uid] = _sender_name(user)
+            elif kind == "mention":
+                handle = _entity_text(text, entity.get("offset"), entity.get("length")).strip()
+                if handle.startswith("@"):
+                    own = self.bot_username and handle[1:].lower() == self.bot_username.lower()
+                    targets["__bot__" if own else handle] = handle
+        return targets
 
     async def _sticker_segment(self, sticker: Mapping[str, Any]) -> Segment | None:
         """Telegram 原生 sticker -> 统一 sticker 段，并保留平台引用。"""

@@ -373,7 +373,8 @@ def format_scene(event: MessageEvent, display: str) -> str:
         )
     return (
         f"当前是群聊：群里有很多人，这条消息是{display}说的。"
-        "你的回复群里所有人都看得见。"
+        "你的回复群里所有人都看得见。甲把问题递给乙时，轮到乙来答；"
+        "说话对象不清楚时，用群友的名字区分人。"
     )
 
 
@@ -1474,6 +1475,18 @@ class RubenBot:
         local = (event.is_group and bool(event.sender_id) and not event.sender_id.startswith("__")
                  and self.store.get_privacy_mode(person_id) == "normal")
         visual = "\n".join(filter(None, map(segment_description, event.segments))) if local else ""
+        if event.reply_to_id and not event.reply_sender_id:
+            target = self.store.message_by_platform_id(
+                event.platform, event.reply_to_id, chat_id=event.chat_id, chat_type=event.chat_type,
+            )
+            if target:
+                event.reply_sender_id = target.sender_id
+        # 只有当前群缓存过的群名片可以补足无显示名的 @；仍以原账号为键。
+        for uid, name in event.mentions.items():
+            if event.is_group and not name and uid not in {BOT_SENDER_ID, "all"}:
+                member = self.store.get_identity(event.platform, uid, group_id=event.chat_id)
+                if member:
+                    event.mentions[uid] = member["name"]
         raw_id = self.store.add_raw_message(
             platform=event.platform,
             chat_id=event.chat_id,
@@ -1485,6 +1498,8 @@ class RubenBot:
             ts=now,
             platform_msg_id=event.platform_msg_id or "",
             reply_to_id=event.reply_to_id or "",
+            reply_sender_id=event.reply_sender_id,
+            mentions=event.mentions,
         )
         self._last_activity[f"{event.platform}:{event.chat_id}"] = now
         self.last_message_at = now
@@ -1510,7 +1525,8 @@ class RubenBot:
             return False
         try:
             return self.store.platform_message_exists(
-                event.platform, event.platform_msg_id, since=now - ttl
+                event.platform, event.platform_msg_id, since=now - ttl,
+                chat_id=event.chat_id, chat_type=event.chat_type,
             )
         except Exception as exc:  # noqa: BLE001 - 去重失败宁可放行，不能丢消息
             logger.warning("入站去重检查失败：%s", exc)
@@ -1805,12 +1821,28 @@ class RubenBot:
             return text
         return text[:limit].rstrip() + "…"
 
+    @staticmethod
+    def _target_name(uid: str, name: str = "") -> str:
+        if uid == BOT_SENDER_ID:
+            return "我"
+        if uid == "all":
+            return "全体成员"
+        return f"{name}（{uid}）" if name and name != uid else uid
+
+    def _direction(self, msg: RawMessage | MessageEvent) -> str:
+        sender = self._target_name(msg.sender_id, msg.sender_name)
+        mentions = "、".join(self._target_name(uid, name) for uid, name in msg.mentions.items())
+        reply = self._target_name(msg.reply_sender_id) or ("未知" if msg.reply_to_id else "无")
+        return f"发言人：{sender}；@ 目标：{mentions or '无'}；回复对象：{reply}"
+
     def _quote_suffix(self, msg, index: dict[str, object]) -> str:
         """被引用消息的附注：查得到就带昵称+截断正文，查不到只说明引用了消息。"""
         if not msg.reply_to_id:
             return ""
         target = index.get(msg.reply_to_id)
         if target is None:
+            if msg.reply_sender_id:
+                return f"（引用 [{self._target_name(msg.reply_sender_id)}] 的消息）"
             return "（引用了一条消息）"
         name = "我" if target.sender_id == BOT_SENDER_ID else (target.sender_name or target.sender_id)
         snippet = self._truncate(target.text, self.QUOTE_SNIPPET_CHARS)
@@ -1839,6 +1871,9 @@ class RubenBot:
             else:
                 name = msg.sender_name or msg.sender_id
                 content = f"[{self._format_clock(msg.ts)}] [{name}] {msg.text}"
+            if msg.mentions:
+                targets = "、".join(self._target_name(uid, name) for uid, name in msg.mentions.items())
+                content += f"（@ 目标：{targets}）"
             content += self._quote_suffix(msg, index)
             rendered.append({"role": "assistant" if is_bot else "user", "content": content})
         return rendered
@@ -1849,7 +1884,7 @@ class RubenBot:
             return ""
         try:
             target = self.store.message_by_platform_id(
-                event.platform, event.reply_to_id, chat_id=event.chat_id
+                event.platform, event.reply_to_id, chat_id=event.chat_id, chat_type=event.chat_type,
             )
         except Exception as exc:  # noqa: BLE001 - 查引用失败不影响回复
             logger.warning("查询被引用消息失败：%s", exc)
@@ -1943,6 +1978,7 @@ class RubenBot:
             limit=self.config.chat.history_size,
             since=since,
             platform=event.platform,
+            chat_type=event.chat_type,
             real_only=True,
             after_id=covered_until,
         )
@@ -2160,7 +2196,13 @@ class RubenBot:
                  f"\n本话题已发言：{count} 条（最近对话窗口内，间隔 {TOPIC_GAP_SECONDS // 60} 分钟分界）"
                  f"\n距上次发言：{elapsed}\n最近 5 条自己的发言（原文，按时间先后）：{texts}")
         feeling = self.states.planner_text(event.platform, event.chat_type, event.chat_id, now=now)
-        return f"{block}\n{feeling}" if feeling else block
+        if feeling:
+            block += "\n" + feeling
+        if event.is_group:
+            directions = [self._direction(msg) for msg in window[-5:]]
+            block = ("【最近指向·按发言先后】\n" + "\n".join(directions)
+                     + "\n本轮合并指向：" + self._direction(event) + "\n" + block)
+        return block
 
     async def plan_expression(
         self,
@@ -2202,7 +2244,6 @@ class RubenBot:
                     for t in event.familiarity]
             local_facts = ("【本群实体账·摄入时】" + json.dumps(tags, ensure_ascii=False)
                            + f"\n本轮原话：{json.dumps(event.text, ensure_ascii=False)}；"
-                           + ("有人 @ 你。" if event.mentions_bot else "无 @ 提及。")
                            + "这句话里，哪部分是在问通用的做法，哪部分要靠本群的近况才接得上？\n")
         prompt = f"{GUIDANCE_TASK_PROMPT}\n本轮已掷档：{band}。\n\n{local_facts}{state}"
         request = [*messages, {"role": "user", "content": prompt}]

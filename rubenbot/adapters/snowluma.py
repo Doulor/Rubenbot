@@ -37,6 +37,7 @@ from .base import (
     Segment,
     as_segment,
     render_segments,
+    segment_mentions,
     sticker_native_ref,
 )
 from .platform import KIND_NOTICE, KIND_REQUEST, PlatformEvent
@@ -46,8 +47,6 @@ logger = logging.getLogger(__name__)
 
 _RECONNECT_MIN = 1.0
 _RECONNECT_MAX = 60.0
-# 字符串形式消息里的 CQ @ 码（用于 mentions_bot 判断）
-_CQ_AT_RE = re.compile(r"\[CQ:at,qq=([^,\]]+)[^\]]*\]")
 
 
 class SnowLumaAdapter(BaseAdapter):
@@ -212,6 +211,7 @@ class SnowLumaAdapter(BaseAdapter):
             return
         if event.reply_to_id and event.reply_to_id in self._bot_message_ids:
             event.mentions_bot = True
+            event.reply_sender_id = "__bot__"
         if self._on_event is not None:
             await self._on_event(event)
 
@@ -678,7 +678,7 @@ _SEGMENT_FIELDS: dict[str, tuple[str, ...]] = {
     "text": ("text",),
     "image": ("file", "url", "summary"),
     "at": ("qq", "name"),
-    "reply": ("id",),
+    "reply": ("id", "user_id", "qq", "sender_id"),
     "face": ("id",),
     "record": ("file", "url"),
     "video": ("file", "url"),
@@ -730,7 +730,7 @@ def _cq_string_to_segments(message: str) -> list[Segment]:
     """字符串形式（CQ 码）消息 -> 消息段列表。
 
     字符串形式只在没有消息段数组时出现（部分实现）；这里仅识别 ``at``，
-    其余 CQ 码（图片、表情、红包等）按历史行为剔除，避免 ``[CQ:...]``
+    以及指明引用关系的 ``reply``，其余 CQ 码按历史行为剔除，避免 ``[CQ:...]``
     原文进入模型上下文。
     """
     segments: list[Segment] = []
@@ -739,8 +739,9 @@ def _cq_string_to_segments(message: str) -> list[Segment]:
         if match.start() > pos:
             segments.append(Segment.text(message[pos : match.start()]))
         params = {key: value for key, value in _CQ_PARAM_RE.findall(match.group("params") or "")}
-        if match.group("type").lower() == "at" and params.get("qq"):
-            segments.append(Segment.at(params["qq"]))
+        kind = match.group("type").lower()
+        if kind in ("at", "reply"):
+            segments.append(Segment(kind, {k: params[k] for k in _SEGMENT_FIELDS[kind] if k in params}))
         pos = match.end()
     if pos < len(message):
         segments.append(Segment.text(message[pos:]))
@@ -754,38 +755,6 @@ def onebot_to_segments(message: Any) -> str:
         # 字符串形式按旧行为归一空白
         text = re.sub(r"\s+", " ", text)
     return text.strip()
-
-
-def _extract_reply_id(message: Any) -> str | None:
-    """被引用消息的 id：消息段数组里的 reply 段，或字符串形式里的 CQ:reply。"""
-    if isinstance(message, list):
-        for item in message:
-            if isinstance(item, dict) and item.get("type") == "reply":
-                rid = (item.get("data") or {}).get("id")
-                if rid is not None:
-                    return str(rid)
-    elif isinstance(message, str):
-        match = _CQ_CODE_RE.search(message)
-        while match is not None:
-            if match.group("type").lower() == "reply":
-                params = {key: value for key, value in _CQ_PARAM_RE.findall(match.group("params") or "")}
-                if params.get("id"):
-                    return str(params["id"])
-            match = _CQ_CODE_RE.search(message, match.end())
-    return None
-
-
-def _mentions_self(message: Any, self_id: str | None) -> bool:
-    if self_id is None:
-        return False
-    if isinstance(message, list):
-        for item in message:
-            if isinstance(item, dict) and item.get("type") == "at":
-                if str((item.get("data") or {}).get("qq")) == self_id:
-                    return True
-    elif isinstance(message, str):
-        return self_id in _CQ_AT_RE.findall(message)
-    return False
 
 
 def parse_onebot_platform_event(
@@ -982,10 +951,14 @@ def parse_onebot_event(data: dict[str, Any], *, self_id: str | None = None) -> M
     # 注意：``reply_id`` 是这条消息自身的 id（变量名沿用旧实现）；被引用的
     # 目标 id 在 ``reply_to`` 里，两个都要带出去。
     reply_id = str(data.get("message_id")) if data.get("message_id") is not None else None
-    reply_to = _extract_reply_id(message)
-    mentions_bot = _mentions_self(message, self_id) or (
-        self_id is not None and _mentions_self(data.get("raw_message"), self_id)
-    )
+    raw_message = data.get("raw_message")
+    fallback = onebot_message_segments(raw_message) if isinstance(raw_message, str) and raw_message != message else []
+    mentions = segment_mentions(fallback, self_id) | segment_mentions(segments, self_id)
+    reply = next((s.data for s in (*segments, *fallback) if s.type == "reply" and s.data.get("id")), {})
+    reply_to = reply.get("id")
+    reply_sender = reply.get("user_id") or reply.get("qq") or reply.get("sender_id") or ""
+    if reply_sender and reply_sender == self_id:
+        reply_sender = "__bot__"
 
     return MessageEvent(
         platform="snowluma",
@@ -995,7 +968,9 @@ def parse_onebot_event(data: dict[str, Any], *, self_id: str | None = None) -> M
         sender_name=sender_name,
         text=text,
         reply_to_id=reply_to,
-        mentions_bot=mentions_bot,
+        mentions=mentions,
+        reply_sender_id=reply_sender,
+        mentions_bot="__bot__" in mentions or reply_sender == "__bot__",
         raw={**data, "_reply_message_id": reply_id},
         segments=segments,
         platform_msg_id=reply_id,
