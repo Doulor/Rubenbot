@@ -13,7 +13,6 @@ DATA = Path(__file__).resolve().parents[1] / "data"
 
 
 def test_model_discussion_and_owner_mention(config, store):
-    config.planner.planner_gate = True
     config.planner.identity_triggers = []  # 关闭旧的关键词注入，以免它兜底
     config.llm.models["chat"] = "offline-backend"
     config.llm.api_key = "test-key-not-for-the-planner"

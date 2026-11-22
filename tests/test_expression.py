@@ -25,11 +25,11 @@ def test_distribution(mentioned, casual, expected):
 
 @pytest.mark.parametrize('increment', ['', '无', None])
 def test_no_increment_returns_control_without_generation(config, store, increment):
-    llm = ScriptedLLM({'fast': [json.dumps({'intent': '接梗', 'increment': increment})]})
+    llm = ScriptedLLM({'fast': [json.dumps({'basis':'settled', 'intent': '接梗', 'increment': increment})]})
     bot = RubenBot(config, store, llm, Persona('R', '人设'))
     adapter = RecordingAdapter()
     bot.register_adapter(adapter)
-    asyncio.run(bot.handle_event(MessageEvent('recording', 'private', '1', '1', '友', '今天下雨')))
+    asyncio.run(bot.handle_event(MessageEvent('recording', 'group', '1', '1', '友', '今天下雨')))
     assert not llm.chat_messages and not adapter.sent
     log, = store.list_decision_logs()
     assert not log['should_reply'] and log['factors']['expression_decision']['intent'] == '沉默'
@@ -58,15 +58,14 @@ def test_extract_last_three_bot_turns_before_limit_and_scope(config, store):
     assert all(t in prompt for t in [*saved['avoid_repetition'], saved['length_band'], plan['increment']])
 
 
-def test_fragment_shortcut_skips_only_planner(config, store):
-    config.decision.base = 1.5
-    llm = ScriptedLLM()
+def test_fragment_length_still_requires_planner(config, store):
+    llm = ScriptedLLM({"fast": ['{"basis":"settled","intent":"短附和"}']})
     bot = RubenBot(config, store, llm, Persona('R', '人设'), rng=Mock(random=lambda: 0.0))
     bot.register_adapter(RecordingAdapter())
     asyncio.run(bot.handle_event(MessageEvent('recording', 'group', 'g', 'u', '友', '看这张图')))
-    assert [c['role'] for c in llm.calls] == ['chat']
+    assert [c['role'] for c in llm.calls] == ['fast', 'chat']
     plan = store.list_decision_logs()[0]['factors']['expression_decision']
-    assert plan['source'] == 'fragment' and plan['length_band'] == '碎片'
+    assert plan['source'] == 'fast' and plan['length_band'] == '碎片'
 
 
 def test_oversize_and_unstructured_plans_do_not_become_chat_instructions():

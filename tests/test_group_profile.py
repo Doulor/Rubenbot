@@ -44,7 +44,6 @@ def make_config(**overrides) -> Config:
     cfg.reply.segment_delay_enabled = False
     cfg.decision.merge_window_seconds = 0
     cfg.decision.hard_merge_window_seconds = 0
-    cfg.planner.planner_gate = False
     cfg.memory.group_profile.min_messages = overrides.pop("min_messages", 3)
     cfg.memory.group_profile.update_interval_hours = overrides.pop("interval_hours", 24.0)
     cfg.memory.group_profile.max_chars = overrides.pop("max_chars", 300)
@@ -168,7 +167,6 @@ def test_private_chat_never_injects_group_profile(store, config):
 def test_core_injects_profile_in_planner_stage(store):
     """策划步与生成步共用同一份系统提示，群定位段不被阶段切换丢掉。"""
     config = make_config()
-    config.planner.planner_gate = True
     store.set_group_manual_note("recording", "g1", "工作群，别开玩笑")
     bot, _, _ = make_bot(config, store)
     planner = asyncio.run(bot.build_context(group_event(), stage="planner"))[0]["content"]
@@ -514,7 +512,6 @@ def test_profile_api_infers_platform_when_unique(config, store, tmp_path):
 
 
 def test_profile_save_takes_effect_immediately(config, store, tmp_path):
-    config.planner.planner_gate = False
     store.add_raw_message(
         platform="recording", chat_id="g1", chat_type="group",
         sender_id="u1", sender_name="阿花", text="hi", ts=100.0,

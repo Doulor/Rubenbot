@@ -1,8 +1,4 @@
-"""人设五文件拆分 + 开口并入策划步：加载、组装、裁定、护栏、反重复。
-
-这里的用例显式打开 ``persona.planner_gate``（新路径）；旧路径的回滚覆盖
-在各自的旧测试里（conftest 默认关掉新路径）。
-"""
+"""人设五文件拆分 + 开口并入策划步：加载、组装、裁定、护栏、反重复。"""
 
 from __future__ import annotations
 
@@ -89,12 +85,10 @@ def planner_config() -> Config:
     config.decision.hard_merge_window_seconds = 0
     # 只测裁定本身，不让查看掷点随机跳过本用例。
     config.attention.talk_value = 1.0
-    config.planner.planner_gate = True
     return config
 
 
 def make_bot(config: Config, store, persona: Persona, llm=None) -> tuple[RubenBot, RecordingAdapter]:
-    config.planner.planner_gate = True
     bot = RubenBot(config, store, llm or ScriptedLLM(), persona)
     adapter = RecordingAdapter()
     bot.register_adapter(adapter)
@@ -137,16 +131,14 @@ def test_stage_assembly_differs(tmp_path):
     planner = persona.system_prompt(stage="planner")
     generator = persona.system_prompt(stage="generator")
     single = persona.system_prompt(stage="single")
-    legacy = persona.system_prompt(stage="legacy")
 
     # 策划步只带常驻人格 + 行为风格；生成步只带常驻人格 + 回复风格
     assert PARTS["persona"].strip() in planner and PARTS["behavior"].strip() in planner
     assert PARTS["reply_style"].strip() not in planner
     assert PARTS["persona"].strip() in generator and PARTS["reply_style"].strip() in generator
     assert PARTS["behavior"].strip() not in generator
-    # 单段生成三份都带；旧路径只剩人格正文
+    # 单段生成三份都带
     assert all(PARTS[k].strip() in single for k in ("persona", "behavior", "reply_style"))
-    assert legacy.strip() == PARTS["persona"].strip()
     # identity / owner 平时不带
     assert PARTS["identity"].strip() not in planner
     assert PARTS["owner"].strip() not in generator
@@ -350,15 +342,14 @@ def test_two_stage_persona_swap(config, store, tmp_path):
     assert stage1[1:-1] == stage2[1:-1]
 
 
-def test_legacy_persona_prompt_is_untouched(config, store):
-    """回滚开关关掉时，人格组装回到整份 SOUL。"""
-    config.planner.planner_gate = False
-    bot = RubenBot(config, store, ScriptedLLM(), Persona("Ruben", "你是 Ruben，旧路径。"))
+def test_single_file_persona_is_preserved_in_context(config, store):
+    """单文件 SOUL 在策划上下文中仍保留。"""
+    bot = RubenBot(config, store, ScriptedLLM(), Persona("Ruben", "你是 Ruben，单文件人格。"))
     adapter = RecordingAdapter()
     bot.register_adapter(adapter)
     event = group_event()
     messages = asyncio.run(bot.build_context(event))
-    assert messages[0]["content"].startswith("你是 Ruben，旧路径。")
+    assert messages[0]["content"].startswith("你是 Ruben，单文件人格。")
 
 
 # ----------------------------------------------------------------------
@@ -368,7 +359,6 @@ def test_legacy_persona_prompt_is_untouched(config, store):
 
 def engine(**overrides) -> DecisionEngine:
     config = DecisionConfig(**overrides)
-    config.planner_gate = True
     return DecisionEngine(config, aliases=["Ruben"])
 
 
@@ -420,8 +410,6 @@ def test_guard_proactive_window_cap():
 
 def test_decide_new_path_does_not_score(config, store, tmp_path):
     """新路径下普通群消息不再看阈值，直接放行给策划步（0 次额外调用）。"""
-    config.decision.threshold = 99.0
-    config.decision.base = 0.0
     bot, _ = make_bot(config, store, multi_persona(tmp_path))
     decision = bot.decide(group_event(), now=1000.0)
     assert decision.should_reply and decision.reason == "planned"
@@ -442,24 +430,20 @@ def test_decide_guard_is_cheap(config, store, tmp_path):
     assert store.list_decision_logs()[0]["factors"]["guard"] == "min_interval"
 
 
-def test_planner_gate_false_keeps_legacy_scoring(config, store):
-    config.decision.base = 0.0
-    config.decision.threshold = 0.85
-    config.decision.threshold_noise = 0.0
+def test_other_chat_reply_does_not_block_planner(config, store):
     bot = RubenBot(config, store, ScriptedLLM(), Persona("Ruben", "你是 Ruben。"))
+    bot.decision_engine.note_bot_reply("recording:g2", 999.0, proactive=True)
     decision = bot.decide(group_event(), now=1000.0)
-    assert not decision.should_reply and decision.reason == "below_threshold"
-    assert decision.factors is not None and decision.factors.base == 0.0
+    assert decision.should_reply and decision.reason == "planned"
 
 
-def test_legacy_path_end_to_end_still_works(config, store):
-    config.decision.base = 0.0
+def test_missing_basis_suppresses_group_but_not_private(config, store):
     llm = ScriptedLLM({"chat": ["在的"]})
     bot = RubenBot(config, store, llm, Persona("Ruben", "你是 Ruben。"))
     adapter = RecordingAdapter()
     bot.register_adapter(adapter)
     asyncio.run(bot.handle_event(group_event()))
-    assert adapter.sent == []
+    assert adapter.sent == [] and [call["task"] for call in llm.calls] == ["gen_stage1"]
     asyncio.run(bot.handle_event(private_event()))
     assert adapter.texts == ["在的"]
 
@@ -545,7 +529,6 @@ def test_planner_config_parsing():
                 "path": "data/SOUL.md",
                 "dir": "data/persona",
                 "planner": {
-                    "planner_gate": False,
                     "identity_triggers": ["", "机器人", 3],
                     "identity_window": 3,
                 },
@@ -554,13 +537,9 @@ def test_planner_config_parsing():
         }
     )
     assert config.persona_dir == "data/persona"
-    assert config.planner_gate is False
     assert config.planner.identity_triggers == ["机器人"]
     assert config.planner.identity_window == 3
     assert config.decision.min_reply_interval_seconds == 5
-    # 默认打开，写错类型回落默认
-    assert Config().planner_gate is True
-    assert Config.from_dict({"persona": {"planner": {"planner_gate": "no"}}}).planner_gate is True
     assert Config.from_dict({"persona": {"planner": {"identity_window": "x"}}}).planner.identity_window == 6
 
 
@@ -572,16 +551,15 @@ def test_persona_directory_defaults_beside_soul():
     assert config.persona_directory == str(Path("custom/persona"))
 
 
-def test_hot_apply_switches_gate_and_interval(config, store):
-    config.planner.planner_gate = False
+def test_hot_apply_changes_interval_and_keeps_reply_time(config, store):
     config.decision.min_reply_interval_seconds = 30
     bot = RubenBot(config, store, ScriptedLLM(), Persona("Ruben", "你是 Ruben。"))
     assert bot.decision_engine.min_reply_interval() == 30
+    bot.decision_engine.note_bot_reply("recording:g1", 100.0)
     new_config = Config()
-    new_config.planner.planner_gate = True
     new_config.decision.min_reply_interval_seconds = 7
     bot.apply_config(new_config, rebuild_llm=False)
-    assert bot.config.planner_gate is True
+    assert bot.decision_engine.last_reply_at("recording:g1") == 100.0
     assert bot.decision_engine.min_reply_interval() == 7
 
 

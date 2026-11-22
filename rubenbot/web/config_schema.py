@@ -9,7 +9,7 @@ WebUI 用与 ``config.yaml`` 同构的嵌套字典编辑配置，这个模块负
   :class:`ConfigValidationError`，里面带着 ``fields`` 列表，API 直接以 422
   返回，不会写文件。
 - :func:`merge_config`：把规范字典合并进现有 YAML，保留未知键；
-  ``decision.groups`` 和 ``adapters`` 这类整体语义的段按表单为准替换/更新。
+  ``llm.models`` 和 ``adapters`` 这类整体语义的段按表单为准替换/更新。
 
 密钥字段（``llm.api_key``、``search.tavily.api_key`` / ``search.deepseek.api_key``、
 ``voice.stt_api_key`` / ``voice.tts_api_key``、``adapters.snowluma.access_token``、
@@ -57,7 +57,6 @@ SECRET_PATHS = (
 # 模型池与策略是「整张表」语义：表单提交的是完整视图，删掉的角色必须真的
 # 从 YAML 里消失（空字典也替换），不能沿用旧值。
 _REPLACE_PATHS = {
-    ("decision", "groups"),
     ("llm", "models"),
     ("llm", "model_strategies"),
 }
@@ -81,8 +80,8 @@ SETTINGS_GROUPS: tuple[dict[str, Any], ...] = (
         "sub": "bot 本体的行为参数：人设、聊天、表达、记忆、情绪、语音与表情",
         "pages": (
             {"id": "persona", "title": "人设", "sub": "编辑人格文件，保存即热生效"},
-            {"id": "chat", "title": "聊天", "sub": "上下文、回复意愿、动量与冷却"},
-            {"id": "expression", "title": "表达", "sub": "群聊查看概率、两段式生成与长回复拆条"},
+            {"id": "chat", "title": "聊天", "sub": "上下文、合批与开口护栏"},
+            {"id": "expression", "title": "表达", "sub": "群聊查看概率、回复示例与长回复拆条"},
             {"id": "memory", "title": "记忆设置", "sub": "抽取、归纳、检索与滚动摘要"},
             {"id": "emotion", "title": "情绪", "sub": "好感度与心情规则"},
             {"id": "voice", "title": "语音", "sub": "语音转写（STT）与语音回复（TTS）"},
@@ -128,11 +127,10 @@ SETTINGS_GROUPS: tuple[dict[str, Any], ...] = (
 _SETTINGS_PAGE_RULES: tuple[tuple[str, str], ...] = (
     # ---- 机器人 ----
     # 表达：生成策略 + 回复形态（拆条 / 打字节奏 / 动作描写）
-    ("generation", "expression"),
     ("reply", "expression"),
     ("attention", "expression"),
     ("chat.strip_action_parens", "expression"),
-    # 聊天：上下文、入站去重、说话时机（回复意愿 / 动量 / 冷却 / 每群覆盖）
+    # 聊天：上下文、入站去重、说话时机（合批与开口护栏）
     ("chat", "chat"),
     ("decision", "chat"),
     ("memory", "memory"),
@@ -287,7 +285,6 @@ def structured_config(config: Config) -> dict[str, Any]:
         "reply": asdict(config.reply),
         "attention": asdict(config.attention),
         "decision": decision,
-        "generation": asdict(config.generation),
         "reminder": asdict(config.reminder),
         "proactive": {
             **asdict(config.proactive),
@@ -635,6 +632,12 @@ def _validate_memory(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
         "consolidate_max_memories": 1,
         "consolidate_remove_min": 1,
         "raw_keep_per_chat": 1,
+        "distill_new_threshold": 1,
+        "distill_max_events": 1,
+        "distill_max_facts": 1,
+        "status_expiry_min_days": 1,
+        "status_expiry_max_days": 1,
+        "self_event_max_chars": 1,
         # 记忆 v2 读取侧
         "index_max_members": 1,
         "index_identity_chars": 8,
@@ -654,6 +657,10 @@ def _validate_memory(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
         "dedupe_threshold": (0, 1),
         "consolidate_interval_hours": (0.1, None),
         "consolidate_remove_ratio": (0, 1),
+        "distill_interval_hours": (0.1, None),
+        "timeline_compress_after_days": (0.1, None),
+        "timeline_prune_after_days": (0.1, None),
+        "timeline_prune_keep_salience": (0, 1),
         # 记忆 v2 读取侧
         "index_active_days": (0.1, None),
         "index_ttl_seconds": (0, None),
@@ -875,7 +882,11 @@ def _validate_chat(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
             number = v.number(section[key], f"chat.{key}", minimum=minimum, integer=True)
             if number is not None:
                 out[key] = int(number)
-    for key in ("history_ttl_hours",):
+    if "strip_action_parens" in section:
+        flag = v.boolean(section["strip_action_parens"], "chat.strip_action_parens")
+        if flag is not None:
+            out["strip_action_parens"] = flag
+    for key in ("history_ttl_hours", "dedupe_ttl_seconds"):
         if key in section:
             number = v.number(section[key], f"chat.{key}", minimum=0)
             if number is not None:
@@ -923,24 +934,6 @@ def _validate_reply(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
     return out
 
 
-def _validate_generation(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
-    out: dict[str, Any] = {}
-    two_stage = section.get("two_stage")
-    if two_stage is None:
-        return out
-    if not isinstance(two_stage, dict):
-        v.fail("generation.two_stage", "应为对象")
-        return out
-    entry: dict[str, Any] = {}
-    if "enabled" in two_stage:
-        flag = v.boolean(two_stage["enabled"], "generation.two_stage.enabled")
-        if flag is not None:
-            entry["enabled"] = flag
-    if entry:
-        out["two_stage"] = entry
-    return out
-
-
 # emotion 段的数值字段 → (下限, 上限)；全都是可调的规则幅度
 _EMOTION_NUMBERS: dict[str, tuple[float | None, float | None]] = {
     "affinity_baseline": (0, 100),
@@ -963,11 +956,7 @@ _EMOTION_NUMBERS: dict[str, tuple[float | None, float | None]] = {
 
 
 def _validate_emotion(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
-    """情绪与好感度：开关、幅度、阈值微调表。
-
-    幅度写错只报字段错误，不挡启动；``threshold_adjust`` 只收「心情 → 数字」，
-    其它类型的值整项忽略。
-    """
+    """校验情绪与好感度的开关和规则幅度。"""
     out: dict[str, Any] = {}
     if "enabled" in section:
         flag = v.boolean(section["enabled"], "emotion.enabled")
@@ -992,20 +981,6 @@ def _validate_emotion(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
             number = v.number(section[key], field, minimum=0, integer=True)
             if number is not None:
                 out[key] = int(number)
-    adjust = section.get("threshold_adjust")
-    if adjust is not None:
-        if not isinstance(adjust, dict):
-            v.fail("emotion.threshold_adjust", "应为「心情 → 数字」的对象")
-        else:
-            table: dict[str, float] = {}
-            for raw_mood, raw_value in adjust.items():
-                mood = str(raw_mood).strip()
-                if not mood:
-                    continue
-                number = v.number(raw_value, f"emotion.threshold_adjust.{mood}", minimum=-1, maximum=1)
-                if number is not None:
-                    table[mood] = float(number)
-            out["threshold_adjust"] = table
     return out
 
 
@@ -1014,19 +989,8 @@ def _validate_decision(section: dict[str, Any], v: _Validator) -> dict[str, Any]
     number_fields = {
         "merge_window_seconds": (0, None),
         "hard_merge_window_seconds": (0, None),
-        "base": (0, 1),
-        "threshold": (0, 1),
-        "threshold_noise": (0, 1),
-        "threshold_noise_band": (0, 1),
-        "momentum_bonus": (0, 10),
-        "momentum_half_life_seconds": (1, None),
-        "relevance_bonus": (0, 10),
-        "relevance_scale": (0.1, None),
-        "ratio_threshold": (0, 1),
-        "ratio_silence": (0, 1),
-        "ratio_penalty": (0, 10),
-        "cooldown_seconds": (0, None),
-        "cooldown_penalty": (0, 10),
+        "batch_max_seconds": (0, None),
+        "urgent_seconds": (0, None),
         "min_reply_interval_seconds": (0, None),
         "refractory_seconds": (0, None),
         "proactive_window_seconds": (0, None),
@@ -1036,7 +1000,7 @@ def _validate_decision(section: dict[str, Any], v: _Validator) -> dict[str, Any]
             number = v.number(section[key], f"decision.{key}", minimum=minimum, maximum=maximum)
             if number is not None:
                 out[key] = float(number)
-    for key in ("exclude_bot_momentum", "refractory_enabled", "proactive_window_enabled"):
+    for key in ("refractory_enabled", "proactive_window_enabled"):
         if key in section:
             value = v.boolean(section[key], f"decision.{key}")
             if value is not None:
@@ -1045,10 +1009,6 @@ def _validate_decision(section: dict[str, Any], v: _Validator) -> dict[str, Any]
         number = v.number(section["proactive_window_limit"], "decision.proactive_window_limit", minimum=0, integer=True)
         if number is not None:
             out["proactive_window_limit"] = int(number)
-    if "ratio_window" in section:
-        number = v.number(section["ratio_window"], "decision.ratio_window", minimum=1, integer=True)
-        if number is not None:
-            out["ratio_window"] = int(number)
     if "aliases" in section:
         aliases = v.string_list(section["aliases"], "decision.aliases")
         if aliases is not None:
@@ -1057,53 +1017,7 @@ def _validate_decision(section: dict[str, Any], v: _Validator) -> dict[str, Any]
         value = v.text(section["veto_marker"], "decision.veto_marker", max_len=40)
         if value is not None:
             out["veto_marker"] = value
-    if "groups" in section:
-        groups = _validate_groups(section["groups"], v)
-        if groups is not None:
-            out["groups"] = groups
     return out
-
-
-def _validate_groups(value: Any, v: _Validator) -> dict[str, Any] | None:
-    if not isinstance(value, dict):
-        v.fail("decision.groups", "应为「群号 → 配置」的对象")
-        return None
-    result: dict[str, Any] = {}
-    for raw_id, options in value.items():
-        chat_id = str(raw_id).strip()
-        if not chat_id:
-            v.fail("decision.groups", "群号不能为空")
-            continue
-        field = f"decision.groups.{chat_id}"
-        if not isinstance(options, dict):
-            v.fail(field, "配置应为对象")
-            continue
-        entry: dict[str, Any] = {}
-        if "activity_multiplier" in options:
-            number = v.number(
-                options["activity_multiplier"], f"{field}.activity_multiplier", minimum=0, maximum=10
-            )
-            if number is not None:
-                entry["activity_multiplier"] = float(number)
-        else:
-            entry["activity_multiplier"] = 1.0
-        base = options.get("base")
-        if base in (None, ""):
-            entry["base"] = None
-        else:
-            number = v.number(base, f"{field}.base", minimum=0, maximum=1)
-            if number is not None:
-                entry["base"] = float(number)
-        quiet = v.string_list(options.get("quiet_hours"), f"{field}.quiet_hours")
-        if quiet is not None:
-            if quiet and not parse_quiet_hours(quiet):
-                v.fail(f"{field}.quiet_hours", "格式应为 HH:MM-HH:MM，例如 23:00-07:30")
-            elif len(parse_quiet_hours(quiet)) != len(quiet):
-                v.fail(f"{field}.quiet_hours", "有格式不对或起止相同的时段")
-            else:
-                entry["quiet_hours"] = quiet
-        result[chat_id] = entry
-    return result
 
 
 def _validate_reminder(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
@@ -1398,9 +1312,6 @@ def validate_structured(payload: dict[str, Any]) -> dict[str, Any]:
     decision = _section(payload, "decision", v)
     if decision is not None:
         update["decision"] = _validate_decision(decision, v)
-    generation = _section(payload, "generation", v)
-    if generation is not None:
-        update["generation"] = _validate_generation(generation, v)
     reminder = _section(payload, "reminder", v)
     if reminder is not None:
         update["reminder"] = _validate_reminder(reminder, v)

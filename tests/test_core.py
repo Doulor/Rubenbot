@@ -69,24 +69,21 @@ def test_mention_always_replies(config, store):
     assert bot.should_reply(group_event(mentions=True)).should_reply
 
 
-def test_group_base_alone_not_enough(config, store):
-    """只有基础值（默认 0.10）不够过阈值，不会随机插话。"""
-    bot, _ = make_bot(config, store, ScriptedLLM(), rng=FixedRng(0.0))
+def test_clean_group_turn_reaches_planner_without_model_call(config, store):
+    llm = ScriptedLLM()
+    bot, _ = make_bot(config, store, llm)
     decision = bot.should_reply(group_event(), now=1000.0)
-    assert not decision.should_reply
-    assert decision.reason == "below_threshold"
-    assert decision.factors.base == config.decision.base
+    assert decision.should_reply and decision.reason == "planned"
+    assert not llm.calls and not store.list_decision_logs()
 
 
-def test_momentum_after_bot_replied(config, store):
-    """bot 刚发过言（动量加成）且过了冷却，普通消息就有机会过线。"""
-    config.decision.cooldown_seconds = 0
-    config.decision.momentum_bonus = 1.0  # 本用例测动量机制本身，钉住满值（默认已校准为 0.5）
-    bot, _ = make_bot(config, store, ScriptedLLM(), rng=FixedRng(0.5))
-    bot.decision_engine.note_reply("recording:g1", 1000.0)
-    decision = bot.should_reply(group_event(), now=1005.0)
-    assert decision.should_reply
-    assert decision.factors.momentum > 0
+def test_guard_releases_group_after_refractory_period(config, store):
+    config.decision.refractory_seconds = 10
+    config.decision.min_reply_interval_seconds = 0
+    bot, _ = make_bot(config, store, ScriptedLLM())
+    bot.decision_engine.note_bot_reply("recording:g1", 1000.0)
+    assert bot.should_reply(group_event(), now=1005.0).reason == "refractory"
+    assert bot.should_reply(group_event(), now=1010.0).reason == "planned"
 
 
 # ----------------------------------------------------------------------
@@ -111,12 +108,12 @@ def test_handle_event_records_and_replies(config, store):
 
 
 def test_group_silent_does_not_call_llm(config, store):
-    config.decision.base = 0.0
+    config.attention.talk_value = 0.0
     llm = ScriptedLLM()
     bot, adapter = make_bot(config, store, llm)
     asyncio.run(bot.handle_event(group_event()))
     assert adapter.sent == []
-    assert llm.chat_messages == []
+    assert llm.calls == []
     # 但消息仍然进流水
     assert store.recent_messages("g1")[0].text == "你好呀"
 
@@ -142,9 +139,8 @@ def test_private_scene_prompt_has_no_group_framing(config, store):
 
 def test_group_scene_prompt_mentions_group(config, store):
     """群聊上下文要说明有很多人、回复所有人可见。"""
-    config.decision.base = 10.0
     store.upsert_person("recording", "u1", "阿花")
-    llm = ScriptedLLM({"chat": ["嗯"]})
+    llm = ScriptedLLM({"fast": ['{"basis":"settled","intent":"短附和","speak":true}'], "chat": ["嗯"]})
     bot, _ = make_bot(config, store, llm)
     asyncio.run(bot.handle_event(group_event("有人吗")))
 
@@ -176,8 +172,8 @@ def test_history_and_memory_in_context(config, store):
     assert "坂本龙一" in system["content"]  # 注入的记忆
     assert "阿花" in system["content"]  # 说话人信息
     # 历史消息按「[HH:MM] [昵称] 正文」渲染
-    assert any(re.match(r"\[\d{2}:\d{2}\] \[阿草\] 今天听歌吗$", m["content"]) for m in messages)
-    assert re.match(r"\[\d{2}:\d{2}\] \[阿花\] 最近在听坂本龙一$", messages[-2]["content"])
+    assert any(re.match(r"\[\d{2}:\d{2}\] \[阿草\] 〔在场者原话·事实部分已定〕今天听歌吗$", m["content"]) for m in messages)
+    assert re.match(r"\[\d{2}:\d{2}\] \[阿花\] 〔在场者原话·事实部分已定〕最近在听坂本龙一$", messages[-2]["content"])
 
 
 def test_llm_failure_does_not_crash(config, store):
@@ -277,8 +273,7 @@ def test_maintenance_error_contained(config, store):
 def test_merge_window_combines_burst(config, store):
     """窗口内同一发送者连发多条，只决策/生成一次，上下文里看到合并文本。"""
     config.decision.merge_window_seconds = 4.0
-    config.decision.base = 10.0  # 保证评分过线
-    llm = ScriptedLLM({"chat": ["慢慢说"]})
+    llm = ScriptedLLM({"fast": ['{"basis":"settled","intent":"短附和","speak":true}'], "chat": ["慢慢说"]})
     bot, adapter = make_bot(config, store, llm)
     asyncio.run(bot.handle_event(group_event("我跟你讲")))
     asyncio.run(bot.handle_event(group_event("今天遇到件事")))
@@ -296,8 +291,7 @@ def test_merge_window_combines_burst(config, store):
 def test_merge_window_other_sender_joins_round(config, store):
     """别人插话时，整批一并裁定，不把两人的话算给同一人。"""
     config.decision.merge_window_seconds = 4.0
-    config.decision.base = 10.0
-    llm = ScriptedLLM({"chat": ["收到"]})
+    llm = ScriptedLLM({"fast": ['{"basis":"settled","intent":"短附和","speak":true}'], "chat": ["收到"]})
     bot, adapter = make_bot(config, store, llm)
     asyncio.run(bot.handle_event(group_event("我先说", sender="u1")))
     assert adapter.sent == []
@@ -311,7 +305,7 @@ def test_merge_window_other_sender_joins_round(config, store):
 
 
 def test_generation_veto_keeps_silent(config, store):
-    """评分过了、模型输出否决标记时静默丢弃，不写 bot 流水。"""
+    """进入正文生成后、模型输出否决标记时静默丢弃，不写 bot 流水。"""
     llm = ScriptedLLM({"chat": ["[不回复]"]})
     bot, adapter = make_bot(config, store, llm)
     asyncio.run(bot.handle_event(private_event("随便说说")))
@@ -330,22 +324,20 @@ def test_prompt_tells_model_veto_marker(config, store):
     assert f"如果你只是默默看着，整条回复就是 {marker}" in system
 
 
-def test_topic_relevance_from_memories(config, store):
-    """存过相关记忆的话题，相关性分数应被带上。"""
-    config.decision.base = 0.0
-    config.decision.momentum_bonus = 0.0
-    store.add_memory("recording:u1", "TA 在学吉他，练的是《阿尔罕布拉宫》")
+def test_inbound_guard_does_not_retrieve_memories(config, store, monkeypatch):
     bot, _ = make_bot(config, store, ScriptedLLM())
-    decision = bot.should_reply(group_event("阿尔罕布拉宫好难弹"), now=1000.0)
-    assert decision.factors.relevance > 0
-    # 不相干的话题没有相关性加分
-    other = bot.should_reply(group_event("今天下雨了"), now=1000.0)
-    assert other.factors.relevance == 0
+    def unexpected(*args, **kwargs):
+        raise AssertionError("护栏不应检索历史或话题相关性")
+    monkeypatch.setattr(bot.retriever, "score", unexpected)
+    monkeypatch.setattr(store, "recent_messages", unexpected)
+    assert bot.decide(group_event()).reason == "planned"
+    assert bot.decide(group_event(mentions=True)).reason == "mentioned"
 
 
 def test_decision_logged(config, store, caplog):
     import logging
 
+    config.attention.talk_value = 0.0
     llm = ScriptedLLM({"chat": ["嗯"]})
     bot, _ = make_bot(config, store, llm)
     with caplog.at_level(logging.INFO, logger="rubenbot.core"):
@@ -437,14 +429,13 @@ def test_decision_written_to_store_log(config, store):
 
 
 def test_group_decision_log_has_factors(config, store):
-    config.decision.base = 0.05
-    bot, _ = make_bot(config, store, ScriptedLLM())
+    bot, _ = make_bot(config, store, ScriptedLLM({"fast": ['{"basis":"guess","intent":"提问","increment":"问地点"}']}))
     asyncio.run(bot.handle_event(group_event()))
     entry = store.list_decision_logs(chat_id="g1")[0]
     assert entry["should_reply"] is False
-    assert entry["reason"] == "below_threshold"
-    assert entry["factors"]["base"] == 0.05
-    assert "momentum" in entry["factors"]
+    assert entry["reason"] == "planner_silence"
+    assert entry["factors"]["planner"] == {"basis": "guess", "speak": False, "reason": ""}
+    assert entry["score"] == entry["threshold"] == 0
 
 
 # ----------------------------------------------------------------------

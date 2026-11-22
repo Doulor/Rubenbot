@@ -37,7 +37,7 @@ class ExpressionDecision:
     increment: str
     avoid_repetition: tuple[str, ...]
     source: str = "fast"
-    # 策划步的开口裁定：None 表示没有裁定（旧路径 / 未返回该字段）
+    # 策划步的开口裁定：None 表示没有裁定（未返回该字段）
     speak: bool | None = None
     # 裁定理由摘要（进 decision_log 的 factors，便于审计）
     reason: str = ""

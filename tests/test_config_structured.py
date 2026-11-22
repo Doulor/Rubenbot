@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from pathlib import Path
 
 import pytest
@@ -61,7 +60,7 @@ def config(tmp_path: Path, persona_path: Path) -> Config:
     cfg.database_path = str(tmp_path / "rubenbot.db")
     cfg.llm.api_key = "sk-original-key"
     cfg.llm.chat_model = "model-old"
-    cfg.decision.threshold = 0.85
+    cfg.decision.min_reply_interval_seconds = 60
     cfg.memory.inject_limit = 20
     cfg.adapters = {"console": {}}
     return cfg
@@ -74,7 +73,7 @@ def config_path(tmp_path: Path, config: Config) -> Path:
         "llm:\n  api_key: sk-original-key\n  chat_model: model-old\n"
         f"persona:\n  path: {config.persona_path}\n"
         f"database_path: {config.database_path}\n"
-        "decision:\n  threshold: 0.85\n"
+        "decision:\n  min_reply_interval_seconds: 60\n"
         "adapters:\n  console: {}\n"
         "webui:\n  host: 127.0.0.1\n  port: 8765\n"
         "unknown_section:\n  keep_me: true\n",
@@ -106,6 +105,34 @@ def read_yaml(path: Path) -> dict:
 # ----------------------------------------------------------------------
 # 结构化视图与校验
 # ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("section", "key", "value"), [
+    ("memory", "distill_new_threshold", 16),
+    ("memory", "distill_interval_hours", 5.5),
+    ("memory", "distill_max_events", 60),
+    ("memory", "distill_max_facts", 55),
+    ("memory", "status_expiry_min_days", 2),
+    ("memory", "status_expiry_max_days", 45),
+    ("memory", "timeline_compress_after_days", 4.5),
+    ("memory", "timeline_prune_after_days", 70.5),
+    ("memory", "timeline_prune_keep_salience", 0.85),
+    ("memory", "self_event_max_chars", 160),
+    ("chat", "dedupe_ttl_seconds", 0),
+    ("chat", "strip_action_parens", True),
+    ("decision", "batch_max_seconds", 8),
+    ("decision", "urgent_seconds", 1.5),
+    ("decision", "refractory_enabled", False),
+    ("decision", "proactive_window_enabled", False),
+])
+def test_edited_control_survives_save_and_reload(client, config_path, section, key, value):
+    draft = client.get("/api/config").json()["structured"]
+    assert draft[section][key] != value
+    draft[section][key] = value
+    response = client.put("/api/config", json={"config": draft})
+    assert response.is_success, response.text
+    assert read_yaml(config_path)[section][key] == value
+    assert client.get("/api/config").json()["structured"][section][key] == value
 
 
 def test_structured_config_covers_every_field(config):
@@ -156,29 +183,13 @@ def test_structured_config_covers_every_field(config):
             "batch_max_seconds",
             "urgent_seconds",
             "aliases",
-            "base",
-            "threshold",
-            "threshold_noise",
-            "threshold_noise_band",
-            "momentum_bonus",
-            "momentum_half_life_seconds",
-            "relevance_bonus",
-            "relevance_scale",
-            "ratio_window",
-            "ratio_threshold",
-            "ratio_silence",
-            "ratio_penalty",
-            "cooldown_seconds",
-            "cooldown_penalty",
             "min_reply_interval_seconds",
-            "exclude_bot_momentum",
             "refractory_enabled",
             "refractory_seconds",
             "proactive_window_enabled",
             "proactive_window_seconds",
             "proactive_window_limit",
             "veto_marker",
-            "groups",
         ],
         "plugins": ["dir", "enabled", "command_prefix"],
         "market": ["index_url"],
@@ -202,7 +213,6 @@ def test_structured_config_covers_every_field(config):
             "boredom_after_seconds",
             "half_life_seconds",
             "min_intensity",
-            "threshold_adjust",
         ],
     }.items():
         for key in keys:
@@ -276,9 +286,9 @@ def test_settings_layout_prefix_resolution():
     assert resolve_page("chat.strip_action_parens") == "expression"
     assert resolve_page("chat.history_size") == "chat"
     assert resolve_page("chat.bot_name") == "chat"
-    assert resolve_page("generation.two_stage.enabled") == "expression"
-    assert resolve_page("decision.threshold") == "chat"
-    assert resolve_page("decision.groups.123.base") == "chat"
+    assert resolve_page("generation.two_stage.enabled") is None
+    assert resolve_page("decision.refractory_seconds") == "chat"
+    assert resolve_page("memory.group_profile.min_messages") == "memory"
     assert resolve_page("llm.models.fast") == "models"
     assert resolve_page("market.index_url") == "system"
     assert resolve_page("persona.path") == "system"
@@ -286,6 +296,24 @@ def test_settings_layout_prefix_resolution():
     # 字段名是前缀的一部分但不是子路径时不能误判
     assert resolve_page("chatty.foo") is None
     assert resolve_page("persona") is None
+
+
+def test_structured_config_does_not_expose_or_accept_scoring_fields():
+    retired = dict.fromkeys((
+        "base", "threshold", "threshold_noise", "threshold_noise_band", "momentum_bonus",
+        "momentum_half_life_seconds", "relevance_bonus", "relevance_scale", "ratio_window",
+        "ratio_threshold", "ratio_silence", "ratio_penalty", "cooldown_seconds", "cooldown_penalty",
+    ), 1)
+    draft = {
+        "decision": {**retired, "min_reply_interval_seconds": 17},
+        "emotion": {"threshold_adjust": {"开心": -0.5}, "chat_delta": 0.3},
+    }
+    view = structured_config(Config.from_dict(draft))
+    assert not retired.keys() & view["decision"].keys()
+    assert "threshold_adjust" not in view["emotion"]
+    assert validate_structured(draft) == {
+        "decision": {"min_reply_interval_seconds": 17}, "emotion": {"chat_delta": 0.3},
+    }
 
 
 def test_settings_layout_api_exposes_rules(client):
@@ -469,7 +497,7 @@ def test_validate_structured_accepts_string_numbers():
         {
             "llm": {"temperature": "0.5", "max_retries": "3"},
             "memory": {"inject_limit": "12"},
-            "decision": {"threshold": "0.7", "ratio_window": "40"},
+            "decision": {"min_reply_interval_seconds": "0.7", "proactive_window_limit": "4"},
             "webui": {"port": "9000", "enabled": True},
             "log_level": "debug",
         }
@@ -477,7 +505,7 @@ def test_validate_structured_accepts_string_numbers():
     assert update["llm"]["temperature"] == 0.5
     assert update["llm"]["max_retries"] == 3
     assert update["memory"]["inject_limit"] == 12
-    assert update["decision"]["threshold"] == 0.7
+    assert update["decision"] == {"min_reply_interval_seconds": 0.7, "proactive_window_limit": 4}
     assert update["webui"]["port"] == 9000
     assert update["log_level"] == "DEBUG"
 
@@ -491,7 +519,7 @@ def test_validate_emotion_section():
                 "insult_delta": "-3",
                 "praise_mood": "开心",
                 "excitement_min_messages": "8",
-                "threshold_adjust": {"开心": "-0.08", "委屈": "0.1"},
+                "praise_intensity": "0.88",
             }
         }
     )
@@ -501,7 +529,7 @@ def test_validate_emotion_section():
     assert emotion["insult_delta"] == -3.0
     assert emotion["praise_mood"] == "开心"
     assert emotion["excitement_min_messages"] == 8
-    assert emotion["threshold_adjust"] == {"开心": -0.08, "委屈": 0.1}
+    assert emotion["praise_intensity"] == 0.88
 
 
 def test_validate_emotion_rejects_bad_values():
@@ -512,13 +540,13 @@ def test_validate_emotion_rejects_bad_values():
                     "chat_delta": -1,
                     "decay_weekly": 2,
                     "half_life_seconds": 0,
-                    "threshold_adjust": {"开心": 5},
+                    "praise_intensity": 5,
                 }
             }
         )
     fields = {item["field"] for item in info.value.fields}
     assert {"emotion.chat_delta", "emotion.decay_weekly", "emotion.half_life_seconds",
-            "emotion.threshold_adjust.开心"} <= fields
+            "emotion.praise_intensity"} <= fields
 
 
 def test_put_structured_emotion_hot_applies(bot_state):
@@ -539,8 +567,8 @@ def test_put_structured_emotion_hot_applies(bot_state):
     "payload,field",
     [
         ({"llm": {"temperature": 3}}, "llm.temperature"),
-        ({"decision": {"threshold": 1.5}}, "decision.threshold"),
-        ({"decision": {"ratio_threshold": -0.1}}, "decision.ratio_threshold"),
+        ({"decision": {"proactive_window_limit": -1}}, "decision.proactive_window_limit"),
+        ({"decision": {"refractory_seconds": -0.1}}, "decision.refractory_seconds"),
         ({"memory": {"inject_limit": -1}}, "memory.inject_limit"),
         ({"webui": {"port": 70000}}, "webui.port"),
         ({"log_level": "LOUD"}, "log_level"),
@@ -556,13 +584,14 @@ def test_validate_structured_rejects_bad_values(payload, field):
     assert any(item["field"] == field for item in info.value.fields)
 
 
-def test_quiet_hours_validation():
-    update = validate_structured(
-        {"decision": {"groups": {"g1": {"quiet_hours": ["23:00-07:30"]}}}}
-    )
-    assert update["decision"]["groups"]["g1"]["quiet_hours"] == ["23:00-07:30"]
-    with pytest.raises(ConfigValidationError):
-        validate_structured({"decision": {"groups": {"g1": {"quiet_hours": ["25:00-30:00"]}}}})
+def test_quiet_hours_only_apply_to_active_sections():
+    old = {"groups": {"g1": {"quiet_hours": ["25:00-30:00"]}}}
+    update = validate_structured({"decision": old, "proactive": {"quiet_hours": ["23:00-07:30"]}})
+    assert "groups" not in update.get("decision", {})
+    assert update["proactive"]["quiet_hours"] == ["23:00-07:30"]
+    with pytest.raises(ConfigValidationError) as info:
+        validate_structured({"gateway": {"quiet_hours": ["25:00-30:00"]}})
+    assert any(error["field"] == "gateway.quiet_hours" for error in info.value.fields)
 
 
 # ----------------------------------------------------------------------
@@ -679,7 +708,7 @@ def test_put_structured_roundtrip_and_hot_fields(client, config, config_path, st
         json={
             "config": {
                 "llm": {"chat_model": "model-new"},
-                "decision": {"threshold": 0.42},
+                "decision": {"min_reply_interval_seconds": 12.5},
                 "memory": {"inject_limit": 7},
             }
         },
@@ -690,25 +719,25 @@ def test_put_structured_roundtrip_and_hot_fields(client, config, config_path, st
     assert body["restart_required"] is False
     assert set(body["applied"]) == {"llm", "decision", "memory"}
     assert body["resolution"]["llm.chat_model"] == "hot"
-    assert body["resolution"]["decision.threshold"] == "hot"
+    assert body["resolution"]["decision.min_reply_interval_seconds"] == "hot"
 
     # 文件写回、未知键保留
     data = read_yaml(config_path)
     assert data["llm"]["chat_model"] == "model-new"
     assert data["llm"]["api_key"] == "sk-original-key"
-    assert data["decision"]["threshold"] == 0.42
+    assert data["decision"]["min_reply_interval_seconds"] == 12.5
     assert data["memory"]["inject_limit"] == 7
     assert data["unknown_section"] == {"keep_me": True}
 
     # 重新加载配置一致
     reloaded = Config.load(config_path)
     assert reloaded.llm.chat_model == "model-new"
-    assert reloaded.decision.threshold == 0.42
+    assert reloaded.decision.min_reply_interval_seconds == 12.5
     assert reloaded.memory.inject_limit == 7
 
     # 进程内配置也已同步（无 bot 时至少 state.config 更新）
     assert state.config.llm.chat_model == "model-new"
-    assert state.config.decision.threshold == 0.42
+    assert state.config.decision.min_reply_interval_seconds == 12.5
 
 
 def test_put_structured_secrets_blank_keeps_original(client, config_path):
@@ -908,13 +937,13 @@ def test_put_structured_invalid_returns_422_with_fields_and_no_write(client, con
     original = config_path.read_text(encoding="utf-8")
     response = client.put(
         "/api/config",
-        json={"config": {"llm": {"temperature": 9}, "decision": {"threshold": 2}}},
+        json={"config": {"llm": {"temperature": 9}, "decision": {"min_reply_interval_seconds": -2}}},
     )
     assert response.status_code == 422
     body = response.json()
     assert body["ok"] is False
     fields = {item["field"] for item in body["fields"]}
-    assert {"llm.temperature", "decision.threshold"} <= fields
+    assert {"llm.temperature", "decision.min_reply_interval_seconds"} <= fields
     assert config_path.read_text(encoding="utf-8") == original
 
 
@@ -971,24 +1000,15 @@ def test_resaving_form_untouched_reports_no_changes(client, config_path):
     assert second.json()["message"] == "配置已保存（与当前一致，无需变更）"
 
 
-def test_group_override_change_is_reported_applied(client, config_path):
-    initial = client.get("/api/config").json()["structured"]["decision"]["groups"]
-    assert initial == {}
-    response = client.put(
-        "/api/config",
-        json={"config": {"decision": {"groups": {"g9": {"activity_multiplier": 2}}}}},
-    )
+def test_retired_group_override_cannot_be_saved_or_hot_applied(client, config_path):
+    before = client.get("/api/config").json()["structured"]
+    assert "groups" not in before["decision"]
+    draft = {"groups": {"g9": {"activity_multiplier": 2, "base": 1, "quiet_hours": ["00:00-23:59"]}}}
+    response = client.put("/api/config", json={"config": {"decision": draft}})
     assert response.status_code == 200, response.text
-    assert response.json()["resolution"]["decision.groups"] == "hot"
-    assert "decision" in response.json()["applied"]
-    written = read_yaml(config_path)
-    assert written["decision"]["groups"]["g9"]["activity_multiplier"] == 2.0
-
-    # 删除群覆盖也算改动，且文件里真的删掉了
-    response = client.put("/api/config", json={"config": {"decision": {"groups": {}}}})
-    assert response.status_code == 200
-    assert "decision" in response.json()["applied"]
-    assert "g9" not in read_yaml(config_path)["decision"]["groups"]
+    assert response.json()["applied"] == []
+    assert "groups" not in read_yaml(config_path)["decision"]
+    assert client.get("/api/config").json()["structured"] == before
 
 
 def test_legacy_text_mode_still_works(client, config_path):
@@ -1005,7 +1025,10 @@ def test_legacy_text_mode_still_works(client, config_path):
 
 def test_hot_apply_updates_decision_engine_and_model(bot_state):
     bot = bot_state.bot
-    assert bot.decision_engine.config.threshold == 0.85
+    event = make_group_event()
+    # 刚开过口：第 50 秒已过默认不应期，但未过配置的最小间隔。
+    bot.decision_engine.note_bot_reply(bot.decision_engine.chat_key(event), now=100)
+    assert bot.decide(event, now=150).reason == "min_interval"
 
     client = TestClient(create_app(bot_state))
     response = client.put(
@@ -1013,7 +1036,7 @@ def test_hot_apply_updates_decision_engine_and_model(bot_state):
         json={
             "config": {
                 "llm": {"chat_model": "model-hot"},
-                "decision": {"threshold": 0.0, "base": 0.0, "threshold_noise": 0.0},
+                "decision": {"min_reply_interval_seconds": 40},
                 "memory": {"inject_limit": 3},
                 "chat": {"bot_name": "小R"},
             }
@@ -1021,14 +1044,13 @@ def test_hot_apply_updates_decision_engine_and_model(bot_state):
     )
     assert response.status_code == 200, response.text
 
-    # 意愿引擎参数已更新，且下一次普通群消息就能通过（阈值 0）
-    assert bot.decision_engine.config.threshold == 0.0
+    # 不必等到旧间隔结束，同一条普通群消息即可进入策划。
+    assert bot.decision_engine.config.min_reply_interval_seconds == 40
     assert bot.extractor.config.inject_limit == 3
     assert bot.config.memory.inject_limit == 3
     assert bot.config.chat.bot_name == "小R"
 
-    event = make_group_event()
-    decision = bot.decide(event, now=time.time())
+    decision = bot.decide(event, now=150)
     assert decision.should_reply is True
 
     # 换了 llm 配置后客户端重建，模型名更新
@@ -1042,10 +1064,10 @@ def test_hot_apply_keeps_fake_llm_when_llm_unchanged(bot_state, store):
     bot = bot_state.bot
     fake = bot.llm
     client = TestClient(create_app(bot_state))
-    response = client.put("/api/config", json={"config": {"decision": {"threshold": 0.3}}})
+    response = client.put("/api/config", json={"config": {"decision": {"proactive_window_limit": 1}}})
     assert response.status_code == 200
     assert bot.llm is fake
-    assert bot.decision_engine.config.threshold == 0.3
+    assert bot.decision_engine.config.proactive_window_limit == 1
 
 
 def make_group_event():

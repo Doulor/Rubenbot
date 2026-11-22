@@ -39,9 +39,8 @@ def test_self_event_written_after_send(config, store):
 
 
 def test_group_self_event_audience(config, store):
-    config.decision.base = 1.0  # 群里也回
     bot = make_bot(config, store, ScriptedLLM({"chat": ["大家好"]}))
-    asyncio.run(bot.handle_event(event("在吗", chat_id="g1", chat_type="group")))
+    asyncio.run(bot.handle_event(event("Ruben 在吗", chat_id="g1", chat_type="group")))
 
     events = store.list_events(person_id="self")
     assert len(events) == 1

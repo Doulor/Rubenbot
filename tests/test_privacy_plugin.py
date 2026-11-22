@@ -171,7 +171,6 @@ def test_privacy_help_for_unknown_args(tmp_path):
 def test_privacy_report_in_group_does_not_leak_profile(tmp_path):
     """群里发 /隐私 只报档位：画像只在私聊里摊开。"""
     bot, adapter, store = make_bot(tmp_path)
-    bot.config.decision.base = 10.0
     seed_profile(store)
     asyncio.run(bot.handle_event(group("/隐私")))
     reply = adapter.texts[-1]
@@ -198,10 +197,9 @@ def test_pending_ask_delivered_after_reply(tmp_path):
 
 def test_pending_ask_not_delivered_in_group(tmp_path):
     bot, adapter, store = make_bot(tmp_path)
-    bot.config.decision.base = 10.0
     store.upsert_person("recording", "u1", "阿花", now=NOW)
     store.add_pending_ask("recording:u1", "health@group", "你之前说过的事，我可以在群里提到吗？")
-    asyncio.run(bot.handle_event(group("大家好")))
+    asyncio.run(bot.handle_event(group("Ruben 大家好")))
     assert not any("可以" in text and "提到吗" in text for text in adapter.texts)
 
 

@@ -92,8 +92,9 @@ def test_frontend_prefix_behavior():
     assert pages == ["expression", "chat", "", ""]
 
 
-def test_attention_card_defines_two_number_inputs():
-    """页面归属规则不渲染控件；两个字段还得进入配置卡的可编辑网格。"""
+@pytest.fixture(scope="module")
+def rendered_fields():
+    """运行真实卡片声明，收集卡片及其内部控件，不依赖浏览器。"""
     from rubenbot.web.config_schema import config_layout
 
     source = APP_JS.read_text(encoding="utf-8")
@@ -102,18 +103,44 @@ def test_attention_card_defines_two_number_inputs():
     cards = source[start : source.index("\n}", start) + 2]
     script = cards + _extract_function("pageOf") + """
 const card = (_, spec) => spec, fieldGrid = defs => defs;
-const h = () => null, groupsEditor = h, pluginEditor = h, modelsEditor = h,
-      adaptersEditor = h, mcpServerEditor = h, mapEditor = h;
+const h = (_, props, ...children) => children, stub = () => [], pluginEditor = stub,
+      modelsEditor = stub, adaptersEditor = stub, mcpServerEditor = stub;
 const LOG_LEVELS = [], MOOD_NAMES = [], MODEL_POOL_STRATEGIES = [], MODEL_POOL_STRATEGY_LABELS = {};
-const fields = settingsCardSpecs({}, {}, []).filter(c => pageOf(LAYOUT, c.path) === 'expression')
-  .flatMap(c => c.node.body).filter(f => f?.path?.startsWith('attention.'));
-console.log(JSON.stringify(fields));
+const cards = settingsCardSpecs({}, {}, []).map(c => ({
+  path: c.path, page: pageOf(LAYOUT, c.path), fields: [c.node.body].flat(Infinity).filter(f => f?.path)
+}));
+console.log(JSON.stringify(cards));
 """.replace("LAYOUT", json.dumps(config_layout()))
     result = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True)
-    fields = {field["path"]: field for field in json.loads(result.stdout)}
+    return json.loads(result.stdout)
+
+
+def test_attention_card_defines_two_number_inputs(rendered_fields):
+    """页面归属规则不渲染控件；两个字段还得进入配置卡的可编辑网格。"""
+    fields = {f["path"]: f for c in rendered_fields if c["page"] == "expression"
+              for f in c["fields"] if f["path"].startswith("attention.")}
     assert set(fields) == {"attention.talk_value", "attention.engaged_window_seconds"}
     assert all(field["kind"] == "number" for field in fields.values())
     assert "不是回复概率" in fields["attention.talk_value"]["hint"]
+
+
+def test_layout_omits_retired_controls_and_keeps_active_neighbors(rendered_fields):
+    paths = {c["path"] for c in rendered_fields} | {f["path"] for c in rendered_fields for f in c["fields"]}
+    retired = {f"decision.{key}" for key in (
+        "base", "threshold", "threshold_noise", "threshold_noise_band", "momentum_bonus",
+        "momentum_half_life_seconds", "relevance_bonus", "relevance_scale", "ratio_window",
+        "ratio_threshold", "ratio_silence", "ratio_penalty", "cooldown_seconds", "cooldown_penalty",
+        "groups", "exclude_bot_momentum",
+    )} | {"generation.two_stage", "persona.planner.planner_gate", "emotion.threshold_adjust"}
+    assert not {p for p in paths if any(p == old or p.startswith(old + ".") for old in retired)}
+    assert {"decision.min_reply_interval_seconds", "decision.aliases", "proactive.threshold",
+            "emotion.praise_intensity", "proactive.quiet_hours", "reply.max_segments"} <= paths
+
+
+@pytest.mark.parametrize("key", ["refractory_enabled", "proactive_window_enabled"])
+def test_guard_controls_are_switches(rendered_fields, key):
+    definition, = (f for c in rendered_fields for f in c["fields"] if f["path"] == f"decision.{key}")
+    assert definition["kind"] == "switch"
 
 
 def test_frontend_script_is_syntactically_valid():

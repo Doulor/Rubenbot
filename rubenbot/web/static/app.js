@@ -569,7 +569,7 @@ const PAGES = {
   persona: { title: "机器人", sub: "人设", render: renderLegacyPersona },
   memory: { title: "记忆", sub: "按人浏览、搜索与维护记忆库", render: renderMemory },
   people: { title: "人物", sub: "见过的每个人和他们的档案", render: renderPeople },
-  groups: { title: "群组与意愿", sub: "每群活跃度、静默时段与决策记录", render: renderGroups },
+  groups: { title: "群组与决策", sub: "查看群定位与会话决策记录", render: renderGroups },
   plugins: { title: "插件", sub: "发现与管理插件，或调整已安装插件的配置", render: renderPlugins },
   logs: { title: "日志", sub: "最近的运行日志", render: renderLogs },
   settings: { title: "设置", sub: "搜索、主动触达、适配器与运行环境", render: renderSettings },
@@ -792,11 +792,11 @@ function overviewHero(data) {
   );
 }
 
-function scoreBar(score, threshold, hard) {
+function scoreBar(score, threshold) {
   const track = h("div", { class: "track" });
   const fill = h("div", { class: `fill ${score < 0 ? "neg" : ""}` });
   // 条的上限取 threshold / 0.75，让阈值线稳定落在 3/4 处，分数超阈值时也不会立刻顶格
-  const scale = hard ? 1 : Math.max(threshold / 0.75, 0.08);
+  const scale = Math.max(threshold / 0.75, 0.08);
   fill.style.width = `${Math.max(0, Math.min(100, (score / scale) * 100))}%`;
   const bar = h(
     "div",
@@ -804,7 +804,7 @@ function scoreBar(score, threshold, hard) {
     track,
     fill
   );
-  if (!hard && threshold > 0) {
+  if (threshold > 0) {
     const mark = h("div", { class: "threshold" });
     mark.style.left = `${Math.min(100, (threshold / scale) * 100)}%`;
     bar.append(mark);
@@ -821,6 +821,8 @@ function decisionItem(decision, { showChat = false } = {}) {
     ? h("span", { class: "tag good" }, icon("check"), "回复")
     : h("span", { class: "tag" }, "不回复");
   const factors = decision.factors || {};
+  // 旧日志有真实评分因子；新裁定显示原因，不把占位零值当成分数。
+  const scored = !hard && Object.hasOwn(factors, "base");
   const parts = [];
   if (factors.base) parts.push(["基础", factors.base]);
   if (factors.momentum) parts.push(["动量", factors.momentum]);
@@ -851,10 +853,10 @@ function decisionItem(decision, { showChat = false } = {}) {
       h(
         "span",
         { class: "decision-score" },
-        hard ? "直接放行" : `${decision.score.toFixed(2)} / ${decision.threshold.toFixed(2)}`
+        scored ? `${decision.score.toFixed(2)} / ${decision.threshold.toFixed(2)}` : decision.reason || hard || ""
       )
     ),
-    hard ? null : scoreBar(decision.score, decision.threshold, false),
+    scored ? scoreBar(decision.score, decision.threshold) : null,
     meta
   );
 }
@@ -947,11 +949,7 @@ function emotionCard(data) {
         "div",
         { class: "emotion-mood" },
         h("span", { class: `tag ${MOOD_TONE[mood.mood] || "outline"}` }, mood.mood || "平静"),
-        mood.phrase ? h("span", { class: "muted" }, mood.phrase) : null,
-        h("span", { class: "emotion-threshold" },
-          data.threshold_adjust
-            ? `开口阈值 ${data.threshold_adjust > 0 ? "+" : ""}${Number(data.threshold_adjust).toFixed(2)}`
-            : "开口阈值不受影响")
+        mood.phrase ? h("span", { class: "muted" }, mood.phrase) : null
       )
     : h("div", { class: "muted" }, "情绪系统已关闭（emotion.enabled: false）");
 
@@ -2037,7 +2035,7 @@ async function renderPeople(view, param) {
 }
 
 /* ------------------------------------------------------------------ */
-/* 群组与意愿                                                         */
+/* 群组与决策                                                         */
 /* ------------------------------------------------------------------ */
 
 async function renderGroups(view) {
@@ -2050,7 +2048,7 @@ async function renderGroups(view) {
     if (!chats.length) {
       panel.replaceChildren(
         h("section", { class: "card" },
-          emptyState("groups", "还没有群聊记录", "群消息进来后会自动出现在这里，可以单独调节每群的活跃度与静默时段"))
+          emptyState("groups", "还没有群聊记录", "收到消息或同步群名单后，会话会自动出现在这里"))
       );
       return;
     }
@@ -2068,8 +2066,6 @@ async function renderGroups(view) {
         oninput: event => showChats(event.target.value) }));
     showChats(keyword);
     panel.replaceChildren(
-      h("div", { class: "notice" }, icon("warning"),
-        "活跃度倍率会放大或压低这个群的意愿分数；静默时段内普通消息不会开口（@、回复和叫名字不受影响）。保存后写入 config.yaml，即时生效。"),
       h("section", { class: "card" },
         h("div", { class: "card-head" }, h("h2", {}, "会话"), h("span", { class: "hint" }, `${chats.length} 个`), search),
         list)
@@ -2112,12 +2108,7 @@ async function renderGroups(view) {
         { class: "chat-settings" },
         chat.chat_type === "group" && chat.platform === "snowluma" ? refreshIdentityButton(
           { platform: chat.platform, chat_id: chat.chat_id }, load) : null,
-        chat.chat_type === "private" ? h("span", { class: "tag outline" }, "私聊直达") : [
-        chat.quiet_hours && chat.quiet_hours.length
-          ? h("span", { class: "tag outline" }, "静默 ", chat.quiet_hours.join(" / "))
-          : null,
-        h("span", { class: "tag" }, `倍率 ${Number(chat.activity_multiplier ?? 1).toFixed(2)}`),
-        h("span", { class: `tag ${chat.configured ? "accent" : "outline"}` }, chat.configured ? "已单独配置" : "默认")]
+        chat.chat_type === "private" ? h("span", { class: "tag outline" }, "私聊直达") : null
       ),
       detail
     );
@@ -2132,8 +2123,7 @@ async function fillDetail(container, chat) {
   container.replaceChildren(skeleton(2));
   const encoded = encodeURIComponent(chatId);
   const platformQuery = chat.platform ? `?platform=${encodeURIComponent(chat.platform)}` : "";
-  const [settings, decisions, profile] = await Promise.all([
-    chat.chat_type === "group" ? api.get(`/api/chats/${encoded}/decision`) : null,
+  const [decisions, profile] = await Promise.all([
     api.get(`/api/decisions?chat_id=${encoded}&platform=${encodeURIComponent(chat.platform)}&chat_type=${encodeURIComponent(chat.chat_type)}&limit=12`),
     chat.chat_type === "group"
       ? api.get(`/api/chats/${encoded}/profile${platformQuery}`).catch(() => null)
@@ -2145,159 +2135,11 @@ async function fillDetail(container, chat) {
         ...decisions.items.map((d) => decisionItem(d)))
     : emptyState("pulse", "这个会话还没有决策记录", "收到消息并完成决策后会出现");
 
-  if (!settings) {
-    container.replaceChildren(h("div", { class: "field-label" }, "最近决策"), decisionList);
-    return;
-  }
-  const multiplier = h("input", {
-    class: "input",
-    type: "number",
-    min: "0",
-    max: "10",
-    step: "0.05",
-    value: String(settings.override.activity_multiplier ?? 1),
-  });
-  const base = h("input", {
-    class: "input",
-    type: "number",
-    min: "0",
-    max: "1",
-    step: "0.01",
-    placeholder: `默认 ${settings.defaults.base}`,
-    value: settings.override.base === null || settings.override.base === undefined ? "" : String(settings.override.base),
-  });
-  const quietChips = h("div", { class: "quiet-chips" });
-  const quietInput = h("input", {
-    class: "input",
-    placeholder: "23:00-07:30",
-    style: { width: "130px", height: "26px", fontSize: "12px", fontFamily: "var(--font-mono)" },
-    "aria-label": "添加静默时段",
-  });
-  let quiet = settings.override.quiet_hours.slice();
-
-  function renderChips() {
-    markListChange(quietChips, quiet);
-    quietChips.replaceChildren(
-      ...quiet.map((item) =>
-        h(
-          "span",
-          { class: "chip", dataset: { motionKey: item } },
-          item,
-          h(
-            "button",
-            {
-              type: "button",
-              "aria-label": `移除 ${item}`,
-              onclick: () => {
-                quiet = quiet.filter((value) => value !== item);
-                renderChips();
-              },
-            },
-            icon("close")
-          )
-        )
-      ),
-      quietInput,
-      h(
-        "button",
-        {
-          class: "btn btn-sm btn-ghost",
-          type: "button",
-          onclick: () => {
-            const value = quietInput.value.trim();
-            if (!/^\d{1,2}:\d{2}-\d{1,2}:\d{2}$/.test(value)) {
-              toast("格式应为 HH:MM-HH:MM，例如 23:00-07:30", "error");
-              return;
-            }
-            if (!quiet.includes(value)) quiet.push(value);
-            quietInput.value = "";
-            renderChips();
-          },
-        },
-        icon("plus"),
-        "添加"
-      )
-    );
-  }
-  renderChips();
-
-  const form = h(
-    "div",
-    { class: "chat-form" },
-    h("div", { class: "field" }, h("span", { class: "field-label" }, "活跃度倍率"), multiplier),
-    h("div", { class: "field" }, h("span", { class: "field-label" }, "基础意愿（留空用默认）"), base),
-    h("div", { class: "field field-wide" }, h("span", { class: "field-label" }, "静默时段"), quietChips),
-    h(
-      "div",
-      { style: { display: "flex", gap: "8px" } },
-      h(
-        "button",
-        {
-          class: "btn btn-primary",
-          type: "button",
-          onclick: async (event) => {
-            const button = event.currentTarget;
-            button.disabled = true;
-            try {
-              const payload = {
-                activity_multiplier: Number(multiplier.value || 1),
-                base: base.value === "" ? null : Number(base.value),
-                quiet_hours: quiet,
-              };
-              await api.put(`/api/chats/${encoded}/decision`, payload);
-              toast("已保存，即时生效");
-              renderRoute();
-            } catch (err) {
-              if (!(err instanceof Unauthorized)) toast(err.message || "保存失败", "error");
-            } finally {
-              button.disabled = false;
-            }
-          },
-        },
-        "保存"
-      ),
-      settings.configured
-        ? h(
-            "button",
-            {
-              class: "btn btn-danger",
-              type: "button",
-              onclick: () =>
-                confirmDialog({
-                  title: "恢复默认设置？",
-                  message: "会删掉这个群在 config.yaml 里的单独配置，回到全局默认值。",
-                  confirmText: "恢复默认",
-                  danger: true,
-                  onConfirm: async () => {
-                    await api.put(`/api/chats/${encoded}/decision`, { remove: true });
-                    toast("已恢复默认");
-                    renderRoute();
-                  },
-                }),
-            },
-            "恢复默认"
-          )
-        : null
-    )
-  );
-
   container.replaceChildren(
     h(
       "div",
       { class: "grid", style: { gridTemplateColumns: "minmax(0, 1fr)", gap: "12px" } },
-      groupProfilePanel(profile, { encoded, platformQuery }),
-      h(
-        "div",
-        { class: "notice good" },
-        icon("pulse"),
-        h(
-          "span",
-          {},
-          `当前生效：基础 ${settings.effective.base} · 阈值 ${settings.effective.threshold} · 倍率 ${settings.effective.activity_multiplier}`
-        )
-      ),
-      form,
-      h("div", { class: "mutted" }),
+      chat.chat_type === "group" ? groupProfilePanel(profile, { encoded, platformQuery }) : null,
       h("div", { class: "field-label" }, "最近决策"),
       decisionList
     )
@@ -3519,106 +3361,6 @@ function modelsEditor(draft) {
 }
 
 
-/** 任意键 → 数值 的表（目前用于 emotion.threshold_adjust 的「心情 → 微调」）。 */
-function mapEditor(draft, path, { keyPlaceholder = "键", valuePlaceholder = "值" } = {}) {
-  const table = () => {
-    const current = getPath(draft, path);
-    return current && typeof current === "object" ? current : {};
-  };
-  const rows = h("div", { style: { display: "grid", gap: "8px" } });
-
-  function render() {
-    const current = table();
-    const entries = Object.keys(current);
-    markListChange(rows, entries);
-    rows.replaceChildren(
-      ...(entries.length
-        ? entries.map((key) =>
-            h(
-              "div",
-              { dataset: { motionKey: key }, style: { display: "flex", alignItems: "center", gap: "10px" } },
-              h("span", { class: "field-label", style: { minWidth: "56px", margin: 0 } }, key),
-              h("input", {
-                class: "input",
-                type: "number",
-                step: "0.01",
-                min: "-1",
-                max: "1",
-                value: String(current[key] ?? ""),
-                "aria-label": `${key} 的微调值`,
-                oninput: (event) => {
-                  const next = { ...table() };
-                  next[key] = event.target.value;
-                  setPath(draft, path, next);
-                },
-              }),
-              h(
-                "button",
-                {
-                  class: "icon-btn-sm danger",
-                  type: "button",
-                  title: `删除 ${key}`,
-                  "aria-label": `删除 ${key}`,
-                  onclick: () => {
-                    const next = { ...table() };
-                    delete next[key];
-                    setPath(draft, path, next);
-                    render();
-                  },
-                },
-                icon("trash")
-              )
-            )
-          )
-        : [h("div", { class: "field-hint" }, "还没有条目；没配的心情按 0 处理。")])
-    );
-  }
-
-  const keyInput = h("input", {
-    class: "input",
-    placeholder: keyPlaceholder,
-    style: { maxWidth: "140px" },
-    "aria-label": keyPlaceholder,
-  });
-  const valueInput = h("input", {
-    class: "input",
-    type: "number",
-    step: "0.01",
-    min: "-1",
-    max: "1",
-    placeholder: valuePlaceholder,
-    style: { maxWidth: "120px" },
-    "aria-label": valuePlaceholder,
-  });
-  const addButton = h(
-    "button",
-    {
-      class: "btn btn-sm btn-ghost",
-      type: "button",
-      onclick: () => {
-        const key = keyInput.value.trim();
-        if (!key) return;
-        const next = { ...table() };
-        next[key] = valueInput.value === "" ? 0 : valueInput.value;
-        setPath(draft, path, next);
-        keyInput.value = "";
-        valueInput.value = "";
-        render();
-      },
-    },
-    icon("plus"),
-    "添加"
-  );
-
-  render();
-  return h(
-    "div",
-    { style: { display: "grid", gap: "10px" } },
-    rows,
-    h("div", { style: { display: "flex", gap: "8px", alignItems: "center" } }, keyInput, valueInput, addButton)
-  );
-}
-
 /** 一个表单项：标签 + 控件 + 说明。 */
 function settingsField(def, draft) {
   const value = getPath(draft, def.path);
@@ -3672,132 +3414,6 @@ function fieldGrid(defs, draft) {
     { class: "settings-fields" },
     ...defs.map((def) => settingsField(def, draft))
   );
-}
-
-function quietHoursNormalize(value) {
-  return /^\d{1,2}:\d{2}-\d{1,2}:\d{2}$/.test(value) ? value : "";
-}
-
-/** 每群覆盖：增删群条目，每条可设倍率、基础意愿与静默时段。 */
-function groupsEditor(draft, identities) {
-  const body = h("div", { style: { display: "grid", gap: "12px" } });
-  const groupsNode = h("div", { class: "group-list" });
-  const newId = h("input", {
-    class: "input",
-    placeholder: "要单独配置的群号",
-    style: { maxWidth: "200px" },
-    "aria-label": "要单独配置的群号",
-  });
-
-  function groups() {
-    if (!draft.decision.groups || typeof draft.decision.groups !== "object") {
-      draft.decision.groups = {};
-    }
-    return draft.decision.groups;
-  }
-
-  function render() {
-    const entries = Object.keys(groups());
-    markListChange(groupsNode, entries);
-    groupsNode.replaceChildren(
-      ...(entries.length
-        ? entries.map((chatId) => groupRow(chatId))
-        : [h("div", { class: "field-hint" }, "还没有单独配置的群。默认所有群使用上面的全局参数。")])
-    );
-  }
-
-  function groupRow(chatId) {
-    const settings = groups()[chatId];
-    if (!settings) return h("div");
-    return h(
-      "div",
-      { class: "group-item", dataset: { motionKey: chatId } },
-      h(
-        "div",
-        { class: "group-item-head" },
-        identityBadge(identities[chatId] || { kind: "group", id: chatId }, "normal"),
-        h(
-          "button",
-          {
-            class: "icon-btn-sm danger",
-            type: "button",
-            title: "删除这个群的覆盖",
-            "aria-label": `删除群 ${chatId} 的覆盖`,
-            onclick: () => {
-              delete groups()[chatId];
-              render();
-            },
-          },
-          icon("trash")
-        )
-      ),
-      h(
-        "div",
-        { class: "settings-fields" },
-        h(
-          "div",
-          { class: "settings-field" },
-          h("span", { class: "field-label" }, "活跃度倍率"),
-          numberField(settings.activity_multiplier ?? 1, (value) => {
-            settings.activity_multiplier = value;
-          }, { step: "0.05", min: 0, max: 10 }),
-          h("span", { class: "field-hint" }, "放大或压低这个群的意愿分数（0–10）")
-        ),
-        h(
-          "div",
-          { class: "settings-field" },
-          h("span", { class: "field-label" }, "基础意愿（留空用全局）"),
-          numberField(settings.base, (value) => {
-            settings.base = value === "" ? null : value;
-          }, { step: "0.01", min: 0, max: 1 }),
-          h("span", { class: "field-hint" }, "覆盖全局 base，留空表示跟随")
-        ),
-        h(
-          "div",
-          { class: "settings-field wide" },
-          h("span", { class: "field-label" }, "静默时段"),
-          listEditor(settings.quiet_hours || [], (values) => {
-            settings.quiet_hours = values;
-          }, { placeholder: "23:00-07:30", normalize: quietHoursNormalize }),
-          h("span", { class: "field-hint" }, "这个时段内普通消息不开口；@、回复和叫名字不受影响")
-        )
-      )
-    );
-  }
-
-  const addButton = h(
-    "button",
-    {
-      class: "btn btn-sm",
-      type: "button",
-      onclick: () => {
-        const chatId = newId.value.trim();
-        if (!chatId) return;
-        if (groups()[chatId]) {
-          toast("这个群已经有单独配置", "error");
-          return;
-        }
-        groups()[chatId] = { activity_multiplier: 1, base: null, quiet_hours: [] };
-        newId.value = "";
-        render();
-      },
-    },
-    icon("plus"),
-    "添加群"
-  );
-  newId.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") {
-      event.preventDefault();
-      addButton.click();
-    }
-  });
-
-  render();
-  body.append(
-    groupsNode,
-    h("div", { style: { display: "flex", gap: "8px", alignItems: "center" } }, newId, addButton)
-  );
-  return body;
 }
 
 function adaptersEditor(draft, secrets) {
@@ -4086,11 +3702,10 @@ function groupName(key) {
     llm: "模型与接口",
     memory: "记忆",
     chat: "聊天与回复",
-    decision: "回复意愿",
+    decision: "开口护栏",
     attention: "群聊回复时机",
     reminder: "提醒",
     proactive: "冷场开口",
-    generation: "生成",
     emotion: "情绪与好感度",
     plugins: "插件",
     market: "插件市场",
@@ -4210,7 +3825,7 @@ function settingsMenu(layout, group, page) {
  * 每张卡用 ``path`` 标出它覆盖的代表字段，具体归到哪个二级页面由后端
  * ``layout.rules`` 决定；这里不再维护第二份「字段 → 页面」表。
  */
-function settingsCardSpecs(draft, secrets, pluginsAvailable, groupIdentities = {}) {
+function settingsCardSpecs(draft, secrets, pluginsAvailable) {
   return [
     {
       path: "llm.base_url",
@@ -4548,23 +4163,6 @@ function settingsCardSpecs(draft, secrets, pluginsAvailable, groupIdentities = {
       }),
     },
     {
-      path: "generation.two_stage.enabled",
-      node: card("生成", {
-        hint: "决定回复之后怎么写出正文",
-        body: fieldGrid(
-          [
-            {
-              path: "generation.two_stage.enabled",
-              label: "两段式生成",
-              kind: "switch",
-              hint: "所有回复都有表达决策书；开启后，闲聊碎片也由快速模型决定，不走本地快速通道",
-            },
-          ],
-          draft
-        ),
-      }),
-    },
-    {
       path: "persona.examples_enabled",
       node: card("我说话的样子", {
         hint: "用自己的短回复作示例，不改人格正文",
@@ -4653,53 +4251,24 @@ function settingsCardSpecs(draft, secrets, pluginsAvailable, groupIdentities = {
       }),
     },
     {
-      path: "emotion.threshold_adjust",
-      node: card("情绪阈值微调", {
-        hint: "按当前心情调整开口阈值：正数更难开口，负数更容易",
-        body: mapEditor(draft, "emotion.threshold_adjust", { keyPlaceholder: "心情，如 开心", valuePlaceholder: "如 -0.05" }),
-      }),
-    },
-    {
       path: "decision.merge_window_seconds",
-      node: card("回复意愿", {
+      node: card("开口护栏", {
         hint: "群聊里什么时候开口",
         body: fieldGrid(
           [
             { path: "decision.merge_window_seconds", label: "合并窗口（秒）", kind: "number", step: "0.5", min: 0, hint: "同一群聊的消息等到静默后合批裁定；私聊即时" },
             { path: "decision.hard_merge_window_seconds", label: "硬触发窗口（秒）", kind: "number", step: "0.5", min: 0, hint: "群内 @、点名、回复 bot 或机主发言时的短窗口；0 表示立即处理" },
             { path: "decision.aliases", label: "叫名别名", kind: "list", wide: true, placeholder: "例如 小R", hint: "叫到这些名字算硬触发；留空则用 Bot 名称" },
-            { path: "decision.base", label: "基础意愿", kind: "number", step: "0.01", min: 0, max: 1, hint: "每个群的基础分，默认低，靠动量和相关性加分" },
-            { path: "decision.threshold", label: "开口阈值", kind: "number", step: "0.01", min: 0, max: 1, hint: "分数达到多少才开口" },
-            { path: "decision.threshold_noise", label: "阈值随机扰动", kind: "number", step: "0.01", min: 0, max: 1, hint: "阈值附近的随机波动幅度" },
-            { path: "decision.threshold_noise_band", label: "扰动生效范围", kind: "number", step: "0.01", min: 0, max: 1, hint: "离阈值多近才摇骰子" },
-            { path: "decision.momentum_bonus", label: "动量加成", kind: "number", step: "0.05", min: 0, max: 10, hint: "刚参与过这个会话时的加分" },
-            { path: "decision.momentum_half_life_seconds", label: "动量半衰期（秒）", kind: "number", step: "10", min: 1, hint: "动量随时间衰减的速度" },
-            { path: "decision.relevance_bonus", label: "相关性加成", kind: "number", step: "0.05", min: 0, max: 10, hint: "记忆检索命中时的最大加分" },
-            { path: "decision.relevance_scale", label: "相关性归一尺度", kind: "number", step: "0.5", min: 0.1, hint: "检索分数除以它后封顶" },
-            { path: "decision.ratio_window", label: "占比统计窗口", kind: "number", step: "1", min: 1, hint: "统计发言占比时看最近多少条消息" },
-            { path: "decision.ratio_threshold", label: "占比阈值", kind: "number", step: "0.01", min: 0, max: 1, hint: "bot 占比超过这个值开始减分" },
-            { path: "decision.ratio_silence", label: "占比静默线", kind: "number", step: "0.01", min: 0, max: 1, hint: "占比到这个值直接静默" },
-            { path: "decision.ratio_penalty", label: "占比最大减分", kind: "number", step: "0.1", min: 0, max: 10, hint: "占比超阈值时的最大减分" },
-            { path: "decision.cooldown_seconds", label: "软冷却（秒）", kind: "number", step: "1", min: 0, hint: "发言后这段时间内降低意愿（仅旧裁定路径）" },
-            { path: "decision.cooldown_penalty", label: "冷却最大减分", kind: "number", step: "0.1", min: 0, max: 10, hint: "冷却期内最多减多少分（仅旧裁定路径）" },
-            { path: "decision.min_reply_interval_seconds", label: "最小发言间隔（秒）", kind: "number", step: "1", min: 0, hint: "新路径护栏：刚说过话的间隔内不接普通消息；@/私聊不受限" },
-            { path: "decision.exclude_bot_momentum", label: "bot 不计入自身动量", kind: "boolean", hint: "关闭后保留旧的动量来源语义" },
-            { path: "decision.refractory_enabled", label: "启用发言不应期", kind: "boolean", hint: "普通消息在不应期内不触发；硬触发不受影响" },
+            { path: "decision.min_reply_interval_seconds", label: "最小发言间隔（秒）", kind: "number", step: "1", min: 0, hint: "刚说过话的间隔内不接普通消息；@/私聊不受限" },
+            { path: "decision.refractory_enabled", label: "启用发言不应期", kind: "switch", hint: "普通消息在不应期内不触发；硬触发不受影响" },
             { path: "decision.refractory_seconds", label: "不应期（秒）", kind: "number", step: "1", min: 0, hint: "默认 45 秒" },
-            { path: "decision.proactive_window_enabled", label: "启用主动发言窗口上限", kind: "boolean", hint: "普通群消息的主动开口受限；硬触发不计入" },
+            { path: "decision.proactive_window_enabled", label: "启用主动发言窗口上限", kind: "switch", hint: "普通群消息的主动开口受限；硬触发不计入" },
             { path: "decision.proactive_window_seconds", label: "主动发言窗口（秒）", kind: "number", step: "1", min: 0, hint: "默认 300 秒" },
             { path: "decision.proactive_window_limit", label: "窗口内主动发言上限", kind: "number", step: "1", min: 0, hint: "默认 3 条" },
             { path: "decision.veto_marker", label: "不回复标记", hint: "模型输出这个标记就静默丢弃" },
           ],
           draft
         ),
-      }),
-    },
-    {
-      path: "decision.groups",
-      node: card("每群覆盖", {
-        hint: "单独调节某个群",
-        body: groupsEditor(draft, groupIdentities),
       }),
     },
     {
@@ -5134,7 +4703,7 @@ async function renderSettingsGroup(view, groupId, sub, entry = {}) {
   });
 
   // 卡片按后端规则落到当前二级页面；同页卡片保持清单里的顺序
-  const cards = settingsCardSpecs(draft, secrets, data.plugins_available || [], data.group_identities)
+  const cards = settingsCardSpecs(draft, secrets, data.plugins_available || [])
     .filter((spec) => pageOf(layout, spec.path) === page.id)
     .map((spec) => spec.node);
 

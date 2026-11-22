@@ -343,8 +343,7 @@ def sticker_bot(config, store, tmp_path, *, intent="接梗"):
     config.stickers.dir = str(tmp_path / "stickers")
     config.stickers.nonverbal_probability = 1.0
     config.stickers.send_probability = 0.0
-    config.generation.two_stage.enabled = True
-    llm = ScriptedLLM({"fast": ['{"intent":"%s","increment":"接住猫猫梗"}' % intent], "chat": ["路过一只"]})
+    llm = ScriptedLLM({"fast": ['{"basis":"settled","intent":"%s","increment":"接住猫猫梗"}' % intent], "chat": ["路过一只"]})
     bot = RubenBot(config, store, llm, Persona("Ruben", "你是 Ruben。"))
     adapter = StickerAdapter()
     adapter.call_capability = AsyncMock(return_value={})
@@ -416,9 +415,7 @@ def test_nonverbal_reply_through_handle_event(config, store, tmp_path, scenario)
         config.stickers.enabled = False
     if scenario == "failed":
         adapter.call_capability.side_effect = RuntimeError("未发出")
-    # 普通群消息确定性地通过意愿评分，验证接线也传递了主动插话标记。
-    config.decision.base = 1.0
-    config.decision.threshold = 0.1
+    # 普通群消息由策划放行，验证接线也传递了主动插话标记。
     asyncio.run(bot.handle_event(event("猫猫")))
     key = "snowluma:g1"
     assert bot.decision_engine.active_reply_count(key, bot.decision_engine.last_reply_at(key)) == 1

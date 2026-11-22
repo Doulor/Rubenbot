@@ -16,7 +16,6 @@ def event(text, **kwargs):
 
 
 def test_argon_peer_question_and_shared_mention(config, store):
-    config.planner.planner_gate = True
     llm = ScriptedLLM({'fast': ['{"speak":false,"intent":"沉默"}'] * 2, 'chat': ['我用过']})
     bot = RubenBot(config, store, llm, Persona('Ruben', '我是群友。'))
     adapter = RecordingAdapter()

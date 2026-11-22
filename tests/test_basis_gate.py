@@ -19,7 +19,6 @@ def proposal(basis, increment):
 
 
 def setup_bot(config, store, raw, reply):
-    config.planner.planner_gate = True
     config.computer.whitelist = ['recording:owner']
     llm = ScriptedLLM({'fast': [raw], 'chat': [reply]})
     bot = RubenBot(config, store, llm, Persona('Ruben', '群友'))

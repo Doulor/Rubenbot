@@ -45,7 +45,6 @@ def test_short_or_new_information(source, reply):
 
 @pytest.mark.parametrize(("rewrite", "sent"), [("好", ["好"]), (SOURCE, []), ("【不回复】", [])])
 def test_core_rewrites_once_or_stays_silent(config, store, rewrite, sent):
-    config.generation.two_stage.enabled = True
     llm = ScriptedLLM({"fast": [PLAN], "chat": [SOURCE, rewrite]})
     bot, adapter = make_bot(config, store, llm)
     asyncio.run(bot.handle_event(private_event(SOURCE)))
@@ -60,7 +59,6 @@ def test_core_rewrites_once_or_stays_silent(config, store, rewrite, sent):
 
 
 def test_quoting_new_information_needs_no_retry(config, store):
-    config.generation.two_stage.enabled = True
     reply = f"「{SOURCE}」——哪个驿站？"
     llm = ScriptedLLM({"fast": [PLAN], "chat": [reply]})
     bot, adapter = make_bot(config, store, llm)
@@ -81,7 +79,6 @@ def test_core_retry_cannot_repeat_a_tool_action(config, store):
                 return {"content": SOURCE}
             return reminder_message({"text": "取快递", "delay_minutes": 10})
 
-    config.generation.two_stage.enabled = True
     config.reminder.enabled = True
     llm = ReminderLLM({"fast": [PLAN], "chat": ["记下了"]})
     bot, adapter = make_bot(config, store, llm)

@@ -1,11 +1,11 @@
-"""回复决策（意愿系统）：群聊里决定「要不要开口」。
+"""回复决策：群聊里决定「要不要开口」。
 
 这个模块只做判断，不发消息、不碰适配器：
 
 - :class:`MessageMerger`：同一群聊短时间连发的消息先攒着，合并成一轮再决策。
   纯逻辑、时钟外部传入，测试可以完全确定。
 - :class:`DecisionEngine`：硬触发直通（私聊、@、回复 bot、叫名字），普通群消息
-  按意愿评分（基础值 + 动量 - 发言占比 - 冷却，阈值附近加随机扰动）。
+  经过节奏护栏后交给策划。冷场主动开口另行评分。
 - :func:`parse_generation_output`：解析模型输出里的「不回复」标记。
 
 设计上刻意保持轻量：所有状态都在内存里，进程重启后从零开始；没有额外的表。
@@ -19,10 +19,10 @@ import re
 import time
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Sequence
+from typing import Iterable
 
 from .adapters.base import MessageEvent
-from .config import DecisionConfig, GroupDecisionConfig, ProactiveConfig
+from .config import DecisionConfig, ProactiveConfig
 
 logger = logging.getLogger(__name__)
 
@@ -225,30 +225,15 @@ class MessageMerger:
 
 
 @dataclass
-class DecisionFactors:
-    """一次意愿评分的各因子，便于日志与调参。"""
+class OpenerFactors:
+    """主动冷场开口的独立评分明细。"""
 
-    base: float = 0.0
-    momentum: float = 0.0
-    relevance: float = 0.0
-    ratio_penalty: float = 0.0
-    cooldown_penalty: float = 0.0
-    multiplier: float = 1.0
+    base: float
+    relevance: float
     noise: float = 0.0
-    score: float = 0.0
-    threshold: float = 0.0
-    share: float = 0.0
-    # 心情对阈值的微调量（开心/兴奋为负、委屈/低落为正；平静时为 0）
-    mood_adjust: float = 0.0
 
     def describe(self) -> str:
-        return (
-            f"基础{self.base:.2f} 动量+{self.momentum:.2f} "
-            f"相关+{self.relevance:.2f} 占比-{self.ratio_penalty:.2f} "
-            f"冷却-{self.cooldown_penalty:.2f} 倍率x{self.multiplier:.2f}"
-            + (f" 心情{self.mood_adjust:+.2f}" if self.mood_adjust else "")
-            + (f" 随机{self.noise:+.2f}" if self.noise else "")
-        )
+        return f"基础{self.base:.2f} 相关+{self.relevance:.2f} 随机{self.noise:+.2f}"
 
 
 @dataclass
@@ -260,7 +245,7 @@ class ReplyDecision:
     score: float = 0.0
     threshold: float = 0.0
     hard_trigger: str | None = None
-    factors: DecisionFactors | None = None
+    factors: OpenerFactors | None = None
     effective_talk_value: float | None = None
 
     def log_text(self) -> str:
@@ -364,19 +349,12 @@ def in_quiet_hours(now: float, ranges: Iterable[tuple[int, int]]) -> bool:
 
 
 # ----------------------------------------------------------------------
-# 意愿评分
+# 会话护栏与主动冷场评分
 # ----------------------------------------------------------------------
 
 
 class DecisionEngine:
-    """意愿评分引擎。状态只有「最近一次发言时间」，按会话记录。
-
-    ``planner_gate=True``（默认）时，动量/阈值/占比这套评分**不再拦截**普通
-    回复：开口与否交给 stage1 的表达决策单，这里只剩护栏
-    :meth:`guard`（最小发言间隔、不应期、主动发言窗口上限）与必回判定
-    :meth:`must_reply`。``planner_gate=False`` 时 :meth:`evaluate` 完全走旧
-    评分路径，作为灰度回滚手段。
-    """
+    """识别硬触发，按会话维护真实发言的间隔与主动发言窗口。"""
 
     def __init__(
         self,
@@ -387,22 +365,12 @@ class DecisionEngine:
     ):
         self.config = config or DecisionConfig()
         self.rng = rng or random.Random()
-        cleaned = []
-        for alias in aliases:
-            if not alias or not alias.strip():
-                continue
-            if alias.strip() not in cleaned:
-                cleaned.append(alias.strip())
-        self.aliases = cleaned
-        self._alias_patterns = [(_compile_alias(a), a) for a in cleaned]
+        self.set_aliases(aliases)
         self._last_reply_at: dict[str, float] = {}
-        self._last_momentum_at: dict[str, float] = {}
-        self._last_bot_reply_at: dict[str, float] = {}
-        self._last_refractory_at: dict[str, float] = {}
         self._active_replies: dict[str, list[float]] = {}
 
     def set_aliases(self, aliases: Iterable[str]) -> None:
-        """替换硬触发的名字/别名（配置热更新用，不改评分逻辑）。"""
+        """替换硬触发的名字/别名（配置热更新用）。"""
         cleaned: list[str] = []
         for alias in aliases:
             if not alias or not alias.strip():
@@ -422,7 +390,7 @@ class DecisionEngine:
         return None
 
     def is_hard_trigger(self, event: MessageEvent) -> str | None:
-        """返回硬触发类型；``None`` 表示需要走意愿评分。"""
+        """返回硬触发类型；``None`` 表示普通群消息。"""
         if event.is_private:
             return "private"
         if event.mentions_bot:
@@ -438,44 +406,18 @@ class DecisionEngine:
     # ---- 状态 ----
 
     def min_reply_interval(self) -> float:
-        """新路径的最小发言间隔（秒）；0 表示关闭。"""
+        """最小发言间隔（秒）；0 表示关闭。"""
         return max(0.0, float(getattr(self.config, "min_reply_interval_seconds", 0.0) or 0.0))
 
     @staticmethod
     def chat_key(event: MessageEvent) -> str:
         return f"{event.platform}:{event.chat_id}"
 
-    def note_reply(
-        self,
-        chat_key: str,
-        now: float,
-        *,
-        proactive: bool = False,
-        momentum: bool = True,
-    ) -> None:
-        """记录 bot 发言；主动发言才入窗口，``momentum`` 可排除 bot 自己的动量。"""
+    def note_bot_reply(self, chat_key: str, now: float, *, proactive: bool = False) -> None:
+        """成功发出才刷新冷却；只有未被叫到的主动发言占用窗口名额。"""
         self._last_reply_at[chat_key] = now
-        self._last_bot_reply_at[chat_key] = now
-        if momentum:
-            self._last_momentum_at[chat_key] = now
         if proactive:
             self._active_replies.setdefault(chat_key, []).append(now)
-
-    def note_bot_reply(
-        self,
-        chat_key: str,
-        now: float,
-        *,
-        proactive: bool = False,
-        addressed: bool = False,
-    ) -> None:
-        """记录真实出站 bot 消息，并启用活人感节奏闸门。
-
-        ``addressed=True`` 表示这次发言是被点名/被回复触发的（真的在参与
-        对话），此时写入对话动量；主动发言不写，避免自激。
-        """
-        self.note_reply(chat_key, now, proactive=proactive, momentum=addressed)
-        self._last_refractory_at[chat_key] = now
 
     def active_reply_count(self, chat_key: str, now: float) -> int:
         """返回滚动窗口内的主动发言次数，并顺手淘汰过期时间戳。"""
@@ -489,15 +431,6 @@ class DecisionEngine:
 
     def last_reply_at(self, chat_key: str) -> float | None:
         return self._last_reply_at.get(chat_key)
-
-    def group_settings(self, chat_id: str) -> GroupDecisionConfig:
-        return self.config.groups.get(str(chat_id)) or GroupDecisionConfig()
-
-    def _quiet_ranges(self, settings: GroupDecisionConfig) -> list[tuple[int, int]]:
-        # 每次现算（量很小），配置改了也能立即生效
-        return parse_quiet_hours(settings.quiet_hours)
-
-    # ---- 护栏与必回（planner_gate 新路径） ----
 
     def must_reply(self, event: MessageEvent) -> str | None:
         """必回规则：被 @/点名/回复、私聊消息一律必回；返回原因或 None。
@@ -532,7 +465,7 @@ class DecisionEngine:
         chat_key = self.chat_key(event)
         cfg = self.config
         if cfg.refractory_enabled and cfg.refractory_seconds > 0 and proactive:
-            refractory_at = self._last_refractory_at.get(chat_key)
+            refractory_at = self._last_reply_at.get(chat_key)
             if refractory_at is not None and now - refractory_at < cfg.refractory_seconds:
                 return ReplyDecision(False, "refractory", 0.0, 0.0)
         interval = self.min_reply_interval()
@@ -552,25 +485,15 @@ class DecisionEngine:
         *,
         relevance: float = 0.0,
     ) -> ReplyDecision:
-        """「主动开口」场景的意愿评分：复用同一套评分结构与阈值扰动。
-
-        与普通群消息不同，主动开口时机的动量、发言占比、冷却都没有意义
-        （它是一个冷启动的独立场景），所以只保留「基础分 + 话题相关性」，
-        基础分给得很低，阈值附近的随机扰动保持同样的手感。
-        """
+        """只给主动冷场开口评分：基础分加话题相关性，阈值附近允许扰动。"""
         relevance_bonus = config.relevance_bonus * min(
             1.0, max(0.0, relevance) / max(1e-6, config.relevance_scale)
         )
-        factors = DecisionFactors(
-            base=config.base,
-            relevance=relevance_bonus,
-            threshold=config.threshold,
-        )
+        factors = OpenerFactors(base=config.base, relevance=relevance_bonus)
         score = factors.base + factors.relevance
         if config.threshold_noise > 0 and abs(score - config.threshold) <= config.threshold_noise_band:
             factors.noise = self.rng.uniform(-config.threshold_noise, config.threshold_noise)
             score += factors.noise
-        factors.score = score
         should = score >= config.threshold
         return ReplyDecision(
             should,
@@ -580,112 +503,3 @@ class DecisionEngine:
             None,
             factors,
         )
-
-    def evaluate(
-        self,
-        event: MessageEvent,
-        *,
-        now: float | None = None,
-        recent_messages: Sequence[Any] = (),
-        relevance: float = 0.0,
-        hard_trigger: str | None = None,
-        mood_adjust: float = 0.0,
-    ) -> ReplyDecision:
-        """对一条（或合并后的一轮）群消息评分。
-
-        ``recent_messages`` 只需有 ``sender_id`` 属性；``relevance`` 是记忆检索的
-        最高分（未命中为 0）。``mood_adjust`` 是心情对阈值的微调量（加到阈值
-        上，负数更容易开口）；硬触发直接通过，不受它和冷却/静默影响。
-        """
-        now = time.time() if now is None else now
-        hard = hard_trigger if hard_trigger is not None else self.is_hard_trigger(event)
-        if hard:
-            # 硬触发不看分数，factors 留空，日志里只记触发原因
-            return ReplyDecision(
-                True,
-                reason=hard,
-                score=1.0,
-                threshold=self.config.threshold,
-                hard_trigger=hard,
-            )
-
-        cfg = self.config
-        settings = self.group_settings(event.chat_id)
-        chat_key = self.chat_key(event)
-        try:
-            adjust = float(mood_adjust)
-        except (TypeError, ValueError):
-            adjust = 0.0
-        threshold = cfg.threshold + adjust
-        factors = DecisionFactors(
-            base=cfg.base if settings.base is None else settings.base,
-            multiplier=settings.activity_multiplier,
-            threshold=threshold,
-            mood_adjust=adjust,
-        )
-
-        # 静默时段：普通消息直接闭嘴，硬触发在上面已经放行
-        if in_quiet_hours(now, self._quiet_ranges(settings)):
-            factors.score = 0.0
-            return ReplyDecision(
-                False, "quiet_hours", 0.0, threshold, None, factors
-            )
-
-        # 对话动量：刚参与过这个会话，对方还在继续说，加分随时间指数衰减。
-        # bot 自己的流水不会调用 evaluate，因此这里的状态只由真实 bot 回复写入；
-        # 配置开关保留为显式语义，方便关闭这项修正做 A/B。
-        last_reply = self._last_reply_at.get(chat_key)
-        elapsed = None if last_reply is None else max(0.0, now - last_reply)
-        momentum_at = self._last_momentum_at.get(chat_key)
-        momentum_elapsed = None if momentum_at is None else max(0.0, now - momentum_at)
-        if momentum_elapsed is not None and cfg.momentum_bonus > 0:
-            half_life = max(1.0, cfg.momentum_half_life_seconds)
-            factors.momentum = cfg.momentum_bonus * (0.5 ** (momentum_elapsed / half_life))
-
-        refractory_at = self._last_refractory_at.get(chat_key)
-        refractory_elapsed = None if refractory_at is None else max(0.0, now - refractory_at)
-        if cfg.refractory_enabled and cfg.refractory_seconds > 0 and refractory_elapsed is not None:
-            if refractory_elapsed < cfg.refractory_seconds:
-                factors.score = 0.0
-                return ReplyDecision(False, "refractory", 0.0, threshold, None, factors)
-
-        if cfg.proactive_window_enabled and cfg.proactive_window_limit >= 0:
-            if self.active_reply_count(chat_key, now) >= cfg.proactive_window_limit:
-                factors.score = 0.0
-                return ReplyDecision(False, "proactive_window", 0.0, threshold, None, factors)
-
-        # 话题相关性：记忆检索最高分归一化后加分
-        if cfg.relevance_bonus > 0 and cfg.relevance_scale > 0 and relevance > 0:
-            factors.relevance = cfg.relevance_bonus * min(1.0, relevance / cfg.relevance_scale)
-
-        # 发言占比抑制：最近 N 条里 bot 占比超过阈值，大幅减分；过高则直接静默
-        total = len(recent_messages)
-        if total > 0:
-            bot_count = sum(1 for msg in recent_messages if getattr(msg, "sender_id", "") == BOT_SENDER_ID)
-            factors.share = bot_count / total
-            if factors.share > cfg.ratio_threshold:
-                span = max(1e-6, 1.0 - cfg.ratio_threshold)
-                factors.ratio_penalty = cfg.ratio_penalty * min(1.0, (factors.share - cfg.ratio_threshold) / span)
-                if factors.share >= cfg.ratio_silence:
-                    factors.score = 0.0
-                    return ReplyDecision(
-                        False, "ratio_silence", 0.0, threshold, None, factors
-                    )
-
-        # 发言后冷却：刚发过言的短时间内压低意愿（硬触发已在上面放行）
-        if elapsed is not None and cfg.cooldown_seconds > 0 and elapsed < cfg.cooldown_seconds:
-            remain = 1.0 - elapsed / cfg.cooldown_seconds
-            factors.cooldown_penalty = cfg.cooldown_penalty * max(0.0, min(1.0, remain))
-
-        positive = factors.base + factors.momentum + factors.relevance
-        score = positive * max(0.0, factors.multiplier) - factors.ratio_penalty - factors.cooldown_penalty
-
-        # 阈值附近加随机扰动，避免每次都在同一个位置机械地卡线
-        if cfg.threshold_noise > 0 and abs(score - threshold) <= cfg.threshold_noise_band:
-            factors.noise = self.rng.uniform(-cfg.threshold_noise, cfg.threshold_noise)
-            score += factors.noise
-
-        factors.score = score
-        should = score >= threshold
-        reason = "willing" if should else "below_threshold"
-        return ReplyDecision(should, reason, score, threshold, None, factors)

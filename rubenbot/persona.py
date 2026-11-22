@@ -141,7 +141,6 @@ class Persona:
         - ``planner``：策划步 = persona + behavior
         - ``generator``：生成步 = persona + reply_style
         - ``single``：单段生成 = persona + behavior + reply_style
-        - ``legacy``：旧路径，只用 SOUL 正文（五文件形态也退回 persona.md）
         """
         if not self.parts:
             return self.text.strip()
@@ -149,10 +148,8 @@ class Persona:
             names = ("persona", "behavior")
         elif stage == "generator":
             names = ("persona", "reply_style")
-        elif stage == "single":
+        else:  # 单段提示词同时提供行为与表达约束
             names = ("persona", "behavior", "reply_style")
-        else:  # legacy
-            names = ("persona",)
         return "\n\n".join(
             self.parts[name].strip() for name in names if self.parts.get(name, "").strip()
         )
@@ -178,7 +175,7 @@ class Persona:
         if extras:
             prompt = "\n\n".join([prompt, *extras])
         # 回复样例是旧的可编辑特性：只有五文件形态的策划步不带（它只负责
-        # 裁定开不开口）；旧路径、单段生成、生成步都照旧注入。
+        # 裁定开不开口）；单段提示词与生成步仍注入。
         if self.examples_enabled and not (self.multi_file and stage == "planner"):
             examples = load_reply_examples(self.examples_path, limit=self.examples_count)
             if examples:
