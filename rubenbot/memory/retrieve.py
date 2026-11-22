@@ -19,9 +19,9 @@ import time
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Iterable, Sequence
+from typing import Collection, Iterable, Sequence
 
-from .gate import PrivacyGate, ReviewItem
+from .gate import OWNER_AUDIENCE, PrivacyGate, ReviewItem, has_high_sensitivity_hint
 from .store import (
     SELF_PERSON_ID,
     Event,
@@ -157,7 +157,7 @@ class Retriever:
         """
         if limit <= 0:
             return []
-        pool = self._corpus()
+        pool = [m for m in self._corpus() if m.audience != OWNER_AUDIENCE]
         if not pool:
             return []
         idf_cache = self._idf_cache(pool)
@@ -348,11 +348,8 @@ class MemberIndex:
         return rows
 
     def evidence_of(self, person_id: str) -> list[str]:
-        """索引行身份/钩子的证据（取 stable 首行），供审查口判断来源场合。"""
-        try:
-            return self.store.get_profile_evidence(person_id).get(("stable", 0), [])
-        except Exception:  # noqa: BLE001
-            return []
+        """钩子没有独立证据，索引行只有在整份画像的来源都允许时才能展示。"""
+        return [ref for refs in self.store.get_profile_evidence(person_id).values() for ref in refs]
 
     def _profile_signature(self) -> float:
         """最新一次画像更新时间；任何画像更新都会让索引重建。"""
@@ -483,6 +480,7 @@ class MemoryReader:
         chat_id: str,
         chat_type: str,
         window_texts: Sequence[str] = (),
+        owner_person_ids: Collection[str] = (),
         now: float | None = None,
     ) -> MemoryBlock:
         """组装本轮记忆区块；任何内部失败都退化为尽量少注入，不向上抛。"""
@@ -547,7 +545,7 @@ class MemoryReader:
             index_rows=index_rows,
             now=now,
         )
-        for other_id in mentioned:
+        for other_id in dict.fromkeys([*mentioned, *sorted(set(owner_person_ids) - {person_id})]):
             try:
                 candidates.extend(
                     self._profile_candidates(
@@ -559,6 +557,9 @@ class MemoryReader:
                     )
                 )
                 candidates.extend(self._timeline_candidates(other_id, topic, now=now, priority=50))
+                if other_id in owner_person_ids:
+                    candidates.extend(c for c in self._fact_candidates(other_id, topic, now=now, priority=20)
+                                      if c.item.audience == OWNER_AUDIENCE)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("读取被提及者记忆失败（%s）：%s", other_id, exc)
 
@@ -591,7 +592,8 @@ class MemoryReader:
         if candidates:
             try:
                 allowed, withheld = await self.gate.review(
-                    [c.item for c in candidates], audience_now=audience_now, speaker=person_id, now=now
+                    [c.item for c in candidates], audience_now=audience_now, speaker=person_id, now=now,
+                    owner_person_ids=owner_person_ids, for_chat=True,
                 )
             except Exception as exc:  # noqa: BLE001 - gate 自身已 fail closed，这里再兜一层
                 logger.warning("分寸审查异常，本轮不注入记忆：%s", exc)
@@ -616,8 +618,16 @@ class MemoryReader:
         speaker_name: str,
     ) -> None:
         by_section: dict[str, list[_Candidate]] = {}
+        owner_lines: dict[tuple[str, str], str] = {}
         for cand in candidates:
-            by_section.setdefault(cand.section, []).append(cand)
+            if cand.item.audience == OWNER_AUDIENCE:
+                name = self._display_name(cand.item.person_id)
+                line = cand.text if cand.section == "timeline" else f"- {name}：{cand.text.removeprefix('- ')}"
+                owner_lines.setdefault((cand.item.person_id, cand.item.ref or cand.item.text), line)
+        block.add("【机主自述记忆】", owner_lines.values())
+        for cand in candidates:
+            if cand.item.audience != OWNER_AUDIENCE:
+                by_section.setdefault(cand.section, []).append(cand)
         index_lines = [c.text for c in by_section.get("index", [])]
         if index_lines:
             block.add(
@@ -874,7 +884,7 @@ class MemoryReader:
         )
         candidates: list[_Candidate] = []
         for event in events:
-            if event.source_chat and event.source_chat != current:
+            if event.source_chat != current or (event.audience and event.audience != audience_now):
                 continue  # 只回看本会话里自己做过的事
             if len(candidates) >= limit:
                 break
@@ -965,13 +975,6 @@ class MemoryReader:
     # 证据 / 预算
     # ------------------------------------------------------------------
 
-    # 画像里出现这些字眼时按高敏感处理（规矩在审查口，这里只提供信号）
-    _HIGH_SENSITIVITY_HINTS = (
-        "抑郁", "焦虑症", "看病", "住院", "手术", "吃药", "心理医生", "病历", "确诊",
-        "癌", "怀孕", "流产", "离婚", "分手", "出轨", "欠债", "负债", "借钱",
-        "工资", "年薪", "拆迁", "遗产", "官司", "坐牢", "取向", "出柜",
-    )
-
     def _refs_context(
         self,
         refs: Sequence[str],
@@ -999,15 +1002,16 @@ class MemoryReader:
             except Exception:  # noqa: BLE001
                 obj = None
             if obj is None:
-                continue
+                return "unverified", "sealed"  # 证据已删除或读不到，绝不当成旧的空来源
             audiences.add(obj.audience or "")
             if _SENSITIVITY_RANK.get(obj.sensitivity, 0) > _SENSITIVITY_RANK.get(sensitivity, 0):
                 sensitivity = obj.sensitivity
-        if sensitivity == "normal" and text:
-            if any(hint in text for hint in self._HIGH_SENSITIVITY_HINTS):
-                sensitivity = "high"
+        if sensitivity == "normal" and has_high_sensitivity_hint(text):
+            sensitivity = "high"
         if not audiences:
             return "", sensitivity
+        if OWNER_AUDIENCE in audiences and len(audiences) > 1:
+            return "unverified", "sealed"  # 混合行不能靠其中一条机主自述扩受众
         if "private" in audiences:
             return "private", sensitivity
         audiences.discard("")
@@ -1059,6 +1063,7 @@ class MemoryReader:
         *,
         audience_now: str = "unknown",
         speaker: str = "",
+        owner_person_ids: Collection[str] = (),
         now: float | None = None,
     ) -> str:
         """按人/话题/时段查记忆，结果过审查口后返回给模型看的纯文本。
@@ -1074,7 +1079,7 @@ class MemoryReader:
         )
         if person_id is None:
             return f"没找到和「{person_query}」对应的人。"
-        if person_id == speaker and speaker:
+        if person_id == speaker and speaker and person_id not in owner_person_ids:
             if str(audience_now or "").startswith("group"):
                 # 群聊里不自查：别人的东西在群里说不合适，也让本人改到私聊问
                 return "这个在群里不方便展开，你私聊问我吧。"
@@ -1107,6 +1112,7 @@ class MemoryReader:
                 [c.item for c in candidates],
                 audience_now=audience_now or "unknown",
                 speaker=speaker,
+                owner_person_ids=owner_person_ids, for_chat=True,
                 now=now,
             )
         except Exception as exc:  # noqa: BLE001 - fail closed

@@ -18,6 +18,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from ..memory.gate import OWNER_AUDIENCE
 from ..memory.store import Event, MemoryStore
 
 logger = logging.getLogger(__name__)
@@ -67,17 +68,19 @@ class TimelineCompressor:
         candidates = [
             event
             for event in self.store.list_events(until=cutoff, include_compressed=False, newest_first=False)
-            if event.kind == "event"
+            # 机主事件保留原 id 和逐条来源，不能用 digest 的新键绕过 deny 或事后封存。
+            if event.kind == "event" and event.audience != OWNER_AUDIENCE
         ]
-        groups: dict[tuple[str, tuple[int, int]], list[Event]] = {}
+        groups: dict[tuple[str, tuple[int, int], str, str], list[Event]] = {}
         for event in candidates:
-            key = (event.person_id, week_key(event.ts))
+            # 不同来源不能压成空受众的梗概，否则会把私聊或机主专属事实洗白。
+            key = (event.person_id, week_key(event.ts), event.audience, event.source_chat)
             groups.setdefault(key, []).append(event)
 
         digests = 0
         children = 0
         digest_ids: list[int] = []
-        for (person_id, _week), events in sorted(groups.items(), key=lambda item: (item[0][0], min(e.ts for e in item[1]))):
+        for (person_id, _week, _audience, _source), events in sorted(groups.items(), key=lambda item: (item[0][0], min(e.ts for e in item[1]))):
             if not events:
                 continue
             child_ids = [int(event.id) for event in events if event.id is not None]

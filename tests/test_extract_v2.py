@@ -326,3 +326,54 @@ def test_followups_run_even_without_pending_messages(store):
     assert [call["role"] for call in llm.calls] == ["distill"]
     # 假模型没给出画像 → 保持无画像，不清空/不写空行
     assert store.get_profile("console:u1") is None
+
+
+@pytest.mark.parametrize("speaker,source,content,self_reported,ref,expected", [
+    ("u1", "今天我吃了鸭腿", "TA 今天吃了鸭腿", True, 1, "owner"),
+    ("u1", "今晚吃的是鸭腿", "TA 今晚吃了鸭腿", True, 1, "owner"),
+    ("u2", "我今晚吃了鸭腿", "TA 今晚吃了鸭腿", True, 1, "group:g1"),
+    ("u1", "我朋友今晚吃了鸭腿", "TA 今晚吃了鸭腿", True, 1, "group:g1"),
+    ("u1", "我今晚没吃鸭腿", "TA 吃了鸭腿", True, 1, "group:g1"),
+    ("u1", "我今晚吃了鸭腿", "TA 今晚吃了猪排", True, 1, "group:g1"),
+    ("u1", "我今晚吃了鸭腿", "TA 今晚吃了鸭腿", "true", 1, "group:g1"),
+    ("u1", "我今晚吃了鸭腿", "TA 今晚吃了鸭腿", True, 42, "group:g1"),
+])
+def test_owner_routing_requires_both_grounding_and_sender(store, speaker, source, content, self_reported, ref, expected):
+    from rubenbot.memory.extract import MemoryExtractor
+
+    seed(store, sender=speaker, texts=(source,))
+    markers = {"self_reported": self_reported, "source_msg_id": ref}
+    llm = FakeLLM(payload(facts=[{"content": content, **markers}], events=[{"summary": content, **markers}]))
+    extractor = MemoryExtractor(llm, store, MemoryConfig(), is_owner=lambda row: row.sender_id == "u1")
+    asyncio.run(extractor.extract_sender(store.pending_senders()[0], now=BASE_TS))
+    assert store.list_memories()[0].audience == store.list_events()[0].audience == expected
+
+
+def test_explicit_secrecy_survives_wrong_model_label_without_hiding_next_statement(store):
+    from rubenbot.memory.extract import MemoryExtractor
+
+    seed(store, texts=("请保密，我喜欢跳舞", "我喜欢唱歌"), chat_type="private")
+    facts = [{"content": content, "source_msg_id": index, "self_reported": True}
+             for index, content in [(1, "TA 喜欢跳舞"), (2, "TA 喜欢唱歌"), (99, "TA 喜欢打球")]]
+    extractor = MemoryExtractor(FakeLLM(payload(facts=facts)), store, MemoryConfig(), is_owner=lambda row: True)
+    asyncio.run(extractor.extract_sender(store.pending_senders()[0], now=BASE_TS))
+    assert {m.content: (m.audience, m.sensitivity) for m in store.list_memories()} == {
+        "TA 喜欢跳舞": ("private", "sealed"), "TA 喜欢唱歌": ("owner", "normal"), "TA 喜欢打球": ("private", "sealed")}
+
+
+def test_followup_seals_previous_owner_fact_and_event_not_other_places(store):
+    from rubenbot.memory.extract import MemoryExtractor
+
+    seed(store, texts=("我喜欢跳舞",), chat_type="private")
+    seed(store, texts=("我喜欢游泳",), chat_type="group")
+    for sender in store.pending_senders():
+        row = store.pending_messages(sender.platform, sender.chat_id, sender.sender_id, chat_type=sender.chat_type)[0]
+        fields = {"source_msg_id": row.id, "self_reported": True}
+        llm = FakeLLM(payload(facts=[{"content": row.text, **fields}], events=[{"summary": row.text, **fields}]))
+        asyncio.run(MemoryExtractor(llm, store, MemoryConfig(), is_owner=lambda r: True).extract_sender(sender))
+    assert all(m.audience == "owner" for m in store.list_memories() + store.list_events())
+    seal_id = store.add_raw_message(platform="console", chat_id="g1", chat_type="private", sender_id="u1", text="刚才那句保密")
+    store.seal_previous_statement("console", "g1", "u1", seal_id)
+    assert {m.content: m.sensitivity for m in store.list_memories()} == {"我喜欢跳舞": "sealed", "我喜欢游泳": "normal"}
+    assert {e.summary: e.sensitivity for e in store.list_events()} == {"我喜欢跳舞": "sealed", "我喜欢游泳": "normal"}
+    assert store.open_owner_sources([1, 2]) == {2}

@@ -1,5 +1,14 @@
 
 
+def test_binary_session_secret_preserves_edge_bytes(tmp_path):
+    """二进制签名密钥两端的空白字节也是密钥本身。"""
+    from rubenbot.web.auth import load_or_create_session_secret
+
+    secret = b"\t" + bytes(range(30)) + b" "
+    (tmp_path / ".webui_session_secret").write_bytes(secret)
+    assert load_or_create_session_secret(str(tmp_path / "rubenbot.db")) == secret
+
+
 def test_session_survives_restart_with_persisted_secret(tmp_path):
     """落盘密钥后，新进程的 signer 必须认旧进程签发的 token（重启不登出）。"""
     from rubenbot.web.auth import SessionSigner, load_or_create_session_secret

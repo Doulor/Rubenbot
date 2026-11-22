@@ -21,6 +21,8 @@ from datetime import datetime, timedelta
 
 from ..llm import LLMProtocol, parse_json_payload
 from ..memory.retrieve import audience_for_chat, jaccard, normalize
+from ..memory.gate import OWNER_AUDIENCE
+from ..memory.owner_statement import is_followup_secrecy, is_owner_self_statement, requests_secrecy
 from ..memory.entities import EntityCandidate, EntityLedger
 from ..memory.store import (
     VALID_SENSITIVITY,
@@ -51,6 +53,9 @@ EXTRACT_SYSTEM_PROMPT = """你是一个记忆整理员。你会看到某个会�
   重要的生活事件 0.7~1.0
 
 标注规则（facts 与 events 都要）：
+- source_msg_id：该条信息的原始流水 id（[id=...] 的整数，不是平台 id）。
+- self_reported：仅当该发言人直接陈述关于自己的事且这条原话足以支持整条结论时为 true。
+  转述、引用、他人经历和推测一律 false。自述的事实和事件请沿用原话用词。
 - sensitivity：normal 普通；high 涉及健康/财务/感情/身份等敏感类目；
   sealed 当事人明确要求保密（如“别跟别人说”）
 - facts 的 stability：stable 长期有效；temporal 临时状态（如“明天出差”），
@@ -72,8 +77,8 @@ scope 为 global（长期有效）或 group（只在当前会话有意义）。
 
 严格输出 JSON 对象：
 {"facts": [{"content": "...", "category": "identity", "scope": "global",
-            "stability": "stable", "expires_in_days": 0, "sensitivity": "normal"}],
- "events": [{"summary": "...", "time_hint": "", "salience": 0.4, "sensitivity": "normal"}],
+            "stability": "stable", "expires_in_days": 0, "sensitivity": "normal", "source_msg_id": 123, "self_reported": true}],
+ "events": [{"summary": "...", "time_hint": "", "salience": 0.4, "sensitivity": "normal", "source_msg_id": 123, "self_reported": true}],
  "entities": [{"name": "...", "gloss": "", "gloss_msg_id": "", "message_ids": [], "aliases": []}]}
 没有内容就输出 {"facts": [], "events": [], "entities": []}。
 """
@@ -87,6 +92,8 @@ class ExtractedFact:
     stability: str = "stable"
     expires_in_days: int | None = None
     sensitivity: str = "normal"
+    source_msg_id: int | None = None
+    self_reported: bool = False
 
 
 @dataclass
@@ -96,6 +103,8 @@ class ExtractedEvent:
     ts: float | None = None  # 代码解析后的绝对时间；None 表示用消息时间
     salience: float = 0.5
     sensitivity: str = "normal"
+    source_msg_id: int | None = None
+    self_reported: bool = False
 
 
 @dataclass
@@ -119,10 +128,11 @@ class ExtractResult:
 class MemoryExtractor:
     """按人批量抽取记忆与事件。"""
 
-    def __init__(self, llm: LLMProtocol, store: MemoryStore, config):
+    def __init__(self, llm: LLMProtocol, store: MemoryStore, config, *, is_owner=None):
         self.llm = llm
         self.store = store
         self.config = config
+        self.is_owner = is_owner
 
     # ------------------------------------------------------------------
     # 触发判断
@@ -220,6 +230,35 @@ class MemoryExtractor:
         audience = audience_for_chat(sender.chat_type, sender.chat_id)
         origin_chat = f"{sender.platform}:{sender.chat_id}"
         source_ref = f"{sender.platform}:{sender.chat_id}:{messages[0].id}-{messages[-1].id}"
+        by_id = {m.id: m for m in messages}
+        owner_source = (self.is_owner is not None and not sender.sender_id.startswith("__")
+                        and self.is_owner(messages[0]))
+        open_sources = self.store.open_owner_sources(by_id) if owner_source else set()
+        sealed_sources: set[int] = set()
+        if owner_source:
+            for index, message in enumerate(messages):
+                if requests_secrecy(message.text):
+                    sealed_sources.add(message.id)
+                    if index and is_followup_secrecy(message.text):
+                        sealed_sources.add(messages[index - 1].id)
+
+        def route(item: ExtractedFact | ExtractedEvent, text: str) -> tuple[str, str]:
+            source = by_id.get(item.source_msg_id)
+            if (owner_source and source and (source.id not in open_sources or source.id in sealed_sources)
+                    or not source and sealed_sources):
+                return audience, "sealed"
+            if (owner_source and item.self_reported and source and item.sensitivity != "sealed"
+                    and is_owner_self_statement(source.text, allow_implicit=True) and _grounded(text, source.text)):
+                return OWNER_AUDIENCE, item.sensitivity
+            return audience, item.sensitivity
+
+        if owner_source:
+            blocked = sealed_sources.copy()
+            for item in [*extraction.facts, *extraction.events]:
+                if item.sensitivity in ("high", "sealed"):
+                    blocked.update([item.source_msg_id] if item.source_msg_id in by_id else by_id)
+            if blocked:
+                self.store.block_raw_recall(blocked)
         base_ts = messages[-1].ts
 
         existing = self.store.list_memories(person_id=person_id)
@@ -230,6 +269,9 @@ class MemoryExtractor:
             if duplicate:
                 skipped += 1
                 continue
+            target, sensitivity = route(fact, fact.content)
+            ref = (f"{origin_chat}:{fact.source_msg_id}-{fact.source_msg_id}"
+                   if fact.source_msg_id in by_id else source_ref)
             mem = self.store.add_memory(
                 person_id,
                 fact.content,
@@ -237,10 +279,10 @@ class MemoryExtractor:
                 scope_id=sender.chat_id if fact.scope_type == "group" else "",
                 category=fact.category,
                 source="extracted",
-                source_ref=source_ref,
+                source_ref=ref,
                 origin_chat=origin_chat,
-                audience=audience,
-                sensitivity=fact.sensitivity,
+                audience=target,
+                sensitivity=sensitivity,
                 stability=fact.stability,
                 expires_at=self._expiry_ts(fact, base_ts),
                 now=now,
@@ -255,13 +297,15 @@ class MemoryExtractor:
             if self._event_exists(person_id, event.summary, ts):
                 skipped_events += 1
                 continue
+            target, sensitivity = route(event, event.summary)
             self.store.add_event(
                 person_id,
                 event.summary,
                 ts=ts,
                 source_chat=origin_chat,
-                audience=audience,
-                sensitivity=event.sensitivity,
+                source_raw_id=event.source_msg_id if event.source_msg_id in by_id else None,
+                audience=target,
+                sensitivity=sensitivity,
                 salience=event.salience,
                 now=now,
             )
@@ -362,6 +406,17 @@ VALID_CATEGORIES = {"identity", "preference", "habit", "relationship", "experien
 # ----------------------------------------------------------------------
 
 
+def _grounded(content: str, source: str) -> bool:
+    """跨场合只接受近原文：去掉整理用的主语、助词后实词须按原顺序出现。"""
+    text = re.sub(r"^(?:机主|本人|ta|他|她|我)(?:说自己|自己)?", "", normalize(content))
+    words = re.sub(r"[的了是\W_]", "", text)
+    raw = re.sub(r"[的了是我\W_]", "", normalize(source))
+    # 不允许从长句里跳过否定词、拼凑分散的字冒充来源。
+    return len(words) >= 2 and words in raw and not any(
+        word in raw and word not in words for word in ("不", "没", "并非", "never", "not")
+    )
+
+
 def parse_extraction(raw: str) -> Extraction:
     """解析模型输出：支持 {"facts": [...], "events": [...]} 与旧的纯数组。"""
     data = parse_json_payload(raw)
@@ -412,6 +467,8 @@ def _parse_facts(data: list) -> list[ExtractedFact]:
                 stability=stability,
                 expires_in_days=_parse_days(item.get("expires_in_days")),
                 sensitivity=sensitivity,
+                self_reported=item.get("self_reported") is True and str(item.get("sensitivity", "normal")) in VALID_SENSITIVITY,
+                source_msg_id=item.get("source_msg_id") if type(item.get("source_msg_id")) is int else None,
             )
         )
     return facts
@@ -440,6 +497,8 @@ def _parse_events(data: list) -> list[ExtractedEvent]:
                 time_hint=str(item.get("time_hint") or item.get("time") or "").strip(),
                 salience=min(1.0, max(0.0, salience)),
                 sensitivity=sensitivity,
+                self_reported=item.get("self_reported") is True and str(item.get("sensitivity", "normal")) in VALID_SENSITIVITY,
+                source_msg_id=item.get("source_msg_id") if type(item.get("source_msg_id")) is int else None,
             )
         )
     return events

@@ -37,7 +37,7 @@ def load_or_create_session_secret(db_path: str) -> bytes | None:
     path = Path(db_path).parent / _SESSION_SECRET_FILE
     try:
         if path.exists():
-            data = path.read_bytes().strip()
+            data = path.read_bytes()
             if len(data) >= 16:
                 return data
         secret = secrets.token_bytes(32)

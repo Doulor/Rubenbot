@@ -266,3 +266,21 @@ def test_unaskable_item_not_queued(store):
     gate = PrivacyGate(store, FakeGateLLM(), MemoryConfig())
     run(gate, [item(audience="private", sensitivity="high", askable=False)])
     assert store.list_pending_asks("console:u1") == []
+
+
+@pytest.mark.parametrize("mode,sensitivity,ruling,allowed", [
+    ("normal", "normal", None, True), ("normal", "normal", "deny", False),
+    ("private", "normal", None, False), ("private", "normal", "allow", True),
+    ("normal", "high", None, False), ("normal", "sealed", "allow", False),
+    ("norecord", "normal", "allow", False),
+])
+def test_owner_audience_is_not_a_privacy_override(store, mode, sensitivity, ruling, allowed):
+    candidate = item(audience="owner", sensitivity=sensitivity)
+    llm = FakeGateLLM(raises=AssertionError("机主分寸口不该调用模型"))
+    gate = PrivacyGate(store, llm, MemoryConfig())
+    store.set_privacy_mode(candidate.person_id, mode)
+    if ruling:
+        store.set_ruling(candidate.person_id, ruling_key(candidate, "group:g1"), ruling)
+    yes, no = asyncio.run(gate.review([candidate], audience_now="group:g1", owner_person_ids={candidate.person_id}))
+    assert (candidate in yes) == allowed and (candidate in no) != allowed
+    assert not llm.calls

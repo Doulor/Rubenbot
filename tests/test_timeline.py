@@ -116,3 +116,14 @@ def test_self_timeline_is_compressed_too(store):
     assert result.digests == 1
     digest = store.list_events(person_id="self", kinds=["digest"])[0]
     assert "晚上好" in digest.summary
+
+
+def test_week_digest_does_not_blend_restricted_sources(store):
+    ts = NOW - 20 * DAY
+    for audience in ("owner", "private", "group:g1"):
+        store.add_event("console:u1", audience, audience=audience, ts=ts)
+    make_compressor(store).run(now=NOW)
+    digests = store.list_events(kinds=["digest"])
+    assert {e.audience for e in digests} == {"private", "group:g1"}
+    assert all(e.summary.endswith(e.audience) and "owner" not in e.summary for e in digests)
+    assert any(e.audience == "owner" for e in store.list_events(include_compressed=False, kinds=["event"]))

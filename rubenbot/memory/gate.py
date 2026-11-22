@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Collection, Sequence
 
 from ..llm import LLMProtocol, parse_json_payload
 from .store import MemoryStore
@@ -30,6 +30,19 @@ logger = logging.getLogger(__name__)
 
 # 每人的待询问上限，防止夹带太多问题去烦人
 MAX_PENDING_PER_PERSON = 5
+OWNER_AUDIENCE = "owner"
+
+# 画像和未抽取原话共用的高敏信号；具体受众能否放行仍由审查口裁定。
+_HIGH_SENSITIVITY_HINTS = (
+    "抑郁", "焦虑症", "看病", "住院", "手术", "吃药", "心理医生", "病历", "确诊",
+    "癌", "怀孕", "流产", "离婚", "分手", "出轨", "欠债", "负债", "借钱",
+    "工资", "年薪", "拆迁", "遗产", "官司", "坐牢", "取向", "出柜",
+)
+
+
+def has_high_sensitivity_hint(text: str) -> bool:
+    return any(hint in text for hint in _HIGH_SENSITIVITY_HINTS)
+
 
 GATE_SYSTEM_PROMPT = """你在替一个聊天 bot 把关：它对某个人的记忆，能不能在此刻这些人面前提起。
 
@@ -132,6 +145,8 @@ class PrivacyGate:
         *,
         audience_now: str,
         speaker: str = "",
+        owner_person_ids: Collection[str] = (),
+        for_chat: bool = False,
         now: float | None = None,
     ) -> tuple[list[ReviewItem], list[ReviewItem]]:
         """返回 ``(allowed, withheld)``；被扣下的项带 ``withhold_reason``。
@@ -147,7 +162,19 @@ class PrivacyGate:
         pending_model: list[ReviewItem] = []
 
         for item in items:
-            if self._same_site(item, audience_now):
+            if for_chat and item.sensitivity == "sealed":
+                item.withhold_reason = "封存事项"
+                withheld.append(item)
+                continue
+            if item.audience == OWNER_AUDIENCE:
+                ok = self.owner_verdict(item, audience_now, owner_person_ids, now=now)
+                (allowed if ok else withheld).append(item)
+                continue
+            # 已归档的私聊资料只在本人的私聊里展示。通用裁定接口仍可评估态度，
+            # 但不可把私聊原料交给群里的模型或自动注入。
+            private_outside = (for_chat and item.audience == "private" and item.person_id != "self"
+                               and not (audience_now == "private" and item.person_id == speaker))
+            if not private_outside and self._same_site(item, audience_now):
                 allowed.append(item)
                 continue
             try:
@@ -157,7 +184,10 @@ class PrivacyGate:
                 item.withhold_reason = "审查异常（fail closed）"
                 withheld.append(item)
                 continue
-            if verdict == "allow":
+            if private_outside:
+                item.withhold_reason = item.withhold_reason or "私聊资料不在此处展示"
+                withheld.append(item)
+            elif verdict == "allow":
                 allowed.append(item)
             elif verdict == "withhold":
                 withheld.append(item)
@@ -203,6 +233,29 @@ class PrivacyGate:
     # ------------------------------------------------------------------
     # 本地判定（不调模型）
     # ------------------------------------------------------------------
+
+    def owner_verdict(self, item: ReviewItem, audience_now: str, owner_person_ids: Collection[str],
+                      *, now: float) -> bool:
+        """本人实际在本轮发言才可用；账号按人匹配，封存、档位及受众裁定优先。"""
+        if (item.audience != OWNER_AUDIENCE or not item.person_id or item.person_id not in owner_person_ids
+                or audience_kind(audience_now) not in ("private", "group")):
+            item.withhold_reason = "受众不含该机主或场合不明"
+            return False
+        try:
+            # 原话没有可靠的单条类目/事件键，不得用换键绕过既有 deny。
+            if item.kind == "raw" and any(
+                r.verdict == "deny" and r.key.endswith("@" + audience_kind(audience_now))
+                for r in self.store.list_rulings(item.person_id)
+            ):
+                item.withhold_reason = "已有裁定：不可说"
+                return False
+            verdict = self._local_verdict(item, audience_now, now=now)
+            # 普通机主自述不另问模型；None 表示没有硬限制。
+            return verdict != "withhold"
+        except Exception as exc:
+            logger.warning("机主分寸审查失败，扣下：%s", exc)
+            item.withhold_reason = "审查异常（fail closed）"
+            return False
 
     @staticmethod
     def _same_site(item: ReviewItem, audience_now: str) -> bool:

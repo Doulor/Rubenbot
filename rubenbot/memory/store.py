@@ -53,7 +53,7 @@ CREATE TABLE IF NOT EXISTS memories (
     source_ref  TEXT NOT NULL DEFAULT '',
     -- 记忆 v2：来源会话、原始受众、敏感度、事实稳定性与过期时间
     origin_chat TEXT NOT NULL DEFAULT '',          -- platform:chat_id
-    audience    TEXT NOT NULL DEFAULT '',          -- private / group:<id> / public
+    audience    TEXT NOT NULL DEFAULT '',          -- private / group:<id> / public / owner
     sensitivity TEXT NOT NULL DEFAULT 'normal',    -- normal / high / sealed
     stability   TEXT NOT NULL DEFAULT 'stable',    -- stable / temporal / uncertain
     expires_at  REAL,
@@ -91,7 +91,8 @@ CREATE TABLE IF NOT EXISTS events (
     ts          REAL NOT NULL,                    -- 事件发生时间
     summary     TEXT NOT NULL,
     source_chat TEXT NOT NULL DEFAULT '',         -- platform:chat_id
-    audience    TEXT NOT NULL DEFAULT '',         -- private / group:<id> / public
+    source_raw_id INTEGER,                        -- 单条原话，可在事后按原文追封
+    audience    TEXT NOT NULL DEFAULT '',         -- private / group:<id> / public / owner
     sensitivity TEXT NOT NULL DEFAULT 'normal',   -- normal / high / sealed
     salience    REAL NOT NULL DEFAULT 0.5,        -- 显著度 0-1
     compressed  INTEGER NOT NULL DEFAULT 0,       -- 1 = 已压进 digest
@@ -165,6 +166,7 @@ CREATE TABLE IF NOT EXISTS raw_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_raw_chat ON raw_messages(chat_id, ts);
 CREATE INDEX IF NOT EXISTS idx_raw_pending ON raw_messages(processed, sender_id);
+CREATE INDEX IF NOT EXISTS idx_raw_sender_ts ON raw_messages(platform, sender_id, ts);
 CREATE INDEX IF NOT EXISTS idx_raw_platform_msg ON raw_messages(platform, platform_msg_id);
 
 -- 每群一本专名账；说明与别名挂在实际提及的原文证据上，可随发送者清空。
@@ -435,6 +437,7 @@ class Event:
     compressed: bool = False
     kind: str = "event"  # event / digest
     created_at: float = field(default_factory=time.time)
+    source_raw_id: int | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -629,6 +632,8 @@ class MemoryStore:
             _migrate_raw_messages(self._conn)
             _migrate_memories(self._conn)
             self._conn.executescript(SCHEMA)
+            if "source_raw_id" not in {row[1] for row in self._conn.execute("PRAGMA table_info(events)")}:
+                self._conn.execute("ALTER TABLE events ADD COLUMN source_raw_id INTEGER")
             if "chat_type" not in {row[1] for row in self._conn.execute("PRAGMA table_info(gateway_audit)")}:
                 self._conn.execute("ALTER TABLE gateway_audit ADD COLUMN chat_type TEXT NOT NULL DEFAULT ''")
             self._conn.commit()
@@ -1284,6 +1289,7 @@ class MemoryStore:
         sensitivity: str = "normal",
         salience: float = 0.5,
         kind: str = "event",
+        source_raw_id: int | None = None,
         compressed: bool = False,
         now: float | None = None,
     ) -> Event:
@@ -1297,8 +1303,8 @@ class MemoryStore:
             cur = self._conn.execute(
                 """
                 INSERT INTO events(person_id, ts, summary, source_chat, audience, sensitivity,
-                                   salience, compressed, kind, created_at)
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                   salience, compressed, kind, source_raw_id, created_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     person_id,
@@ -1310,6 +1316,7 @@ class MemoryStore:
                     salience,
                     1 if compressed else 0,
                     kind,
+                    source_raw_id,
                     now,
                 ),
             )
@@ -1818,6 +1825,33 @@ class MemoryStore:
             self._conn.commit()
         return int(cur.lastrowid)
 
+    def open_owner_sources(self, raw_ids: Iterable[int]) -> set[int]:
+        """抽取等待模型期间若原话被撤回、清空或进入隐私模式，不再提升它的受众。"""
+        ids = list(raw_ids)
+        with self._lock:
+            return {row[0] for row in self._conn.execute(
+                f"SELECT id FROM raw_messages WHERE entity_blocked=0 AND id IN ({','.join('?' for _ in ids)})", ids,
+            )}
+
+    def seal_previous_statement(self, platform: str, chat_id: str, sender_id: str, before_id: int) -> None:
+        """本人私聊补一句封口：原话及其已抽取结果一起封，不触及其他场合/人的事。"""
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                """SELECT id FROM raw_messages WHERE platform=? AND chat_type='private' AND chat_id=?
+                   AND sender_id=? AND id<? ORDER BY id DESC LIMIT 1""", (platform, chat_id, sender_id, before_id),
+            ).fetchone()
+            if row is None:
+                return
+            rid = row['id']
+            person = make_person_id(platform, sender_id)
+            origin = f"{platform}:{chat_id}"
+            self._conn.execute("UPDATE raw_messages SET entity_blocked=1 WHERE id=?", (rid,))
+            self._conn.execute("""UPDATE memories SET sensitivity='sealed' WHERE person_id=? AND origin_chat=?
+                               AND audience IN ('private','owner') AND source_ref=?""",
+                               (person, origin, f"{origin}:{rid}-{rid}"))
+            self._conn.execute("""UPDATE events SET sensitivity='sealed' WHERE person_id=? AND source_chat=?
+                               AND audience IN ('private','owner') AND source_raw_id=?""", (person, origin, rid))
+
     def platform_message_exists(
         self,
         platform: str,
@@ -1920,6 +1954,54 @@ class MemoryStore:
         with self._lock:
             rows = self._conn.execute(sql, params).fetchall()
         return [self._row_to_raw(row) for row in reversed(rows)]
+
+    def recent_sender_messages_elsewhere(
+        self, platform: str, sender_id: str, *, chat_type: str, chat_id: str,
+        since: float, until: float, limit: int,
+    ) -> list[RawMessage]:
+        """同一平台账号在别处的近期流水；只取可用原话，最新在先。"""
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT r.* FROM raw_messages r LEFT JOIN privacy_settings p
+                   ON p.person_id=r.platform || ':' || r.sender_id
+                   WHERE r.platform=? AND r.sender_id=? AND r.ts BETWEEN ? AND ?
+                   AND r.chat_type IN ('group','private') AND NOT (r.chat_type=? AND r.chat_id=?)
+                   AND r.entity_blocked=0 AND COALESCE(p.mode,'normal')='normal'
+                   AND substr(r.sender_id,1,2)<>'__' AND r.text<>''
+                   ORDER BY r.ts DESC,r.id DESC LIMIT ?""",
+                (platform, sender_id, since, until, chat_type, str(chat_id), max(0, limit)),
+            ).fetchall()
+        return [self._row_to_raw(row) for row in rows]
+
+    def preceding_sender_raw_ids(self, raw_ids: Sequence[int]) -> set[int]:
+        """旧追封指令对应的前一条同源流水；包括已封存行，不会误扣更早的无关原话。"""
+        if not raw_ids:
+            return set()
+        with self._lock:
+            return {row[0] for row in self._conn.execute(
+                f"""SELECT (SELECT MAX(p.id) FROM raw_messages p
+                            WHERE p.platform=r.platform AND p.sender_id=r.sender_id AND p.chat_type=r.chat_type
+                            AND p.chat_id=r.chat_id AND p.id<r.id)
+                    FROM raw_messages r WHERE r.id IN ({','.join('?' for _ in raw_ids)})""", raw_ids,
+            ) if row[0] is not None}
+
+    def block_raw_recall(self, raw_ids: Iterable[int]) -> None:
+        """按已核实的流水主键封住原话检索，不删除本会话的短期上下文。"""
+        with self._lock, self._conn:
+            self._conn.executemany('UPDATE raw_messages SET entity_blocked=1 WHERE id=?',
+                                   ((i,) for i in set(raw_ids)))
+
+    def restricted_raw_sources(self, person_id: str, *, since: float) -> list[tuple[str, str, float]]:
+        """取近期已受保护事项的（来源会话，流水引用，入库时间），兼容旧抽取数据。"""
+        with self._lock:
+            return [tuple(row) for row in self._conn.execute(
+                """SELECT origin_chat,source_ref,created_at FROM memories
+                   WHERE person_id=? AND created_at>=? AND sensitivity IN ('sealed','high')
+                   UNION ALL SELECT source_chat,
+                       COALESCE(source_chat || ':' || source_raw_id || '-' || source_raw_id,''),created_at FROM events
+                   WHERE person_id=? AND created_at>=? AND sensitivity IN ('sealed','high')""",
+                (person_id, since, person_id, since),
+            )]
 
     def pending_senders(self) -> list[PendingSender]:
         """仍有未抽取消息的发送者，按待处理条数降序。"""
