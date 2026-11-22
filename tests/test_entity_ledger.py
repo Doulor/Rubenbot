@@ -13,7 +13,7 @@ from rubenbot.memory.store import MemoryStore
 
 @pytest.fixture
 def store():
-    with_store = MemoryStore(':memory:')
+    with_store = MemoryStore(':memory:', privacy_enabled=True)
     yield with_store
     with_store.close()
 

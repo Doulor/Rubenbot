@@ -10,7 +10,7 @@ import pytest
 
 from rubenbot.config import LLMConfig, MemoryConfig
 from rubenbot.llm import LLMClient, ToolUnsupported
-from rubenbot.memory.gate import PrivacyGate
+from rubenbot.privacy import PrivacyGate
 from rubenbot.memory.retrieve import (
     CROSS_SESSION_HEADER,
     MEMORY_HEADER,
@@ -65,7 +65,7 @@ class EchoGateLLM(FakeLLM):
 
 @pytest.fixture()
 def store():
-    s = MemoryStore(":memory:")
+    s = MemoryStore(":memory:", privacy_enabled=True)
     yield s
     s.close()
 
@@ -552,12 +552,13 @@ def test_recall_self_in_group_declines(store):
 
 def test_recall_by_nickname_and_topic(store):
     seed_person(store, "u2", "阿草", stable=["TA 喜欢弹吉他"])
-    store.add_event("console:u2", "TA 去听了吉他演奏会", ts=NOW - 86400, audience="group:g1", now=NOW)
+    store.add_event("console:u2", "TA 去听了吉他演奏会", ts=NOW - 86400,
+                    source_chat="console:g1", audience="group:g1", now=NOW)
     text = asyncio.run(reader(store).recall("阿草", "吉他", audience_now="group:g1", speaker="console:u1", now=NOW))
     assert "阿草" in text
     assert "弹吉他" in text
     assert "演奏会" in text
-    assert "昨天" in text
+    assert time.strftime("%Y-%m-%d %H:%M", time.localtime(NOW - 86400)) in text
 
 
 def test_recall_unknown_person(store):
@@ -590,7 +591,7 @@ def test_time_range_parse(store):
     assert r._parse_time_range("7d", NOW) == NOW - 7 * 86400
     assert r._parse_time_range("24h", NOW) == NOW - 86400
     assert r._parse_time_range("3天", NOW) == NOW - 3 * 86400
-    assert r._parse_time_range("", NOW) == NOW - 365 * 86400
+    assert r._parse_time_range("", NOW) is None  # 未指定不限制时间，包括一年以前的记录
 
 
 # ----------------------------------------------------------------------

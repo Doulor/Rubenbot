@@ -402,6 +402,46 @@ def test_mcp_live_status_is_read_only(client, state):
     assert client.get("/api/mcp/status").json()["servers"] == [row]
 
 
+@pytest.mark.parametrize("state_fixture", ["state", "bot_state"])
+def test_timeline_privacy_settings_round_trip(request, state_fixture, config_path):
+    state = request.getfixturevalue(state_fixture)
+    client = TestClient(create_app(state))
+    view = client.get("/api/config").json()["structured"]
+    assert view["privacy"]["enabled"] is False
+    assert view["memory"]["timeline_recent_hours"] == 24
+    assert view["memory"]["timeline_max_chars"] == 1800
+    assert resolve_page("privacy.enabled") == "memory"
+
+    for enabled in (True, False):
+        result = client.put("/api/config", json={"config": {
+            "privacy": {"enabled": enabled},
+            "memory": {"timeline_recent_hours": "2.5", "timeline_max_chars": "300"},
+        }})
+        assert result.status_code == 200, result.text
+        assert result.json()["resolution"]["privacy.enabled"] == "hot"
+        saved = Config.load(config_path)
+        assert saved.privacy.enabled is enabled
+        if state.bot is not None:
+            assert (state.bot.memory_reader.gate is not None) is enabled
+        assert state.store.privacy_enabled is enabled
+        assert (saved.memory.timeline_recent_hours, saved.memory.timeline_max_chars) == (2.5, 300)
+        view = client.get("/api/config").json()["structured"]
+        assert view["privacy"]["enabled"] is enabled
+        assert (view["memory"]["timeline_recent_hours"], view["memory"]["timeline_max_chars"]) == (2.5, 300)
+
+
+@pytest.mark.parametrize("bad", [
+    {"privacy": {"enabled": "false"}}, {"memory": {"timeline_max_chars": -1}},
+    {"memory": {"timeline_recent_hours": -2}},
+])
+def test_timeline_privacy_invalid_values_rejected(client, config_path, bad):
+    original = config_path.read_bytes()
+    assert client.put("/api/config", json={"config": bad}).status_code == 422
+    assert config_path.read_bytes() == original
+    with pytest.raises(ValueError):
+        Config.from_dict(bad)
+
+
 def test_attention_expression_form_round_trip(client, config_path):
     view = client.get("/api/config").json()["structured"]
     assert view["attention"] == {"talk_value": 0.75, "engaged_window_seconds": 120}

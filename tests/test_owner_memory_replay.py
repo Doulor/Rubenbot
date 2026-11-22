@@ -1,4 +1,4 @@
-"""机主全局记忆：两条独立通道回放同一实测对话，并检查裁定和正文都没看到禁带材料。"""
+"""跨场合回放：核对策划和正文实际收到的证据，区分近况、原话与蒸馏结果。"""
 
 import asyncio
 import json
@@ -21,15 +21,17 @@ UNKNOWN = "不知道呢，你吃的啥"
 class EvidenceLLM(ScriptedLLM):
     """不预排肯定答案：回复只取决于生成请求里实际收到的证据。"""
 
+    answer = "鸭腿"
+
     async def complete(self, messages, *, role="chat", task=None, temperature=None, json_mode=False):
-        evidence = any("鸭腿" in msg["content"] for msg in messages)
+        evidence = any(self.answer in msg["content"] for msg in messages)
         if task == "gen_stage1":
             self.responses[role] = [json.dumps({
                 "basis": "ledger" if evidence else "guess", "speak": True,
                 "intent": "补充新信息", "increment": "回答对方",
             }, ensure_ascii=False)]
         elif role == "chat":
-            self.responses[role] = ["鸭腿" if evidence else UNKNOWN]
+            self.responses[role] = [self.answer if evidence else UNKNOWN]
         elif role == "gate":
             # 反例不能靠「恰好模型拒绝」通过。
             self.responses[role] = [json.dumps({"items": [
@@ -53,9 +55,12 @@ def event(place, sender, text):
                         sender, "机主", text, mentions_bot=place == "group")
 
 
+@pytest.mark.parametrize("privacy", [False, True])
 @pytest.mark.parametrize("route", ["recent", "fact", "event"])
 @pytest.mark.parametrize("source,target", [("group", "private"), ("private", "group")])
-def test_owner_answers_across_places(config, store, monkeypatch, route, source, target):
+def test_owner_answers_across_places(config, store, monkeypatch, route, source, target, privacy):
+    config.privacy.enabled = privacy
+
     async def replay():
         bot, llm, adapter = setup(config, store)
         first = event(source, "owner", STATEMENT)
@@ -74,6 +79,8 @@ def test_owner_answers_across_places(config, store, monkeypatch, route, source, 
             records = store.list_memories if route == "fact" else store.list_events
             record, = records(person_id="recording:owner")
             assert record.audience == "owner"
+            if route == "event":
+                assert record.source_chat_type == source  # 清理流水不应让私聊/群聊出处丢失
         else:
             assert not store.list_memories(person_id="recording:owner")
         llm.calls.clear()
@@ -84,7 +91,7 @@ def test_owner_answers_across_places(config, store, monkeypatch, route, source, 
             contents = [m["content"] for m in call["messages"]]
             assert any(QUESTION in c for c in contents)
             if route == "recent":
-                assert any("【机主最近说过】" in c and STATEMENT in c for c in contents)
+                assert any("【相关原话摘录】" in c and STATEMENT in c for c in contents)
             else:
                 assert any("机主今晚吃了鸭腿" in c for c in contents)
                 assert all(STATEMENT not in c for c in contents)
@@ -96,6 +103,8 @@ def test_owner_answers_across_places(config, store, monkeypatch, route, source, 
 
 
 def test_sealing_last_statement_after_extraction_blocks_both_routes(config, store):
+    config.privacy.enabled = True
+
     async def replay():
         bot, llm, adapter = setup(config, store)
         first = event("private", "owner", STATEMENT)
@@ -116,7 +125,10 @@ def test_sealing_last_statement_after_extraction_blocks_both_routes(config, stor
     asyncio.run(replay())
 
 
-def test_owner_need_not_be_primary_speaker(config, store):
+@pytest.mark.parametrize("privacy", [False, True])
+def test_owner_need_not_be_primary_speaker(config, store, privacy):
+    config.privacy.enabled = privacy
+
     async def replay():
         bot, llm, adapter = setup(config, store)
         await bot.handle_event(event("private", "owner", STATEMENT))
@@ -128,17 +140,216 @@ def test_owner_need_not_be_primary_speaker(config, store):
         assert batch.primary_sender == "peer"
         await bot.process_round(batch)
         assert adapter.texts[-1] == "鸭腿"
-        assert any("【机主最近说过】" in m["content"] and STATEMENT in m["content"]
-                   for m in llm.calls[0]["messages"])
+        stages = [c for c in llm.calls if c["task"] in {"gen_stage1", "gen_stage2"}]
+        assert [c["task"] for c in stages] == ["gen_stage1", "gen_stage2"]
+        for call in stages:
+            assert any("【相关原话摘录】" in m["content"] and STATEMENT in m["content"]
+                       for m in call["messages"])
 
     asyncio.run(replay())
 
 
+@pytest.mark.parametrize("privacy", [False, True])
+def test_same_name_guest_cannot_claim_owner_via_raw_sender(config, store, privacy):
+    config.privacy.enabled = privacy
+    bot, llm, adapter = setup(config, store)
+    asyncio.run(bot.handle_event(event("private", "owner", STATEMENT)))
+    llm.calls.clear()
+    guest = event("group", "guest", QUESTION)
+    guest.raw = {"sender_id": "owner"}  # 昵称也与机主相同；真实适配器发送者仍是 guest。
+    asyncio.run(bot.handle_event(guest))
+    stages = [c for c in llm.calls if c["task"] in {"gen_stage1", "gen_stage2"}]
+    assert [c["task"] for c in stages] == ["gen_stage1", "gen_stage2"]
+    for call in stages:
+        contents = [m["content"] for m in call["messages"]]
+        if privacy:
+            assert all("鸭腿" not in text for text in contents)
+        else:
+            assert any("【相关原话摘录】" in text and STATEMENT in text for text in contents)
+    assert adapter.texts[-1] == (UNKNOWN if privacy else "鸭腿")
+
+
+def test_recent_context_prefers_distilled_events_and_keeps_current_history_once(config, store):
+    now = time.time()
+    bot, _, _ = setup(config, store)
+    store.upsert_person('recording', 'u3', '阿织')
+    store.add_raw_message(platform='recording', chat_id='group-A', sender_id='u3', sender_name='阿织',
+                          text='夜市游记的超长逐字稿', ts=now - 300)
+    store.add_event('recording:u3', '夜市游记压缩版', ts=now - 120, source_chat='recording:group-A',
+                    audience='group:group-A', now=now)
+    store.add_event('recording:u3', '前天的景点', ts=now - 25 * 3600, source_chat='recording:old',
+                    audience='group:old', now=now)
+    store.add_raw_message(platform='recording', chat_id='group-B', sender_id='u3', sender_name='阿织',
+                          text='丽江刚下了一阵雨', ts=now - 240)
+    # bot 回复成功就有自我事件，却不代表这个场合已蒸馏过群友的话。
+    store.add_self_event('收到啦', source_chat='recording:group-B', audience='group:group-B', ts=now - 230)
+    current = event('group', 'peer', '有谁还在线？')
+    asyncio.run(bot._record(current, now))
+    messages = asyncio.run(bot.build_context(current, now=now))
+    recent, = [m['content'] for m in messages if '【最近发生的事】' in m['content']]
+    for needle, group, ts in [('夜市游记压缩版', 'group-A', now - 120), ('丽江刚下了一阵雨', 'group-B', now - 240)]:
+        line, = [line for line in recent.splitlines() if needle in line]
+        assert all(part in line for part in [group, '群', '阿织', time.strftime('%Y-%m-%d %H:%M', time.localtime(ts))])
+    assert recent.index('夜市游记压缩版') < recent.index('丽江刚下了一阵雨')
+    assert all(part not in recent for part in [current.text, '超长逐字稿', '前天的景点'])
+    assert sum(m['content'].count(current.text) for m in messages) == 1
+
+
+def test_auto_search_finds_old_local_quotes_without_repeating_visible_history(config, store):
+    config.chat.history_size = 2
+    bot, _, _ = setup(config, store)
+    now = time.time()
+    old = event('group', 'peer', '给夜市订了两箱橘子')
+    visible = event('group', 'peer', '夜市的账本收好了')
+    current = event('group', 'owner', '夜市订了什么？')
+    for item, age in [(old, 300), (visible, 100), (current, 0)]:
+        asyncio.run(bot._record(item, now - age))
+    contents = [m['content'] for m in asyncio.run(bot.build_context(current, now=now))]
+    excerpt, = [c for c in contents if '【相关原话摘录】' in c]
+    assert old.text in excerpt and 'main-group' in excerpt
+    assert visible.text not in excerpt and current.text not in excerpt
+    assert all(sum(c.count(item.text) for c in contents) == 1 for item in (old, visible, current))
+
+
+def test_disabled_privacy_bypasses_judgment_on_every_read(config, store, monkeypatch):
+    """读已有封存数据时，关闭不是「调用后默认 allow」，而是完全不裁定。"""
+    from rubenbot.privacy import PrivacyGate
+
+    calls = []
+
+    async def unexpected(*args, **kwargs):
+        calls.append(True)
+        raise AssertionError('隐私关闭时不得调用裁定')
+
+    monkeypatch.setattr(PrivacyGate, 'review', unexpected)
+    monkeypatch.setattr(PrivacyGate, 'review_timeline', unexpected)
+    bot, _, _ = setup(config, store)
+    now = time.time()
+    store.upsert_person('recording', 'peer', '机主')
+    rid = store.add_raw_message(platform='recording', chat_type='private', chat_id='peer', sender_id='peer',
+                                text='纸鹤项目的代号是蓝杉', ts=now - 400)
+    store.block_raw_recall([rid])
+    store.add_memory('recording:peer', '纸鹤项目由阿织管理', origin_chat='recording:peer',
+                     audience='private', sensitivity='sealed', now=now - 360)
+    store.add_event('recording:peer', '纸鹤项目昨日签约', source_chat='recording:peer', audience='private',
+                    sensitivity='sealed', ts=now - 360, now=now - 360)
+    current = event('group', 'peer', '纸鹤项目进展怎样？')
+    messages = asyncio.run(bot.build_context(current, now=now))
+    content = '\n'.join(m['content'] for m in messages)
+    assert '纸鹤项目由阿织管理' in content
+    assert any('【最近发生的事】' in m['content'] and '纸鹤项目昨日签约' in m['content'] for m in messages)
+    assert any('【相关原话摘录】' in m['content'] and '纸鹤项目的代号是蓝杉' in m['content'] for m in messages)
+    recalled = asyncio.run(bot.recall('', '纸鹤项目', event=current, now=now))
+    assert all(key in recalled for key in ('纸鹤项目的代号是蓝杉', '纸鹤项目昨日签约', '纸鹤项目由阿织管理'))
+    assert calls == []
+
+
+@pytest.mark.parametrize('privacy', [True, False])
+def test_high_sensitivity_group_to_group(config, store, privacy):
+    """出发地本来就是群，不能靠私聊隔离碰巧挡住高敏原话。"""
+    config.privacy.enabled = privacy
+    bot, _, _ = setup(config, store)
+    now = time.time()
+    source = MessageEvent('recording', 'group', 'group-A', 'u3', '阿织', '工资这月降到九千八了。')
+    asyncio.run(bot._record(source, now - 60))
+    current = event('group', 'peer', '阿织的工资怎么样？')
+    messages = asyncio.run(bot.build_context(current, now=now))
+    for title in ('【最近发生的事】', '【相关原话摘录】'):
+        assert any(title in m['content'] and source.text in m['content'] for m in messages) is not privacy
+    recalled = asyncio.run(bot.recall('', '工资', event=current, now=now))
+    assert (source.text in recalled) is not privacy
+
+
+@pytest.mark.parametrize('privacy', [True, False])
+def test_private_sessions_with_same_chat_id_on_different_platforms(config, store, privacy):
+    config.privacy.enabled = privacy
+    bot, _, _ = setup(config, store)
+    now = time.time()
+    secret = '灯塔航标重新涂成海蓝色了'
+    source = MessageEvent('elsewhere', 'private', '42', '42', '小舟', secret)
+    current = MessageEvent('recording', 'private', '42', '42', '过客', '灯塔航标是什么颜色？')
+    asyncio.run(bot._record(source, now - 30))
+    messages = asyncio.run(bot.build_context(current, now=now))
+    for title in ('【最近发生的事】', '【相关原话摘录】'):
+        assert any(title in m['content'] and secret in m['content'] for m in messages) is not privacy
+    assert (secret in asyncio.run(bot.recall('', '航标', event=current, now=now))) is not privacy
+
+
+def test_hot_switch_changes_visibility_without_erasing_mode(config, store):
+    from copy import deepcopy
+
+    config.privacy.enabled = True
+    bot, _, _ = setup(config, store)
+    now = time.time()
+    source = event('private', 'peer', '灯塔方案暂定锈红色。')
+    current = event('group', 'other', '灯塔方案定了吗？')
+    store.set_privacy_mode('recording:peer', 'private')
+    asyncio.run(bot._record(source, now - 90))
+    for enabled in (True, False, True):
+        changed = deepcopy(bot.config)
+        changed.privacy.enabled = enabled
+        bot.apply_config(changed, rebuild_llm=False)
+        messages = asyncio.run(bot.build_context(current, now=now))
+        for title in ('【最近发生的事】', '【相关原话摘录】'):
+            assert any(title in m['content'] and source.text in m['content'] for m in messages) is not enabled
+    assert store.get_privacy_mode('recording:peer') == 'private'
+
+
+@pytest.mark.parametrize('privacy', [True, False])
+def test_owner_identity_quote_obeys_privacy_in_all_group_reads(config, store, privacy):
+    config.privacy.enabled = privacy
+    bot, _, _ = setup(config, store)
+    now = time.time()
+    secret = '我的身份证号是测试编号甲'
+    asyncio.run(bot._record(event('private', 'owner', secret), now - 60))
+    current = event('group', 'owner', '我的身份证号是什么？')
+    messages = asyncio.run(bot.build_context(current, now=now))
+    for title in ('【最近发生的事】', '【相关原话摘录】'):
+        assert any(title in m['content'] and secret in m['content'] for m in messages) is not privacy
+    assert (secret in asyncio.run(bot.recall('', '身份证号', event=current, now=now))) is not privacy
+
+
+def test_owner_correction_reaches_group_verbatim(config, store):
+    """机主实测原句不是「我……」起头；即使拿掉近况层，也要自动查到。"""
+    config.memory.timeline_max_chars = 0
+    bot, llm, adapter = setup(config, store)
+    llm.answer = "意大利火箭炮拌鹈鹕骑自行车"
+    correction = "骗你的，其实我吃的意大利火箭炮拌鹈鹕骑自行车"
+    asyncio.run(bot.handle_event(event("private", "owner", correction)))
+    llm.calls.clear()
+    asyncio.run(bot.handle_event(event("group", "owner", QUESTION)))
+    assert adapter.texts[-1] == llm.answer
+    assert [call['task'] for call in llm.calls] == ['gen_stage1', 'gen_stage2']
+    for call in llm.calls:
+        assert any("【相关原话摘录】" in msg['content'] and correction in msg['content']
+                   for msg in call['messages'])
+
+
+@pytest.mark.parametrize("target", ["private", "group"])
+def test_non_owner_statement_reaches_other_places(config, store, target):
+    """说话人不在场、也不是机主；按话题和人名从全域查原话。"""
+    config.memory.timeline_max_chars = 0
+    bot, llm, adapter = setup(config, store)
+    source = MessageEvent('recording', 'group', 'group-A', 'u3', '阿织', '昨晚夜市最后一份鸭腿，被我们分啦。')
+    asyncio.run(bot._record(source, time.time() - 61))
+    destination = event(target, 'u4', '阿织昨晚在夜市吃啥了？')
+    asyncio.run(bot.handle_event(destination))
+    assert adapter.texts[-1] == '鸭腿'
+    stages = [call for call in llm.calls if call['task'] in {'gen_stage1', 'gen_stage2'}]
+    assert len(stages) == 2
+    for call in stages:
+        excerpt, = [m['content'] for m in call['messages'] if '【相关原话摘录】' in m['content']]
+        assert all(value in excerpt for value in [source.text, 'group-A', '阿织'])
+
+
+@pytest.mark.parametrize("privacy", [True, False])
 @pytest.mark.parametrize("extract", [False, True])
 @pytest.mark.parametrize("sender,questioner,sealed", [
     ("peer", "peer", False), ("owner", "owner", True), ("owner", "peer", False),
 ])
-def test_private_evidence_stays_out_of_group(config, store, sender, questioner, sealed, extract):
+def test_private_evidence_follows_switch(config, store, sender, questioner, sealed, extract, privacy):
+    config.privacy.enabled = privacy
+
     async def replay():
         bot, llm, adapter = setup(config, store)
         statement = "请保密，" + STATEMENT if sealed else STATEMENT
@@ -157,7 +368,8 @@ def test_private_evidence_stays_out_of_group(config, store, sender, questioner, 
         await bot.handle_event(group_question)
         stages = [c for c in llm.calls if c["task"] in {"gen_stage1", "gen_stage2"}]
         assert len(stages) == 2
-        assert all("鸭腿" not in m["content"] for c in stages for m in c["messages"])
-        assert adapter.texts[-1] == UNKNOWN
+        for call in stages:
+            assert any("鸭腿" in m["content"] for m in call["messages"]) is not privacy
+        assert adapter.texts[-1] == (UNKNOWN if privacy else "鸭腿")
 
     asyncio.run(replay())

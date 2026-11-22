@@ -1,56 +1,32 @@
-"""privacy 插件：/隐私 命令、待询问投递、答复解析与落裁定、清空。"""
+"""核心隐私模块：/隐私 命令、待询问投递、答复解析与落裁定、清空。"""
 
 import asyncio
 from pathlib import Path
 
+import pytest
 
 from rubenbot.adapters.base import MessageEvent
 from rubenbot.config import Config
 from rubenbot.core import RubenBot
 from rubenbot.memory.store import MemoryStore, ProfileLine
 from rubenbot.persona import Persona
-from rubenbot.plugins.loader import PluginManager
+from rubenbot.privacy.commands import parse_answer
 
 from conftest import RecordingAdapter, ScriptedLLM
 
-PLUGIN_DIR = Path(__file__).resolve().parent.parent / "plugins"
 NOW = 1_795_000_000.0
 
 
-def load_plugin():
-    import importlib.util
-    import sys
-
-    name = "rubenbot_plugin_privacy_test"
-    spec = importlib.util.spec_from_file_location(name, PLUGIN_DIR / "privacy" / "plugin.py")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-def make_bot(tmp_path: Path):
-    root = tmp_path / "plugins"
-    plugin_dir = root / "privacy"
-    plugin_dir.mkdir(parents=True)
-    (plugin_dir / "plugin.py").write_text(
-        (PLUGIN_DIR / "privacy" / "plugin.py").read_text(encoding="utf-8"), encoding="utf-8"
-    )
-    (plugin_dir / "manifest.json").write_text(
-        (PLUGIN_DIR / "privacy" / "manifest.json").read_text(encoding="utf-8"), encoding="utf-8"
-    )
-    store = MemoryStore(":memory:")
+def make_bot(tmp_path: Path, *, enabled=True):
+    store = MemoryStore(":memory:", privacy_enabled=enabled)
     config = Config()
-    config.plugins.dir = str(root)
-    config.plugins.enabled = ["privacy"]
+    config.privacy.enabled = enabled
+    config.plugins.dir = str(tmp_path / "plugins")
     config.reply.segment_delay_enabled = False
     config.decision.merge_window_seconds = 0
     config.decision.hard_merge_window_seconds = 0
-    manager = PluginManager(config, store)
-    manager.load_all()
     llm = ScriptedLLM({"chat": ["嗯嗯"]}, default="嗯嗯")
-    bot = RubenBot(config, store, llm, Persona("Ruben", "你是 Ruben"), plugins=manager)
-    manager.extras["bot"] = bot
+    bot = RubenBot(config, store, llm, Persona("Ruben", "你是 Ruben"))
     adapter = RecordingAdapter()
     bot.register_adapter(adapter)
     return bot, adapter, store
@@ -268,14 +244,66 @@ def test_pending_ask_answer_via_command(tmp_path):
     assert store.get_ruling("recording:u1", "health@group").verdict == "allow"
 
 
+@pytest.mark.parametrize("delivered,reply", [
+    (False, private("/隐私 可以")), (True, group("/隐私 可以")),
+    (True, private("/隐私 可以 吗")), (True, private("可以吗？")),
+])
+def test_only_explicit_private_reply_to_delivered_question_grants_consent(tmp_path, delivered, reply):
+    bot, _, store = make_bot(tmp_path)
+    store.add_pending_ask("recording:u1", "health@group", "可以提到吗？")
+    if delivered:
+        asyncio.run(bot.handle_event(private("在吗")))
+    asyncio.run(bot.handle_event(reply))
+    assert store.get_ruling("recording:u1", "health@group") is None
+    assert store.list_pending_asks("recording:u1")[0].status == "pending"
+
+
+def test_expired_delivery_cannot_be_answered_by_command(tmp_path, monkeypatch):
+    import time
+    from rubenbot.privacy.commands import ASK_ANSWER_WINDOW_SECONDS
+
+    bot, _, store = make_bot(tmp_path)
+    store.add_pending_ask("recording:u1", "health@group", "可以提到吗？")
+    asyncio.run(bot.handle_event(private("在吗")))
+    later = time.time() + ASK_ANSWER_WINDOW_SECONDS + 1
+    monkeypatch.setattr(time, "time", lambda: later)
+    asyncio.run(bot.handle_event(private("/隐私 可以")))
+    assert store.get_ruling("recording:u1", "health@group") is None
+
+
 def test_parse_answer():
-    plugin = load_plugin()
-    assert plugin.parse_answer("可以") == "allow"
-    assert plugin.parse_answer("可以的！") == "allow"
-    assert plugin.parse_answer("不行") == "deny"
-    assert plugin.parse_answer("不可以") == "deny"
-    assert plugin.parse_answer("那就算了吧") is None
-    assert plugin.parse_answer("我去银行") is None
-    assert plugin.parse_answer("") is None
+    assert parse_answer("可以") == "allow"
+    assert parse_answer("可以的！") == "allow"
+    assert parse_answer("不行") == "deny"
+    assert parse_answer("不可以") == "deny"
+    assert parse_answer("不可以啊") == "deny"
+    assert parse_answer("不可以说") == "deny"
+    assert parse_answer("可以吗？") is None
+    assert parse_answer("可以的话") is None
+    assert parse_answer("那就算了吧") is None
+    assert parse_answer("我去银行") is None
+    assert parse_answer("") is None
     # 否定优先，避免「可以不说」被误判成允许
-    assert plugin.parse_answer("不行，别说") == "deny"
+    assert parse_answer("不行，别说") == "deny"
+
+
+@pytest.mark.parametrize("prefix", ["/", "!"])
+def test_disabled_module_only_keeps_standalone_purge(tmp_path, prefix):
+    bot, adapter, store = make_bot(tmp_path, enabled=False)
+    bot.config.plugins.command_prefix = prefix
+    seed_profile(store)
+    row = store.add_raw_message(platform="recording", chat_id="elsewhere", sender_id="u1", text="鸭腿")
+    other = store.add_raw_message(platform="recording", chat_id="elsewhere", sender_id="u2", text="羊排")
+    store.upsert_person("recording", "u2", "阿川")
+    store.save_profile("recording:u2", stable_lines=[ProfileLine(text="TA 做木工", evidence_refs=[])], status_lines=[], now=NOW + 1)
+    assert "后端工程师" in "".join(r.render() for r in bot.memory_reader.index.get("recording", "elsewhere"))
+    store.add_pending_ask("recording:u1", "health@group", "可以提到吗？")
+    asyncio.run(bot.handle_event(private(prefix + "隐私 模式 不记")))
+    assert adapter.texts == ["嗯嗯"]
+    assert store.get_privacy_mode("recording:u1") == "normal"
+    asyncio.run(bot.handle_event(private(prefix + "清空我的数据")))
+    assert "已经清空" in adapter.texts[-1]
+    assert store.get_profile("recording:u1") is None
+    assert store.raw_message_by_id(row) is None
+    assert store.raw_message_by_id(other) is not None
+    assert "后端工程师" not in "".join(r.render() for r in bot.memory_reader.index.get("recording", "elsewhere"))

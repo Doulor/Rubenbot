@@ -115,6 +115,34 @@ console.log(JSON.stringify(cards));
     return json.loads(result.stdout)
 
 
+def card_fields(page: str, prefix: str) -> dict:
+    """返回指定页面的实际卡片字段定义，而不只检查归属规则。"""
+    from rubenbot.web.config_schema import config_layout
+
+    source = APP_JS.read_text(encoding="utf-8")
+    # 无浏览器也能跑真实卡片清单：用字段定义代替 DOM 节点，其他专用编辑器不参与。
+    start = source.index("function settingsCardSpecs(")
+    cards = source[start : source.index("\n}", start) + 2]
+    script = cards + _extract_function("pageOf") + """
+const card = (_, spec) => spec, fieldGrid = defs => defs;
+const h = () => null, groupsEditor = h, pluginEditor = h, modelsEditor = h,
+      adaptersEditor = h, mcpServerEditor = h, mapEditor = h;
+const LOG_LEVELS = [], MOOD_NAMES = [], MODEL_POOL_STRATEGIES = [], MODEL_POOL_STRATEGY_LABELS = {};
+const [layout, page, prefix] = JSON.parse(process.argv[1]);
+const fields = settingsCardSpecs({}, {}, []).filter(c => pageOf(layout, c.path) === page)
+  .flatMap(c => c.node.body).filter(f => f?.path?.startsWith(prefix));
+console.log(JSON.stringify(fields));
+"""
+    args = json.dumps([config_layout(), page, prefix])
+    result = subprocess.run(["node", "-e", script, args], capture_output=True, text=True, check=True)
+    return {field["path"]: field for field in json.loads(result.stdout)}
+
+
+def test_memory_card_defines_privacy_switch():
+    field = card_fields("memory", "privacy.")["privacy.enabled"]
+    assert field["kind"] == "switch"
+    assert "开启后启用保密封存与跨场合审查，默认关" in field["hint"]
+
 def test_attention_card_defines_two_number_inputs(rendered_fields):
     """页面归属规则不渲染控件；两个字段还得进入配置卡的可编辑网格。"""
     fields = {f["path"]: f for c in rendered_fields if c["page"] == "expression"

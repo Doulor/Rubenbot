@@ -86,6 +86,14 @@ def test_retrieve_recency_fallback_and_limit(store):
     assert retriever.retrieve("x", limit=0) == []
 
 
+def test_legacy_retrieve_without_audience_cannot_disclose_when_protected(store):
+    fact = store.add_memory('console:u1', '封存的蓝莓项目', audience='private', sensitivity='sealed')
+    reader = Retriever(store)
+    assert [m.id for m in reader.retrieve('蓝莓')] == [fact.id]
+    store.privacy_enabled = True
+    assert reader.retrieve('蓝莓', group_id='elsewhere') == []
+
+
 def test_retrieve_no_duplicates(store):
     store.add_memory("console:u1", "TA 喜欢弹吉他")
     store.add_memory("console:u1", "TA 喜欢弹吉他")

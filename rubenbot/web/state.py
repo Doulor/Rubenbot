@@ -269,6 +269,9 @@ class WebState:
         old = self.config
         restart = restart_fields(old, new_config)
         self.config = new_config
+        if self.bot is None:
+            # 独立 WebUI 没有 bot.apply_config；同一进程的档位读写也要切换。
+            self.store.privacy_enabled = new_config.privacy.enabled
         # 记住尚未重启的字段：GET /api/config 会提示，重启后自然清空
         if restart:
             pending = self.extras.setdefault("pending_restart", [])

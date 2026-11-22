@@ -22,6 +22,9 @@ def test_config_defaults():
     assert cfg.llm.model_for("consolidate") == cfg.llm.chat_model
     assert cfg.memory.extract_every_n == 30
     assert cfg.memory.inject_limit == 20
+    assert cfg.memory.timeline_recent_hours == 24
+    assert cfg.memory.timeline_max_chars == 1800
+    assert cfg.privacy.enabled is False
     assert cfg.decision.merge_window_seconds == 2.5
     assert cfg.decision.hard_merge_window_seconds == 1.0
     assert cfg.decision.batch_max_seconds == 10.0
@@ -37,6 +40,10 @@ def test_config_defaults():
     assert cfg.reply.segment_delay_max_ms == 4000.0
     assert cfg.chat.strip_action_parens is False
     assert cfg.enabled_adapters == []
+
+
+def test_legacy_privacy_plugin_does_not_enable_core_privacy():
+    assert Config.from_dict({"plugins": {"enabled": ["privacy"]}}).privacy.enabled is False
 
 
 def test_attention_defaults_and_overrides():

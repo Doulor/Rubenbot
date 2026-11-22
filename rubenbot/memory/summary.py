@@ -141,7 +141,7 @@ class RollingSummarizer:
         for chat in chats:
             try:
                 result = await self.summarize_chat(
-                    chat["platform"], chat["chat_id"], now=now
+                    chat["platform"], chat["chat_id"], chat_type=chat["chat_type"], now=now
                 )
             except Exception as exc:  # noqa: BLE001 - 单会话失败不影响其他会话
                 logger.warning(
@@ -150,7 +150,7 @@ class RollingSummarizer:
                 )
                 results.append(
                     SummaryResult(
-                        conversation_id=f"{chat['platform']}:{chat['chat_id']}",
+                        conversation_id=f"{chat['platform']}:{chat['chat_type']}:{chat['chat_id']}",
                         error=str(exc),
                     )
                 )
@@ -160,24 +160,24 @@ class RollingSummarizer:
         return results
 
     async def summarize_chat(
-        self, platform: str, chat_id: str, *, now: float | None = None
+        self, platform: str, chat_id: str, *, chat_type: str = "group", now: float | None = None
     ) -> SummaryResult | None:
         """对单个会话做一次检查；不需要更新时返回 None。"""
         now = time.time() if now is None else now
         settings = self.settings
         if not settings.enabled:
             return None
-        conversation_id = f"{platform}:{chat_id}"
-        current = self.store.get_conversation_summary(conversation_id)
+        conversation_id = f"{platform}:{chat_type}:{chat_id}"
+        current = self.store.get_conversation_summary(platform, chat_id, chat_type=chat_type)
         covered = current.covered_until_msg_id if current else 0
         pending_count = self.store.count_raw_messages_after(
-            chat_id, platform=platform, after_id=covered, real_only=True
+            chat_id, platform=platform, chat_type=chat_type, after_id=covered, real_only=True
         )
         if pending_count <= settings.trigger_after:
             return None
 
         messages = self.store.raw_messages_after(
-            chat_id, platform=platform, after_id=covered, real_only=True
+            chat_id, platform=platform, chat_type=chat_type, after_id=covered, real_only=True
         )
         keep = max(0, int(settings.keep_recent))
         batch = messages[:-keep] if keep else messages
@@ -212,9 +212,11 @@ class RollingSummarizer:
             )
 
         covered_until = int(batch[-1].id)
-        self.store.set_conversation_summary(
-            conversation_id, summary, covered_until, now=now
-        )
+        if not self.store.set_conversation_summary(
+            platform, chat_id, summary, covered_until, chat_type=chat_type, previous=current,
+            source_ids=[msg.id for msg in batch], now=now,
+        ):
+            return SummaryResult(conversation_id, error="摘要或来源已变更")
         logger.info(
             "会话摘要已更新：%s，压缩 %s 条，水位 %s",
             conversation_id,
@@ -247,7 +249,7 @@ class RollingSummarizer:
     # 读取侧：拼上下文时取摘要
     # ------------------------------------------------------------------
 
-    def active_summary(self, platform: str, chat_id: str) -> ConversationSummary | None:
+    def active_summary(self, platform: str, chat_id: str, *, chat_type: str = "group") -> ConversationSummary | None:
         """当前生效的摘要；开关关闭、没有摘要或读库失败都返回 None。
 
         调用方据此决定「摘要块 + 水位之后原文」还是「照旧全量原文」。
@@ -255,7 +257,7 @@ class RollingSummarizer:
         if not self.settings.enabled:
             return None
         try:
-            current = self.store.get_conversation_summary(f"{platform}:{chat_id}")
+            current = self.store.get_conversation_summary(platform, chat_id, chat_type=chat_type)
         except Exception as exc:  # noqa: BLE001 - 摘要读不到就退回纯原文
             logger.warning("读取会话摘要失败：%s", exc)
             return None

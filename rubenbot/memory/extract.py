@@ -21,8 +21,9 @@ from datetime import datetime, timedelta
 
 from ..llm import LLMProtocol, parse_json_payload
 from ..memory.retrieve import audience_for_chat, jaccard, normalize
-from ..memory.gate import OWNER_AUDIENCE
-from ..memory.owner_statement import is_followup_secrecy, is_owner_self_statement, requests_secrecy
+from ..privacy.gate import OWNER_AUDIENCE
+from ..privacy.sealing import batch_source_ref, register_extraction
+from ..memory.owner_statement import is_owner_self_statement
 from ..memory.entities import EntityCandidate, EntityLedger
 from ..memory.store import (
     VALID_SENSITIVITY,
@@ -165,13 +166,11 @@ class MemoryExtractor:
         """
         now = time.time() if now is None else now
         pending = self.store.pending_senders()
-        if not pending:
-            await self.run_followups(now=now)
-            return []
+        # 即使全是不记消息、抽取队列为空，末尾也要照常裁剪短期历史。
         if force:
             chats = sorted({p.chat_id for p in pending})
         else:
-            chats = self._chats_to_extract(now)
+            chats = self._chats_to_extract(now) if pending else []
         results: list[ExtractResult] = []
         for chat_id in chats:
             for sender in [p for p in pending if p.chat_id == chat_id]:
@@ -217,9 +216,7 @@ class MemoryExtractor:
         if not messages:
             return ExtractResult(person_id=person_id)
         # 不记模式：不建画像、不进时间线；消息仍标记已处理，避免反复查库
-        if self._is_norecord(person_id):
-            self.store.mark_processed([m.id for m in messages])
-            logger.info("跳过不记模式的用户：%s", person_id, extra={"person_id": person_id})
+        if self._skip_norecord(person_id, messages):
             return ExtractResult(person_id=person_id, skipped_norecord=True)
         try:
             extraction = await self._ask_model(sender, messages)
@@ -227,38 +224,29 @@ class MemoryExtractor:
             logger.warning("抽取失败（%s）：%s", person_id, exc, extra={"person_id": person_id})
             return ExtractResult(person_id=person_id, error=str(exc))
 
+        # 模型等待期间可能切到不记；在封存登记和任何抽取产物落库前再检查一次。
+        if self._skip_norecord(person_id, messages):
+            return ExtractResult(person_id=person_id, skipped_norecord=True)
+        if len(self.store.available_raw_ids(m.id for m in messages)) != len(messages):
+            # 等待模型时本人可能已清空；不能再把旧的异步快照写回去。
+            return ExtractResult(person_id=person_id)
         audience = audience_for_chat(sender.chat_type, sender.chat_id)
         origin_chat = f"{sender.platform}:{sender.chat_id}"
-        source_ref = f"{sender.platform}:{sender.chat_id}:{messages[0].id}-{messages[-1].id}"
         by_id = {m.id: m for m in messages}
+        source_ref = batch_source_ref(origin_chat, by_id)
         owner_source = (self.is_owner is not None and not sender.sender_id.startswith("__")
                         and self.is_owner(messages[0]))
-        open_sources = self.store.open_owner_sources(by_id) if owner_source else set()
-        sealed_sources: set[int] = set()
-        if owner_source:
-            for index, message in enumerate(messages):
-                if requests_secrecy(message.text):
-                    sealed_sources.add(message.id)
-                    if index and is_followup_secrecy(message.text):
-                        sealed_sources.add(messages[index - 1].id)
+        sealed_sources = register_extraction(self.store, messages, [*extraction.facts, *extraction.events])
 
         def route(item: ExtractedFact | ExtractedEvent, text: str) -> tuple[str, str]:
             source = by_id.get(item.source_msg_id)
-            if (owner_source and source and (source.id not in open_sources or source.id in sealed_sources)
-                    or not source and sealed_sources):
+            if (source and source.id in sealed_sources) or (not source and sealed_sources):
                 return audience, "sealed"
             if (owner_source and item.self_reported and source and item.sensitivity != "sealed"
                     and is_owner_self_statement(source.text, allow_implicit=True) and _grounded(text, source.text)):
                 return OWNER_AUDIENCE, item.sensitivity
             return audience, item.sensitivity
 
-        if owner_source:
-            blocked = sealed_sources.copy()
-            for item in [*extraction.facts, *extraction.events]:
-                if item.sensitivity in ("high", "sealed"):
-                    blocked.update([item.source_msg_id] if item.source_msg_id in by_id else by_id)
-            if blocked:
-                self.store.block_raw_recall(blocked)
         base_ts = messages[-1].ts
 
         existing = self.store.list_memories(person_id=person_id)
@@ -303,7 +291,9 @@ class MemoryExtractor:
                 event.summary,
                 ts=ts,
                 source_chat=origin_chat,
+                source_chat_type=sender.chat_type,
                 source_raw_id=event.source_msg_id if event.source_msg_id in by_id else None,
+                source_ref=source_ref if event.source_msg_id not in by_id else '',
                 audience=target,
                 sensitivity=sensitivity,
                 salience=event.salience,
@@ -329,12 +319,12 @@ class MemoryExtractor:
             skipped_events=skipped_events,
         )
 
-    def _is_norecord(self, person_id: str) -> bool:
-        try:
-            return self.store.is_norecord(person_id)
-        except Exception as exc:  # noqa: BLE001 - 隐私检查失败不能拖垮抽取
-            logger.warning("查询隐私设置失败（%s）：%s", person_id, exc, extra={"person_id": person_id})
+    def _skip_norecord(self, person_id: str, messages: list[RawMessage]) -> bool:
+        if not self.store.privacy_enabled or not self.store.is_norecord(person_id):
             return False
+        self.store.mark_processed((m.id for m in messages), block_extraction=True)
+        logger.info("跳过不记模式的用户：%s", person_id, extra={"person_id": person_id})
+        return True
 
     def _expiry_ts(self, fact: ExtractedFact, base_ts: float) -> float | None:
         """临时事实的过期时间：天数夹到配置区间；非 temporal 一律无过期。"""

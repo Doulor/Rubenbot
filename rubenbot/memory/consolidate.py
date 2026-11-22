@@ -20,7 +20,8 @@ from dataclasses import dataclass, field
 from typing import Iterable
 
 from ..llm import LLMProtocol, parse_json_payload
-from .gate import OWNER_AUDIENCE
+from ..privacy.gate import OWNER_AUDIENCE
+from ..privacy.sealing import merged_source_ref
 from ..memory.store import Memory, MemoryStore
 
 logger = logging.getLogger(__name__)
@@ -221,7 +222,10 @@ class Consolidator:
             json_mode=True,
         )
         proposals = parse_proposals(raw)
-        by_id = {m.id: m for m in memories}
+        # 模型等待期间可能发生追封或清空；绝不能按旧敏感度合并出新记录。
+        current = self.store.get_memories_by_ids([m.id for m in memories])
+        original = {m.id: m for m in memories}
+        by_id = {m.id: m for m in current if m == original[m.id]}
         consumed: set[int] = set()
         removed_so_far = 0
         budget = removal_budget(len(memories), self.config.consolidate_remove_ratio, self.config.consolidate_remove_min)
@@ -256,7 +260,7 @@ class Consolidator:
                             "stability": sources[0].stability,
                             "expires_at": sources[0].expires_at,
                             "source": "extracted",
-                            "source_ref": ",".join(str(m.id) for m in sources),
+                            "source_ref": merged_source_ref(sources[0].origin_chat, (m.source_ref for m in sources)),
                         }
                     ],
                     reason=proposal.reason,

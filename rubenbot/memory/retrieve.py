@@ -6,7 +6,7 @@
    分词：英文/数字按整词，中文按字符 bigram（单字句按 unigram）；
    打分：``sum(idf(token))``，稀有词权重高；整句原文命中额外加 bonus。
 2. **记忆 v2 读取与注入**：群成员索引（T0）、预拉取与注入（T1）、
-   跨会话摘要、recall（T2）。隐私判断全部交给 :mod:`rubenbot.memory.gate`，
+   跨会话摘要、recall（T2）。隐私判断全部交给 :mod:`rubenbot.privacy`，
    本模块只负责「按场合筛出候选、按优先级拼装、按预算裁剪」。
 """
 
@@ -17,11 +17,13 @@ import math
 import re
 import time
 import unicodedata
+from functools import partial
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Collection, Iterable, Sequence
 
-from .gate import OWNER_AUDIENCE, PrivacyGate, ReviewItem, has_high_sensitivity_hint
+from ..privacy.gate import OWNER_AUDIENCE, PrivacyGate, ReviewItem
+from .timeline import search_timeline
 from .store import (
     SELF_PERSON_ID,
     Event,
@@ -155,9 +157,11 @@ class Retriever:
         时间兜底——只注入真命中；这里保留兜底是为了兼容这些旧调用方。
         结果去重，总量不超过 limit。
         """
-        if limit <= 0:
+        # 旧同步接口没有可信的来源/目标场合，也无法等待裁定；保护开启时
+        # 调用方必须改用 MemoryReader 的异步读取接口，而不能在这里兜底披露。
+        if limit <= 0 or self.store.privacy_enabled:
             return []
-        pool = [m for m in self._corpus() if m.audience != OWNER_AUDIENCE]
+        pool = self._corpus()
         if not pool:
             return []
         idf_cache = self._idf_cache(pool)
@@ -230,7 +234,6 @@ _SELF_INQUIRY_RE = re.compile(
 )
 
 _AT_RE = re.compile(r"@([0-9A-Za-z_\-]+)")
-_SENSITIVITY_RANK = {"normal": 0, "high": 1, "sealed": 2}
 # 话题匹配时的轻量停用字
 _STOP_HINT = set("的那了是我你他她它们这有在和也就还吗呢吧啊呀哦嗯")
 # 模型/用户在 recall 里指代「当前说话人」的说法
@@ -363,7 +366,7 @@ class MemberIndex:
         days = float(getattr(self.config, "index_active_days", 30.0))
         limit = max(1, int(getattr(self.config, "index_max_members", 40)))
         since = now - days * 86400
-        active = self.store.active_senders(platform=platform, chat_id=chat_id, since=since)
+        active = self.store.active_senders(platform=platform, chat_id=chat_id, chat_type="group", since=since)
         rows: list[MemberRow] = []
         for entry in active:
             person_id = make_person_id(platform, entry["sender_id"])
@@ -430,6 +433,7 @@ class MemoryBlock:
     allowed: int = 0
     withheld: int = 0
     trimmed: int = 0
+    privacy_enabled: bool = False
 
     def add(self, title: str, lines: Iterable[str]) -> None:
         lines = [line for line in lines if line]
@@ -440,7 +444,8 @@ class MemoryBlock:
         if not self.sections:
             return ""
         body = "\n\n".join(f"{title}\n" + "\n".join(lines) for title, lines in self.sections)
-        return MEMORY_HEADER + "\n\n" + body
+        header = MEMORY_HEADER if self.privacy_enabled else "【背景记忆】这些是过去了解的事，不是当前发言。注意区分说话人和场合。"
+        return header + "\n\n" + body
 
     def __bool__(self) -> bool:
         return bool(self.sections)
@@ -464,7 +469,7 @@ class MemoryReader:
         self.config = config
         self.now_fn = now_fn
         self.retriever = retriever or Retriever(store)
-        self.gate = gate or PrivacyGate(store, llm, config, now_fn=now_fn)
+        self.gate = gate
         self.index = MemberIndex(store, config, now_fn=now_fn)
 
     # ------------------------------------------------------------------
@@ -486,7 +491,7 @@ class MemoryReader:
         """组装本轮记忆区块；任何内部失败都退化为尽量少注入，不向上抛。"""
         now = self.now_fn() if now is None else now
         audience_now = audience_for_chat(chat_type, chat_id)
-        block = MemoryBlock()
+        block = MemoryBlock(privacy_enabled=self.gate is not None)
         candidates: list[_Candidate] = []
 
         # ---- T0：群成员索引（常驻）。身份/钩子来自画像，也要过审查口：
@@ -500,7 +505,7 @@ class MemoryReader:
                 index_rows = []
         for row in index_rows:
             audience, sensitivity = self._refs_context(
-                self.index.evidence_of(row.person_id), text=row.render()
+                self.index.evidence_of(row.person_id) if self.gate is not None else (), text=row.render()
             )
             candidates.append(
                 _Candidate(
@@ -557,7 +562,9 @@ class MemoryReader:
                     )
                 )
                 candidates.extend(self._timeline_candidates(other_id, topic, now=now, priority=50))
-                if other_id in owner_person_ids:
+                if self.gate is None:
+                    candidates.extend(self._fact_candidates(other_id, topic, now=now, priority=20))
+                elif other_id in owner_person_ids:
                     candidates.extend(c for c in self._fact_candidates(other_id, topic, now=now, priority=20)
                                       if c.item.audience == OWNER_AUDIENCE)
             except Exception as exc:  # noqa: BLE001
@@ -580,7 +587,7 @@ class MemoryReader:
             logger.warning("读取自我时间线失败：%s", exc)
 
         # ---- 私聊跨会话接续（群聊永不组装） ----
-        if str(chat_type).lower() == "private":
+        if self.gate is not None and str(chat_type).lower() == "private":
             try:
                 candidates.extend(
                     self._cross_session_candidates(person_id, platform, chat_id, now=now, priority=30)
@@ -589,11 +596,13 @@ class MemoryReader:
                 logger.warning("组装跨会话摘要失败：%s", exc)
 
         # ---- 唯一审查口 ----
-        if candidates:
+        if self.gate is None:
+            block.allowed = len(candidates)
+        elif candidates:
             try:
                 allowed, withheld = await self.gate.review(
                     [c.item for c in candidates], audience_now=audience_now, speaker=person_id, now=now,
-                    owner_person_ids=owner_person_ids, for_chat=True,
+                    owner_person_ids=owner_person_ids, for_chat=True, target_platform=platform,
                 )
             except Exception as exc:  # noqa: BLE001 - gate 自身已 fail closed，这里再兜一层
                 logger.warning("分寸审查异常，本轮不注入记忆：%s", exc)
@@ -679,7 +688,7 @@ class MemoryReader:
         profile = self.store.get_profile(person_id)
         if profile is None:
             return []
-        evidence = self.store.get_profile_evidence(person_id)
+        evidence = self.store.get_profile_evidence(person_id) if self.gate is not None else {}
         max_chars = max(120, int(getattr(self.config, "profile_inject_max_chars", 600)))
         lines: list[tuple[str, str, list[str]]] = []
         for index, line in enumerate(profile.stable_lines):
@@ -751,6 +760,7 @@ class MemoryReader:
                         person_id=person_id,
                         text=event.summary,
                         audience=event.audience,
+                        origin=event.source_chat,
                         sensitivity=event.sensitivity,
                         subject=f"event:{event.id}",
                         ref=f"event:{event.id}",
@@ -766,9 +776,9 @@ class MemoryReader:
         return candidates
 
     def _fact_candidates(
-        self, person_id: str, topic: str, *, now: float, priority: int
+        self, person_id: str | None, topic: str, *, now: float, priority: int
     ) -> list[_Candidate]:
-        """事实层只留真命中；已写进画像的事实不重复注入。
+        """事实层只留真命中；已写进人物画像的事实不重复注入。空人物表示全域工具查询。
 
         - 过期的事实（``expires_at`` 已过，如「明天出差」）不再参与注入；
         - ``uncertain`` 的带一句不确定标注，别让模型当成确凿事实说出去。
@@ -776,12 +786,14 @@ class MemoryReader:
         limit = max(0, int(getattr(self.config, "inject_limit", 20)))
         if limit == 0 or not (topic or "").strip():
             return []
-        memories = self.store.list_memories(person_id=person_id, limit=300)
+        memories = self.store.list_memories(person_id=person_id, limit=300 if person_id else None)
         if not memories:
             return []
-        distilled = self.store.profile_evidence_refs(person_id)
+        distilled = self.store.profile_evidence_refs(person_id) if person_id else set()
         candidates: list[_Candidate] = []
-        for item in self.retriever.score(topic, memories)[:limit]:
+        for item in self.retriever.score(topic, memories):
+            if len(candidates) >= limit:
+                break
             mem = item.memory
             if mem.id is not None and f"memory:{mem.id}" in distilled:
                 continue  # 已提炼进画像，不重复占预算
@@ -793,9 +805,10 @@ class MemoryReader:
             candidates.append(
                 _Candidate(
                     item=ReviewItem(
-                        person_id=person_id,
+                        person_id=mem.person_id,
                         text=mem.content,
                         audience=mem.audience,
+                        origin=mem.origin_chat,
                         sensitivity=mem.sensitivity,
                         subject="fact",
                         ref=f"memory:{mem.id}",
@@ -803,7 +816,7 @@ class MemoryReader:
                         kind="memory",
                     ),
                     section="fact",
-                    text=f"- {text}",
+                    text=f"- {text}" if person_id else f"- {self._display_name(mem.person_id)}：{text}",
                     priority=priority,
                     score=item.score,
                 )
@@ -841,6 +854,7 @@ class MemoryReader:
                         person_id=person_id,
                         text=event.summary,
                         audience=event.audience,
+                        origin=event.source_chat,
                         sensitivity=event.sensitivity,
                         subject=f"event:{event.id}",
                         ref=f"event:{event.id}",
@@ -975,51 +989,18 @@ class MemoryReader:
     # 证据 / 预算
     # ------------------------------------------------------------------
 
-    def _refs_context(
-        self,
-        refs: Sequence[str],
-        *,
-        text: str = "",
-    ) -> tuple[str, str]:
-        """由证据链推断一行画像的来源受众与敏感度（取最保守值）。
+    def _refs_context(self, refs: Sequence[str], *, text: str) -> tuple[str, str]:
+        if self.gate is None:
+            return "", "normal"
+        return self.gate.evidence_context(refs, text=text)
 
-        画像允许抽象，抽象后的句子本身没有敏感度标注，只能沿证据链取最高值；
-        证据被清掉/已过期的行再按文字补一次高敏感判断，
-        避免「抽象一层就洗白」。
-        """
-        audiences: set[str] = set()
-        sensitivity = "normal"
-        for ref in refs:
-            kind, _, raw_id = str(ref or "").partition(":")
-            obj = None
-            try:
-                if kind == "event":
-                    obj = self.store.get_event(int(raw_id))
-                elif kind == "memory":
-                    obj = self.store.get_memory(int(raw_id))
-            except (TypeError, ValueError):
-                obj = None
-            except Exception:  # noqa: BLE001
-                obj = None
-            if obj is None:
-                return "unverified", "sealed"  # 证据已删除或读不到，绝不当成旧的空来源
-            audiences.add(obj.audience or "")
-            if _SENSITIVITY_RANK.get(obj.sensitivity, 0) > _SENSITIVITY_RANK.get(sensitivity, 0):
-                sensitivity = obj.sensitivity
-        if sensitivity == "normal" and has_high_sensitivity_hint(text):
-            sensitivity = "high"
-        if not audiences:
-            return "", sensitivity
-        if OWNER_AUDIENCE in audiences and len(audiences) > 1:
-            return "unverified", "sealed"  # 混合行不能靠其中一条机主自述扩受众
-        if "private" in audiences:
-            return "private", sensitivity
-        audiences.discard("")
-        if not audiences:
-            return "", sensitivity
-        if len(audiences) == 1:
-            return audiences.pop(), sensitivity
-        return "mixed", sensitivity
+    def timeline_reviewer(self, audience_now, speaker, owner_person_ids, now, *, platform, chat_id):
+        """仅开启隐私时才向时间线传入裁定函数，关闭不查裁定、不请求模型。"""
+        if self.gate is None:
+            return None
+        return partial(self.gate.review_timeline, audience_now=audience_now, speaker=speaker,
+                       owner_person_ids=owner_person_ids, now=now,
+                       target_platform=platform, target_chat_id=chat_id)
 
     def _apply_budget(self, candidates: list[_Candidate]) -> int:
         """按「画像 > 时间线 > 事实」裁剪；返回被裁掉的条数。
@@ -1056,73 +1037,44 @@ class MemoryReader:
     # ------------------------------------------------------------------
 
     async def recall(
-        self,
-        person_query: str,
-        topic: str = "",
-        time_range: str = "",
-        *,
-        audience_now: str = "unknown",
-        speaker: str = "",
-        owner_person_ids: Collection[str] = (),
-        now: float | None = None,
+        self, person_query: str = "", topic: str = "", time_range: str = "", *,
+        audience_now: str = "unknown", speaker: str = "", owner_person_ids: Collection[str] = (),
+        target_platform: str = "", target_chat_id: str = "", now: float | None = None,
     ) -> str:
-        """按人/话题/时段查记忆，结果过审查口后返回给模型看的纯文本。
-
-        本人自查（问的是自己）走 :meth:`self_report` 的宽松路径；问别人时
-        照常过审查口，跨场合项照常可能被扣下。
-        """
+        """按时间和话题深查全部会话；指定了人物时，另附该人的画像与相关事实。"""
         now = self.now_fn() if now is None else now
-        person_id = self.resolve_person(
-            person_query,
-            platform_hint=self._platform_of(speaker),
-            viewer=speaker,
-        )
-        if person_id is None:
+        platform = target_platform or self._platform_of(speaker) or ""
+        person_id = self.resolve_person(person_query, platform_hint=platform, viewer=speaker)
+        if person_query.strip() and person_id is None:
             return f"没找到和「{person_query}」对应的人。"
-        if person_id == speaker and speaker and person_id not in owner_person_ids:
-            if str(audience_now or "").startswith("group"):
-                # 群聊里不自查：别人的东西在群里说不合适，也让本人改到私聊问
+        if self.gate and person_id and person_id == speaker and person_id not in owner_person_ids:
+            if audience_now.startswith("group"):
                 return "这个在群里不方便展开，你私聊问我吧。"
-            return self.self_report(person_id, topic=topic, now=now)
+            if audience_now == "private" and not topic and not time_range:
+                return self.self_report(person_id, now=now)
+
         since = self._parse_time_range(time_range, now)
-        name = self._display_name(person_id)
-
-        candidates: list[_Candidate] = []
-        try:
-            candidates.extend(
-                self._profile_candidates(
-                    person_id, now=now, section="speaker_profile", priority=100, protected=True
-                )
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("recall 读画像失败：%s", exc)
-        try:
-            if (topic or "").strip():
-                candidates.extend(self._timeline_candidates(person_id, topic, now=now, priority=50))
-            else:
-                candidates.extend(self._recent_event_candidates(person_id, since, now=now, priority=50))
-            candidates.extend(self._fact_candidates(person_id, topic or "", now=now, priority=20))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("recall 查时间线/事实失败：%s", exc)
-
-        if not candidates:
-            return f"关于 {name}，没有找到相关的记忆。"
-        try:
-            allowed, _ = await self.gate.review(
-                [c.item for c in candidates],
-                audience_now=audience_now or "unknown",
-                speaker=speaker,
-                owner_person_ids=owner_person_ids, for_chat=True,
-                now=now,
-            )
-        except Exception as exc:  # noqa: BLE001 - fail closed
-            logger.warning("recall 审查失败，不返回内容：%s", exc)
-            return f"关于 {name} 的记忆，现在不太方便展开。"
-        allowed_ids = {id(item) for item in allowed}
-        kept = [c for c in candidates if id(c.item) in allowed_ids]
-        if not kept:
-            return f"关于 {name} 的记忆，现在不太方便展开。"
-        return "\n".join([f"关于 {name} 的记忆：", *[c.text for c in kept]])
+        limit = max(1, int(getattr(self.config, "timeline_hit_limit", 6)))
+        name = self._display_name(person_id) if person_id else "这段时间线"
+        review = self.timeline_reviewer(audience_now, speaker, owner_person_ids, now,
+                                        platform=platform, chat_id=target_chat_id)
+        hits = await search_timeline(self.store, topic, person_id=person_id, since=since,
+                                     limit=limit, allow=review, now=now)
+        lines = [hit.line() for hit in hits]
+        if since is None:
+            candidates = (self._profile_candidates(person_id, now=now, section="speaker_profile", priority=100)
+                          if person_id else [])
+            candidates.extend(self._fact_candidates(person_id, topic, now=now, priority=20))
+            if candidates and self.gate is not None:
+                allowed, _ = await self.gate.review([c.item for c in candidates], audience_now=audience_now,
+                                                    speaker=speaker, owner_person_ids=owner_person_ids,
+                                                    for_chat=True, target_platform=platform, now=now)
+                allowed_ids = {id(item) for item in allowed}
+                candidates = [c for c in candidates if id(c.item) in allowed_ids]
+            lines.extend(c.text for c in candidates)
+        if not lines:
+            return f"关于 {name}，没有找到可用的相关记忆。"
+        return "\n".join([f"关于 {name} 的记忆：", *lines])
 
     def self_report(
         self,
@@ -1135,7 +1087,7 @@ class MemoryReader:
 
         查看自己的画像不属于跨场合披露，**不走审查口**（否则隐私模式、
         高敏感默认扣下都会让本人看不到自己的东西，与「任何人可私聊查询、
-        如实摊开其画像」的规格相反）。格式与 privacy 插件的 ``/隐私`` 一致，
+        如实摊开其画像」的规格相反）。格式与核心隐私命令的 ``/隐私`` 一致，
         方便两边对得上。
         """
         now = self.now_fn() if now is None else now
@@ -1163,37 +1115,6 @@ class MemoryReader:
                 lines.extend(cand.text for cand in extra[:5])
         return "\n".join(lines)
 
-    def _recent_event_candidates(
-        self, person_id: str, since: float, *, now: float, priority: int
-    ) -> list[_Candidate]:
-        limit = max(1, int(getattr(self.config, "timeline_hit_limit", 6)))
-        events = self.store.list_events(
-            person_id=person_id, since=since, include_compressed=False, limit=limit
-        )
-        name = self._display_name(person_id)
-        candidates: list[_Candidate] = []
-        for event in events:
-            when = format_relative_time(event.ts, now)
-            candidates.append(
-                _Candidate(
-                    item=ReviewItem(
-                        person_id=person_id,
-                        text=event.summary,
-                        audience=event.audience,
-                        sensitivity=event.sensitivity,
-                        subject=f"event:{event.id}",
-                        ref=f"event:{event.id}",
-                        kind=event.kind,
-                        salience=event.salience,
-                    ),
-                    section="timeline",
-                    text=f"- {name}（{when}）：{event.summary}",
-                    priority=priority,
-                    score=event.salience,
-                )
-            )
-        return candidates
-
     def resolve_person(
         self,
         query: str,
@@ -1218,28 +1139,23 @@ class MemoryReader:
         except Exception:  # noqa: BLE001
             pass
         lowered = query.lower()
-        best: str | None = None
-        for person in self.store.list_people(limit=1000):
-            if platform_hint and person.platform != platform_hint:
-                continue
-            name = (person.display_name or "").strip()
-            if not name:
-                continue
-            if name == query:
+        # 全域找人：同名优先本平台，但不能因当前场合不同就找不到别处的说话人。
+        people = sorted(self.store.list_people(limit=1000), key=lambda p: p.platform != platform_hint)
+        for person in people:
+            if query == person.platform_uid or lowered == (person.display_name or "").strip().lower():
                 return person.person_id
-            if lowered in name.lower() or name.lower() in lowered:
-                best = best or person.person_id
-        if best is not None:
-            return best
-        for person in self.store.list_people(limit=1000):
-            if person.platform_uid and person.platform_uid == query:
+        for person in people:
+            name = (person.display_name or "").strip().lower()
+            if name and (lowered in name or name in lowered):
                 return person.person_id
         return None
 
     @staticmethod
-    def _parse_time_range(value: str, now: float) -> float:
-        """解析「7d / 24h / 3天 / 2周 / 1个月」等；不写就默认看一年内。"""
+    def _parse_time_range(value: str, now: float) -> float | None:
+        """解析「7d / 24h / 3天 / 2周 / 1个月」等；不写则查所有留存记录。"""
         text = (value or "").strip().lower()
+        if not text:
+            return None
         match = re.match(r"^(\d+(?:\.\d+)?)\s*(d|day|days|h|hour|hours|天|日|周|个月|月|年)?$", text)
         if not match:
             return now - 365 * 86400

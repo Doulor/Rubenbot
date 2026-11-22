@@ -30,6 +30,7 @@ def update(worker, *, now=NOW):
 
 
 def test_distills_only_local_event_and_profile_evidence(store, config):
+    store.privacy_enabled = True
     local = event(store)
     secret = event(store, '私聊里的消息', audience='private')  # 同号异场合
     event(store, '另一平台的消息', source='other:g')
@@ -112,6 +113,7 @@ def test_failed_synthesis_keeps_old_state_and_timestamp(store, config, failure):
 
 @pytest.mark.parametrize('action', ['purge', 'norecord', 'private'])
 def test_withdrawal_invalidates_reflection(store, config, action):
+    store.privacy_enabled = True
     event(store)
     worker = StateDistiller(ScriptedLLM({'summary': [ANSWER]}), store, config.memory)
     update(worker)
@@ -124,6 +126,7 @@ def test_withdrawal_invalidates_reflection(store, config, action):
 
 
 def test_private_mode_changed_during_synthesis_discards_result(store, config):
+    store.privacy_enabled = True
     event(store)
 
     class ChangedLLM:

@@ -435,7 +435,10 @@ def run(coro):
 
 
 def test_stats_reply_aggregates_today(tmp_path):
-    insights = make_insights(tmp_path, store=make_store())
+    store = make_store()
+    store.add_raw_message(platform='recording', chat_type='private', chat_id='g1',
+                          sender_id='u3', sender_name='私聊访客', text='不计入群发言榜')
+    insights = make_insights(tmp_path, store=store)
     text = insights.stats_reply(group_event(), window_days=1)
     assert "今日发言榜" in text
     assert "共 4 条" in text  # bot 自己的不计

@@ -249,6 +249,24 @@ def test_check_does_nothing_when_disabled(store):
     assert adapter.texts == [] and llm.calls == []
 
 
+def test_same_id_private_activity_does_not_reach_group_opener(store, monkeypatch):
+    config = make_config()
+    config.privacy.enabled = True
+    llm = ScriptedLLM({'chat': ['爬山的路线定了吗？']})
+    bot, _ = make_bot(store, llm, config)
+    group_message(store, ts=NOW - 7 * 3600, text='群里约了爬山')
+    rid = store.add_raw_message(platform='recording', chat_type='private', chat_id='g1', sender_id='g1',
+                                text='不对外讲的私聊原话', ts=NOW-1)
+    store.set_conversation_summary('recording', 'g1', '私聊早期摘要', rid, chat_type='private', source_ids=[rid])
+    queries = []
+    monkeypatch.setattr(bot.retriever, 'score', lambda text: queries.append(text) or [])
+    assert asyncio.run(bot._proactive_check(now=NOW))  # 刚来的私聊不能重置群的冷场时间。
+    assert queries == ['群里约了爬山']
+    prompt = '\n'.join(m['content'] for call in llm.calls for m in call['messages'])
+    assert '群里约了爬山' in prompt
+    assert '私聊原话' not in prompt and '私聊早期摘要' not in prompt
+
+
 def test_check_opens_once_when_all_conditions_met(store):
     group_message(store, ts=NOW - 7 * 3600, text="周末谁去爬山")
     llm = ScriptedLLM({"chat": ["爬山那事儿最后定了没？"]})

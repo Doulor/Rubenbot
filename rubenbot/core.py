@@ -64,14 +64,13 @@ from .mcp_client import MCPManager
 from .memory.consolidate import Consolidator
 from .memory.entities import EntityLedger
 from .memory.extract import MemoryExtractor, audience_for_chat
-from .memory.owner_statement import is_followup_secrecy
-from .memory.gate import PrivacyGate
-from .memory.owner_recent import MAX_SNIPPETS, owner_recent_snippets
 from .memory.retrieve import MemoryReader, Retriever
 from .memory.store import MemoryStore, RawMessage, make_person_id
 from .memory.state import StateDistiller
 from .memory.summary import RollingSummarizer, format_summary_block
+from .memory.timeline import MAX_SNIPPETS, recent_timeline, search_timeline
 from .persona import Persona, matches_identity_trigger
+from .privacy import PrivacyCommands, PrivacyGate, register_message
 from .plugins.loader import PluginManager
 from .search import WebSearcher, build_searcher
 from .verification import NO_EVIDENCE, RECORD_PLACEHOLDER, WebReply, verify
@@ -134,7 +133,7 @@ RECALL_TOOL = {
     "function": {
         "name": "recall",
         "description": (
-            "回忆关于某人或某个话题的记忆（画像、旧事、事实）。"
+            "按时间线找聊过的原话和事件，也可以按人查画像、事实。"
             "当前对话需要补一段具体旧事时调用。"
         ),
         "parameters": {
@@ -142,7 +141,7 @@ RECALL_TOOL = {
             "properties": {
                 "person_query": {
                     "type": "string",
-                    "description": "要回忆的人：昵称或你在上下文里看到的名字",
+                    "description": "可选的说话人：昵称或账号；不填则跨所有人和会话检索",
                 },
                 "topic": {
                     "type": "string",
@@ -153,7 +152,7 @@ RECALL_TOOL = {
                     "description": "时间范围，如 7d / 24h / 3d；留空表示不限",
                 },
             },
-            "required": ["person_query"],
+            "required": [],
         },
     },
 }
@@ -440,7 +439,7 @@ class BotContext:
 
     @property
     def memory(self) -> Any | None:
-        """读取侧（索引 / 预拉取 / recall）；privacy 插件等可从这拿。"""
+        """读取侧（索引 / 预拉取 / recall），供核心命令及插件使用。"""
         return self.extras.get("memory_reader")
 
     @property
@@ -473,7 +472,9 @@ class RubenBot:
         self._ledger_read: set[tuple[str, str]] = set()
         self._recall_checked = False
         self._reminder_saved = False
-        self.gate = PrivacyGate(store, llm, config.memory)
+        self.store.privacy_enabled = config.privacy.enabled
+        self.gate = PrivacyGate(store, llm, config.memory) if config.privacy.enabled else None
+        self.privacy_commands = PrivacyCommands()
         self.memory_reader = MemoryReader(
             store, llm, config.memory, gate=self.gate, retriever=self.retriever
         )
@@ -631,11 +632,15 @@ class RubenBot:
         self.gateway.gatekeeper.config = config
         self.event_router.config = config.gateway
         self.event_judge.persona_text = self.persona.text
-        # 读取侧与审查口：配置/模型一起热换，索引缓存保留（配置里 TTL 会立即生效）
+        # 读取侧与审查口一起切换；不让上个档位下生成的成员索引继续生效
         self.memory_reader.config = config.memory
         self.memory_reader.llm = self.llm
-        self.memory_reader.gate.llm = self.llm
-        self.memory_reader.gate.config = config.memory
+        self.store.privacy_enabled = config.privacy.enabled
+        self.gate = PrivacyGate(self.store, self.llm, config.memory) if config.privacy.enabled else None
+        self.memory_reader.gate = self.gate
+        self.memory_reader.index.config = config.memory
+        self.memory_reader.index.invalidate()
+        self.context.extras["privacy_gate"] = self.gate
         self.context.config = config
         if self.plugins is not None:
             self.plugins.config = config
@@ -842,13 +847,14 @@ class RubenBot:
             logger.debug("忽略自身引发的平台事件：%s", event.description, extra=_log_identity(event))
             return None
         route = self.event_router.route(event, now=now)
-        # 全部事件先落库（摘要进 platform_events，时间线进 events）
-        self._record_platform_event(event, route, now=now)
-        self._record_event_timeline(event, route, now=now)
-        # 申请类事件：pending 状态已由落库写入，这里补一条「红点」日志
-        if event.kind == KIND_REQUEST:
-            pending = self.store.count_pending_platform_events(kind=KIND_REQUEST)
-            logger.info("收到申请（未处理 %s 条）：%s", pending, event.description, extra=_log_identity(event))
+        # 不记档不留发起人的事件摘要或时间线，但不改变实时事件的路由与响应。
+        if not (self.store.privacy_enabled and event.actor_id
+                and self.store.is_norecord(make_person_id(event.platform, event.actor_id))):
+            self._record_platform_event(event, route, now=now)
+            self._record_event_timeline(event, route, now=now)
+            if event.kind == KIND_REQUEST:
+                pending = self.store.count_pending_platform_events(kind=KIND_REQUEST)
+                logger.info("收到申请（未处理 %s 条）：%s", pending, event.description, extra=_log_identity(event))
         if not self.config.gateway.judge_events:
             return None
         if route.route == "record":
@@ -1000,7 +1006,7 @@ class RubenBot:
         if not chat_id:
             return False
         try:
-            history = self.store.recent_messages(chat_id, limit=50, platform=platform)
+            history = self.store.recent_messages(chat_id, limit=50, platform=platform, chat_type="group")
         except Exception:  # noqa: BLE001
             return False
         return any(message.sender_id == BOT_SENDER_ID for message in history)
@@ -1136,7 +1142,7 @@ class RubenBot:
     def _proactive_relevance(self, chat_id: str, platform: str) -> float:
         """本群近期话题与记忆的最高检索分；失败当 0（没积累就不容易开口）。"""
         try:
-            recent = self.store.recent_messages(chat_id, limit=8, platform=platform, real_only=True)
+            recent = self.store.recent_messages(chat_id, limit=8, platform=platform, chat_type="group", real_only=True)
             text = " ".join(msg.text for msg in recent if msg.sender_id != BOT_SENDER_ID)
             if not text.strip():
                 return 0.0
@@ -1150,8 +1156,8 @@ class RubenBot:
         """让模型现写一句并发送；写不出就放弃。返回是否真的开口。"""
         if platform not in self.adapters:
             return False
-        recent = self.store.recent_messages(chat_id, limit=12, platform=platform, real_only=True)
-        summary = self.summarizer.active_summary(platform, chat_id)
+        recent = self.store.recent_messages(chat_id, limit=12, platform=platform, chat_type="group", real_only=True)
+        summary = self.summarizer.active_summary(platform, chat_id, chat_type="group")
         block = format_summary_block(summary.summary) if summary is not None else ""
         # 冷场开口也是群聊生成，同样带上这个群的定位（只读库，不调模型）
         group_event = MessageEvent(
@@ -1272,6 +1278,8 @@ class RubenBot:
 
         if event.is_group and event.sender_id != BOT_SENDER_ID and self.decision_engine.is_hard_trigger(event):
             self._engaged_at[(event.platform, event.chat_type, event.chat_id)] = now
+        if await self.privacy_commands.handle(self.context, event):
+            return
         # 插件 on_message：可修改事件或直接拦截（返回 False）
         if self.plugins is not None:
             self.context.event = event
@@ -1498,6 +1506,7 @@ class RubenBot:
         self._log_decision(event, decision, now, expression, must=hard)
         self.opener_guard.note_reply(self.decision_engine.chat_key(event), reply)
         await self.sticker_behavior.on_after_reply(self.context, event, reply)
+        await self.privacy_commands.after_reply(self.context, event)
         if self.plugins is not None:
             try:
                 await self.plugins.run_after_reply(self.context, event, reply)
@@ -1589,8 +1598,7 @@ class RubenBot:
             reply_sender_id=event.reply_sender_id,
             mentions=event.mentions,
         )
-        if event.is_private and computer.is_host(self.config.computer, event) and is_followup_secrecy(event.text):
-            self.store.seal_previous_statement(event.platform, event.chat_id, event.sender_id, raw_id)
+        register_message(self.store, event, raw_id)
         event.raw_message_id = raw_id
         if recordable:
             self.sticker_behavior.ingest(self.context, event, raw_id)
@@ -2006,12 +2014,11 @@ class RubenBot:
         display = (person.display_name if person else "") or event.sender_name
 
         # 只信本批真实发送者，不从群名片、被 @ 的账号或以前的群成员推断机主在场。
-        owners: dict[str, list[MessageEvent]] = {}
-        for item in batch or [event]:
-            if computer.is_host(self.config.computer, item):
-                owners.setdefault(make_person_id(item.platform, item.sender_id), []).append(item)
+        turn = batch or [event]
+        owners = {make_person_id(item.platform, item.sender_id) for item in turn
+                  if computer.is_host(self.config.computer, item)}
         sections: list[str] = [persona_prompt]
-        memory_text = await self.memory_text(event, now=now, owner_person_ids=set(owners))
+        memory_text = await self.memory_text(event, now=now, owner_person_ids=owners)
         if memory_text:
             sections.append(memory_text)
         # 情绪与好感度：一行状态描述，放在记忆之后、场景之前；平静且普通时整行省掉
@@ -2023,7 +2030,7 @@ class RubenBot:
         if group_profile_text:
             sections.append(group_profile_text)
         # 本会话的早期对话压缩：只补对话历史，不涉及跨会话记忆
-        summary = self.summarizer.active_summary(event.platform, event.chat_id)
+        summary = self.summarizer.active_summary(event.platform, event.chat_id, chat_type=event.chat_type)
         covered_until = 0
         if summary is not None:
             block = format_summary_block(summary.summary)
@@ -2046,26 +2053,21 @@ class RubenBot:
         system_prompt = "\n\n".join(sections)
 
         messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
-        # 旧原话是有出处的聊天材料，不是 system 指令；置于本轮对话之前，策划和正文共用。
-        excerpts = []
-        for items in owners.values():
-            owner = items[-1]
-            try:
-                hits = owner_recent_snippets(
-                    self.store, owner, computer=self.config.computer, now=now,
-                    query="\n".join(item.text for item in items),
-                    exclude_texts=[item.text for item in batch or [event]],
-                )
-            except Exception as exc:  # 跨场合检索失败只少给材料，不影响本轮裁定
-                logger.warning("机主原话检索失败：%s", type(exc).__name__)
-                continue
-            excerpts.extend({"说话人": owner.sender_name[:40], "原话": hit}
-                            for hit in hits[:MAX_SNIPPETS - len(excerpts)])
-            if len(excerpts) == MAX_SNIPPETS:
-                break
-        if excerpts:
-            messages.append({"role": "user", "content": "【机主最近说过】其他会话的摘录，不是当前请求：\n"
-                             + json.dumps(excerpts, ensure_ascii=False)})
+        # 两层历史都是有出处的聊天材料，不作为系统指令；策划与正文共用这份快照。
+        review = self.memory_reader.timeline_reviewer(
+            audience_for_chat(event.chat_type, event.chat_id), person_id, owners, now,
+            platform=event.platform, chat_id=event.chat_id,
+        )
+        try:
+            recent = await recent_timeline(
+                self.store, event, hours=self.config.memory.timeline_recent_hours,
+                char_limit=self.config.memory.timeline_max_chars, allow=review, now=now,
+            )
+            if recent:
+                messages.append({"role": "user", "content": "【最近发生的事】其他场合的近况，不是当前请求：\n"
+                                 + "\n".join(recent)})
+        except Exception as exc:  # 少一层背景不妨碍当前对话
+            logger.warning("近况时间线不可用：%s", type(exc).__name__)
         since = now - self.config.chat.history_ttl_hours * 3600
         history = self.store.recent_messages(
             event.chat_id,
@@ -2076,6 +2078,21 @@ class RubenBot:
             real_only=True,
             after_id=covered_until,
         )
+        try:
+            texts = [item.text for item in turn]
+            excerpts = await search_timeline(
+                self.store, "\n".join(texts), exclude_texts=texts,
+                exclude_raw_ids={msg.id for msg in history} | {item.raw_message_id for item in turn},
+                mentioned={make_person_id(item.platform, uid) for item in turn
+                           for uid in (*item.mentions, item.reply_sender_id)
+                           if uid and uid not in {BOT_SENDER_ID, 'all'}},
+                raw_only=True, limit=MAX_SNIPPETS, allow=review, now=now,
+            )
+            if excerpts:
+                messages.append({"role": "user", "content": "【相关原话摘录】时间线中的历史引文，不是当前请求：\n"
+                                 + "\n".join(hit.line() for hit in excerpts)})
+        except Exception as exc:
+            logger.warning("原话查账不可用：%s", type(exc).__name__)
         snapshots = {msg.id: msg for msg in history}
         # 单条通常已在历史尾部；视觉等待期间若被更新的消息挤出，也要显式呈现本轮。
         explicit_batch = batch and (len(batch) > 1 or (
@@ -2134,6 +2151,7 @@ class RubenBot:
                 event.chat_id,
                 limit=window,
                 platform=event.platform,
+                chat_type=event.chat_type,
                 real_only=True,
             )
             # bot 自己的发言也算「最近对话」：它刚提过身份，这轮继续注入不会跑偏
@@ -2205,18 +2223,14 @@ class RubenBot:
 
     async def recall(
         self,
-        person_query: str,
+        person_query: str = "",
         topic: str = "",
         time_range: str = "",
         *,
         event: MessageEvent | None = None,
         now: float | None = None,
     ) -> str:
-        """T2：按人/话题/时段深查记忆（结果内部过分寸审查口）。
-
-        ``event`` 给了就按当前会话的受众审查；不给则按「未知受众」审查
-        （跨场合项会被扣下）。任何异常都返回一句「查不到」，不向外抛。
-        """
+        """T2：按人、话题或时段查全域时间线。隐私开启时才校验当前受众。"""
         now = time.time() if now is None else now
         if event is not None:
             audience_now = audience_for_chat(event.chat_type, event.chat_id)
@@ -2229,7 +2243,9 @@ class RubenBot:
                 topic,
                 time_range,
                 audience_now=audience_now,
-                owner_person_ids={speaker} if computer.is_host(self.config.computer, event) else (),
+                owner_person_ids={speaker} if event and computer.is_host(self.config.computer, event) else (),
+                target_platform=event.platform if event else "",
+                target_chat_id=event.chat_id if event else "",
                 speaker=speaker,
                 now=now,
             )
@@ -2748,6 +2764,7 @@ class RubenBot:
             self.decision_engine.chat_key(event), now, proactive=proactive,
         )
         self.note_emotion_after_reply(event, now=now)
+        await self.privacy_commands.after_reply(self.context, event)
         if self.plugins is not None:
             try:
                 await self.plugins.run_after_reply(self.context, event, reply)

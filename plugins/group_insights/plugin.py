@@ -562,6 +562,7 @@ class GroupInsights:
                     limit=limit,
                     since=since,
                     platform=getattr(event, "platform", None),
+                    chat_type="group",
                 )
             )
         except Exception as exc:  # noqa: BLE001 - 读失败按空数据处理

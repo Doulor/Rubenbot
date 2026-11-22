@@ -29,7 +29,7 @@ class FakeLLM:
 
 @pytest.fixture()
 def store():
-    s = MemoryStore(":memory:")
+    s = MemoryStore(":memory:", privacy_enabled=True)
     s.upsert_person("console", "u1", "阿花")
     s.upsert_person("console", "u2", "阿草")
     yield s
@@ -181,8 +181,9 @@ def test_temporal_expiry_days_are_clamped(store):
 def test_norecord_skips_facts_and_events(store):
     from rubenbot.memory.extract import MemoryExtractor
 
-    store.set_privacy_mode("console:u1", "norecord")
+    # 先已有待抽取消息，再切到不记；不记期间新入库的流水根本不会进入队列。
     seed(store)
+    store.set_privacy_mode("console:u1", "norecord")
     llm = FakeLLM(payload(facts=[{"content": "TA 住在杭州"}], events=[{"summary": "TA 去爬山了"}]))
     result = asyncio.run(MemoryExtractor(llm, store, MemoryConfig()).maybe_extract(now=BASE_TS + 10, force=True))[0]
     assert result.skipped_norecord is True
@@ -191,6 +192,80 @@ def test_norecord_skips_facts_and_events(store):
     # 模型根本没被调用，消息也标记完成了，避免反复尝试
     assert llm.calls == []
     assert store.pending_senders() == []
+
+
+def test_norecord_history_never_enters_later_extraction(store):
+    from rubenbot.memory.extract import MemoryExtractor
+
+    store.set_privacy_mode("console:u1", "norecord")
+    seed(store, texts=("我今天骑了单车",))
+    row, = store.recent_messages("g1")
+    assert row.text == "我今天骑了单车"
+    store.set_privacy_mode("console:u1", "normal")
+    assert not store.set_raw_visual_text(row.id, "单车照片")
+
+    # 同一人、同一会话恢复记录后，封存的消息仍可抽取，但产物必须封存。
+    seed(store, texts=("请保密，我喜欢游泳",), ts=BASE_TS + 1)
+    llm = FakeLLM(payload(facts=[{"content": "喜欢游泳"}], events=[{"summary": "说起游泳"}]))
+    asyncio.run(MemoryExtractor(llm, store, MemoryConfig()).maybe_extract(now=BASE_TS + 10, force=True))
+    transcript = llm.calls[0]["messages"][-1]["content"]
+    assert "游泳" in transcript and "单车" not in transcript
+    assert [m.sensitivity for m in store.list_memories()] == ["sealed"]
+    assert [e.sensitivity for e in store.list_events(person_id="console:u1")] == ["sealed"]
+
+    # 关闭审查不应把此前不记的流水重新排进后台抽取。
+    store.privacy_enabled = False
+    assert not store.set_raw_visual_text(row.id, "迟到的视觉描述")
+    assert store.pending_senders() == []
+
+
+def test_norecord_only_chat_keeps_bounded_short_term_history(store):
+    from rubenbot.memory.extract import MemoryExtractor
+
+    store.set_privacy_mode("console:u1", "norecord")
+    seed(store, texts=("第一条", "第二条", "第三条"))
+    llm = FakeLLM()
+    extractor = MemoryExtractor(llm, store, MemoryConfig(raw_keep_per_chat=2))
+    assert asyncio.run(extractor.maybe_extract(now=BASE_TS + 10, force=True)) == []
+    assert [m.text for m in store.recent_messages("g1")] == ["第二条", "第三条"]
+    assert llm.calls == []
+
+
+def test_norecord_during_model_call_discards_extraction(store):
+    from rubenbot.memory.extract import MemoryExtractor
+
+    class SwitchingLLM(FakeLLM):
+        async def complete(self, *args, **kwargs):
+            store.set_privacy_mode("console:u1", "norecord")
+            return await super().complete(*args, **kwargs)
+
+    seed(store)
+    llm = SwitchingLLM(payload(facts=[{"content": "经常爬山"}], events=[{"summary": "去爬山"}]))
+    result, = asyncio.run(MemoryExtractor(llm, store, MemoryConfig()).maybe_extract(now=BASE_TS + 10, force=True))
+    assert result.skipped_norecord
+    assert store.list_memories() == []
+    assert store.list_events(person_id="console:u1") == []
+    store.set_privacy_mode("console:u1", "normal")
+    assert store.pending_senders() == []
+
+
+def test_privacy_off_records_despite_saved_norecord_mode(store):
+    from rubenbot.memory.extract import MemoryExtractor
+
+    store.set_privacy_mode("console:u1", "norecord")
+    store.privacy_enabled = False
+    seed(store, texts=("请保密，我喜欢游泳",))
+    row, = store.recent_messages("g1")
+    assert store.set_raw_visual_text(row.id, "泳池照片")
+    llm = FakeLLM(payload(events=[{"summary": "说起游泳"}]))
+    asyncio.run(MemoryExtractor(llm, store, MemoryConfig()).maybe_extract(now=BASE_TS + 10, force=True))
+    assert [e.sensitivity for e in store.list_events(person_id="console:u1")] == ["sealed"]
+    from rubenbot.adapters.base import MessageEvent
+    from rubenbot.memory.timeline import search_timeline
+
+    other = MessageEvent('console', 'group', 'g2', 'u2', '小周', '游泳')
+    hits = asyncio.run(search_timeline(store, '游泳', exclude_chat=other, now=BASE_TS + 11))
+    assert any(hit.text == '说起游泳' for hit in hits)
 
 
 def test_private_mode_still_records(store):
@@ -376,4 +451,38 @@ def test_followup_seals_previous_owner_fact_and_event_not_other_places(store):
     store.seal_previous_statement("console", "g1", "u1", seal_id)
     assert {m.content: m.sensitivity for m in store.list_memories()} == {"我喜欢跳舞": "sealed", "我喜欢游泳": "normal"}
     assert {e.summary: e.sensitivity for e in store.list_events()} == {"我喜欢跳舞": "sealed", "我喜欢游泳": "normal"}
-    assert store.open_owner_sources([1, 2]) == {2}
+    assert store.available_raw_ids([1, 2], unblocked=True) == {2}
+
+
+def test_purge_while_extracting_does_not_recreate_old_memory(store):
+    from rubenbot.memory.extract import MemoryExtractor
+
+    seed(store, texts=("我喜欢鸭腿",))
+
+    class PurgingLLM(FakeLLM):
+        async def complete(self, *args, **kwargs):
+            store.purge_person("console:u1")
+            return payload(facts=["TA 喜欢鸭腿"], events=["TA 喜欢鸭腿"])
+
+    extractor = MemoryExtractor(PurgingLLM(), store, MemoryConfig())
+    asyncio.run(extractor.extract_sender(store.pending_senders()[0]))
+    assert store.list_memories() == [] and store.list_events() == []
+
+
+def test_member_followup_seals_existing_weekly_digest(store):
+    from rubenbot.memory.timeline import TimelineCompressor
+    from rubenbot.adapters.base import MessageEvent
+    from rubenbot.privacy import PrivacyGate
+
+    day = 86400
+    source = store.add_raw_message(platform="console", chat_id="g1", sender_id="u1", text="我计划周日去春游")
+    store.add_event("console:u1", "我计划周日去春游", ts=BASE_TS - 10 * day,
+                    source_chat="console:g1", audience="group:g1", source_raw_id=source)
+    TimelineCompressor(store, MemoryConfig()).run(now=BASE_TS)
+    request = MessageEvent("console", "group", "g1", "u1", "阿花", "前面那句别告诉别人")
+    rid = store.add_raw_message(platform=request.platform, chat_id=request.chat_id,
+                                sender_id=request.sender_id, text=request.text)
+    PrivacyGate(store, None).register_message(request, rid)
+    rows = store.list_events(person_id="console:u1")
+    assert {row.kind for row in rows} == {"event", "digest"}
+    assert all(row.sensitivity == "sealed" for row in rows)

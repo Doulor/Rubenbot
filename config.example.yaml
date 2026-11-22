@@ -36,6 +36,9 @@ persona:
 
 database_path: "data/rubenbot.db"
 
+privacy:
+  enabled: false               # 开启后启用保密封存与跨场合审查；关时群聊、私聊记忆互通
+
 memory:
   extract_every_n: 30          # 同一会话攒够多少条未抽取消息就触发
   extract_silence_seconds: 300 # 或者会话静默这么久后触发
@@ -69,6 +72,8 @@ memory:
   profile_inject_max_chars: 600  # 说话人核心画像注入的最大字符数
   inject_budget_tokens: 1200     # 本轮记忆注入预算；超了先砍事实、再砍时间线
   timeline_hit_limit: 6          # 每人最多带几条相关旧事
+  timeline_recent_hours: 24      # 上下文补入其他会话近多少小时发生的事
+  timeline_max_chars: 1800       # 近期事件流整段字符上限，最新的优先
   cross_session_hours: 24        # 私聊跨会话摘要回看的小时数
   self_inject_hours: 24          # 自我注入回看本会话的小时数
   self_inject_limit: 3           # 自我注入最多几条

@@ -156,7 +156,7 @@ class GroupProfileSummarizer:
         current = self.store.get_group_profile(platform, chat_id)
         covered = current.covered_until_msg_id if current else 0
         pending = self.store.count_raw_messages_after(
-            chat_id, platform=platform, after_id=covered, real_only=True
+            chat_id, platform=platform, chat_type="group", after_id=covered, real_only=True
         )
         if pending <= 0:
             return None
@@ -171,7 +171,7 @@ class GroupProfileSummarizer:
             return None
 
         messages = self.store.raw_messages_after(
-            chat_id, platform=platform, after_id=covered, real_only=True
+            chat_id, platform=platform, chat_type="group", after_id=covered, real_only=True
         )
         batch = messages[: max(1, int(self.config.max_batch_messages))]
         if not batch:
@@ -198,6 +198,13 @@ class GroupProfileSummarizer:
                 error="empty summary",
             )
 
+        # 等待模型期间可能有人清空了原话或使旧定位失效，不再写回过时的归纳。
+        latest = self.store.get_group_profile(platform, chat_id)
+        source_ids = {msg.id for msg in batch}
+        if (self.store.available_raw_ids(source_ids) != source_ids
+                or (latest.covered_until_msg_id if latest else 0) != covered
+                or (latest.auto_summary if latest else '') != old_summary):
+            return None
         covered_until = int(batch[-1].id)
         self.store.set_group_auto_summary(
             platform, chat_id, summary, covered_until, now=now

@@ -1715,6 +1715,9 @@ class QzonePostPlugin:
     def _recent_topic(self, *, now: float | None = None) -> str:
         """最近群聊优先，其次最近记忆；都没有返回空串（写日常向）。"""
         store = self.ctx.store
+        # 公开动态没有聊天中的目标受众，也不应旁路裁定；启用保护时只写日常。
+        if store.privacy_enabled:
+            return ""
         now = time.time() if now is None else now
         since = now - self.config.topic_window_hours * 3600
         try:
@@ -1733,6 +1736,7 @@ class QzonePostPlugin:
                     limit=self.config.topic_limit,
                     since=since,
                     platform=chat.get("platform"),
+                    chat_type="group",
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[qzone_post] 读取最近消息失败：%s", exc)

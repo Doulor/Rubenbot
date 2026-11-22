@@ -1710,6 +1710,7 @@ def _save_message(applied: list[str], requires_restart: list[str]) -> str:
     groups = {
         "llm": "模型与接口",
         "memory": "记忆",
+        "privacy": "跨场合隐私保护",
         "chat": "聊天与回复",
         "reply": "回复形态（拆条）",
         "decision": "开口护栏",
