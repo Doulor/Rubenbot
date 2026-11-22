@@ -261,6 +261,7 @@ class ReplyDecision:
     threshold: float = 0.0
     hard_trigger: str | None = None
     factors: DecisionFactors | None = None
+    effective_talk_value: float | None = None
 
     def log_text(self) -> str:
         verdict = "回" if self.should_reply else "不回"

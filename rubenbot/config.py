@@ -267,6 +267,21 @@ class ChatConfig:
 
 
 @dataclass
+class AttentionConfig:
+    """群聊消息送去评估的概率，不是最终回复概率。"""
+
+    talk_value: float = 0.75
+    engaged_window_seconds: float = 120.0
+
+    def __post_init__(self) -> None:
+        for key, maximum in (("talk_value", 1.0), ("engaged_window_seconds", math.inf)):
+            raw = getattr(self, key)
+            default = getattr(type(self), key)
+            value = default if isinstance(raw, bool) else _as_float(raw, default)
+            setattr(self, key, min(maximum, max(0.0, value)) if math.isfinite(value) else default)
+
+
+@dataclass
 class ReplyConfig:
     """回复形态：一次回复拆成几段、段与段之间停多久。
 
@@ -1086,6 +1101,7 @@ class Config:
     voice: VoiceConfig = field(default_factory=VoiceConfig)
     chat: ChatConfig = field(default_factory=ChatConfig)
     reply: ReplyConfig = field(default_factory=ReplyConfig)
+    attention: AttentionConfig = field(default_factory=AttentionConfig)
     decision: DecisionConfig = field(default_factory=DecisionConfig)
     generation: GenerationConfig = field(default_factory=GenerationConfig)
     emotion: EmotionConfig = field(default_factory=EmotionConfig)
@@ -1208,6 +1224,9 @@ class Config:
         )
         chat = ChatConfig(**{k: v for k, v in (data.get("chat") or {}).items() if _has(ChatConfig, k)})
         reply = ReplyConfig(**{k: v for k, v in (data.get("reply") or {}).items() if _has(ReplyConfig, k)})
+        attention = data.get("attention")
+        if not isinstance(attention, dict):
+            attention = {}
         decision = _load_decision(data.get("decision") or {})
         generation = _load_generation(data.get("generation") or {})
         emotion = _load_emotion(data.get("emotion") or {})
@@ -1246,6 +1265,7 @@ class Config:
             voice=voice,
             chat=chat,
             reply=reply,
+            attention=AttentionConfig(**{k: v for k, v in attention.items() if _has(AttentionConfig, k)}),
             decision=decision,
             generation=generation,
             emotion=emotion,

@@ -3685,6 +3685,7 @@ function groupName(key) {
     memory: "记忆",
     chat: "聊天与回复",
     decision: "回复意愿",
+    attention: "群聊回复时机",
     reminder: "提醒",
     proactive: "冷场开口",
     generation: "生成",
@@ -4107,6 +4108,16 @@ function settingsCardSpecs(draft, secrets, pluginsAvailable, groupIdentities = {
       }),
     },
     {
+      path: "attention.talk_value",
+      node: card("群聊回复时机", {
+        hint: "先查看一批消息，再决定要不要开口。私聊和硬触发消息始终会查看。",
+        body: fieldGrid([
+          { path: "attention.talk_value", label: "普通群聊查看概率", kind: "number", min: 0, max: 1, step: "0.01", hint: "这是查看概率，不是回复概率。0.75 表示平均每四批普通群消息查看三批。" },
+          { path: "attention.engaged_window_seconds", label: "保持投入的时间（秒）", kind: "number", min: 0, step: "any", hint: "在本会话发言、被点名或被 @ 后，这段时间里每批都查看。" },
+        ], draft),
+      }),
+    },
+    {
       // 拆条属于「回复形态」：这一段在 YAML 里仍属于 chat 段，但按语义归到表达页
       path: "reply.max_segments",
       node: card("回复分段", {
@@ -4242,8 +4253,8 @@ function settingsCardSpecs(draft, secrets, pluginsAvailable, groupIdentities = {
         hint: "群聊里什么时候开口",
         body: fieldGrid(
           [
-            { path: "decision.merge_window_seconds", label: "合并窗口（秒）", kind: "number", step: "0.5", min: 0, hint: "同一人连发的多条先攒着合并成一轮" },
-            { path: "decision.hard_merge_window_seconds", label: "硬触发窗口（秒）", kind: "number", step: "0.5", min: 0, hint: "私聊/@/回复/叫名字的短窗口，0 表示立即处理" },
+            { path: "decision.merge_window_seconds", label: "合并窗口（秒）", kind: "number", step: "0.5", min: 0, hint: "同一群聊的消息等到静默后合批裁定；私聊即时" },
+            { path: "decision.hard_merge_window_seconds", label: "硬触发窗口（秒）", kind: "number", step: "0.5", min: 0, hint: "群内 @、点名、回复 bot 或机主发言时的短窗口；0 表示立即处理" },
             { path: "decision.aliases", label: "叫名别名", kind: "list", wide: true, placeholder: "例如 小R", hint: "叫到这些名字算硬触发；留空则用 Bot 名称" },
             { path: "decision.base", label: "基础意愿", kind: "number", step: "0.01", min: 0, max: 1, hint: "每个群的基础分，默认低，靠动量和相关性加分" },
             { path: "decision.threshold", label: "开口阈值", kind: "number", step: "0.01", min: 0, max: 1, hint: "分数达到多少才开口" },

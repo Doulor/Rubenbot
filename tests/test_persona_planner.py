@@ -87,6 +87,8 @@ def planner_config() -> Config:
     config.reply.segment_delay_enabled = False
     config.decision.merge_window_seconds = 0
     config.decision.hard_merge_window_seconds = 0
+    # 只测裁定本身，不让查看掷点随机跳过本用例。
+    config.attention.talk_value = 1.0
     config.planner.planner_gate = True
     return config
 

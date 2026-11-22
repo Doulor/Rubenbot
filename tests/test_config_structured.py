@@ -374,6 +374,21 @@ def test_mcp_live_status_is_read_only(client, state):
     assert client.get("/api/mcp/status").json()["servers"] == [row]
 
 
+def test_attention_expression_form_round_trip(client, config_path):
+    view = client.get("/api/config").json()["structured"]
+    assert view["attention"] == {"talk_value": 0.75, "engaged_window_seconds": 120}
+    assert resolve_page("attention.talk_value") == resolve_page("attention.engaged_window_seconds") == "expression"
+
+    response = client.put("/api/config", json={"config": {
+        "attention": {"talk_value": "0.25", "engaged_window_seconds": "45"},
+    }})
+    assert response.status_code == 200, response.text
+    assert response.json()["applied"] == ["attention"]
+    expected = {"talk_value": 0.25, "engaged_window_seconds": 45}
+    assert read_yaml(config_path)["attention"] == expected
+    assert client.get("/api/config").json()["structured"]["attention"] == expected
+
+
 def test_nonverbal_probability_round_trip():
     update = validate_structured({"stickers": {"nonverbal_probability": 0.72}})
     assert structured_config(Config.from_dict(update))["stickers"]["nonverbal_probability"] == 0.72
@@ -490,6 +505,9 @@ def test_put_structured_emotion_hot_applies(bot_state):
         ({"webui": {"port": 70000}}, "webui.port"),
         ({"log_level": "LOUD"}, "log_level"),
         ({"reply": {"max_segments": 0}}, "reply.max_segments"),
+        ({"attention": {"talk_value": -0.01}}, "attention.talk_value"),
+        ({"attention": {"talk_value": 1.01}}, "attention.talk_value"),
+        ({"attention": {"engaged_window_seconds": -1}}, "attention.engaged_window_seconds"),
     ],
 )
 def test_validate_structured_rejects_bad_values(payload, field):

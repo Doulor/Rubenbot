@@ -77,7 +77,7 @@ SETTINGS_GROUPS: tuple[dict[str, Any], ...] = (
         "pages": (
             {"id": "persona", "title": "人设", "sub": "编辑人格文件，保存即热生效"},
             {"id": "chat", "title": "聊天", "sub": "上下文、回复意愿、动量与冷却"},
-            {"id": "expression", "title": "表达", "sub": "两段式生成与长回复拆条"},
+            {"id": "expression", "title": "表达", "sub": "群聊查看概率、两段式生成与长回复拆条"},
             {"id": "memory", "title": "记忆设置", "sub": "抽取、归纳、检索与滚动摘要"},
             {"id": "emotion", "title": "情绪", "sub": "好感度与心情规则"},
             {"id": "voice", "title": "语音", "sub": "语音转写（STT）与语音回复（TTS）"},
@@ -119,6 +119,7 @@ _SETTINGS_PAGE_RULES: tuple[tuple[str, str], ...] = (
     # 表达：生成策略 + 回复形态（拆条 / 打字节奏 / 动作描写）
     ("generation", "expression"),
     ("reply", "expression"),
+    ("attention", "expression"),
     ("chat.strip_action_parens", "expression"),
     # 聊天：上下文、入站去重、说话时机（回复意愿 / 动量 / 冷却 / 每群覆盖）
     ("chat", "chat"),
@@ -270,6 +271,7 @@ def structured_config(config: Config) -> dict[str, Any]:
         "voice": {**voice, "stt_api_key": "", "tts_api_key": ""},
         "chat": asdict(config.chat),
         "reply": asdict(config.reply),
+        "attention": asdict(config.attention),
         "decision": decision,
         "generation": asdict(config.generation),
         "reminder": asdict(config.reminder),
@@ -784,6 +786,16 @@ def _validate_chat(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
     return out
 
 
+def _validate_attention(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
+    out = {}
+    for key, maximum in (("talk_value", 1), ("engaged_window_seconds", None)):
+        if key in section:
+            value = v.number(section[key], f"attention.{key}", minimum=0, maximum=maximum)
+            if value is not None:
+                out[key] = value
+    return out
+
+
 def _validate_reply(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
     """回复形态：最多几段、段间延迟开关与每字毫秒数/上下限。"""
     out: dict[str, Any] = {}
@@ -1280,6 +1292,9 @@ def validate_structured(payload: dict[str, Any]) -> dict[str, Any]:
     chat = _section(payload, "chat", v)
     if chat is not None:
         update["chat"] = _validate_chat(chat, v)
+    attention = _section(payload, "attention", v)
+    if attention is not None:
+        update["attention"] = _validate_attention(attention, v)
     reply = _section(payload, "reply", v)
     if reply is not None:
         update["reply"] = _validate_reply(reply, v)

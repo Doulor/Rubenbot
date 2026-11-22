@@ -536,6 +536,7 @@ class RubenBot:
         self._chat_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
         self._flights: dict[tuple[str, str, str], ReplyFlight] = {}
         self._round_tasks: set[asyncio.Task] = set()
+        self._engaged_at: dict[tuple[str, str, str], float] = {}
         self._bg_task: asyncio.Task | None = None
         self._merge_task: asyncio.Task | None = None
         # 定时任务与冷场开口：跟随主程序生命周期启停
@@ -1255,6 +1256,8 @@ class RubenBot:
         await self.prepare_voice(event)
         visual_id = await self._record(event, now)
 
+        if event.is_group and self.decision_engine.is_hard_trigger(event):
+            self._engaged_at[(event.platform, event.chat_type, event.chat_id)] = now
         # 视觉描述回写原始流水，不等待视觉模型，也不把描述冒充发言正文。
         await self.sticker_behavior.on_message(self.context, event, raw_id=visual_id)
         # 插件 on_message：可修改事件或直接拦截（返回 False）
@@ -1280,7 +1283,8 @@ class RubenBot:
         hard = self.decision_engine.is_hard_trigger(event)
         # 主人按已配置的平台账号白名单识别，只提高查看优先级，不改必回规则。
         priority = hard is not None or computer.is_host(self.config.computer, event)
-        flight = self._flights.get((event.platform, event.chat_type, event.chat_id))
+        key = (event.platform, event.chat_type, event.chat_id)
+        flight = self._flights.get(key)
         if flight and flight.take(event, direct=hard is not None and not event.is_private):
             return
         ready = self.merger.add(event, now, hard=priority, urgent=priority)
@@ -1312,7 +1316,6 @@ class RubenBot:
                 # 这一轮的纠偏没兑现（异常中断），允许下一轮重新提醒
                 self.opener_guard.clear_pending(self.decision_engine.chat_key(event))
                 logger.exception("处理合并消息异常：%s", exc)
-
             finally:
                 self._flights.pop(round_.key, None)
 
@@ -1328,8 +1331,17 @@ class RubenBot:
         self, round_: MergedRound, event: MessageEvent, flight: ReplyFlight, *, retry: bool = False,
     ) -> None:
         now = time.time()
-        hard = next(filter(None, map(self.decision_engine.is_hard_trigger, round_.events)), None)
-        decision = self.decide(event, now=now) if not hard else ReplyDecision(True, reason=hard, hard_trigger=hard)
+        hard_event = next((item for item in round_.events if self.decision_engine.is_hard_trigger(item)), None)
+        if self.config.planner_gate and round_.hard and hard_event is None:
+            # 机主消息一定送去查看，但是否开口仍由策划判断。
+            decision = ReplyDecision(True, reason="planned")
+        else:
+            decision = self.decide(hard_event or event, now=now)
+        hard = decision.hard_trigger
+        if self.config.planner_gate and decision.should_reply and not (retry or hard or round_.hard):
+            effective = self.effective_talk_value(event, now)
+            if self.rng.random() >= effective:
+                decision = ReplyDecision(False, reason="attention_skip", effective_talk_value=effective)
         self.last_decision[self.decision_engine.chat_key(event)] = decision
         logger.info(
             "决策 %s/%s %s：%s %s",
@@ -1511,6 +1523,8 @@ class RubenBot:
             "share": factors.share,
             "mood_adjust": factors.mood_adjust,
         } if factors is not None else {}
+        if decision.effective_talk_value is not None:
+            factor_data["effective_talk_value"] = decision.effective_talk_value
         if expression is not None:
             factor_data["expression_decision"] = expression.to_dict()
             # 新路径的审计字段：策划步裁定与理由摘要（表结构不变，塞进 factors）
@@ -1741,6 +1755,14 @@ class RubenBot:
     # ------------------------------------------------------------------
     # 回复决策
     # ------------------------------------------------------------------
+
+    def effective_talk_value(self, event: MessageEvent, now: float) -> float:
+        """只决定是否查看，不覆盖护栏，也不代替策划的内容裁定。"""
+        cfg = self.config.attention
+        last = self._engaged_at.get((event.platform, event.chat_type, event.chat_id))
+        if event.is_private or (last is not None and now - last < cfg.engaged_window_seconds):
+            return 1.0
+        return cfg.talk_value
 
     def topic_relevance(self, event: MessageEvent) -> float:
         """话题相关性：当前消息与记忆的最高检索分（没有积累就是 0）。"""
@@ -2834,6 +2856,8 @@ class RubenBot:
         self, event: MessageEvent, text: str, message_id: str | None
     ) -> None:
         """把 bot 自己发出的一条话写进流水与自我时间线（失败只记日志）。"""
+        if event.is_group:
+            self._engaged_at[(event.platform, event.chat_type, event.chat_id)] = time.time()
         # 记入流水，供后续上下文使用；标记已处理，不参与记忆抽取。
         # 平台回执的消息 id 一并落库，后续引用解析与自我时间线依赖它。
         self.store.add_raw_message(

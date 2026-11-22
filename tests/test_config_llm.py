@@ -39,6 +39,16 @@ def test_config_defaults():
     assert cfg.enabled_adapters == []
 
 
+def test_attention_defaults_and_overrides():
+    attention = Config().attention
+    assert attention.talk_value == 0.75
+    assert attention.engaged_window_seconds == 120
+    for probability in (0, 0.35, 1):
+        attention = Config.from_raw({"attention": {"talk_value": probability, "engaged_window_seconds": 0}}).attention
+        assert attention.talk_value == probability
+        assert attention.engaged_window_seconds == 0
+
+
 def test_config_from_dict_and_env(tmp_path, monkeypatch):
     monkeypatch.setenv("MY_KEY", "sk-test")
     path = tmp_path / "config.yaml"
