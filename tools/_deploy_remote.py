@@ -125,7 +125,7 @@ def main(action, *args):
         LOCK.rmdir()
     elif action == 'status':
         previous = STAMP.read_text().strip() if STAMP.is_file() else ''
-        print(pid(), previous if re.fullmatch('[0-9a-f]{40,64}', previous) else 'unknown')
+        print(pid(), previous if re.fullmatch(r'[0-9a-f]{40}(?:[0-9a-f]{24})?', previous) else 'unknown')
     elif action == 'unpack':
         unpack(args == ('persona',))
     elif action == 'stop':

@@ -57,6 +57,7 @@ def test_dry_run_clean_main_no_writes_or_network(repo, tmp_path_factory, monkeyp
     assert snapshot() == before
     for expected in (commit, '--timeout=300', 'scp', '8765', 'setsid', '零 ERROR', '回滚', '不同步人设'):
         assert expected in out
+    assert '上次线上提交' in out and 'fallback' in out
     Path('untracked').touch()
     with pytest.raises(deploy.Failure, match='先提交'):
         deploy.anchor()
@@ -178,18 +179,41 @@ def test_unpack_preserves_site_files(tmp_path, monkeypatch, sync):
     assert all(Path(p).read_text() == 'live' for p in ['data/private', 'config.yaml', 'bot.log', 'start.sh'])
 
 
-@pytest.mark.parametrize(('failures', 'rc'), [(0, 0), (1, 1), (2, 2)])
-def test_release_and_pinned_rollback(repo, monkeypatch, failures, rc, capsys):
+@pytest.mark.parametrize('stamp', [None, 'a' * 40, 'b' * 64, 'a' * 41])
+def test_status_only_returns_full_hash(tmp_path, monkeypatch, capsys, stamp):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(host, 'SITE', tmp_path)
+    monkeypatch.setattr(host, 'pid', lambda: 10)
+    if stamp is not None:
+        host.STAMP.write_text(stamp + '\n')
+    host.main('status')
+    expected = stamp if stamp and len(stamp) in (40, 64) else 'unknown'
+    assert capsys.readouterr().out.strip() == f'10 {expected}'
+
+
+@pytest.mark.parametrize(('stamp', 'failures', 'rc'), [
+    ('previous', 0, 0), ('previous', 1, 1), ('previous', 2, 2),
+    ('unknown', 1, 1), ('same', 1, 1), ('missing-object', 1, 2),
+])
+def test_release_and_pinned_rollback(repo, monkeypatch, stamp, failures, rc, capsys):
+    previous = deploy.anchor()
+    Path(deploy.APP).write_bytes(b'release')
+    deploy.git('commit', '-qam', 'release')
     commit = deploy.anchor()
+    before = {'previous': previous, 'unknown': 'unknown', 'same': commit, 'missing-object': 'a' * 40}[stamp]
+    target = commit if before == 'unknown' else before
+    expected = target if failures else commit
     calls = []
     archives = []
     real_run = deploy.run
-    md5 = hashlib.md5(b'fixture').hexdigest()
+    md5 = hashlib.md5(b'fixture' if expected == previous else b'release').hexdigest()
 
     def run(args, **kwargs):
+        if args[:2] == ['git', 'archive']:
+            archives.append(args[-1])
         if args[0] == 'scp':
             assert args[1:3] == ['-F', deploy.SSH_CONFIG] and args[-1] == 'homecloud:rubenbot-main.tar.gz'
-            archives.append(Path(args[-2]).read_bytes())
+            assert Path(args[-2]).stat().st_size > 0
             return b''
         assert args[0] == 'git'
         return real_run(args, **kwargs)
@@ -197,7 +221,7 @@ def test_release_and_pinned_rollback(repo, monkeypatch, failures, rc, capsys):
     def remote(action, *args, **kwargs):
         calls.append(action)
         if action == 'status':
-            return f'{10 + calls.count("start")} unknown'
+            return f'{10 + calls.count("start")} {before}'
         if action == 'stop':
             assert int(args[0]) == 10 + calls.count('start')
         if action == 'probe':
@@ -209,7 +233,7 @@ def test_release_and_pinned_rollback(repo, monkeypatch, failures, rc, capsys):
                 return 'WAIT pid=0 http=000 ws=0 ERROR=1'
             return f'OK {10 + calls.count("start")} {md5}'
         if action == 'stamp':
-            assert args == (commit,)
+            assert args == (expected,)
         if action == 'diagnose':
             return 'ERROR=1 当前PID=0'
         return ''
@@ -219,8 +243,14 @@ def test_release_and_pinned_rollback(repo, monkeypatch, failures, rc, capsys):
     monkeypatch.setattr(deploy, 'public_checks', lambda *a: calls.append('public'))
     assert deploy.deploy(deploy.parse(['--skip-tests'])) == rc
     assert calls[0] == 'lock' and calls[-1] == 'unlock'
-    assert calls.count('start') == len(archives) == (2 if failures else 1)
-    assert archives[0] == archives[-1]
-    assert ('public' in calls) == ('stamp' in calls) == (rc != 2)
+    assert archives == ([commit, target] if failures else [commit])
+    assert calls.count('start') == len(archives) - (stamp == 'missing-object')
+    assert calls.count('public') == calls.count('stamp') == int(rc != 2)
+    out = capsys.readouterr().out
+    assert ('fallback' in out) == (stamp in ('unknown', 'same'))
     if rc == 2:
-        assert 'ERROR=1 当前PID=0' in capsys.readouterr().out
+        assert 'ERROR=1 当前PID=0' in out
+        if stamp == 'missing-object':
+            assert f'归档 {target} 失败' in out
+    else:
+        assert f'commit {before} → {expected}' in out

@@ -66,7 +66,8 @@ def dry_plan(commit, args):
         'setsid（start_new_session）运行 ./start.sh：stdin=/dev/null，stdout/stderr=新 bot.log，关闭其他 fd',
         '核对新 PID、curl http://127.0.0.1:8765/ 为 200、新日志 WS 已连接且零 ERROR、磁盘 app.js md5',
         f'curl {PUBLIC} 须为 200，curl {PUBLIC}static/app.js 须为 200 且 md5 与 git show 一致',
-        f'失败：重新 git archive {commit}，重复上传、解包、停启及全部验活（最多回滚一次）',
+        f'失败：归档部署前服务器盖戳的上次线上提交；无盖戳或与本次相同时才 fallback 重装锚点 {commit}。'
+        '只回滚一次，重复上传、解包、停启及全部验活；已知提交无法归档则报错退出',
         '记录健康提交；输出部署前后 PID/commit、失败时输出日志计数；释放部署锁',
     ]
     for step in steps:
@@ -89,7 +90,7 @@ def public_checks(md5, temp):
             raise Failure(f'公网 {url} 未返回 200')
     if hashlib.md5((temp / 'app.js').read_bytes()).hexdigest() != md5:
         raise Failure('公网 app.js md5 不符')
-    report('OK', '公网首页 200，公网 app.js 200 且 md5 与 main 一致')
+    report('OK', '公网首页 200，公网 app.js 200 且 md5 与目标提交一致')
 
 
 def health(old, md5, temp):
@@ -113,7 +114,10 @@ def health(old, md5, temp):
 
 def install(commit, old, persona, temp):
     archive = temp / 'release.tar.gz'
-    run(['git', 'archive', '--format=tar.gz', '-o', archive, commit], timeout=120)
+    try:
+        run(['git', 'archive', '--format=tar.gz', '-o', archive, commit], timeout=120)
+    except Failure as exc:
+        raise Failure(f'归档 {commit} 失败：{exc}') from None
     md5 = hashlib.md5(run(['git', 'show', f'{commit}:{APP}'])).hexdigest()
     report('OK', f'已归档 {commit}')
     run(['scp', *OPTIONS, archive, HOST + ':rubenbot-main.tar.gz'], timeout=120)
@@ -148,11 +152,12 @@ def deploy(args):
     try:
         old, before = remote('status').split()
         report('OK', f'部署前 PID={old} commit={before}')
+        target = commit
         with tempfile.TemporaryDirectory(prefix='rubenbot-release-') as directory:
             for rollback in (False, True):
                 try:
                     previous = remote('status').split()[0] if rollback else old
-                    new = install(commit, previous, args.sync_persona, Path(directory))
+                    new = install(target, previous, args.sync_persona, Path(directory))
                 except (Failure, OSError) as exc:
                     report('FAIL', f'{"回滚" if rollback else "部署"}：{exc}')
                     if rollback:
@@ -162,9 +167,14 @@ def deploy(args):
                             state = f'当前 PID、日志状态不可读：{diag}'
                         report('FAIL', f'部署前 PID={old} commit={before}；部署后 commit=未验证；{state}')
                         return 2
-                    report('RETRY', f'仅一次，按固定锚点重新打包 {commit}')
+                    if before in ('unknown', commit):
+                        reason = '无上次提交盖戳' if before == 'unknown' else '上次提交与本次相同'
+                        report('RETRY', f'{reason}，fallback 重装锚点 {commit}（仅一次）')
+                    else:
+                        target = before
+                        report('RETRY', f'退回服务器盖戳的上次线上提交 {target}（仅一次）')
                 else:
-                    report('OK', f'{"回滚" if rollback else "部署"}验活通过：PID {old} → {new}；commit {before} → {commit}')
+                    report('OK', f'{"回滚" if rollback else "部署"}验活通过：PID {old} → {new}；commit {before} → {target}')
                     return 1 if rollback else 0
     finally:
         remote('unlock')
