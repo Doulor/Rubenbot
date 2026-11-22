@@ -257,6 +257,110 @@ function skeleton(rows = 4) {
   return list;
 }
 
+/** 整页占位只画轮廓，不挂事件或发请求；局部列表仍用上面的 skeleton。 */
+function skeletonBar(width = "100%", height = "14px") {
+  return h("span", { class: "skeleton sk-bar", style: { width, height } });
+}
+
+function skBox(className, ...children) {
+  return h("div", { class: className }, ...children);
+}
+
+function skItems(count, make) {
+  return Array.from({ length: count }, (_, i) => make(i));
+}
+
+function overviewSkeleton() {
+  const hero = skBox("card hero",
+    skBox("hero-head", skeletonBar("76px", "26px"), skeletonBar("80px", "32px")),
+    skBox("hero-title", skeletonBar("132px", "1lh")),
+    skBox("hero-sub", skeletonBar("224px", "1lh")),
+    skBox("hero-chips", [58, 52, 54, 116].map(w => skBox("hero-chip", skeletonBar(`${w}px`, "11px")))));
+  // 沿用实际磁贴的标签和图标，只遮住需要接口才能填入的部分。
+  const tiles = [["消息总数", "chat"], ["记忆总量", "memory"], ["人物与会话", "people"], ["回复决策", "pulse"]];
+  return [hero, skBox("grid grid-kpi", tiles.map(([label, glyph]) =>
+    kpi(label, glyph, skeletonBar("46%", "1lh"), skeletonBar("76%", "1lh")))),
+    card("情绪与好感", { body: skBox("emotion-body", skeletonBar("30%", "26px"),
+      skBox("grid grid-2", skeleton(2), skeleton(2))) }),
+    skBox("grid grid-2",
+      skBox("grid", card("运行状态", { body: skeleton(3) }), card("适配器", { flush: true, body: skeleton(2) })),
+      skBox("grid", card("插件", { body: skeletonBar("45%", "32px") }), card("WebUI", { body: skeleton(2) }))),
+    card("最近决策", { flush: true, body: skeleton(2) })];
+}
+
+function settingsSkeleton(page, param) {
+  const plugin = page === "plugins";
+  const bot = page === "bot" || page === "persona";
+  // 分类由后端提供，占位只估计菜单项的宽度，不维护第二份分类表。
+  const menu = skBox("settings-menu", skBox("settings-menu-group", plugin ? "已安装插件" : bot ? "机器人" : "设置"),
+    skItems(bot ? 8 : 7, i => skBox("settings-menu-item", skeletonBar(i % 3 === 0 ? "52px" : "26px"))));
+  const fields = () => card(skeletonBar("90px", "1lh"), { body: skBox(plugin ? "plugin-config-fields" : "settings-fields",
+    skItems(4, () => skBox("settings-field", skeletonBar("38%"), skeletonBar("100%", "40px")))) });
+  let body;
+  if (bot && (!param || param === "persona" || page === "persona")) {
+    body = [card("人格文件", { body: skBox("persona-edit", skeletonBar("66%", "24px"),
+      skeletonBar("82%", "40px"), skBox("persona-editor", skeletonBar("76%")), skeletonBar("32%", "40px")) }),
+      skBox("grid grid-2", card("当前生效的人格", { body: skeletonBar() }), card("拼装预览", { body: skeletonBar() }))];
+  } else if (bot && param === "tools") {
+    body = card("MCP 连接状态", { actions: [skeletonBar("108px", "32px")], body: skeleton(2) });
+  } else if (plugin) {
+    body = fields();
+  } else {
+    body = [skBox("settings-savebar", skeletonBar("26%", "40px"), skBox("spacer"),
+      skeletonBar("92px", "40px"), skeletonBar("118px", "40px")), skBox("settings-stack", fields(), fields())];
+  }
+  return skBox("settings-layout", menu, skBox("settings-content", body));
+}
+
+function pluginSkeleton(param) {
+  const tabs = skBox("segmented plugin-tabs", skeletonBar("80px", "32px"), skeletonBar("80px", "32px"));
+  if (param.split("/")[0] === "config") return skBox("grid", tabs, settingsSkeleton("plugins", param));
+  return skBox("grid", tabs, skBox("grid sk-market",
+    skBox("notice", skeletonBar("70%", "40px")),
+    skBox("market-toolbar", skeletonBar("min(100%, 420px)", "40px"),
+      skBox("market-tabs", skItems(5, () => skeletonBar("53px", "32px")))),
+    skBox("market-grid", skItems(4, () => skBox("market-card",
+      skBox("market-card-head", skeletonBar("44px", "44px"), skeletonBar("44%")),
+      skeletonBar("84%", "40px"), skeletonBar("48%", "22px"),
+      skBox("market-foot", skeletonBar("30%", "32px")))))));
+}
+
+function routeSkeleton(page, param = "") {
+  const search = () => skBox("input-search", skeletonBar("100%", "40px"));
+  let body;
+  switch (page) {
+    case "overview": body = overviewSkeleton(); break;
+    case "bot": case "persona": case "settings": body = settingsSkeleton(page, param); break;
+    case "plugins": body = pluginSkeleton(param); break;
+    case "people":
+      body = skBox("split", skBox("card", skBox("toolbar", search()), skeleton(5)),
+        skBox("card", skBox("person-head", skeletonBar("52px", "52px"), skeletonBar("28%")),
+          skBox("person-stats", skItems(3, () => skeletonBar("72px", "36px"))), skeleton(3)));
+      break;
+    case "groups":
+      body = skBox("grid", skBox("notice", skeletonBar("92%", "2lh")),
+        skBox("card", skBox("card-head", h("h2", {}, "会话"), search()), skeleton(5)));
+      break;
+    case "memory":
+      body = [skBox("card", skBox("toolbar", search(), skeletonBar("170px", "40px"), skBox("spacer"),
+        skeletonBar("276px", "40px"), skeletonBar("110px", "40px")), skeleton(5),
+        skBox("toolbar", skeletonBar("32%", "32px"))), card("待执行提醒", { flush: true, body: skeleton(2) })];
+      break;
+    case "logs":
+      body = [skBox("card", skBox("card-head", h("h2", {}, "运行日志")),
+        skBox("toolbar", skeletonBar("120px", "40px"), search(), skBox("spacer"),
+          skeletonBar("100px", "32px"), skeletonBar("74px", "32px")),
+        skBox("logs", skItems(8, i => skBox("log-line", skeletonBar("58px", "1lh"),
+          skeletonBar("36px", "1lh"), skeletonBar(`${84 - i * 5}%`, "1lh"))))),
+        skBox("card advanced-yaml", skBox("card-head", h("h2", {}, "网关调用审计")))];
+      break;
+    default: body = skeleton(3);
+  }
+  // 单根节点便于路由整体替换；一组装饰性占位只向读屏报一次加载状态。
+  return h("div", { role: "status", "aria-label": "正在加载页面", class: "route-skeleton" },
+    h("div", { class: "sk-sections", "aria-hidden": "true" }, body));
+}
+
 /* ------------------------------------------------------------------ */
 /* 请求                                                               */
 /* ------------------------------------------------------------------ */
@@ -291,6 +395,8 @@ async function request(method, path, body) {
     error.fields = (data && data.fields) || [];
     throw error;
   }
+  // 写入可能同时影响列表、详情和概览；不让旧快照在下次切页时回显。
+  if (method !== "GET") invalidatePages();
   return data;
 }
 
@@ -344,6 +450,11 @@ function setupTheme() {
 }
 
 function showLogin() {
+  routeCache.clear();
+  state.routeVersion++;
+  stopPoll();
+  $("#view").replaceChildren();
+  setPersonaDirty(false);
   $("#app").hidden = true;
   $("#login").hidden = false;
   const input = $("#login-password");
@@ -466,7 +577,24 @@ const state = {
   param: "",
   pollTimer: null,
   booted: false,
+  routeVersion: 0,
 };
+
+// 只保存本次登录中完整渲染的页面；限制数量，避免逐个人物浏览时无限保留 DOM。
+const routeCache = new Map();
+const routeCacheLimit = 16;
+
+let cacheGeneration = 0;
+function invalidatePages() {
+  routeCache.clear();
+  cacheGeneration++;
+}
+
+function rememberPage(key, entry) {
+  routeCache.delete(key);
+  routeCache.set(key, entry);
+  if (routeCache.size > routeCacheLimit) routeCache.delete(routeCache.keys().next().value);
+}
 
 function currentRoute() {
   const raw = location.hash.replace(/^#\/?/, "");
@@ -508,19 +636,62 @@ async function renderRoute() {
   }
   const mobileTitle = $("#mobile-page-title");
   if (mobileTitle) mobileTitle.textContent = PAGES[route.page].title;
-  if (state.pollTimer) {
-    clearInterval(state.pollTimer);
-    state.pollTimer = null;
-  }
+  stopPoll();
+  const version = ++state.routeVersion;
   const meta = PAGES[route.page];
-  setHeader(meta.title, meta.sub, []);
-  // 换页即丢弃上一页的未保存编辑，顺带收掉 beforeunload 提醒
+  const key = `${route.page}/${route.param}`;
+  // 只复用干净的已完成视图；同页主动重读也不用先清屏。
+  const cached = routeCache.get(key);
   setPersonaDirty(false);
-  view.replaceChildren(skeleton(3));
+  if (cached) {
+    cached.interacting = false;
+    rememberPage(key, cached);
+  }
+  view.replaceChildren(cached ? cached.node : routeSkeleton(route.page, route.param));
+  setHeader(...(cached ? cached.header : [meta.title, meta.sub]));
+
+  const fresh = { node: h("div", { class: "route-page" }), header: [meta.title, meta.sub] };
+  // 每个加载器只写自己的容器和元信息，旧请求不能换掉新路由的标题、内容或轮询。
+  const animate = (enter) => {
+    if (!routeChanged) return;
+    const menu = view.querySelector(".settings-menu");
+    const tabs = view.querySelector(".plugin-tabs");
+    Motion.moveSelection(menu, previous.menu);
+    Motion.moveSelection(tabs, previous.tab);
+    if (enter) Motion.enter((subpage && (view.querySelector(".settings-content") || tabs?.nextElementSibling)) || view, subpage);
+  };
+  const generation = cacheGeneration;
+  if (cached) {
+    startPoll(cached);
+    // 命中时不从透明度零开始入场，首帧就能读到缓存。
+    animate(false);
+  }
   try {
-    await meta.render(view, route.param, previous);
+    const success = await meta.render(fresh.node, route.param, fresh);
+    if (version !== state.routeVersion) return;
+    if (success !== false && generation === cacheGeneration) {
+      rememberPage(key, fresh);
+      // 表单、搜索和仅由按钮修改的配置都算交互；不缓存草稿，也不打断焦点或弹窗。
+      const interact = event => {
+        const target = event.target;
+        if (target.closest(".settings-menu, .plugin-tabs, a[href^='#/']")) return;
+        if (event.type === "click" && !target.closest("button, summary, [role=button], [role=switch]")) return;
+        fresh.interacting = true;
+        if (event.type !== "focusin" && target.closest(".settings-content, .chat-detail") && routeCache.get(key) === fresh) {
+          routeCache.delete(key);
+        }
+      };
+      for (const type of ["focusin", "input", "change", "click"]) fresh.node.addEventListener(type, interact, true);
+    }
+    if (cached && (cached.interacting || personaDirty.active || success === false || generation !== cacheGeneration)) return;
+    view.replaceChildren(fresh.node);
+    startPoll(fresh);
+    if (fresh.status) setSidebarStatus(...fresh.status);
+    setHeader(...fresh.header);
+    if (fresh.notice && state.settingsNotice === fresh.notice) state.settingsNotice = null;
+    if (!cached) animate(true);
   } catch (err) {
-    if (err instanceof Unauthorized) return;
+    if (version !== state.routeVersion || cached || err instanceof Unauthorized) return;
     view.replaceChildren();
     view.append(
       h(
@@ -534,17 +705,19 @@ async function renderRoute() {
         )
       )
     );
-  } finally {
-    if (routeChanged && state.page === route.page && state.param === route.param) {
-      const panel = subpage && (view.querySelector(".settings-content") || view.querySelector(".plugin-tabs + div"));
-      Motion.enter(panel || view, subpage);
-    }
   }
 }
 
-/** 按间隔刷新页面（只在该页面停留时）。 */
-function onPoll(ms, fn) {
-  if (state.pollTimer) clearInterval(state.pollTimer);
+function stopPoll() {
+  if (state.pollTimer !== null) clearInterval(state.pollTimer);
+  state.pollTimer = null;
+}
+
+/** 只在这份视图展示期间轮询，后台构建的视图不会注册定时器。 */
+function startPoll(entry) {
+  stopPoll();
+  if (!entry.poll) return;
+  const [ms, fn] = entry.poll;
   state.pollTimer = setInterval(() => {
     if (document.hidden) return;
     fn();
@@ -818,8 +991,7 @@ function emotionCard(data) {
   });
 }
 
-async function renderOverview(view) {
-  view.replaceChildren(skeleton(4));
+async function renderOverview(view, param, entry = {}) {
   const load = async () => {
     const [data, emotion] = await Promise.all([
       api.get("/api/overview"),
@@ -930,10 +1102,11 @@ async function renderOverview(view) {
         decisions,
       ].filter(Boolean)
     );
-    setSidebarStatus(data.bot.running ? "运行中" : "未运行", data.bot.running ? "ok" : "off");
+    entry.status = [data.bot.running ? "运行中" : "未运行", data.bot.running ? "ok" : "off"];
+    if (view.isConnected) setSidebarStatus(...entry.status);
   };
   await load();
-  onPoll(6000, () => load().catch(() => {}));
+  entry.poll = [6000, () => load().catch(() => {})];
 }
 
 function kvRow(key, value) {
@@ -964,9 +1137,9 @@ function setPersonaDirty(dirty, { dot, saveButton, note } = {}) {
   }
 }
 
-async function renderLegacyPersona(view) {
+async function renderLegacyPersona(view, param, entry) {
   // 旧路由 #/persona：人设已并入机器人选项卡，这里仍显示编辑器并保持侧栏高亮
-  await renderBot(view, "persona");
+  return renderBot(view, "persona", entry);
 }
 
 /**
@@ -974,7 +1147,11 @@ async function renderLegacyPersona(view) {
  * 但编辑器本身（保存、.bak 备份、热重载、只读预览）保持原样。
  */
 async function personaNodes() {
-  const data = await api.get("/api/persona");
+  const readPersona = () => Promise.all([
+    api.get("/api/persona"),
+    api.get("/api/persona/preview").catch(() => null),
+  ]);
+  const [data, initialPreview] = await readPersona();
   // 五文件形态：目录里有 persona.md 时逐份编辑；否则仍是单个 SOUL 编辑器
   const files = data.multi_file && data.files ? data.files : null;
   const fileNames = files ? Object.keys(files) : [];
@@ -1090,8 +1267,8 @@ async function personaNodes() {
     updateStats();
     markDirty();
   });
+  // 新建编辑器初始就是干净的；后台渲染不能清除当前编辑器的脏标记。
   updateStats();
-  markDirty();
 
   const showNotice = (kind, message) => {
     notice.hidden = false;
@@ -1119,7 +1296,7 @@ async function personaNodes() {
       setPersonaDirty(false, { dot, saveButton, note: dirtyNote });
       showNotice("good", result.message || "已生效，无需重启。");
       toast(result.applied ? "人设已保存并生效" : "人设已保存，下次启动生效");
-      await loadEffective();
+      renderEffective(...await readPersona());
     } catch (err) {
       if (err instanceof Unauthorized) return;
       showNotice("bad", err.message || "保存失败");
@@ -1204,11 +1381,7 @@ async function personaNodes() {
     body: previewBody,
   });
 
-  const loadEffective = async () => {
-    const [current, preview] = await Promise.all([
-      api.get("/api/persona"),
-      api.get("/api/persona/preview").catch(() => null),
-    ]);
+  const renderEffective = (current, preview) => {
     const editorText = files ? (files.persona?.text || "") : data.text;
     const drift =
       current.effective_source !== "default" && current.effective !== editorText;
@@ -1237,7 +1410,7 @@ async function personaNodes() {
       previewBody.replaceChildren(h("p", { class: "muted", style: { margin: 0, fontSize: "12.5px" } }, "预览不可用。"));
     }
   };
-  await loadEffective();
+  renderEffective(data, initialPreview);
 
   // 切到别的页时由 renderRoute / 二级菜单统一清掉脏标记与 beforeunload 提醒
   return [editCard, h("div", { class: "grid grid-2" }, effectiveCard, previewCard)];
@@ -1258,15 +1431,14 @@ const memoryState = {
 };
 
 /** 只读的待执行提醒：没有取消入口（一期不做取消工具），只在记忆页顺带展示。 */
-function remindersCard() {
+function remindersCard(initialLoads = []) {
   const body = h("div", { class: "rows" }, skeleton(2));
   const wrap = card("待执行提醒", {
     hint: "只读；到点后 bot 会在原会话说一句",
     flush: true,
     body,
   });
-  api
-    .get("/api/reminders?limit=50")
+  const ready = api.get("/api/reminders?limit=50")
     .then((result) => {
       if (!result.items.length) {
         body.replaceChildren(emptyState("pulse", "没有待执行的提醒", "用户明确要求「提醒我」时，模型会创建提醒"));
@@ -1289,6 +1461,7 @@ function remindersCard() {
     .catch(() => {
       body.replaceChildren(emptyState("warning", "提醒列表加载失败", "稍后刷新页面试试"));
     });
+  initialLoads.push(ready);
   return wrap;
 }
 
@@ -1312,10 +1485,18 @@ function portraitPanel(data) {
 }
 
 async function renderMemory(view) {
-  const data = await api.get("/api/people?limit=500");
-  memoryState.people = data.items;
-  if (memoryState.people.length && !memoryState.personId) memoryState.personId = "";
-
+  const initialLoads = [];
+  const reminders = remindersCard(initialLoads);
+  const personFilter = h("select", {
+    class: "select",
+    style: { width: "auto", minWidth: "170px" },
+    "aria-label": "按人物筛选",
+    onchange: (event) => {
+      memoryState.personId = event.target.value;
+      memoryState.offset = 0;
+      loadTab();
+    },
+  }, h("option", { value: "" }, "全部人物"));
   const toolbar = h(
     "div",
     { class: "toolbar" },
@@ -1335,27 +1516,7 @@ async function renderMemory(view) {
         },
       })
     ),
-    h(
-      "select",
-      {
-        class: "select",
-        style: { width: "auto", minWidth: "170px" },
-        "aria-label": "按人物筛选",
-        onchange: (event) => {
-          memoryState.personId = event.target.value;
-          memoryState.offset = 0;
-          loadTab();
-        },
-      },
-      h("option", { value: "" }, "全部人物"),
-      ...memoryState.people.map((person) =>
-        h(
-          "option",
-          { value: person.person_id, selected: person.person_id === memoryState.personId },
-          `${person.identity?.name || person.display_name || "未知用户"} · ${person.platform_uid}（${person.memory_count}）`
-        )
-      )
-    ),
+    personFilter,
     h("div", { class: "spacer" }),
     h("div", { class: "segmented", role: "tablist", "aria-label": "记忆视图" },
       tabButton("list", "记忆列表"),
@@ -1365,7 +1526,15 @@ async function renderMemory(view) {
   );
 
   const content = h("div", { id: "memory-content" });
-  view.replaceChildren(h("section", { class: "card" }, toolbar, content), remindersCard());
+  // 当前标签的请求由筛选条件决定；只有列表行的身份回退和下拉选项需要人物目录。
+  const peopleReady = api.get("/api/people?limit=500").then(({ items }) => {
+    memoryState.people = items;
+    personFilter.append(...items.map(person => h("option",
+      { value: person.person_id, selected: person.person_id === memoryState.personId },
+      `${person.identity?.name || person.display_name || "未知用户"} · ${person.platform_uid}（${person.memory_count}）`
+    )));
+    return items;
+  });
 
   let requestVersion = 0;
   async function loadTab() {
@@ -1424,7 +1593,7 @@ async function renderMemory(view) {
     if (memoryState.query.trim()) params.set("q", memoryState.query.trim());
     if (memoryState.personId) params.set("person_id", memoryState.personId);
     content.replaceChildren(skeleton(3));
-    const result = await api.get(`/api/memories?${params.toString()}`);
+    const [result, people] = await Promise.all([api.get(`/api/memories?${params.toString()}`), peopleReady]);
     if (version !== requestVersion) return;
     memoryState.total = result.total;
     if (!result.items.length) {
@@ -1439,7 +1608,7 @@ async function renderMemory(view) {
     }
     const list = h("div", { class: "rows" });
     for (const memory of result.items) {
-      const person = memoryState.people.find((p) => p.person_id === memory.person_id);
+      const person = people.find((p) => p.person_id === memory.person_id);
       list.append(memoryRow(memory, person));
     }
     const footer = h(
@@ -1716,7 +1885,8 @@ async function renderMemory(view) {
     contentInput.focus();
   }
 
-  await loadTab();
+  await Promise.all([peopleReady, loadTab(), ...initialLoads]);
+  view.replaceChildren(h("section", { class: "card" }, toolbar, content), reminders);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1724,8 +1894,12 @@ async function renderMemory(view) {
 /* ------------------------------------------------------------------ */
 
 async function renderPeople(view, param) {
-  const peopleData = await api.get("/api/people?limit=500");
-  const people = peopleData.items;
+  const readDetail = id => api.get(`/api/people/${encodeURIComponent(id)}`);
+  const directory = api.get("/api/people?limit=500");
+  const detailReady = param ? Promise.resolve().then(() => readDetail(decodeURIComponent(param))) : null;
+  // 先观察预取错误：目录为空或失败时仍只显示目录结果；非空时 loadDetail 会照常抛错。
+  detailReady?.catch(() => {});
+  const { items: people } = await directory;
   const searchBox = h(
     "div",
     { class: "input-search", style: { maxWidth: "none", width: "100%" } },
@@ -1790,10 +1964,9 @@ async function renderPeople(view, param) {
     );
   }
 
-  async function loadDetail(personId, { scrollTop = false } = {}) {
+  async function loadDetail(personId, pending = null) {
     detailNode.replaceChildren(skeleton(3));
-    const encoded = encodeURIComponent(personId);
-    const data = await api.get(`/api/people/${encoded}`);
+    const data = await (pending || readDetail(personId));
     const person = data.person;
     const entry = people.find(row => row.person_id === personId);
     if (entry) entry.identity = person.identity;
@@ -1856,7 +2029,7 @@ async function renderPeople(view, param) {
   if (!target) target = people[0].person_id;
   renderList(people, target);
   view.replaceChildren(h("div", { class: "split" }, listCard, detailNode));
-  await loadDetail(target);
+  await loadDetail(target, detailReady);
 }
 
 /* ------------------------------------------------------------------ */
@@ -2442,7 +2615,7 @@ function detailDrawer(item) {
 }
 
 /** 配置页只读本地清单，不必等市场索引；没有 schema 的插件同样列出。 */
-async function renderPluginConfigs(panel, selected, oldMenu) {
+async function renderPluginConfigs(panel, selected) {
   const { items } = await api.get("/api/plugins");
   if (!items.length) {
     panel.replaceChildren(card("", { body: emptyState("plugins", "还没有已安装的插件", "到插件市场安装后，即可在这里配置。") }));
@@ -2460,7 +2633,6 @@ async function renderPluginConfigs(panel, selected, oldMenu) {
     }, nameOf(item))));
   const editor = h("div", { class: "settings-content" });
   panel.replaceChildren(h("div", { class: "settings-layout" }, menu, editor));
-  if (oldMenu) Motion.moveSelection(menu, oldMenu);
   const title = nameOf(current);
   if (!current.valid || !current.manifest?.config_schema?.length) {
     editor.replaceChildren(card(title, { body: emptyState("plugins", "无可配置项", current.invalid_reason || "该插件未声明配置项。") }));
@@ -2476,6 +2648,7 @@ async function renderPluginConfigs(panel, selected, oldMenu) {
       emptyState("warning", "读取配置失败", err.message),
       h("button", { class: "btn", type: "button", onclick: () => renderRoute() }, "重试"),
     ] }));
+    return false;
   }
 }
 
@@ -2681,7 +2854,7 @@ function marketCard(item, refresh) {
   );
 }
 
-async function renderPlugins(view, sub = "", previous = {}) {
+async function renderPlugins(view, sub = "") {
   const [tab, selected] = sub.split("/");
   const config = tab === "config";
   const tabs = h("nav", { class: "segmented plugin-tabs", "aria-label": "插件页面" },
@@ -2692,14 +2865,14 @@ async function renderPlugins(view, sub = "", previous = {}) {
   const panel = h("div", {}, skeleton(3));
   view.replaceChildren(h("div", { class: "grid" }, tabs, panel));
   try {
-    if (previous.tab) Motion.moveSelection(tabs, previous.tab);
-    if (config) await renderPluginConfigs(panel, selected, previous.menu);
+    if (config) return await renderPluginConfigs(panel, selected);
     else await renderPluginMarket(panel);
   } catch (err) {
     if (!(err instanceof Unauthorized)) panel.replaceChildren(card("", { body: [
       emptyState("warning", "加载失败", err.message),
       h("button", { class: "btn", type: "button", onclick: () => renderRoute() }, "重试"),
     ] }));
+    return false;
   }
 }
 
@@ -2827,10 +3000,11 @@ function logIdentities(item) {
   return h("span", { class: "log-identities" }, identityBadge(item.chat_identity), identityBadge(item.person_identity));
 }
 
-async function renderLogs(view) {
+async function renderLogs(view, param, entry = {}) {
   let level = "";
   let query = "";
   let following = true;
+  const initialLoads = [];
 
   const content = h("div", { class: "logs", id: "log-content" });
   const levelSelect = h(
@@ -2919,19 +3093,19 @@ async function renderLogs(view) {
         h("span", { class: "hint" }, "进程内最近 1000 条，重启后清空")),
       toolbar,
       content),
-    auditCard()
+    auditCard(initialLoads)
   );
-  await load();
-  onPoll(3000, () => {
+  await Promise.all([load(), ...initialLoads]);
+  entry.poll = [3000, () => {
     if (following) load().catch(() => {});
-  });
+  }];
 }
 
 /**
  * 网关调用审计（最小挂点）：只读列表，默认折叠在日志页底部。
  * 前端整体重组在另一分支进行，这里只保留接口可用时的一张小卡片。
  */
-function auditCard() {
+function auditCard(initialLoads = []) {
   const body = h("div", { class: "rows" }, h("div", { class: "log-empty" }, "加载中…"));
   const load = async () => {
     try {
@@ -2960,7 +3134,7 @@ function auditCard() {
       body.replaceChildren(h("div", { class: "log-empty" }, "审计接口暂不可用"));
     }
   };
-  load();
+  initialLoads.push(load());
   return h(
     "details",
     { class: "card advanced-yaml" },
@@ -3580,7 +3754,7 @@ function mcpServerEditor(draft) {
 }
 
 /** 仅在操作电脑页读取审计；刷新记录不改动表单草稿。 */
-function computerAuditCard() {
+function computerAuditCard(initialLoads = []) {
   const rows = h("div", { class: "rows", "aria-live": "polite" }, skeleton(2));
   const refresh = h("button", { type: "button", class: "btn btn-sm", onclick: load }, icon("refresh"), "刷新");
   async function load() {
@@ -3600,12 +3774,12 @@ function computerAuditCard() {
       if (!(err instanceof Unauthorized)) rows.replaceChildren(h("p", { class: "field-hint" }, "无法读取操作记录，请刷新重试。"));
     } finally { refresh.disabled = false; }
   }
-  load();
+  initialLoads.push(load());
   return card("操作审计", { hint: "最近 30 次操作，仅显示参数用量，不显示命令或文件内容。", actions: [refresh], body: rows });
 }
 
 /** 工具卡只读；按需刷新，不因查看状态发起连接。 */
-function mcpStatusCard() {
+function mcpStatusCard(initialLoads = []) {
   const states = { disabled: "已停用", connecting: "连接中", connected: "已连接", disconnected: "已断开", unavailable: "未运行" };
   const rows = h("div", { class: "rows", "aria-live": "polite" }, skeleton(2));
   const refresh = h("button", { type: "button", class: "btn btn-sm", onclick: load }, icon("refresh"), "刷新");
@@ -3623,7 +3797,7 @@ function mcpStatusCard() {
       if (!(err instanceof Unauthorized)) rows.replaceChildren(h("p", { class: "field-hint" }, "暂时无法读取连接状态。"));
     } finally { refresh.disabled = false; }
   }
-  load();
+  initialLoads.push(load());
   return card("MCP 连接状态", { actions: [h("a", { class: "btn btn-sm", href: "#/settings/mcp" }, "配置服务器"), refresh], body: rows });
 }
 
@@ -4484,7 +4658,7 @@ function settingsCardSpecs(draft, secrets, pluginsAvailable, groupIdentities = {
 }
 
 /** 只有系统页展示的纯前端设置（主题、原始 YAML），不参与配置字段归类。 */
-function stickerLibraryCard() {
+function stickerLibraryCard(initialLoads = []) {
   const box = h("div", { class: "sticker-library-grid" });
   const load = async () => {
     try {
@@ -4565,7 +4739,7 @@ function stickerLibraryCard() {
     }
   };
   const cardNode = card("表情库", { hint: "图片本体与索引存放在 stickers.dir", body: box });
-  load();
+  initialLoads.push(load());
   return cardNode;
 }
 
@@ -4660,13 +4834,9 @@ function settingsMenuSkeleton(title) {
   );
 }
 
-async function renderSettingsGroup(view, groupId, sub, previous) {
-  // 先把页头和分类菜单骨架放进 DOM；配置接口慢时也能立即确认已切页。
+async function renderSettingsGroup(view, groupId, sub, entry = {}) {
+  // 此处构建本次加载的分类菜单，外层路由负责首屏骨架和缓存切换。
   const groupTitle = groupId === "bot" ? "机器人" : "设置";
-  const groupSub = groupId === "bot"
-    ? "人设、聊天、表达、记忆、情绪、语音与表情"
-    : "模型、搜索、主动触达、适配器与运行环境";
-  setHeader(groupTitle, groupSub, []);
   const menuHost = settingsMenuSkeleton(groupTitle);
   const content = h(
     "div",
@@ -4683,16 +4853,17 @@ async function renderSettingsGroup(view, groupId, sub, previous) {
     content.replaceChildren(emptyState("warning", "没有这个分类", "刷新页面后再试"));
     return;
   }
-  setHeader(`${group.title} · ${page.title}`, page.sub || group.sub, []);
+  entry.header = [`${group.title} · ${page.title}`, page.sub || group.sub];
   const menu = settingsMenu(layout, group, page);
   menuHost.replaceChildren(...menu.childNodes);
   menuHost.setAttribute("aria-label", `${group.title}分类`);
   menuHost.removeAttribute("aria-busy");
-  if (previous?.menu) Motion.moveSelection(menuHost, previous.menu);
 
   // 人设页是 SOUL 编辑器，不走结构化表单；保存、备份与热重载保持原样
   if (page.id === "tools" && group.id === "bot") {
-    content.replaceChildren(mcpStatusCard());
+    const initialLoads = [];
+    content.replaceChildren(mcpStatusCard(initialLoads));
+    await Promise.all(initialLoads);
     return;
   }
   if (page.id === "persona" && group.id === "bot") {
@@ -4806,12 +4977,13 @@ async function renderSettingsGroup(view, groupId, sub, previous) {
 
   if (state.settingsNotice) {
     showResult(state.settingsNotice);
-    state.settingsNotice = null;
+    entry.notice = state.settingsNotice;
   }
 
+  const initialLoads = [];
   const extras = page.id === "system" ? systemExtras(data) : [];
-  if (page.id === "emoji") extras.push(stickerLibraryCard());
-  if (page.id === "computer") extras.push(computerAuditCard());
+  if (page.id === "emoji") extras.push(stickerLibraryCard(initialLoads));
+  if (page.id === "computer") extras.push(computerAuditCard(initialLoads));
   const hasContent = cards.length > 0 || extras.length > 0;
   const stack = hasContent
     ? h("div", { class: "settings-stack" }, ...cards, ...extras)
@@ -4823,14 +4995,15 @@ async function renderSettingsGroup(view, groupId, sub, previous) {
   content.replaceChildren(
     ...[saveBar, noticeBox, errorBox, pendingCard, stack].filter((node) => node && (node !== saveBar || hasContent))
   );
+  await Promise.all(initialLoads);
 }
 
-async function renderBot(view, sub, previous) {
-  await renderSettingsGroup(view, "bot", sub, previous);
+async function renderBot(view, sub, entry) {
+  return renderSettingsGroup(view, "bot", sub, entry);
 }
 
-async function renderSettings(view, sub, previous) {
-  await renderSettingsGroup(view, "settings", sub, previous);
+async function renderSettings(view, sub, entry) {
+  return renderSettingsGroup(view, "settings", sub, entry);
 }
 
 /* ------------------------------------------------------------------ */

@@ -431,7 +431,23 @@ button {
   align-items: flex-end;
   justify-content: space-between;
   gap: 16px;
-  flex-wrap: wrap;
+}
+
+/* 初始页名和接口返回的二级页名共用同一组行盒，正文起点不随文案移动。 */
+.page-head > :first-child {
+  min-width: 0;
+  flex: 1;
+}
+
+.page-actions:empty {
+  display: none;
+}
+
+.page-title,
+.page-sub {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .page-title {
@@ -455,11 +471,12 @@ button {
 }
 
 .view {
+  --view-gap: 16px;
   max-width: var(--content-max);
   margin: 0 auto;
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: var(--view-gap);
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -679,6 +696,13 @@ button {
   font-style: normal;
   color: var(--accent-text);
   font-weight: 600;
+}
+
+/* 极窄屏上一张磁贴不足以放下一整行备注，加载前后都预留两行。 */
+@media (max-width: 360px) {
+  .grid-kpi .kpi-note {
+    min-height: 2lh;
+  }
 }
 
 /* ---------------- 列表 / 表格 ---------------- */
@@ -1206,6 +1230,39 @@ button {
 
 .skeleton-row:first-child {
   border-top: 0;
+}
+
+/* 整页只由实页容器决定列数与内距；多个区块跟 .view 取同一间距。 */
+.route-page,
+.sk-sections {
+  display: flex;
+  flex-direction: column;
+  gap: var(--view-gap);
+  min-width: 0;
+}
+
+.sk-sections {
+  pointer-events: none;
+}
+
+.sk-bar {
+  display: block;
+  max-width: 100%;
+}
+
+/* 首屏有多块占位，使用静态色块，避免在手机上同时重绘几十条扫光。 */
+.route-skeleton .skeleton {
+  background: var(--surface-sunk);
+  animation: none;
+}
+
+.route-skeleton .notice {
+  background: var(--card-fill);
+}
+
+.sk-market {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 14px;
 }
 
 /* ---------------- 记忆 / 人物 ---------------- */
@@ -2540,6 +2597,8 @@ button {
 @media (max-width: 768px) {
   .app {
     grid-template-columns: minmax(0, 1fr);
+    /* 剩余视口高度只分配给正文，避免短页把顶栏拉高。 */
+    grid-template-rows: auto 1fr;
   }
 
   .sidebar {
