@@ -110,7 +110,14 @@ async def _body(response: httpx.Response, output_limit: int) -> str:
 
 
 async def fetch_url(url: str, *, sandbox: bool, output_limit: int, timeout: float) -> str:
-    """读取网页正文；DNS、重定向、正文读取共用一次超时预算。"""
+    """电脑工具只需要正文，不把跳转目标当成消息的一部分。"""
+    _, text = await fetch_page(url, sandbox=sandbox, output_limit=output_limit, timeout=timeout)
+    return text
+
+
+async def fetch_page(url: str, *, sandbox: bool, output_limit: int, timeout: float,
+                     text_only: bool = False) -> tuple[str, str]:
+    """返回重定向后的实际出处和正文；DNS、跳转和读取共用一次超时。"""
     if output_limit <= 0 or timeout <= 0:
         raise ValueError("抓取限额必须为正数")
     if len(url) > _MAX_URL:
@@ -144,7 +151,10 @@ async def fetch_url(url: str, *, sandbox: bool, output_limit: int, timeout: floa
                             continue
                         if not 200 <= response.status_code < 300:
                             raise ValueError(f"网页返回 HTTP {response.status_code}")
-                        return await _body(response, output_limit)
+                        mime = response.headers.get("content-type", "").partition(";")[0].strip().lower()
+                        if text_only and mime not in {"text/plain", "text/html", "application/xhtml+xml"}:
+                            raise ValueError("不是可读的网页正文")
+                        return str(target), await _body(response, output_limit)
                     finally:
                         await response.aclose()
     except TimeoutError:

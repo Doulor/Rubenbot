@@ -8,7 +8,7 @@ import zlib
 import httpcore
 import pytest
 
-from rubenbot.computer_fetch import fetch_url
+from rubenbot.computer_fetch import fetch_page, fetch_url
 
 
 class Wire(httpcore.AsyncNetworkStream):
@@ -124,6 +124,30 @@ def test_redirect_cannot_switch_to_disallowed_url(network, location):
     with pytest.raises(ValueError, match="HTTP"):
         fetch()
     assert len(network.connections) == 1
+
+
+def test_evidence_reader_uses_final_url_and_anonymous_get_on_every_hop(network):
+    network.dns = {'page.test': [['1.1.1.1']], 'final.test': [['8.8.8.8']]}
+    network.replies = [[b'HTTP/1.1 302 Found\r\nLocation: https://final.test/manual\r\nSet-Cookie: token=private\r\n\r\n'],
+                       [b'HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n',
+                        b'<head><title>not evidence</title></head><p>Verified.</p><script>hidden</script>']]
+    origin, text = asyncio.run(fetch_page('https://page.test/start', sandbox=True, text_only=True,
+                                          timeout=2, output_limit=256))
+    assert (origin, text) == ('https://final.test/manual', 'Verified.')
+    for _, _, wire in network.connections:
+        assert wire.sent.startswith(b'GET ') and wire.closed
+        assert all(h not in wire.sent.lower() for h in (b'cookie:', b'authorization:', b'referer:'))
+
+
+def test_evidence_reader_rejects_non_document_before_body(network):
+    def reply():
+        yield b'HTTP/1.1 200 OK\r\nContent-Type: image/png\r\n\r\n'
+        pytest.fail('非文档响应不应读正文')
+    network.dns = {'page.test': [['1.1.1.1']]}
+    network.replies = [reply()]
+    with pytest.raises(ValueError, match='正文'):
+        asyncio.run(fetch_page('https://page.test/image', sandbox=True, text_only=True, timeout=2, output_limit=256))
+    assert network.connections[0][2].closed
 
 
 def test_host_allows_loopback_and_skips_proxy(network):

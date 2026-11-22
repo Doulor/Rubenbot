@@ -98,6 +98,7 @@ class StickerBehavior:
         self.rng = rng or random.Random()
         self.clock = clock or time.monotonic
         self._last_sent_at: dict[tuple[str, str], float] = {}
+        self._verified_adapter: dict[tuple[str, str], Any] = {}
         self._downloader = downloader
         self._embed_fn = embed_fn
         self._embed_client: httpx.AsyncClient | None = None
@@ -374,6 +375,11 @@ class StickerBehavior:
                 platform, SEND_STICKER, sticker=store.reference(sticker),
                 chat_id=event.chat_id, chat_type=event.chat_type,
             )
+            route = (platform, event.chat_type)
+            if ok:
+                self._verified_adapter[route] = bot.adapters.get(platform)
+            else:
+                self._verified_adapter.pop(route, None)
             if not ok:
                 logger.debug("发表情失败（忽略）：%s", reason)
             elif sticker.id:
@@ -385,6 +391,15 @@ class StickerBehavior:
         except Exception as exc:  # noqa: BLE001
             logger.debug("表情包发送异常：%s", exc)
             return False
+
+    def available_for(self, event: Any, adapter: Any) -> bool:
+        """只读验通记录、概率、冷却和实际可选图片；控制台占位不是发表情。"""
+        return bool(self.enabled and event.platform != 'console'
+                    and self._verified_adapter.get((event.platform, event.chat_type)) is adapter
+                    and max(self.config.send_probability, self.config.nonverbal_probability) > 0
+                    and not self._in_cooldown(event, self.clock()) and self._store is not None
+                    and any(_has_local_file(self._store, item) for item in
+                            self._store.find_by_tags(None, kind=KIND_STICKER)))
 
     def _in_cooldown(self, event: Any, now: float) -> bool:
         last = self._last_sent_at.get(_chat_key(event))

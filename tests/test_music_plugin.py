@@ -312,6 +312,21 @@ def test_cooldown_blocks_second_request():
     assert adapter.sent[-1][2][0]["type"] == "music"
 
 
+def test_note_only_after_real_search_and_send_on_current_route():
+    clock = FakeClock()
+    player, adapter = make_player(clock=clock)
+    asked = event()
+    assert player.capability_note(asked, adapter) is None
+    asyncio.run(player.on_message(runtime(adapter), asked))
+    assert player.capability_note(asked, adapter) is None  # 这个点歌人还在冷却
+    clock.now += 61
+    note = player.capability_note(asked, adapter)
+    assert note.title == '点歌' and '卡片或歌曲链接' in note.detail
+    assert player.capability_note(asked, RecordingAdapter()) is None
+    asked.chat_type = 'private'
+    assert player.capability_note(asked, adapter) is None
+
+
 def test_cooldown_starts_even_if_search_fails():
     clock = FakeClock()
     player, adapter = make_player(status=500, clock=clock)
@@ -335,6 +350,10 @@ class StubCtx:
         self.plugin = SimpleNamespace(path=path)
         self.message_hooks = []
         self.stop_hooks = []
+        self.notes = []
+
+    def capability_note(self, describe):
+        self.notes.append(describe)
 
     def on_message(self, handler):
         self.message_hooks.append(handler)
@@ -350,6 +369,7 @@ def test_register_wires_hooks():
     plugin.register(ctx)
     assert len(ctx.message_hooks) == 1
     assert len(ctx.stop_hooks) == 1
+    assert ctx.notes == [ctx.extras['music'].capability_note]
     assert isinstance(ctx.extras["music"], plugin.MusicPlayer)
 
 

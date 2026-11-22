@@ -357,6 +357,8 @@ CREATE TABLE IF NOT EXISTS computer_audit (
     duration_ms  INTEGER NOT NULL
 );
 
+CREATE INDEX IF NOT EXISTS idx_computer_audit_scope ON computer_audit(who, context, tool, id);
+
 -- 网关冷却状态：四维冷却里需要跨重启保留的部分
 -- scope: conversation（动作×会话）/ object（动作×对象）/ budget（会话日预算）
 --        / global（全局日上限）/ backoff（动作连续失败退避）
@@ -2998,6 +3000,16 @@ class MemoryStore:
                 (time.time(), who, context, tool, json.dumps(args_summary), int(success), duration_ms),
             )
             self._conn.commit()
+
+    def verified_computer_tools(self, who: str, context: str) -> set[str]:
+        """只看当前账号、当前权限档最近一次操作是否成功，不读参数或结果。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT tool FROM computer_audit WHERE success=1 AND id IN "
+                "(SELECT MAX(id) FROM computer_audit WHERE who=? AND context=? GROUP BY tool)",
+                (who, context),
+            ).fetchall()
+        return {row['tool'] for row in rows}
 
     def recent_computer_actions(self, limit: int = 50) -> list[dict]:
         """按完成顺序返回最近的电脑操作，用于只读审计页。"""

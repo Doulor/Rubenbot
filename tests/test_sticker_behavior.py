@@ -244,6 +244,26 @@ def test_send_falls_back_to_any(tmp_path):
     assert bot.calls[0][2]["sticker"]["id"] == added.id
 
 
+def test_capability_requires_live_candidate_and_verified_delivery(tmp_path):
+    store = StickerStore(tmp_path / 'stickers')
+    sticker = store.add(png(b'cat'))
+    bot = Bot(store)
+    behavior = make_behavior(store, nonverbal_probability=0)
+    asked = event()
+    adapter = bot.adapters[asked.platform]
+    assert not behavior.available_for(asked, adapter)
+    asyncio.run(behavior.on_after_reply(runtime(bot), asked, '嗯'))
+    assert not behavior.available_for(asked, adapter)
+    behavior.clock.value += 301
+    assert behavior.available_for(asked, adapter)
+    assert not behavior.available_for(asked, Adapter())
+    behavior.config.send_probability = 0
+    assert not behavior.available_for(asked, adapter)
+    behavior.config.send_probability = 1
+    store.path_of(sticker).unlink()
+    assert not behavior.available_for(asked, adapter)
+
+
 def test_empty_store_skips(tmp_path):
     store = StickerStore(tmp_path / "stickers")
     bot = Bot(store)

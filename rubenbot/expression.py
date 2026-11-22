@@ -15,6 +15,22 @@ MAX_REASON = 60
 
 
 @dataclass(frozen=True)
+class CapabilityNote:
+    """索引只给标题和自述；策划步选中标题，生成步才读到对应情境说明。"""
+
+    title: str
+    summary: str
+    detail: str
+
+
+def capability_index(notes: tuple[CapabilityNote, ...]) -> str:
+    if not notes:
+        return ''
+    return ('\n【这轮我能做的事】\n' + '\n'.join(f'〔{n.title}〕{n.summary}' for n in notes)
+            + '\n需要哪项的具体说明，就把标题列入 JSON 的 capabilities 数组；不用可省略。')
+
+
+@dataclass(frozen=True)
 class ExpressionDecision:
     intent: str
     length_band: str
@@ -25,6 +41,7 @@ class ExpressionDecision:
     speak: bool | None = None
     # 裁定理由摘要（进 decision_log 的 factors，便于审计）
     reason: str = ""
+    capabilities: tuple[str, ...] = ()
 
     def prompt_block(self) -> str:
         return (
@@ -78,7 +95,7 @@ def repetition_list(recent: list[str], proposed: object = None) -> tuple[str, ..
     return tuple(result)
 
 
-def parse_plan(raw: str, band: str, recent: list[str]) -> ExpressionDecision:
+def parse_plan(raw: str, band: str, recent: list[str], notes: tuple[CapabilityNote, ...] = ()) -> ExpressionDecision:
     """非结构化输出不作指导；模型故障只允许保守的碎片呼应。
 
     ``speak`` 是策划步的开口裁定：模型给了就照它的；只写 intent=沉默 也
@@ -109,4 +126,6 @@ def parse_plan(raw: str, band: str, recent: list[str]) -> ExpressionDecision:
     reason = ' '.join(reason.split())[:MAX_REASON] if isinstance(reason, str) else ''
     return ExpressionDecision(intent, '碎片' if intent == '短附和' else band, increment,
                               repetition_list(recent, data.get('avoid_repetition')),
-                              speak=speak, reason=reason)
+                              speak=speak, reason=reason,
+                              capabilities=tuple(n.title for n in notes if isinstance(data.get('capabilities'), list)
+                                                 and n.title in data['capabilities']))

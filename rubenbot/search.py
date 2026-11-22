@@ -134,10 +134,22 @@ class WebSearcher:
         self._last_search: dict[str, float] = {}
         # 最近一次实际命中（胜出）的渠道名；只用于调试/日志
         self.last_provider: str | None = None
+        # 只有当前实例通过搜索实际打开非空公网原文，能力索引才宣称能读结果页。
+        self.verified_pages_read = False
 
     @property
     def enabled(self) -> bool:
         return self.config.configured
+
+    def _remaining(self, chat_key: str, now: float) -> int:
+        last = self._last_search.get(chat_key)
+        if last is None or self.config.cooldown_seconds <= 0:
+            return 0
+        return max(0, math.ceil(self.config.cooldown_seconds - (now - last)))
+
+    def available_for(self, chat_key: str) -> bool:
+        """只读查询；不试搜，不更新冷却。"""
+        return self.enabled and self._remaining(chat_key, self.now_fn()) == 0
 
     def _channels(self) -> list[str]:
         """链上真正会尝试的渠道：按顺序、跳过没配 key 的。"""
@@ -161,21 +173,25 @@ class WebSearcher:
         self._client = None
 
     async def search(self, query: str, count: object = None, *, chat_key: str = "") -> str:
-        """执行一次搜索并返回注入文本；任何失败都返回提示句，不抛异常。"""
+        """仅供展示的摘要列表；聊天查证走 lookup 取原始链接。"""
+        result = await self.lookup(query, count, chat_key=chat_key)
+        return result if isinstance(result, str) else format_results(result)
+
+    async def lookup(self, query: str, count: object = None, *, chat_key: str = "") -> list[SearchResult] | str:
+        """成功返回本次命中的结构化结果；冷却、空结果或失败返回提示。"""
         query = _clean(query)
         if not query:
             return "搜索词不能为空。"
         if not self.enabled:
             return "联网搜索未启用。"
         now = self.now_fn()
-        cooldown = max(0.0, float(self.config.cooldown_seconds))
-        last = self._last_search.get(chat_key)
-        if cooldown > 0 and last is not None and now - last < cooldown:
-            remaining = math.ceil(cooldown - (now - last))
+        remaining = self._remaining(chat_key, now)
+        if remaining:
             return f"{COOLDOWN_TEXT}（{remaining} 秒后可再搜）。"
         # 先记时间再发请求：并发/慢请求期间也不会被重复触发（整条链只记一次）
         self._last_search[chat_key] = now
         self.last_provider = None
+        self.verified_pages_read = False
         limit = clamp_count(count)
         client = await self._get_client()
         any_responded = False
@@ -191,7 +207,7 @@ class WebSearcher:
                 continue
             logger.info("联网搜索命中渠道 %s（%d 条）", name, len(results))
             self.last_provider = name
-            return format_results(results)
+            return results[:limit]
         # 全部渠道都没给出结果：至少一个正常返回就用「没搜到」，全挂则「暂时不可用」
         return NO_RESULT_TEXT if any_responded else UNAVAILABLE_TEXT
 
