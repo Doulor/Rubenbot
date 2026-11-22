@@ -17,10 +17,39 @@ import secrets
 import time
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from dataclasses import dataclass
+from pathlib import Path
 
 from ..config import WebUIConfig, is_loopback_host
 
 COOKIE_NAME = "rubenbot_session"
+
+_SESSION_SECRET_FILE = ".webui_session_secret"
+
+
+def load_or_create_session_secret(db_path: str) -> bytes | None:
+    """从数据库同目录读会话签名密钥；没有就生成一份落盘（0600）。
+
+    密钥落盘后，进程重启不再使已签发的登录 Cookie 失效。读写失败时
+    返回 None，调用方退回进程内临时密钥（旧行为），不阻断启动。
+    """
+    if not db_path or db_path == ":memory:":
+        return None
+    path = Path(db_path).parent / _SESSION_SECRET_FILE
+    try:
+        if path.exists():
+            data = path.read_bytes().strip()
+            if len(data) >= 16:
+                return data
+        secret = secrets.token_bytes(32)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(secret)
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+        return secret
+    except OSError:
+        return None
 
 
 class BindSecurityError(RuntimeError):
@@ -52,6 +81,11 @@ class SessionSigner:
         self._secret = secret or secrets.token_bytes(32)
         self.ttl_seconds = max(60.0, ttl_hours * 3600)
         self._password_hash = hashlib.sha256(self.password.encode("utf-8")).digest()
+
+    @property
+    def secret(self) -> bytes:
+        """当前签名密钥；热更新重建 signer 时带过去，避免无故登出。"""
+        return self._secret
 
     # ---- 口令 ----
 

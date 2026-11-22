@@ -832,7 +832,7 @@ class WebUIConfig:
     port: int = 8765
     password: str = ""
     # 登录会话有效期（小时）
-    session_hours: float = 72.0
+    session_hours: float = 720.0
 
 
 @dataclass

@@ -208,9 +208,13 @@ def main(argv: list[str] | None = None) -> int:
             signer=None,
             webui_only=True,
         )
-        from .web.auth import SessionSigner
+        from .web.auth import SessionSigner, load_or_create_session_secret
 
-        state.signer = SessionSigner(config.webui.password, ttl_hours=config.webui.session_hours)
+        state.signer = SessionSigner(
+            config.webui.password,
+            ttl_hours=config.webui.session_hours,
+            secret=load_or_create_session_secret(config.database_path),
+        )
         try:
             asyncio.run(run_webui_standalone(state))
         except BindSecurityError as exc:

@@ -23,7 +23,7 @@ from ..memory.store import MemoryStore
 from ..persona import Persona, load_persona
 from ..plugins.loader import PluginManager
 from ..stickers import StickerStore
-from .auth import SessionSigner
+from .auth import SessionSigner, load_or_create_session_secret
 from .logbuffer import install
 
 logger = logging.getLogger(__name__)
@@ -65,7 +65,11 @@ class WebState:
             bot=bot,
             plugins=bot.plugins,
             started_at=getattr(bot, "started_at", time.time()),
-            signer=SessionSigner(config.webui.password, ttl_hours=config.webui.session_hours),
+            signer=SessionSigner(
+                config.webui.password,
+                ttl_hours=config.webui.session_hours,
+                secret=load_or_create_session_secret(bot.store.path),
+            ),
             argv=list(argv) if argv is not None else list(sys.argv),
             webui_only=webui_only,
         )
@@ -287,7 +291,9 @@ class WebState:
             )
         ):
             self.signer = SessionSigner(
-                new_config.webui.password, ttl_hours=new_config.webui.session_hours
+                new_config.webui.password,
+                ttl_hours=new_config.webui.session_hours,
+                secret=self.signer.secret,
             )
 
         # 插件启停列表：显式启用制下，列表就是唯一来源；运行时同步（新增启用会现场加载）
