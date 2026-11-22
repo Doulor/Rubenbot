@@ -101,6 +101,7 @@ def test_end_to_end_merge_window_with_merge_loop():
     async def scenario():
         bot, console, llm = build()
         bot.config.decision.merge_window_seconds = 0.05
+        console.user_id = "群友账号"  # 不用默认的本地机主账号测普通静默窗口
         bot.merger.window = 0.05
         bot.config.decision.base = 10.0  # 群里保证过线
         bot._stop.clear()

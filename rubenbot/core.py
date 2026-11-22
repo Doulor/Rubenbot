@@ -17,7 +17,7 @@ import logging
 import random
 import re
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -385,6 +385,29 @@ def _parse_tool_arguments(arguments: Any) -> dict[str, Any] | None:
 
 
 @dataclass
+class ReplyFlight:
+    """持锁的首稿在飞期间，接走会使该草稿过时的入站消息。"""
+
+    primary: str
+    updates: list[MessageEvent] = field(default_factory=list)
+    collecting: bool = True
+    used_action: bool = False
+
+    def take(self, event: MessageEvent, direct: bool) -> bool:
+        if not self.collecting or (not self.updates and event.sender_id != self.primary and not direct):
+            return False
+        self.updates.append(event)
+        return True
+
+    def begin_send(self) -> bool:
+        # 从实际首段送出起不可撤回；此后到达的事件正常排到下一批。
+        if self.updates:
+            return False
+        self.collecting = False
+        return True
+
+
+@dataclass
 class BotContext:
     """插件钩子与命令处理拿到的运行时上下文。"""
 
@@ -511,6 +534,8 @@ class RubenBot:
         self.last_message_at: float | None = None
         # 每个会话的消息处理锁，保证串行，避免同一会话并发回复混乱
         self._chat_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
+        self._flights: dict[tuple[str, str, str], ReplyFlight] = {}
+        self._round_tasks: set[asyncio.Task] = set()
         self._bg_task: asyncio.Task | None = None
         self._merge_task: asyncio.Task | None = None
         # 定时任务与冷场开口：跟随主程序生命周期启停
@@ -757,7 +782,8 @@ class RubenBot:
             if self._stop.is_set():
                 return
             try:
-                await self.flush_merger()
+                for batch in self.merger.pop_ready(time.time()):
+                    self._start_round(batch)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("放出合并消息异常：%s", exc)
             try:
@@ -765,12 +791,20 @@ class RubenBot:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("放出合并事件异常：%s", exc)
 
+    def _start_round(self, batch: MergedRound) -> None:
+        """运行中，慢生成不能挡住适配器收下一条消息或其他群的截止时间。"""
+        task = asyncio.create_task(self.process_round(batch))
+        self._round_tasks.add(task)
+        task.add_done_callback(self._round_tasks.discard)
+
     async def flush_merger(self, now: float | None = None, *, all_rounds: bool = False) -> None:
         """处理已到期的合并轮次；``all_rounds`` 时连未到期的一起处理（停机用）。"""
         now = time.time() if now is None else now
         rounds = self.merger.flush_all() if all_rounds else self.merger.pop_ready(now)
         for round_ in rounds:
             await self.process_round(round_)
+        if all_rounds and self._round_tasks:
+            await asyncio.gather(*self._round_tasks)
 
     # ------------------------------------------------------------------
     # 事件通道（感知面第二、三层）
@@ -1246,9 +1280,15 @@ class RubenBot:
         hard = self.decision_engine.is_hard_trigger(event)
         # 主人按已配置的平台账号白名单识别，只提高查看优先级，不改必回规则。
         priority = hard is not None or computer.is_host(self.config.computer, event)
+        flight = self._flights.get((event.platform, event.chat_type, event.chat_id))
+        if flight and flight.take(event, direct=hard is not None and not event.is_private):
+            return
         ready = self.merger.add(event, now, hard=priority, urgent=priority)
         for round_ in ready:
-            await self.process_round(round_)
+            if self._merge_task is not None:
+                self._start_round(round_)
+            else:
+                await self.process_round(round_)
 
     async def process_round(self, round_: MergedRound) -> None:
         """对合并后的一轮消息做决策与生成。异常只记录，不向上抛。"""
@@ -1256,20 +1296,38 @@ class RubenBot:
         lock = self._chat_locks.setdefault(round_.key, asyncio.Lock())
         async with lock:
             try:
-                await self._process_round_locked(round_, event)
+                self._observe_batch(round_.events)
+                flight = ReplyFlight(event.sender_id)
+                self._flights[round_.key] = flight
+                await self._process_round_locked(round_, event, flight)
+                if flight.updates:
+                    # 已在入口逐条落库。只给新增事件记互动，旧批次不再摄入。
+                    self._observe_batch(flight.updates)
+                    round_.events.extend(flight.updates)
+                    flight.updates.clear()
+                    flight.collecting = False
+                    self.opener_guard.clear_pending(self.decision_engine.chat_key(event))
+                    await self._process_round_locked(round_, round_.to_event(), flight, retry=True)
             except Exception as exc:  # noqa: BLE001 - 单轮失败不能带死循环
                 # 这一轮的纠偏没兑现（异常中断），允许下一轮重新提醒
                 self.opener_guard.clear_pending(self.decision_engine.chat_key(event))
                 logger.exception("处理合并消息异常：%s", exc)
 
-    async def _process_round_locked(self, round_: MergedRound, event: MessageEvent) -> None:
-        now = time.time()
+            finally:
+                self._flights.pop(round_.key, None)
+
+    def _observe_batch(self, events: list[MessageEvent]) -> None:
         # 同一人的补充仍算一个对话轮，不能把甲受到的称呼或赞骂记到乙名下。
         by_sender: dict[str, list[MessageEvent]] = {}
-        for item in round_.events:
+        for item in events:
             by_sender.setdefault(item.sender_id, []).append(item)
         for items in by_sender.values():
-            self.observe_emotion(items[-1], events=items, now=now)
+            self.observe_emotion(items[-1], events=items)
+
+    async def _process_round_locked(
+        self, round_: MergedRound, event: MessageEvent, flight: ReplyFlight, *, retry: bool = False,
+    ) -> None:
+        now = time.time()
         hard = next(filter(None, map(self.decision_engine.is_hard_trigger, round_.events)), None)
         decision = self.decide(event, now=now) if not hard else ReplyDecision(True, reason=hard, hard_trigger=hard)
         self.last_decision[self.decision_engine.chat_key(event)] = decision
@@ -1303,13 +1361,15 @@ class RubenBot:
                 logger.warning("插件 on_before_reply 异常：%s", exc)
 
         expression = await self.plan_expression(messages, event, decision, planned=planner_gate, now=now)
+        if flight.updates:
+            return
         if planner_gate:
             decision.hard_trigger = must
         # stage1 的开口裁定：speak=false 且非必回 → 中止，不调 stage2
         # （灰度回滚到旧路径时不做这项裁定，完全沿用旧 DecisionEngine 语义）
-        if planner_gate and expression.speak is False and not must:
+        if planner_gate and expression.speak is False and (retry or not must):
             decision.should_reply, decision.reason = False, "planner_silence"
-            self._log_decision(event, decision, now, expression, must=must)
+            self._log_decision(event, decision, now, expression)
             return
         # 明确裁定沉默而被必回覆盖时，原裁定照常审计；只替换给生成端的指导。
         override_silence = bool(must and expression.speak is False)
@@ -1324,9 +1384,11 @@ class RubenBot:
         # 主动开口（含评分过线）不算，防自激
         addressed = decision.hard_trigger is not None
         if await self.try_sticker_reply(
-            event, expression, proactive=proactive, now=now, addressed=addressed,
+            event, expression, proactive=proactive, now=now, addressed=addressed, begin_send=flight.begin_send,
         ):
             self._log_decision(event, decision, now, expression, must=must)
+            return
+        if flight.updates:
             return
         if planner_gate:
             # 生成步换成人格 + 回复风格；场景/记忆/工具说明原样保留。
@@ -1368,15 +1430,19 @@ class RubenBot:
                     guidance += f"\n〔{note.title}〕{note.detail}"
         messages = [*messages, {"role": "system", "content": guidance}]
         task = "chat" if expression.source == "fragment" else "gen_stage2"
+        tools_allowed = not flight.used_action and all(item.sender_id == event.sender_id for item in round_.events)
         for attempt in range(2):
             # 重写只改文字，不能再给工具，否则可能重复设提醒或执行平台动作。
             # 多人批次没有可代表全体的授权账号，不能以主要发言人的权限执行工具。
-            raw = await self.generate(messages, event=None if attempt or len(by_sender) > 1 else event,
+            raw = await self.generate(messages, event=event if tools_allowed and not attempt else None,
                                       task="gen_agreement_retry" if attempt else task)
+            if flight.updates:
+                return
             if isinstance(raw, WebReply):
                 # 原文一条直发，既不做附和重写，也不让表情/插件拿它去做下一轮素材。
+                await self.send_reply(event, raw, now=now, proactive=proactive, addressed=addressed,
+                                      begin_send=flight.begin_send)
                 self._log_decision(event, decision, now, expression, must=must)
-                await self.send_reply(event, raw, now=now, proactive=proactive, addressed=addressed)
                 self.opener_guard.clear_pending(self.decision_engine.chat_key(event))
                 return
             body = clean_reply_patterns(strip_transcript_prefix(raw))
@@ -1397,8 +1463,8 @@ class RubenBot:
                 messages = [*messages, {"role": "assistant", "content": parsed.text}, {
                     "role": "system", "content": "刚才的草稿复述了对方。换一个新角度，或只回三个字以内。",
                 }]
-        self._log_decision(event, decision, now, expression, must=must)
         if not decision.should_reply:
+            self._log_decision(event, decision, now, expression, must=must)
             # 没发出去：本轮纠偏没兑现，下轮可以继续提醒
             self.opener_guard.clear_pending(self.decision_engine.chat_key(event))
             return
@@ -1410,7 +1476,11 @@ class RubenBot:
             now=now,
             proactive=proactive,
             addressed=addressed,
+            begin_send=flight.begin_send,
         )
+        if flight.updates:
+            return
+        self._log_decision(event, decision, now, expression, must=must)
         self.opener_guard.note_reply(self.decision_engine.chat_key(event), reply)
         await self.sticker_behavior.on_after_reply(self.context, event, reply)
         if self.plugins is not None:
@@ -2484,6 +2554,10 @@ class RubenBot:
         call_id = str(call.get("id") or "")
         function = call.get("function") or {}
         name = str(function.get("name") or "")
+        flight = self._flights.get((event.platform, event.chat_type, event.chat_id))
+        if flight and name != "recall":
+            # 提醒、外部工具或平台动作可能已有副作用，重裁不能再执行一次。
+            flight.used_action = True
         cfg = self.config.computer
         if name in computer.COMPUTER_TOOLS:
             content = await computer.call(
@@ -2645,14 +2719,14 @@ class RubenBot:
 
     async def try_sticker_reply(
         self, event: MessageEvent, expression: ExpressionDecision | None, *, proactive: bool, now: float,
-        addressed: bool = False,
+        addressed: bool = False, begin_send: Callable[[], bool] | None = None,
     ) -> bool:
         """接梗或短附和时尝试只发表情；未发出就交还文字生成路径。"""
         if expression is None or expression.intent not in ("接梗", "短附和"):
             return False
         if not await self.sticker_behavior.try_send(
             self.context, event, probability=self.config.stickers.nonverbal_probability,
-            emotion_hint=_sticker_emotion_hint(expression),
+            emotion_hint=_sticker_emotion_hint(expression), begin_send=begin_send,
         ):
             return False
         reply = "[表情]"
@@ -2678,6 +2752,7 @@ class RubenBot:
         now: float | None = None,
         proactive: bool = False,
         addressed: bool = False,
+        begin_send: Callable[[], bool] | None = None,
     ) -> None:
         """拆条发送，并把 bot 自己的话写进流水（``processed=True``，不参与记忆抽取）。
 
@@ -2714,6 +2789,8 @@ class RubenBot:
             parts = [segments] if segments else []
         if not parts:
             # 拆条后什么都不剩（例如动作括号清理后为空）：不发，也不记发言
+            return
+        if begin_send and not begin_send():
             return
         if voice_audio:
             # 语音回复：成功就不再补发文字；平台不支持或失败都照常发文字

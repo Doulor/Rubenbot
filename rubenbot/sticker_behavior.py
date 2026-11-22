@@ -351,6 +351,7 @@ class StickerBehavior:
         *,
         probability: float,
         emotion_hint: str = "",
+        begin_send: Callable[[], bool] | None = None,
     ) -> bool:
         """独立回复与文字后补发共用选图、冷却和发送；只有能力调用成功才算已发。"""
         try:
@@ -367,7 +368,7 @@ class StickerBehavior:
             if store is None:
                 return False
             sticker = await self._pick(runtime, store, event, emotion_hint)
-            if sticker is None:
+            if sticker is None or (begin_send and not begin_send()):
                 return False
             # 冷却按尝试计，避免平台故障时每轮重试；它不是发言额度。
             self._last_sent_at[_chat_key(event)] = now
