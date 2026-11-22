@@ -277,6 +277,8 @@ tools/deploy.sh --skip-tests             # 跳过本地 pytest 和 ruff，不跳
 
 前置条件：本地装好 `.[dev]`（优先使用 `.venv`）、Git、OpenSSH 和 curl，能从部署机访问公网首页。`ssh -F /home/hatch/.ssh/config homecloud` 必须可免交互登录且已验证主机密钥；scp 使用同一配置。家里云需有 Linux `/proc`、支持 pidfd 的 Python 3.9+ 和内核、`ps`、`ss`、GNU tar、curl；部署账号拥有 `~/rubenbot-test/`，其下已有可执行的 `start.sh`、配置和依赖。bot 应以该目录为 cwd，运行 `python -m rubenbot` 或 `rubenbot` 入口。脚本不安装远端依赖，不改启动脚本及其密钥引用。
 
+默认预检先跑全量 pytest，遇到首个失败即停止。`pytest-timeout` 可用时每例限时 300 秒（线程模式）；缺少插件时会提示「单测超时未生效」，不传超时参数，测试通过后仍须通过 ruff。可在部署脚本使用的本地 Python 环境运行 `pip install -e '.[dev]'` 补装；脚本不会自动安装。
+
 发布固定使用预检时的 `main` 提交。上传到 `~/rubenbot-main.tar.gz` 后覆盖解包，不清理站点额外文件；默认保留 `data/`、`config.yaml`、`bot.log`、`start.sh`。按账号、cwd 和命令行定位旧 PID，发送 TERM，最多等 30 秒确认进程与 8765 监听都消失。启动前将旧日志留为 `bot.log.before-<时间戳>`（按站点保留策略清理），以独立会话和重定向的文件描述符运行 `start.sh`。随后用独立 SSH 检查新 PID、本机 WebUI 200、新日志的 SnowLuma WS 连接及零 ERROR；部署机另查公网首页 200，并将磁盘和公网 `/static/app.js` 的 MD5 与提交内容比对。
 
 **失败时回到哪一版：** 本地预检失败不碰线上。发布失败后，脚本只回滚一次：重新归档部署前从服务器 `.deploy-commit` 读到的**上次线上提交**，复用相同的人设选项和全部验活，通过后才盖戳；不还原数据库或配置。如果本地无法归档这个已知提交，直接报回滚失败，不改装本次版本。只有没有有效盖戳（`unknown`）或盖戳与本次提交相同时，才打印 `fallback` 并重装预检时固定的 `main` 提交。手工部署的 `ca4c938` 没有盖戳，因此首次脚本部署若失败，走的是这条 fallback 路径。

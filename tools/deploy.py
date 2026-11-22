@@ -54,10 +54,32 @@ def parse(argv):
     return parser.parse_args(argv)
 
 
+def has_pytest_timeout():
+    # 查当前解释器实际加载的选项：插件已安装但被禁用时也应降级。
+    try:
+        help_text = run([sys.executable, '-m', 'pytest', '--help'])
+    except Failure:
+        return False
+    return b'--timeout=' in help_text and b'--timeout-method=' in help_text
+
+
+def preflight():
+    flags = []
+    if has_pytest_timeout():
+        flags = ['--timeout=300', '--timeout-method=thread']
+    else:
+        report('WARN', "pytest-timeout 不可用，单测超时未生效；建议在当前环境运行 pip install -e '.[dev]'")
+    for cmd in [['pytest', *flags, '-x'], ['ruff', 'check', '.']]:
+        if subprocess.run([sys.executable, '-m', *cmd], stderr=subprocess.STDOUT).returncode:
+            raise Failure(f'{cmd[0]} 未通过，不连接远端')
+        report('OK', f'{cmd[0]} 通过')
+
+
 def dry_plan(commit, args):
     steps = [
         '跳过 pytest 与 ruff' if args.skip_tests else
-        'python -m pytest --timeout=300 --timeout-method=thread -x；python -m ruff check .',
+        'pytest-timeout 可用时运行 python -m pytest --timeout=300 --timeout-method=thread -x；'
+        '不可用时告警并运行 python -m pytest -x；测试通过后运行 python -m ruff check .',
         f'ssh -F {SSH_CONFIG} {HOST}：检查 ~/rubenbot-test/start.sh，加部署锁，ps 核对旧 PID、读取上次提交标记',
         f'git archive --format=tar.gz {commit}；scp -F {SSH_CONFIG} 归档 {HOST}:rubenbot-main.tar.gz',
         '在 ~/rubenbot-test/ 执行 tar -xzf，排除 data/、config.yaml、bot.log、start.sh' +
@@ -142,10 +164,7 @@ def deploy(args):
     if args.skip_tests:
         report('SKIP', '本地测试与 lint')
     else:
-        for cmd in [['pytest', '--timeout=300', '--timeout-method=thread', '-x'], ['ruff', 'check', '.']]:
-            if subprocess.run([sys.executable, '-m', *cmd], stderr=subprocess.STDOUT).returncode:
-                raise Failure(f'{cmd[0]} 未通过，不连接远端')
-            report('OK', f'{cmd[0]} 通过')
+        preflight()
     if anchor() != commit:
         raise Failure('预检期间 main 已变化，拒绝部署')
     remote('lock')

@@ -23,6 +23,34 @@ def test_arguments():
         deploy.parse(['--sync'])
 
 
+@pytest.mark.parametrize('has_timeout', [True, False])
+def test_preflight_timeout(monkeypatch, capsys, has_timeout):
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(deploy, 'has_pytest_timeout', lambda: has_timeout)
+    monkeypatch.setattr(deploy.subprocess, 'run', run)
+    deploy.preflight()
+    flags = ['--timeout=300', '--timeout-method=thread'] if has_timeout else []
+    assert calls == [[sys.executable, '-m', 'pytest', *flags, '-x'],
+                     [sys.executable, '-m', 'ruff', 'check', '.']]
+    out = capsys.readouterr().out
+    if has_timeout:
+        assert 'WARN' not in out
+    else:
+        assert 'WARN' in out and '单测超时未生效' in out and 'pip install -e' in out
+
+
+def test_preflight_without_timeout_still_rejects_failed_tests(monkeypatch):
+    monkeypatch.setattr(deploy, 'has_pytest_timeout', lambda: False)
+    monkeypatch.setattr(deploy.subprocess, 'run', lambda argv, **kw: subprocess.CompletedProcess(argv, 1))
+    with pytest.raises(deploy.Failure, match='pytest 未通过，不连接远端'):
+        deploy.preflight()
+
+
 @pytest.fixture
 def repo(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
@@ -57,6 +85,7 @@ def test_dry_run_clean_main_no_writes_or_network(repo, tmp_path_factory, monkeyp
     assert snapshot() == before
     for expected in (commit, '--timeout=300', 'scp', '8765', 'setsid', '零 ERROR', '回滚', '不同步人设'):
         assert expected in out
+    assert 'pytest-timeout' in out and 'python -m pytest -x' in out
     assert '上次线上提交' in out and 'fallback' in out
     Path('untracked').touch()
     with pytest.raises(deploy.Failure, match='先提交'):
