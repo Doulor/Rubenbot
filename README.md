@@ -274,6 +274,8 @@ WebUI 当前包含概览、机器人/人设、模型、记忆、人物、群组�
 
 **群聊电脑任务回放**：`python -m pytest tests/test_chat_computer_routing.py` 会从 Console 入站，核对 `list_dir → write_file → send_file` 的三条审计、落盘字节和原群收到的附件，而不是只看聊天回复。开启 `computer.enabled`、配置真实平台账号白名单、使用支持工具调用的模型，并保持 `memory.recall_tool_max_rounds > 0`。机主可直接委托或 @ bot；授予机主权限不等于每句话都要接。机主操作默认最多 4 轮（`computer.max_task_rounds`）；访客只能用自己的沙盒，不能借同群机主调用真机、MCP 或平台原始接口。
 
+**SnowLuma 网关真机验收**：[44 项逐动作回执与审计](docs/gateway-e2e-results.md) · [静态接口对照](docs/snowluma-contract.md)。`2.1.1-node` 上已核实空间说说发布、独立读回与清理；私聊贴表情不支持，好友/入群审批等机主配合真实申请。`delete_friend`、`set_group_dismiss`、`set_restart`、`clean_cache`、`set_online_status` 五项永久拒绝，即使开启敏感动作也不会发往协议端。
+
 **手动真实中转自测**（会计费，不由 pytest 启动）：
 
 ```bash

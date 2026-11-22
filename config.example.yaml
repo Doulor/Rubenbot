@@ -261,6 +261,8 @@ gateway:
   enabled: false               # 总开关：关时模型看不见网关工具
   enabled_conversations: []    # 允许用网关的会话（platform:chat_id）；群聊要显式列出，私聊主人恒可
   judge_events: false          # 事件判断总开关（快判）；关时事件只落库
+  # 即使打开敏感动作，以下五项仍在网关拒绝，不会请求 OneBot：
+  # delete_friend、set_group_dismiss、set_restart、clean_cache、set_online_status。
   allow_sensitive: false       # 踢人/禁言/撤回/申请处理等敏感动作，需显式打开
   quiet_hours: "23:00-08:00"   # 安静时段：非必判事件只记录，不当场动作
   daily_budget_per_conversation: 20   # 每会话每天主动类动作上限

@@ -392,4 +392,6 @@ loader 加载时校验 manifest：缺失或字段不全的插件拒绝加载并�
 - **三层漏斗**：L0 全量记录事件；L1 规则门（类型/会话/安静时段过滤）；L2 由 fast 角色判定（ignore / react / message / gateway / notify_owner）。request 类事件在一期永不自动执行加好友/加群审批。
 - **闸门**：动作按风险分级——denied（硬禁名单）、sensitive（需 `gateway.allow_sensitive=true`，默认关）、safe；四维冷却：单动作×会话、人均 ≤3 次/小时、单会话每日预算（默认 20）、全局每日上限（默认 200），失败退避。
 - **作用域**：总开关 `gateway.enabled` 默认关；群聊必须显式写进 `gateway.enabled_conversations` 才放行，私聊主人会话恒可；安静时段（默认 00:00–08:00）不执行动作。
-- **审计**：每次判定与执行写入 `gateway_audit` 表，WebUI 有只读审计卡可查。
+- **硬禁动作**：`delete_friend`、`set_group_dismiss`、`set_restart`、`clean_cache`、`set_online_status` 不可通过网关调用；即使打开敏感动作也须拒绝并记审计，不向协议端发送请求。
+- **审计**：每次判定与执行写入 `gateway_audit` 表，WebUI 有只读审计卡可查。`get_cookies`、`get_csrf_token` 保留动作、会话、来源与成败，不保存参数、返回凭据或上游错误正文。
+- **实测边界**：[SnowLuma 2.1.1-node 逐项验收](docs/gateway-e2e-results.md) 与[静态契约](docs/snowluma-contract.md) 分开记录。群历史锚点用 `message_id`，表情限群消息。申请审批必须有真实事件、实际效果与审计才能算终验。
