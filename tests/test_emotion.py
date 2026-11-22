@@ -272,7 +272,6 @@ def test_disabled_engine_changes_nothing(store):
     assert engine.record_chat_round(PID, now=NOW) == 0.0
     assert engine.apply_delta(PID, 1.0, reason="被夸", now=NOW) == 50.0
     assert engine.injection_line(PID, now=NOW) == ""
-    assert engine.threshold_adjust(now=NOW) == 0.0
     assert store.get_affinity(PID) is None
 
 
@@ -410,32 +409,28 @@ def test_excitement_does_not_override_strong_mood(engine, store):
 
 
 # ----------------------------------------------------------------------
-# 阈值微调
+# 心情仍能展示和注入，不参与是否开口的计算。
 # ----------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "mood,expected",
-    [("开心", -0.05), ("兴奋", -0.05), ("无聊", -0.03), ("委屈", 0.05), ("低落", 0.05)],
-)
-def test_threshold_adjust_per_mood(engine, mood, expected):
+@pytest.mark.parametrize("mood", ["开心", "兴奋", "无聊", "委屈", "低落"])
+def test_displayed_mood_matches_injected_mood(engine, mood):
     engine.react(mood, 0.6, now=NOW)
-    assert engine.threshold_adjust(now=NOW) == pytest.approx(expected)
+    displayed = engine.status(now=NOW)["mood"]
+    assert displayed["mood"] == mood
+    assert f"{mood}（{displayed['phrase']}）" in engine.injection_line(PID, now=NOW)
 
 
-def test_threshold_adjust_zero_when_calm(engine):
-    assert engine.threshold_adjust(now=NOW) == 0.0
-    # 强度低于阈值后也归零
-    assert engine.threshold_adjust(now=NOW + 10 * 3600) == 0.0
+def test_displayed_intensity_decays_without_writing(engine, store):
+    engine.react("开心", .6, now=NOW)
+    assert engine.status(now=NOW + 3600)["mood"]["intensity"] == pytest.approx(.3)
+    assert store.get_mood().intensity == pytest.approx(.6)
 
 
-def test_threshold_adjust_reads_config_table(store):
-    cfg = EmotionConfig(threshold_adjust={"开心": -0.2})
-    engine = EmotionEngine(store, cfg, now_fn=lambda: NOW)
-    engine.react("开心", 0.6, now=NOW)
-    assert engine.threshold_adjust(now=NOW) == pytest.approx(-0.2)
-    # 表里没写的心情回落到 0
-    assert cfg.adjust_for("失落") == 0.0
+def test_custom_praise_mood_is_used_in_context(store):
+    engine = EmotionEngine(store, EmotionConfig(praise_mood="兴奋"), now_fn=lambda: NOW)
+    engine.observe_message(person_id=PID, text="你真厉害", addressed=True, now=NOW)
+    assert "心情：兴奋" in engine.injection_line(PID, now=NOW)
 
 
 # ----------------------------------------------------------------------
@@ -522,7 +517,6 @@ def test_emotion_config_parsed_and_lenient():
                 "chat_delta": "0.5",
                 "praise_delta": "不是数字",
                 "praise_mood": None,
-                "threshold_adjust": {"开心": "-0.2", "乱写": "abc", "空": ""},
             }
         }
     )
@@ -531,11 +525,6 @@ def test_emotion_config_parsed_and_lenient():
     assert emotion.chat_delta == pytest.approx(0.5)
     assert emotion.praise_delta == pytest.approx(1.0)  # 写错回落默认
     assert emotion.praise_mood == "开心"  # None 回落默认
-    assert emotion.threshold_adjust["开心"] == pytest.approx(-0.2)
-    assert "乱写" not in emotion.threshold_adjust
-    assert "空" not in emotion.threshold_adjust
-    # 没写的项保留默认
-    assert emotion.threshold_adjust["委屈"] == pytest.approx(0.05)
 
 
 # ----------------------------------------------------------------------
@@ -552,7 +541,7 @@ def test_private_message_counts_as_chat_round(config, store):
 
 
 def test_group_chatter_not_addressed_does_not_gain(config, store):
-    config.decision.base = 0.0  # 普通群消息不回复
+    config.attention.talk_value = 0.0
     bot, _ = make_bot(config, store)
     asyncio.run(bot.handle_event(group_event("今天食堂真难吃")))
     assert bot.store.get_affinity(PID) is None
@@ -626,36 +615,23 @@ def test_emotion_failure_does_not_break_reply(config, store, monkeypatch):
     assert adapter.texts == ["在的"]
 
 
-def test_decision_threshold_uses_mood_adjust(config, store):
-    config.decision.threshold = 0.5
-    config.decision.threshold_noise = 0.0
-    config.decision.base = 0.47
-    config.decision.momentum_bonus = 0.0
-    config.decision.cooldown_seconds = 0
+def test_mood_does_not_override_refractory_guard(config, store):
     bot, _ = make_bot(config, store)
-    # 平静时 0.47 < 0.5，不开口
-    assert bot.decide(group_event(), now=NOW).should_reply is False
-    bot.emotion.react("开心", 0.6)
-    decision = bot.decide(group_event(), now=NOW)
-    # 开心把阈值降 0.05 → 0.45，0.47 过线
-    assert decision.threshold == pytest.approx(0.45)
-    assert decision.factors.mood_adjust == pytest.approx(-0.05)
-    assert decision.should_reply is True
+    bot.decision_engine.note_bot_reply("recording:g1", NOW)
+    bot.emotion.react("开心", .6, now=NOW)
+    assert bot.decide(group_event(), now=NOW + 1).reason == "refractory"
+    assert bot.decide(group_event(mentions=True), now=NOW + 1).reason == "mentioned"
 
 
-def test_decision_log_records_mood_adjust(config, store):
-    config.decision.threshold = 0.85
-    config.decision.base = 0.95
-    config.decision.threshold_noise = 0.0
-    config.decision.momentum_bonus = 0.0
-    config.decision.cooldown_seconds = 0
-    bot, _ = make_bot(config, store)
-    bot.emotion.react("委屈", 0.6)
+def test_mood_does_not_override_planner_silence(config, store):
+    bot, adapter = make_bot(config, store)
+    bot.llm.responses["fast"] = ['{"basis":"settled","speak":false,"reason":"在听","intent":"沉默"}']
+    bot.emotion.react("兴奋", 0.6)
     asyncio.run(bot.handle_event(group_event("今天好累")))
-    entry = store.list_decision_logs()[0]
-    assert entry["hard_trigger"] is None
-    assert entry["factors"]["mood_adjust"] == pytest.approx(0.05)
-    assert entry["threshold"] == pytest.approx(0.90)
+    entry, = store.list_decision_logs()
+    assert not adapter.sent and entry["reason"] == "planner_silence"
+    assert entry["factors"]["planner"]["reason"] == "在听"
+    assert "心情：兴奋" in bot.llm.calls[0]["messages"][0]["content"]
 
 
 def test_run_initializes_engagement_baseline(config, store):

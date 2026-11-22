@@ -19,8 +19,6 @@
 - ``GET  /api/people``          人物列表（带记忆条数）
 - ``GET  /api/people/{id}``     人物档案 + 记忆
 - ``GET  /api/chats``           会话列表
-- ``GET  /api/chats/{id}/decision`` 群决策配置
-- ``PUT  /api/chats/{id}/decision`` 保存群决策配置（写 config.yaml）
 - ``GET  /api/chats/{id}/profile`` 群定位：手写备注 + 自归纳总结并排（附生效来源）
 - ``PUT  /api/chats/{id}/profile`` 保存手写群备注（立即生效）；``DELETE`` 清掉两份定位
 - ``GET  /api/decisions``       决策日志（可按 chat_id 过滤）
@@ -62,9 +60,8 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from ..adapters.base import MessageEvent
-from ..config import Config, GroupDecisionConfig, MODEL_ROLES, is_loopback_host
+from ..config import Config, MODEL_ROLES, is_loopback_host
 from ..core import format_scene
-from ..decision import parse_quiet_hours
 from ..identity import IdentityService, avatar_url
 from ..emotion import EmotionEngine
 from ..group_profile import MANUAL_NOTE_MAX_CHARS, resolve_profile_text
@@ -187,119 +184,9 @@ def _log_payload(entry) -> dict[str, Any]:
     }
 
 
-def _group_decision_payload(config, chat_id: str) -> dict[str, Any]:
-    """生效中的群决策参数（全局默认 + 群覆盖）。"""
-    decision = config.decision
-    settings: GroupDecisionConfig | None = decision.groups.get(str(chat_id))
-    groups = decision.groups or {}
-    effective = {
-        "base": decision.base if settings is None or settings.base is None else settings.base,
-        "threshold": decision.threshold,
-        "activity_multiplier": settings.activity_multiplier if settings else 1.0,
-        "quiet_hours": list(settings.quiet_hours) if settings else [],
-    }
-    return {
-        "chat_id": str(chat_id),
-        "configured": settings is not None,
-        "override": {
-            "activity_multiplier": settings.activity_multiplier if settings else 1.0,
-            "base": settings.base if settings else None,
-            "quiet_hours": list(settings.quiet_hours) if settings else [],
-        },
-        "effective": effective,
-        "defaults": {
-            "base": decision.base,
-            "threshold": decision.threshold,
-            "activity_multiplier": 1.0,
-        },
-        "configured_chats": sorted(groups),
-    }
-
-
-def _write_group_decision(state, chat_id: str, body: dict[str, Any]) -> dict[str, Any]:
-    """把群覆盖写回 config.yaml 的 ``decision.groups``，保留其余内容与顺序。"""
-    import yaml
-
-    config = state.config
-    config_path = state.config_path
-    path = Path(config_path)
-    if path.exists():
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        if not isinstance(data, dict):
-            raise ApiError(500, "config.yaml 顶层不是键值对，无法写入")
-    else:
-        data = {}
-    decision = data.setdefault("decision", {})
-    if not isinstance(decision, dict):
-        raise ApiError(500, "config.yaml 里的 decision 段格式不正确")
-    groups = decision.setdefault("groups", {})
-    if not isinstance(groups, dict):
-        raise ApiError(500, "config.yaml 里的 decision.groups 格式不正确")
-
-    multiplier = body.get("activity_multiplier")
-    try:
-        multiplier = float(1.0 if multiplier is None else multiplier)
-    except (TypeError, ValueError) as exc:
-        raise ApiError(422, "活跃度倍率必须是数字") from exc
-    if not (0.0 <= multiplier <= 10.0):
-        raise ApiError(422, "活跃度倍率应在 0 到 10 之间")
-
-    base_value = body.get("base")
-    if base_value in (None, ""):
-        base = None
-    else:
-        try:
-            base = float(base_value)
-        except (TypeError, ValueError) as exc:
-            raise ApiError(422, "基础意愿必须是数字") from exc
-        if not (0.0 <= base <= 1.0):
-            raise ApiError(422, "基础意愿应在 0 到 1 之间")
-
-    quiet_raw = body.get("quiet_hours") or []
-    if isinstance(quiet_raw, str):
-        quiet_raw = [quiet_raw]
-    if not isinstance(quiet_raw, list):
-        raise ApiError(422, "静默时段应为字符串列表")
-    quiet = [str(item).strip() for item in quiet_raw if str(item or "").strip()]
-    for item in quiet:
-        if not parse_quiet_hours([item]):
-            raise ApiError(422, f"静默时段格式不对：{item}（应为 HH:MM-HH:MM）")
-
-    if bool(body.get("remove")):
-        groups.pop(str(chat_id), None)
-        _apply_groups(state, data)
-        save_config_text(path, yaml.safe_dump(data, allow_unicode=True, sort_keys=False))
-        return _group_decision_payload(config, chat_id)
-
-    entry: dict[str, Any] = {"activity_multiplier": multiplier}
-    if base is not None:
-        entry["base"] = base
-    if quiet:
-        entry["quiet_hours"] = quiet
-    groups[str(chat_id)] = entry
-    _apply_groups(state, data)
-    save_config_text(path, yaml.safe_dump(data, allow_unicode=True, sort_keys=False))
-    return _group_decision_payload(config, chat_id)
-
-
-def _apply_groups(state, data: dict[str, Any]) -> None:
-    """保存成功后同步内存中的配置，页面与意愿引擎立即看到新值。"""
-    from ..config import _load_decision
-
-    config = state.config
-    config.decision = _load_decision(data.get("decision") or {})
-    bot = getattr(state, "bot", None)
-    if bot is not None and hasattr(bot, "apply_config"):
-        try:
-            bot.apply_config(config, rebuild_llm=False)
-        except Exception as exc:  # noqa: BLE001 - 热应用失败不影响已写盘的配置
-            logger.warning("群决策配置热应用失败：%s", exc)
-
-
 def _profile_platform(state, chat_id: str, platform: str = "", *, required: bool = False) -> str:
     """群定位按 (platform, chat_id) 区分；没给平台时按本群唯一平台推断。
 
-    与「每群覆盖」同源：先看显式参数，再看该群号出现过的平台。
     推断不出唯一平台时用空串，不跨平台猜测（宁可新建一份空记录）；
     写操作要求能确定平台，否则拒绝，避免把备注存到一个取不回来的键上。
     """
@@ -579,11 +466,6 @@ def create_app(state: WebState):
                     f"{platform}:{row['sender_id']}", hint=row.get("sender_name", ""),
                     group_id=chat_id if row["chat_type"] == "group" else "",
                 ) if row.get("sender_id") else None}
-
-    def configured_group(chat_id):
-        # 每群覆盖沿用原始群号作键；不能用「第一个适配器」猜名字。
-        platforms = state.store.group_platforms(chat_id)
-        return identities.chat(platforms[0] if len(platforms) == 1 else "", chat_id)
 
     def memory_payload(mem):
         person = identities.person_id(mem.person_id)
@@ -996,7 +878,7 @@ def create_app(state: WebState):
         }
 
     # ------------------------------------------------------------------
-    # 群组与意愿
+    # 群组与决策
     # ------------------------------------------------------------------
 
     @app.get("/api/chats")
@@ -1007,7 +889,6 @@ def create_app(state: WebState):
         # 列表一次读群名，不为名单里的每个群/人发一个 HTTP 请求。
         for platform in getattr(state.bot, "adapters", {}):
             await identities.refresh(platform=platform)
-        configured = state.config.decision.groups
         seen = {(row["platform"], row["chat_id"]) for row in chats if row["chat_type"] == "group"}
         for row in state.store.list_identities(kind="group"):
             key = row["platform"], row["object_id"]
@@ -1017,36 +898,13 @@ def create_app(state: WebState):
                 chats.append({"platform": key[0], "chat_id": key[1], "chat_type": "group",
                               "last_ts": None, "message_count": 0})
                 seen.add(key)
-        # 仅配置过、没有消息的群也保留卡片；配置键没有平台，不跨平台猜测。
-        for chat_id in sorted(configured.keys() - {key[1] for key in seen}):
-            group = configured_group(chat_id)
-            chats.append({"platform": group["platform"], "chat_id": chat_id, "chat_type": "group",
-                          "last_ts": None, "message_count": 0})
         for chat in chats:
             platform, chat_id = chat["platform"], chat["chat_id"]
             chat["chat_identity"] = identities.chat(platform, chat_id, chat_type=chat["chat_type"])
-            override = configured.get(chat_id) if chat["chat_type"] == "group" else None
-            chat["activity_multiplier"] = override.activity_multiplier if override else 1.0
-            chat["quiet_hours"] = list(override.quiet_hours) if override else []
-            chat["configured"] = override is not None
             chat["recent_decisions"] = [decision_payload(row) for row in state.store.list_decision_logs(
                 chat_id=chat_id, platform=platform, chat_type=chat["chat_type"], limit=3
             )]
         return {"ok": True, "items": chats}
-
-    @app.get("/api/chats/{chat_id}/decision")
-    async def get_chat_decision(chat_id: str, request: Request):
-        require_session(request)
-        return {"ok": True, **_group_decision_payload(state.config, chat_id)}
-
-    @app.put("/api/chats/{chat_id}/decision")
-    async def put_chat_decision(chat_id: str, request: Request):
-        require_session(request)
-        body = await _json_body(request)
-        payload = _write_group_decision(state, chat_id, body)
-        logger.info("WebUI 更新群 %s 的决策配置", chat_id,
-                    extra={"platform": configured_group(chat_id)["platform"], "chat_type": "group", "chat_id": chat_id})
-        return {"ok": True, **payload, "restart_required": False}
 
     @app.get("/api/chats/{chat_id}/profile")
     async def get_chat_profile(chat_id: str, request: Request, platform: str = ""):
@@ -1398,7 +1256,6 @@ def create_app(state: WebState):
             "exists": path.exists(),
             "effective": _mask_config(_config_to_dict(state.config)),
             "structured": structured_config(state.config),
-            "group_identities": {key: configured_group(key) for key in state.config.decision.groups},
             "layout": config_layout(),
             "plugins_available": state.plugin_list(),
             "restart_fields": _pending_restart_fields(state),
@@ -1760,12 +1617,6 @@ async def _save_structured_config(state: WebState, payload: Any) -> dict[str, An
             leaves = ["database_path"]
         else:
             leaves = _leaf_paths(group, value)
-            # 群覆盖单独整段比较（增删群、改某群参数都只算这一项），
-            # 避免每个群各占一行，也避免删群时被当成「没有变化」
-            if group == "decision" and isinstance(value, dict) and "groups" in value:
-                leaves = [path for path in leaves if not path.startswith("decision.groups.")]
-        if not leaves and not (group == "decision" and isinstance(value, dict) and "groups" in value):
-            continue
         hot_changed = False
         for leaf in leaves:
             if _is_restart(leaf):
@@ -1773,11 +1624,6 @@ async def _save_structured_config(state: WebState, payload: Any) -> dict[str, An
                 continue
             resolution[leaf] = "hot"
             if _get_path(before, leaf) != _get_path(after, leaf):
-                hot_changed = True
-        if group == "decision" and isinstance(value, dict) and "groups" in value:
-            # 群覆盖整段比较：删掉某个群后 leaf 列表可能为空，仍要报生效
-            resolution["decision.groups"] = "hot"
-            if _get_path(before, "decision.groups") != _get_path(after, "decision.groups"):
                 hot_changed = True
         if hot_changed:
             applied_groups.append(group)
@@ -1852,7 +1698,7 @@ def _config_snapshot(config: Config) -> dict[str, Any]:
 
 
 def _get_path(flat: dict[str, Any], path: str) -> Any:
-    """按点分路径从摊平字典取值；没这个键时按前缀取（例如整段 groups）。"""
+    """按点分路径从摊平字典取值；没这个键时按前缀取。"""
     if path in flat:
         return flat[path]
     prefix = path + "."
@@ -1866,9 +1712,8 @@ def _save_message(applied: list[str], requires_restart: list[str]) -> str:
         "memory": "记忆",
         "chat": "聊天与回复",
         "reply": "回复形态（拆条）",
-        "decision": "回复意愿",
+        "decision": "开口护栏",
         "computer": "操作电脑",
-        "generation": "生成",
         "emotion": "情绪与好感度",
         "plugins": "插件",
         "webui": "WebUI",

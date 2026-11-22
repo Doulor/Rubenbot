@@ -1,4 +1,4 @@
-"""两段式生成：开关、指导注入、失败回退与用量打标。"""
+"""两段式生成：指导注入、失败回退与用量打标。"""
 
 import asyncio
 import json
@@ -59,40 +59,45 @@ class Stage1BoomLLM(ScriptedLLM):
 
 
 # ----------------------------------------------------------------------
-# 开关关：行为与单段直出一致
+# 开口裁定始终先于正文
 # ----------------------------------------------------------------------
 
 
-def test_disabled_by_default():
-    assert Config().generation.two_stage.enabled is False
+def test_group_with_missing_basis_does_not_generate(config, store):
+    llm = ScriptedLLM({"fast": ['{"intent":"提问","increment":"问地点"}']})
+    bot, adapter = make_bot(config, store, llm)
+    event = MessageEvent("recording", "group", "g", "u", "群友", "去哪里玩")
+    asyncio.run(bot.handle_event(event))
+    assert not adapter.sent and not llm.chat_messages
+    row, = store.list_decision_logs()
+    assert row["factors"]["planner"]["basis"] == "guess"
 
 
 def test_default_flow_still_plans_private_reply(config, store):
-    config.generation.two_stage.enabled = False
     llm = ScriptedLLM({"chat": ["在的"]})
     bot, adapter = make_bot(config, store, llm)
     asyncio.run(bot.handle_event(private_event()))
     assert adapter.texts == ["在的"]
-    # 旧开关关闭也不绕过表达决策。
     assert [c["task"] for c in llm.calls] == ["gen_stage1", "gen_stage2"]
     assert [c["role"] for c in llm.calls] == ["fast", "chat"]
 
 
-def test_config_parses_switch_and_defaults_to_off():
-    assert Config.from_dict({"generation": {"two_stage": {"enabled": True}}}).generation.two_stage.enabled
-    assert not Config.from_dict({}).generation.two_stage.enabled
-    # 写错类型一律按关闭处理
-    assert not Config.from_dict({"generation": {"two_stage": {"enabled": "yes"}}}).generation.two_stage.enabled
-    assert not Config.from_dict({"generation": {"two_stage": "on"}}).generation.two_stage.enabled
+def test_invalid_plan_in_direct_reply_carries_uncertainty(config, store):
+    llm = ScriptedLLM({"fast": ["不是裁定书"], "chat": ["这个我不确定"]})
+    bot, adapter = make_bot(config, store, llm)
+    asyncio.run(bot.handle_event(private_event()))
+    assert adapter.texts == ["这个我不确定"]
+    assert "不确定" in llm.chat_messages[0][-1]["content"]
+    row, = store.list_decision_logs()
+    assert row["factors"]["expression_decision"]["source"] == "fallback"
 
 
 # ----------------------------------------------------------------------
-# 开关开：指导生成并注入第二段
+# 策划指导生成并注入第二段
 # ----------------------------------------------------------------------
 
 
 def test_guidance_generated_and_injected(config, store):
-    config.generation.two_stage.enabled = True
     llm = ScriptedLLM(
         {
             "fast": [json.dumps({"intent": "提问", "increment": "问问是哪件事累着了"})],
@@ -127,7 +132,6 @@ def test_guidance_generated_and_injected(config, store):
 
 def test_guidance_after_history_before_instruction(config, store):
     """指导块位于历史之后、生成指令之前。"""
-    config.generation.two_stage.enabled = True
     llm = ScriptedLLM({"fast": ["- 语气：轻松"], "chat": ["好"]})
     bot, adapter = make_bot(config, store, llm)
     asyncio.run(bot.handle_event(private_event()))
@@ -140,7 +144,6 @@ def test_guidance_after_history_before_instruction(config, store):
 
 def test_fast_missing_falls_back_to_chat_model(config, store):
     """没配 fast 时，第一段仍用 fast 角色，由客户端回退到 chat 模型。"""
-    config.generation.two_stage.enabled = True
     assert config.llm.model_for("fast") == config.llm.model_for("chat")
     llm = ScriptedLLM({"fast": ["- 语气：随口"], "chat": ["嗯"]})
     bot, _ = make_bot(config, store, llm)
@@ -149,7 +152,6 @@ def test_fast_missing_falls_back_to_chat_model(config, store):
 
 
 def test_guidance_truncated_to_limit(config, store):
-    config.generation.two_stage.enabled = True
     long_guidance = "长" * 1000
     llm = ScriptedLLM({"fast": [long_guidance], "chat": ["好"]})
     bot, _ = make_bot(config, store, llm)
@@ -159,23 +161,21 @@ def test_guidance_truncated_to_limit(config, store):
 
 
 # ----------------------------------------------------------------------
-# 容错：第一段失败/超时/空 → 回退单段直出
+# 容错：第一段失败/超时/空 → 硬触发仍按保守指导生成
 # ----------------------------------------------------------------------
 
 
-def test_stage1_failure_falls_back_to_single_pass(config, store):
-    config.generation.two_stage.enabled = True
+def test_stage1_failure_uses_conservative_direct_reply(config, store):
     llm = Stage1BoomLLM({"chat": ["还好吗"]})
     bot, adapter = make_bot(config, store, llm)
     asyncio.run(bot.handle_event(private_event()))  # 不抛异常
     assert adapter.texts == ["还好吗"]
-    # 正文照常生成；第二段 prompt 里没有指导块
+    # 正文按保守的碎片指导生成
     assert llm.calls[-1]["role"] == "chat"
     assert "短附和；长度档：碎片" in llm.calls[-1]["messages"][-1]["content"]
 
 
 def test_stage1_empty_guidance_falls_back(config, store):
-    config.generation.two_stage.enabled = True
     llm = ScriptedLLM({"fast": ["   "], "chat": ["在的"]})
     bot, adapter = make_bot(config, store, llm)
     asyncio.run(bot.handle_event(private_event()))
@@ -185,17 +185,16 @@ def test_stage1_empty_guidance_falls_back(config, store):
 
 def test_stage1_veto_marker_is_not_guidance(config, store):
     """第一段顺着「不回复」出口只回了标记：不能把它当指导塞进正文。"""
-    config.generation.two_stage.enabled = True
     marker = config.decision.veto_marker
     llm = ScriptedLLM({"fast": [marker], "chat": ["在的"]})
     bot, adapter = make_bot(config, store, llm)
-    asyncio.run(bot.handle_event(private_event()))
-    assert not adapter.sent
-    assert not llm.chat_messages
+    asyncio.run(bot.handle_event(MessageEvent("recording", "group", "g", "u", "群友", "今天好累")))
+    assert not adapter.sent and not llm.chat_messages
+    row, = store.list_decision_logs()
+    assert row["factors"]["planner"]["reason"] == "veto_marker"
 
 
 def test_stage1_timeout_falls_back(config, store):
-    config.generation.two_stage.enabled = True
     config.llm.timeout = 0.05
     llm = SlowLLM()
     bot, adapter = make_bot(config, store, llm)
@@ -219,7 +218,6 @@ def test_plugin_can_edit_context_before_stage1(config, store):
     PluginContext(plugin, plugins).on_before_reply(edit)
     plugins.plugins["hint"] = plugin
 
-    config.generation.two_stage.enabled = True
     llm = ScriptedLLM({"fast": ["- 避开：玩笑"], "chat": ["好"]})
     bot = RubenBot(config, store, llm, Persona("Ruben", "你是 Ruben"), plugins=plugins)
     adapter = RecordingAdapter()
@@ -253,7 +251,6 @@ def test_usage_records_both_stages(config, store):
             },
         )
 
-    config.generation.two_stage.enabled = True
     config.llm.models = {"fast": "m-fast"}
     client = LLMClient(
         config.llm,
@@ -306,7 +303,6 @@ def test_stage1_failed_call_still_counted_as_failure(config, store):
             return httpx.Response(401, text="unauthorized")
         return httpx.Response(200, json={"choices": [{"message": {"content": "好呀"}}]})
 
-    config.generation.two_stage.enabled = True
     config.llm.models = {"fast": "m-fast"}
     config.llm.max_retries = 0
     client = LLMClient(
@@ -329,59 +325,44 @@ def test_stage1_failed_call_still_counted_as_failure(config, store):
 # ----------------------------------------------------------------------
 
 
-def test_structured_view_exposes_switch(config):
+def test_structured_view_omits_retired_switch():
     from rubenbot.web.config_schema import structured_config
 
-    view = structured_config(config)
-    assert view["generation"]["two_stage"]["enabled"] is False
+    config = Config.from_dict({"generation": {"two_stage": {"enabled": True}}})
+    assert "two_stage" not in structured_config(config).get("generation", {})
 
 
-def test_validate_structured_switch():
-    from rubenbot.web.config_schema import ConfigValidationError, validate_structured
+@pytest.mark.parametrize("old_switch", [{"enabled": True}, {"enabled": "on"}, True])
+def test_validate_structured_ignores_retired_switch(old_switch):
+    from rubenbot.web.config_schema import validate_structured
 
-    update = validate_structured({"generation": {"two_stage": {"enabled": True}}})
-    assert update["generation"]["two_stage"]["enabled"] is True
-    with pytest.raises(ConfigValidationError):
-        validate_structured({"generation": {"two_stage": {"enabled": "on"}}})
-    with pytest.raises(ConfigValidationError):
-        validate_structured({"generation": {"two_stage": True}})
+    update = validate_structured({"generation": {"two_stage": old_switch}, "reply": {"max_segments": 2}})
+    assert update == {"reply": {"max_segments": 2}}
 
 
-def test_put_structured_switch_written(tmp_path):
-    """保存后写进 YAML，重新加载仍是开启状态。"""
+def test_stale_form_cannot_save_or_apply_retired_switch(tmp_path, store):
+    """旧表单和现役回复设置一起提交时，只保存并热应用现役部分。"""
     pytest.importorskip("fastapi")
     import yaml
     from fastapi.testclient import TestClient
 
-    from rubenbot.memory.store import MemoryStore
     from rubenbot.web.app import create_app
     from rubenbot.web.state import WebState
 
-    persona = tmp_path / "SOUL.md"
-    persona.write_text("# Ruben\n\n你是 Ruben。\n", encoding="utf-8")
     config_path = tmp_path / "config.yaml"
-    config_path.write_text(
-        f"llm:\n  api_key: k\npersona:\n  path: {persona}\n", encoding="utf-8"
-    )
-    store = MemoryStore(":memory:")
-    try:
-        state = WebState(config=Config.load(config_path), store=store, config_path=config_path)
-        client = TestClient(create_app(state))
-        response = client.put(
-            "/api/config", json={"config": {"generation": {"two_stage": {"enabled": True}}}}
-        )
-        assert response.status_code == 200, response.text
-        assert response.json()["resolution"]["generation.two_stage.enabled"] == "hot"
-        data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-        assert data["generation"]["two_stage"]["enabled"] is True
-        assert "generation" in response.json()["applied"]
-        # 热生效：运行中的配置对象立即可见
-        assert state.config.generation.two_stage.enabled is True
-        # 原样再存一次不算改动
-        view = client.get("/api/config").json()["structured"]
-        view.pop("secrets")
-        again = client.put("/api/config", json={"config": view})
-        assert again.status_code == 200, again.text
-        assert again.json()["applied"] == []
-    finally:
-        store.close()
+    config_path.write_text("reply:\n  max_segments: 3\n", encoding="utf-8")
+    state = WebState(config=Config.load(config_path), store=store, config_path=config_path)
+    client = TestClient(create_app(state))
+    draft = {"generation": {"two_stage": {"enabled": True}}, "reply": {"max_segments": 2}}
+    response = client.put("/api/config", json={"config": draft})
+    assert response.status_code == 200, response.text
+    assert response.json()["applied"] == ["reply"]
+    assert response.json()["resolution"] == {"reply.max_segments": "hot"}
+    assert yaml.safe_load(config_path.read_text(encoding="utf-8")) == {"reply": {"max_segments": 2}}
+    assert state.config.reply.max_segments == 2
+    view = client.get("/api/config").json()["structured"]
+    assert "two_stage" not in view.get("generation", {})
+    assert view["reply"]["max_segments"] == 2
+    again = client.put("/api/config", json={"config": view})
+    assert again.status_code == 200, again.text
+    assert again.json()["applied"] == []

@@ -195,7 +195,7 @@ reply:
   segment_delay_min_ms: 1500
   segment_delay_max_ms: 4000
 
-# 回复决策（意愿系统）：群里什么时候开口
+# 回复决策（合批与护栏）：群里什么时候开口
 decision:
   # 消息合并窗口：同一群聊静默多久后裁定整批，私聊即时（秒）
   merge_window_seconds: 2.5
@@ -208,42 +208,15 @@ decision:
   # 叫到这些名字/别名就算硬触发；留空则用 chat.bot_name
   aliases: []
 
-  base: 0.10                  # 每个群的基础意愿（默认低，靠动量和相关性加分）
-  threshold: 0.85             # 分数达到多少才开口
-  threshold_noise: 0.10       # 阈值附近的随机扰动幅度
-  threshold_noise_band: 0.20  # 离阈值多近才摇骰子
-
-  # 对话动量：被 @/回复触发的发言才算真参与，之后一两分钟内加分、按半衰期衰减；
-  # 主动开口不喂动量（防自激）。0.50 的量级目标是被点名后约两分钟内还够过阈值
-  momentum_bonus: 0.50
-  momentum_half_life_seconds: 120  # 动量的半衰期
-  relevance_bonus: 0.60       # 话题相关性：记忆检索命中时的最大加分
-  relevance_scale: 8.0        # 检索分数归一化尺度
-
-  ratio_window: 30            # 统计发言占比时看最近多少条消息（含 bot）
-  ratio_threshold: 0.20       # bot 占比超过这个值开始减分
-  ratio_silence: 0.60         # 占比到这个值直接静默
-  ratio_penalty: 1.50         # 占比超阈值时的最大减分
-
-  cooldown_seconds: 30        # 发言后冷却时间（硬触发不受影响）
-  cooldown_penalty: 0.60      # 冷却期内最多减多少分
+  min_reply_interval_seconds: 20  # 普通群消息两次开口间的最小间隔
+  refractory_enabled: true
+  refractory_seconds: 45
+  proactive_window_enabled: true
+  proactive_window_seconds: 300
+  proactive_window_limit: 3       # 滚动窗口内最多主动开口几次
 
   veto_marker: "[不回复]"     # 模型输出这个标记就静默丢弃
 
-  # 每群覆盖：键是群的 chat_id
-  groups: {}
-  # groups:
-  #   "123456":
-  #     activity_multiplier: 1.5   # 活跃度倍率
-  #     base: 0.15                 # 覆盖基础值（不写则用全局 base）
-  #     quiet_hours: ["23:00-07:30"]  # 静默时段，可写多个
-
-# 回复生成策略：决定要回之后，正文怎么写
-generation:
-  # 默认先掷长度档并生成表达决策书；闲聊碎片可省一次 fast 调用。
-  # true 表示即使闲聊碎片也调用 fast；不是表达决策的总开关。
-  two_stage:
-    enabled: false
 # 提醒工具（模型工具 set_reminder）：只回应用户明确说「提醒我」的请求
 reminder:
   enabled: true                # 关闭后模型无法设置提醒，已设的提醒照常触发
@@ -255,7 +228,7 @@ reminder:
 proactive:
   enabled: false               # 只在群聊里生效，私聊不主动开口
   idle_hours: 6                # 距上一条消息超过这么久才考虑
-  quiet_hours: ["23:00-08:00"] # 这段时间内不开口，格式同 decision.groups
+  quiet_hours: ["23:00-08:00"] # 这段时间内不开口，格式为 HH:MM-HH:MM
   daily_limit: 1               # 每个群每日最多主动开口几次
   cooldown_minutes: 60         # 一次评估没开口后，隔多久再评估
   # 主动开口场景的意愿评分：基础分给得低，阈值附近有随机扰动
@@ -278,7 +251,7 @@ gateway:
   daily_budget_per_conversation: 20   # 每会话每天主动类动作上限
   global_daily_cap: 200        # 全局每天动作上限（熔断）
 
-# 情绪与好感度：状态全部由代码规则算，模型不参与打分；只做背景注入与阈值微调
+# 情绪与好感度：状态全部由代码规则算，模型不参与打分；只作生成背景
 emotion:
   enabled: true                 # 总开关：关掉后不记录、不注入、不调阈值
   affinity_baseline: 50         # 好感度基线（也是衰减回归的目标）
@@ -302,13 +275,6 @@ emotion:
   boredom_after_seconds: 10800       # 三小时没人理 bot 才判无聊
   half_life_seconds: 3600            # 情绪强度减半所需时间
   min_intensity: 0.05                # 低于它视为平静
-  # 意愿阈值微调（加到阈值上；负数更容易开口）
-  threshold_adjust:
-    开心: -0.05
-    兴奋: -0.05
-    无聊: -0.03
-    委屈: 0.05
-    低落: 0.05
 
 plugins:
   dir: "plugins"

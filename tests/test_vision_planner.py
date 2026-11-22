@@ -19,7 +19,6 @@ NOW = 1_800_000_000.0
 @pytest.fixture
 def bot(config, store, monkeypatch):
     monkeypatch.setattr('rubenbot.core.time.time', lambda: NOW)
-    config.planner.planner_gate = True
     return RubenBot(config, store, ScriptedLLM(), Persona('Ruben', '群友'))
 
 

@@ -18,9 +18,7 @@ def build() -> tuple[RubenBot, ConsoleAdapter, ScriptedLLM]:
     config.reply.segment_delay_enabled = False
     config.decision.merge_window_seconds = 0  # 测试里不攒消息，逐条处理
     config.decision.hard_merge_window_seconds = 0
-    config.decision.base = 0.0  # 群里默认不插话
-    # 端到端走旧裁定路径（意愿评分 + 整份 SOUL），与线上灰度前的行为一致
-    config.planner.planner_gate = False
+    config.attention.talk_value = 1.0  # 查看后由策划裁定，不依赖随机数
     store = MemoryStore(":memory:")
     extract_payload = json.dumps(
         [
@@ -80,7 +78,7 @@ def test_end_to_end_memory_roundtrip():
 def test_end_to_end_group_mention():
     async def scenario():
         bot, console, llm = build()
-        # 群聊里没被 @：低活跃度下不回复
+        # 群聊里没被 @：无依据就不开口
         await console.feed_line("[摸鱼群|阿花] 今天好累")
         assert "Ruben:" not in console.stdout.getvalue()
 
@@ -103,7 +101,7 @@ def test_end_to_end_merge_window_with_merge_loop():
         bot.config.decision.merge_window_seconds = 0.05
         console.user_id = "群友账号"  # 不用默认的本地机主账号测普通静默窗口
         bot.merger.window = 0.05
-        bot.config.decision.base = 10.0  # 群里保证过线
+        llm.responses["fast"] = ['{"basis":"settled","intent":"短附和"}']
         bot._stop.clear()
         task = asyncio.create_task(bot._merge_loop())
         await console.feed_line("[摸鱼群|阿花] 我跟你讲")

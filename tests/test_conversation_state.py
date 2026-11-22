@@ -143,7 +143,6 @@ def test_actual_planner_request_has_state_but_stage2_has_neither(store, config, 
     store.add_raw_message(platform='recording', chat_id='g', sender_id='u', sender_name='友', text='在吗', ts=now)
     store.set_group_auto_summary('recording', 'g', '这是开源项目群', 1, now=now)
     store.set_group_manual_note('recording', 'g', manual)
-    config.planner.planner_gate = True
     llm = ScriptedLLM({'summary': [ANSWER], 'fast': [json.dumps({'speak': True, 'intent': '短附和'})], 'chat': ['在呢']})
     bot = RubenBot(config, store, llm, Persona(name='Ruben', text='你是 Ruben。'))
     bot.register_adapter(RecordingAdapter())

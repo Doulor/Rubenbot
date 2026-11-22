@@ -7,7 +7,7 @@ import re
 import time
 
 from rubenbot.agreement import is_repetitive_agreement
-from rubenbot.config import Config, GroupDecisionConfig
+from rubenbot.config import Config
 from rubenbot.expression import BUDGETS, INTENTS
 
 
@@ -15,10 +15,10 @@ _RHYTHM_CHAT = "e2e-rhythm"
 
 
 def configure(config: Config) -> None:
-    """在构造 bot 前调用；提高测试群的意愿，让节奏闸门而非低基础分决定静默。"""
+    """在构造 bot 前调用；普通群消息每次都看，让节奏闸门和策划决定是否开口。"""
     cfg = config.decision
     cfg.merge_window_seconds = cfg.hard_merge_window_seconds = 0
-    cfg.groups[_RHYTHM_CHAT] = GroupDecisionConfig(base=3.0)
+    config.attention.talk_value = 1.0
     cfg.refractory_enabled = cfg.proactive_window_enabled = True
     cfg.refractory_seconds = 15
     cfg.proactive_window_seconds = 120

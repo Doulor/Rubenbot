@@ -181,7 +181,6 @@ def test_gateway_audit_preserves_chat_kind_and_unknown_legacy_rows(client, store
 
 def test_group_directory_fetches_once_and_manual_member_refresh_uses_source_group(client, state, store):
     from types import SimpleNamespace
-    from rubenbot.config import GroupDecisionConfig
 
     calls = []
 
@@ -193,12 +192,10 @@ def test_group_directory_fetches_once_and_manual_member_refresh_uses_source_grou
             return [{"id": "88", "kind": "group", "name": "新书群"}]
 
     state.bot = SimpleNamespace(adapters={"snowluma": Adapter()})
-    state.config.decision.groups["404"] = GroupDecisionConfig()
     for _ in range(2):
         groups = {row["chat_id"]: row for row in client.get("/api/chats").json()["items"]}
         assert groups["88"]["chat_identity"]["name"] == "新书群"
-        assert groups["404"]["chat_identity"]["name"] == "未知群"
-        assert groups["404"]["chat_identity"]["avatar_url"] == ""
+        assert groups["88"]["message_count"] == 0
     assert calls == [(None, None)]
     body = {"platform": "snowluma", "chat_id": "88", "person_id": "72"}
     assert client.post("/api/identities/refresh", json=body).json()["refreshed"] == 1
@@ -506,57 +503,40 @@ def test_chats_include_decision_summary(client, store):
     chat = data["items"][0]
     assert chat["chat_id"] == "g1"
     assert chat["message_count"] == 2
+    assert {"configured", "activity_multiplier", "quiet_hours"}.isdisjoint(chat)
     assert len(chat["recent_decisions"]) == 1
 
 
-def test_get_and_put_group_decision(client, store, config, config_path):
-    seed(store)
-    initial = client.get("/api/chats/g1/decision").json()
-    assert initial["configured"] is False
-    assert initial["effective"]["base"] == config.decision.base
-
-    saved = client.put(
-        "/api/chats/g1/decision",
-        json={"activity_multiplier": 1.5, "base": 0.2, "quiet_hours": ["23:00-07:30"]},
-    )
-    assert saved.status_code == 200
-    assert saved.json()["restart_required"] is False
-
-    # 写进了配置文件，而且保留了其它段
-    import yaml
-
-    data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    assert data["decision"]["groups"]["g1"]["activity_multiplier"] == 1.5
-    assert data["decision"]["groups"]["g1"]["base"] == 0.2
-    assert data["decision"]["groups"]["g1"]["quiet_hours"] == ["23:00-07:30"]
-    assert data["chat"]["bot_name"] == "Ruben"
-
-    # 内存配置同步生效
-    assert config.decision.groups["g1"].activity_multiplier == 1.5
-
-    current = client.get("/api/chats/g1/decision").json()
-    assert current["configured"] is True
-    assert current["effective"]["base"] == 0.2
-
-    # 恢复默认
-    removed = client.put("/api/chats/g1/decision", json={"remove": True}).json()
-    assert removed["configured"] is False
-    assert "g1" not in config.decision.groups
+def test_retired_group_decision_routes_cannot_read_or_write(client, config_path):
+    original = config_path.read_bytes()
+    assert client.get("/api/chats/g1/decision").status_code == 404
+    assert client.put("/api/chats/g1/decision", json={"activity_multiplier": 1.5}).status_code == 404
+    assert config_path.read_bytes() == original
 
 
-def test_group_decision_validation(client):
-    for payload in (
-        {"activity_multiplier": "abc"},
-        {"activity_multiplier": 99},
-        {"base": 2},
-        {"quiet_hours": ["25:00-30:00"]},
-        {"quiet_hours": "23:00-07:00"},  # 单字符串也接受
-    ):
-        response = client.put("/api/chats/g1/decision", json=payload)
-        if payload == {"quiet_hours": "23:00-07:00"}:
-            assert response.status_code == 200
-        else:
-            assert response.status_code == 422, payload
+def test_legacy_group_settings_do_not_create_chat_cards(client, state):
+    # 老配置仍能启动，但没有群目录或消息的旧群号不是一个会话。
+    state.config = Config.from_raw({"decision": {"groups": {"ghost": {"base": 0.8}}}})
+    assert client.get("/api/chats").json()["items"] == []
+    assert "group_identities" not in client.get("/api/config").json()
+
+
+def test_recent_decisions_scope_by_platform_and_chat_type(client, store):
+    # 同一群号、私聊号可能重合，列表摘要与详情日志只显示本会话裁定。
+    for platform, kind in [("snowluma", "group"), ("snowluma", "private"), ("telegram", "group")]:
+        store.add_raw_message(platform=platform, chat_id="42", chat_type=kind, sender_id="12", text="消息")
+        store.add_decision_log(platform=platform, chat_id="42", chat_type=kind, reason="attention_skip",
+                               factors={"effective_talk_value": 0.5})
+    chats = client.get("/api/chats").json()["items"]
+    assert len(chats) == 3
+    for chat in chats:
+        scope = {key: chat[key] for key in ("platform", "chat_id", "chat_type")}
+        logs = client.get("/api/decisions", params=scope).json()["items"]
+        assert chat["recent_decisions"] == logs
+        assert len(logs) == 1
+        assert {key: logs[0][key] for key in scope} == scope
+        assert logs[0]["reason"] == "attention_skip"
+        assert logs[0]["factors"]["effective_talk_value"] == 0.5
 
 
 def test_decisions_list_and_filter(client, store):
@@ -616,7 +596,7 @@ def test_emotion_status_card(client, store):
     assert payload["ok"] is True
     assert payload["enabled"] is True
     assert payload["mood"]["mood"] == "开心"
-    assert payload["threshold_adjust"] == -0.05
+    assert "threshold_adjust" not in payload
     top = payload["affinity"]["top"]
     assert [(item["display_name"], item["band"]) for item in top] == [("阿花", "亲近"), ("老周", "冷淡")]
     assert payload["affinity"]["tracked"] == 2
@@ -645,7 +625,6 @@ def test_emotion_status_uses_running_bot_engine(client, store, config):
     state.bot = FakeBot()
     payload = client.get("/api/emotion").json()
     assert payload["mood"]["mood"] == "委屈"
-    assert payload["threshold_adjust"] == 0.05
 
 
 # ----------------------------------------------------------------------

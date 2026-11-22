@@ -19,7 +19,6 @@ def event(text, sender='A', kind='group', room='g', **kwargs):
 
 
 def build(config, store, probability, seed=0):
-    config.planner.planner_gate = True
     config.attention.talk_value = probability
     llm = ScriptedLLM({'fast': ['{"speak":false,"intent":"沉默"}']})
     bot = RubenBot(config, store, llm, Persona('Ruben', '群友'), rng=random.Random(seed))

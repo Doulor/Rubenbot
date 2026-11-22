@@ -26,10 +26,10 @@ def test_config_defaults():
     assert cfg.decision.hard_merge_window_seconds == 1.0
     assert cfg.decision.batch_max_seconds == 10.0
     assert cfg.decision.urgent_seconds == 2.0
-    assert cfg.decision.cooldown_seconds == 30.0
-    assert cfg.decision.ratio_threshold == 0.2
+    assert cfg.decision.min_reply_interval_seconds == 20.0
+    assert cfg.decision.refractory_seconds == 45.0
     assert cfg.decision.veto_marker == "[不回复]"
-    assert cfg.decision.groups == {}
+    assert cfg.decision.proactive_window_limit == 3
     assert cfg.reply.max_segments == 3
     assert cfg.reply.segment_delay_enabled is True
     assert cfg.reply.segment_delay_per_char_ms == 130.0
@@ -104,31 +104,38 @@ def test_config_empty_adapter_is_disabled():
     assert cfg.enabled_adapters == ["console"]
 
 
-def test_config_decision_section():
-    cfg = Config.from_dict(
-        {
-            "decision": {
-                "base": 0.05,
-                "threshold": 0.9,
-                "merge_window_seconds": 2,
-                "aliases": ["小R", "Ruben"],
-                "groups": {
-                    "123": {"activity_multiplier": 1.5, "base": 0.2, "quiet_hours": ["23:00-07:30"]},
-                    "456": {"quiet_hours": "00:00-06:00"},
-                },
-            }
-        }
-    )
-    assert cfg.decision.base == 0.05
-    assert cfg.decision.threshold == 0.9
-    assert cfg.decision.merge_window_seconds == 2
-    assert cfg.decision.aliases == ["小R", "Ruben"]
-    group = cfg.decision.groups["123"]
-    assert group.activity_multiplier == 1.5
-    assert group.base == 0.2
-    assert group.quiet_hours == ["23:00-07:30"]
-    # 字符串形式也接受
-    assert cfg.decision.groups["456"].quiet_hours == ["00:00-06:00"]
+def test_old_yaml_loads_without_changing_active_settings(tmp_path):
+    """混入全局评分、群覆盖和回退开关，不改变同一份现役设置的解析结果。"""
+    path = tmp_path / "config.yaml"
+    path.write_text("""
+decision:
+  base: 0.05
+  threshold: 0.9
+  momentum_bonus: 4
+  cooldown_seconds: 900
+  groups:
+    '123': {activity_multiplier: 1.5, base: 0.2, quiet_hours: ['23:00-07:30']}
+    '456': {quiet_hours: '00:00-06:00'}
+  merge_window_seconds: 2
+  min_reply_interval_seconds: 11
+  aliases: [小R, Ruben]
+generation: {two_stage: {enabled: true}}
+persona: {planner: {planner_gate: false, identity_window: 3}}
+emotion: {threshold_adjust: {开心: -0.9}, praise_intensity: 0.8}
+attention: {talk_value: 0.36}
+proactive: {base: 0.35, threshold: 0.8, quiet_hours: ['22:00-06:00']}
+""", encoding="utf-8")
+    expected = Config()
+    expected.decision.merge_window_seconds = 2
+    expected.decision.min_reply_interval_seconds = 11
+    expected.decision.aliases = ["小R", "Ruben"]
+    expected.planner.identity_window = 3
+    expected.emotion.praise_intensity = 0.8
+    expected.attention.talk_value = 0.36
+    expected.proactive.base = 0.35
+    expected.proactive.threshold = 0.8
+    expected.proactive.quiet_hours = ["22:00-06:00"]
+    assert Config.load(path) == expected
 
 
 # ----------------------------------------------------------------------

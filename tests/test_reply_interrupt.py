@@ -32,7 +32,6 @@ def test_stale_replans_even_when_hard_trigger_now_silent(config, store, blocked_
                     await release.wait()
                 return result
 
-        config.planner.planner_gate = True
         llm = Paused({'fast': ['{"speak":true,"intent":"提问","increment":"问结果"}', '{"speak":false,"intent":"沉默"}'],
                       'chat': ['作废的草稿']})
         bot = RubenBot(config, store, llm, Persona('Ruben', '群友'))
@@ -57,7 +56,6 @@ def test_stale_replans_even_when_hard_trigger_now_silent(config, store, blocked_
 
 def test_retry_budget_and_noninterrupting_chatter(config, store):
     async def scenario():
-        config.planner.planner_gate = True
         llm = ScriptedLLM({'fast': ['{"speak":true,"intent":"提问","increment":"问结果"}'] * 2})
         bot = RubenBot(config, store, llm, Persona('Ruben', '群友'))
         adapter = RecordingAdapter()

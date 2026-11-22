@@ -39,7 +39,6 @@ class EvidenceLLM(ScriptedLLM):
 
 
 def setup(config, store):
-    config.planner.planner_gate = True
     config.computer.whitelist = ["recording:owner"]
     llm = EvidenceLLM()
     bot = RubenBot(config, store, llm, Persona("Ruben", "你是群友。"))

@@ -437,7 +437,7 @@ class ProactiveConfig:
     enabled: bool = False
     # 群里安静多久才考虑开口（小时）
     idle_hours: float = 6.0
-    # 安静时段，默认深夜到早上不开口；格式同 decision.groups 的 quiet_hours
+    # 安静时段，默认深夜到早上不开口；格式为 HH:MM-HH:MM
     quiet_hours: list[str] = field(default_factory=lambda: ["23:00-08:00"])
     # 每群每日最多主动开口几次
     daily_limit: int = 1
@@ -453,17 +453,8 @@ class ProactiveConfig:
 
 
 @dataclass
-class GroupDecisionConfig:
-    """单个群的决策覆盖项；未写的字段沿用全局默认。"""
-
-    activity_multiplier: float = 1.0
-    base: float | None = None
-    quiet_hours: list[str] = field(default_factory=list)
-
-
-@dataclass
 class DecisionConfig:
-    """回复意愿系统参数（见 SPEC「回复决策」）。"""
+    """合批与开口护栏参数（见 SPEC「回复决策」）。"""
 
     # 消息合并窗口：群聊静默 2.5 秒；硬触发走短窗口，0 表示立即处理
     merge_window_seconds: float = 2.5
@@ -475,24 +466,7 @@ class DecisionConfig:
     # 叫到这些名字/别名视为硬触发；为空时使用 chat.bot_name
     aliases: list[str] = field(default_factory=list)
 
-    # 意愿评分：基础值 + 动量 + 相关性 - 占比 - 冷却
-    base: float = 0.10
-    threshold: float = 0.85
-    threshold_noise: float = 0.10
-    threshold_noise_band: float = 0.20
-    momentum_bonus: float = 0.50
-    momentum_half_life_seconds: float = 120.0
-    relevance_bonus: float = 0.60
-    relevance_scale: float = 8.0
-    # 发言占比：看最近 ratio_window 条消息（含 bot 自己的）
-    ratio_window: int = 30
-    ratio_threshold: float = 0.20
-    ratio_silence: float = 0.60
-    ratio_penalty: float = 1.50
-    # 发言后冷却（软抑制；planner_gate=true 时不再参与普通消息拦截）
-    cooldown_seconds: float = 30.0
-    cooldown_penalty: float = 0.60
-    # 新路径护栏：两次开口之间的最小间隔（普通消息；@/私聊等必回不受影响）
+    # 两次开口之间的最小间隔（普通消息；硬触发不受影响）
     min_reply_interval_seconds: float = 20.0
     # 活人感节奏闸门：普通消息在不应期内直接不触发；窗口内主动发言封顶
     refractory_enabled: bool = True
@@ -502,8 +476,6 @@ class DecisionConfig:
     proactive_window_limit: int = 3
     # 模型输出该标记时静默丢弃
     veto_marker: str = "[不回复]"
-    # 每群覆盖：群 id -> 配置
-    groups: dict[str, GroupDecisionConfig] = field(default_factory=dict)
 
 
 @dataclass
@@ -511,11 +483,10 @@ class EmotionConfig:
     """情绪与好感度参数（确定性规则，全部幅度集中在这里）。
 
     设计原则见 SPEC「情绪与好感度」：状态变化只由代码按规则计算，模型
-    不参与打分；变化写 ``affinity_log`` 可追溯；生成侧只注入一句状态描述，
-    另外对意愿阈值做小幅微调。
+    不参与打分；变化写 ``affinity_log`` 可追溯；生成侧只注入一句状态描述。
     """
 
-    # 总开关：关掉后不记录、不注入、不调阈值，行为回到没有这套系统之前
+    # 总开关：关掉后不记录、不注入，行为回到没有这套系统之前
     enabled: bool = True
 
     # ---- 好感度 ----
@@ -548,55 +519,14 @@ class EmotionConfig:
     boredom_after_seconds: float = 3 * 3600.0
     # 情绪强度向平静衰减的半衰期
     half_life_seconds: float = 3600.0
-    # 强度低于这个值就视为平静（不再注入、不再调阈值）
+    # 强度低于这个值就视为平静（不再注入）
     min_intensity: float = 0.05
-
-    # 意愿阈值微调：正数更难开口，负数更容易开口（按当前心情取）
-    threshold_adjust: dict[str, float] = field(
-        default_factory=lambda: {
-            "开心": -0.05,
-            "兴奋": -0.05,
-            "无聊": -0.03,
-            "委屈": 0.05,
-            "低落": 0.05,
-        }
-    )
-
-    def adjust_for(self, mood: str) -> float:
-        """某心情对应的阈值微调量；没配置就是 0。"""
-        value = self.threshold_adjust.get(mood, 0.0)
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return 0.0
-
-
-@dataclass
-class TwoStageConfig:
-    """两段式生成：先「想」再「说」。"""
-
-    # 默认允许闲聊碎片省一次 fast 请求；开启则所有档位都走完整两段。
-    enabled: bool = False
-
-
-@dataclass
-class GenerationConfig:
-    """回复生成的策略配置。"""
-
-    two_stage: TwoStageConfig = field(default_factory=TwoStageConfig)
 
 
 @dataclass
 class PlannerConfig:
-    """开口裁定与人格组装的总开关（灰度用）。
+    """策划步使用的身份话题触发条件。"""
 
-    ``planner_gate`` 为 true 时，开口与否由 stage1 的表达决策单裁定，
-    :mod:`rubenbot.decision` 的动量/阈值降级为护栏，系统提示按策划步 /
-    生成步分别组装；为 false 时完全走旧路径（旧 DecisionEngine 裁定 +
-    整份 SOUL 拼装），方便一键回滚。
-    """
-
-    planner_gate: bool = True
     # identity.md 的触发词：最近若干条消息任一命中就注入身份处理
     identity_triggers: list[str] = field(
         default_factory=lambda: list(DEFAULT_IDENTITY_TRIGGERS)
@@ -1199,7 +1129,6 @@ class Config:
     reply: ReplyConfig = field(default_factory=ReplyConfig)
     attention: AttentionConfig = field(default_factory=AttentionConfig)
     decision: DecisionConfig = field(default_factory=DecisionConfig)
-    generation: GenerationConfig = field(default_factory=GenerationConfig)
     emotion: EmotionConfig = field(default_factory=EmotionConfig)
     plugins: PluginsConfig = field(default_factory=PluginsConfig)
     stickers: StickerConfig = field(default_factory=StickerConfig)
@@ -1243,11 +1172,6 @@ class Config:
             "examples_count": self.persona_examples_count,
             "examples_position": self.persona_examples_position,
         }
-
-    @property
-    def planner_gate(self) -> bool:
-        """``persona.planner_gate`` 总开关：true 走「模型裁定 + 护栏」新路径。"""
-        return self.planner.planner_gate
 
     @property
     def persona_directory(self) -> str:
@@ -1324,7 +1248,6 @@ class Config:
         if not isinstance(attention, dict):
             attention = {}
         decision = _load_decision(data.get("decision") or {})
-        generation = _load_generation(data.get("generation") or {})
         emotion = _load_emotion(data.get("emotion") or {})
         plugins = PluginsConfig(**{k: v for k, v in (data.get("plugins") or {}).items() if _has(PluginsConfig, k)})
         stickers = StickerConfig(
@@ -1363,7 +1286,6 @@ class Config:
             reply=reply,
             attention=AttentionConfig(**{k: v for k, v in attention.items() if _has(AttentionConfig, k)}),
             decision=decision,
-            generation=generation,
             emotion=emotion,
             plugins=plugins,
             stickers=stickers,
@@ -1390,7 +1312,6 @@ def _load_planner(data: dict[str, Any]) -> PlannerConfig:
     else:
         triggers = list(DEFAULT_IDENTITY_TRIGGERS)
     return PlannerConfig(
-        planner_gate=data.get("planner_gate", default.planner_gate) is not False,
         identity_triggers=triggers,
         identity_window=max(0, _safe_nonnegative_int(data.get("identity_window", default.identity_window), default.identity_window)),
     )
@@ -1555,67 +1476,25 @@ def _load_search(data: dict[str, Any]) -> SearchConfig:
 
 
 def _load_decision(data: dict[str, Any]) -> DecisionConfig:
-    """解析 decision 段；``groups`` 单独转成 GroupDecisionConfig。"""
+    """只读取现役合批与护栏配置，忽略旧 YAML 里的未知键。"""
     if not isinstance(data, dict):
         return DecisionConfig()
-    plain = {k: v for k, v in data.items() if _has(DecisionConfig, k) and k != "groups"}
-    config = DecisionConfig(**plain)
-    groups = data.get("groups") or {}
-    if isinstance(groups, dict):
-        for chat_id, options in groups.items():
-            if not isinstance(options, dict):
-                continue
-            quiet = options.get("quiet_hours") or []
-            if isinstance(quiet, str):
-                quiet = [quiet]
-            config.groups[str(chat_id)] = GroupDecisionConfig(
-                activity_multiplier=float(options.get("activity_multiplier", 1.0)),
-                base=None if options.get("base") is None else float(options["base"]),
-                quiet_hours=[str(item) for item in quiet],
-            )
-    return config
-
-
-def _load_generation(data: dict[str, Any]) -> GenerationConfig:
-    """解析 generation 段；只接受写明的布尔开关，写错类型回落默认（关闭）。"""
-    if not isinstance(data, dict):
-        return GenerationConfig()
-    two_stage_raw = data.get("two_stage")
-    enabled = isinstance(two_stage_raw, dict) and two_stage_raw.get("enabled") is True
-    return GenerationConfig(two_stage=TwoStageConfig(enabled=enabled))
+    return DecisionConfig(**{k: v for k, v in data.items() if _has(DecisionConfig, k)})
 
 
 def _load_emotion(data: dict[str, Any]) -> EmotionConfig:
-    """解析 emotion 段：标量宽松解析，阈值微调表单独处理。
-
-    写错类型不挡启动：能按默认值的类型转换的就用，转不了回落默认值；
-    ``threshold_adjust`` 只接受「心情 → 数字」的映射，非数字的值忽略
-    （保持默认表里对应的项）。
-    """
+    """按默认类型转换情绪参数；类型不对时回落默认值。"""
     if not isinstance(data, dict):
         return EmotionConfig()
     defaults = EmotionConfig()
     plain: dict[str, Any] = {}
     for key, value in data.items():
-        if key == "threshold_adjust" or not _has(EmotionConfig, key):
+        if not _has(EmotionConfig, key):
             continue
         coerced = _coerce_like_default(value, getattr(defaults, key))
         if coerced is not None:
             plain[key] = coerced
-    config = EmotionConfig(**plain)
-    raw_adjust = data.get("threshold_adjust")
-    if isinstance(raw_adjust, dict):
-        adjust = dict(config.threshold_adjust)
-        for mood, value in raw_adjust.items():
-            name = str(mood).strip()
-            if not name or isinstance(value, bool):
-                continue
-            try:
-                adjust[name] = float(value)
-            except (TypeError, ValueError):
-                continue
-        config.threshold_adjust = adjust
-    return config
+    return EmotionConfig(**plain)
 
 
 def _coerce_like_default(value: Any, default: Any) -> Any:

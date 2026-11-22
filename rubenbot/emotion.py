@@ -5,7 +5,7 @@
 - **状态变化全部由代码按规则算**，不让模型凭感觉打分；关键词规则宁可漏判，
   不可误判。
 - 每笔好感度变化（含惰性折算出来的衰减）都写 ``affinity_log``，可追溯。
-- 影响生成只靠两处：上下文里注入一句状态描述、意愿阈值小幅微调；不硬控文本。
+- 只在上下文里注入一句状态描述；不硬控文本。
 - 衰减、无聊、情绪回落全部**惰性计算**：读时按 ``updated_at`` / ``since``
   折算，不单开定时线程。
 
@@ -505,16 +505,6 @@ class EmotionEngine:
         self.react(cfg.excitement_mood, cfg.excitement_intensity, now=now)
         return True
 
-    def threshold_adjust(self, *, now: float | None = None) -> float:
-        """当前心情对意愿阈值的微调量（加到阈值上；负数更容易开口）。"""
-        cfg = self.config
-        if not cfg.enabled:
-            return 0.0
-        state = self.current_mood(now=now)
-        if state.mood == MOOD_CALM or state.intensity < cfg.min_intensity:
-            return 0.0
-        return cfg.adjust_for(state.mood)
-
     # ------------------------------------------------------------------
     # 观测与注入
     # ------------------------------------------------------------------
@@ -619,7 +609,6 @@ class EmotionEngine:
                 "phrase": "" if state.is_calm else intensity_phrase(state.intensity),
                 "since": state.since,
             },
-            "threshold_adjust": round(self.threshold_adjust(now=now), 3),
             "affinity": {"top": top, "bottom": bottom, "tracked": len(items)},
             "recent_changes": recent,
         }

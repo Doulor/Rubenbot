@@ -19,7 +19,6 @@ def event(text, sender="master", *, mentions=False, segments=()):
 
 
 def bot_for(config, store, llm):
-    config.planner.planner_gate = True
     persona = load_persona(Path(__file__).resolve().parents[1] / "data/SOUL.md", examples_enabled=False)
     bot = RubenBot(config, store, llm, persona)
     adapter = RecordingAdapter()

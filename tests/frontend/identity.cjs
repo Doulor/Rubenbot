@@ -70,3 +70,14 @@ test('决策与日志使用结构化身份，普通日志不把数字识别为�
   assert.equal(telegram.childNodes[0].textContent, '晚');
   assert.equal(byTag(telegram,'IMG').length, 0);
 });
+
+
+test('现役裁定展示原因，不把零占位当成得分；历史评分仍可读', () => {
+  const { run } = fixture();
+  const render = extra => run(`decisionItem({text:'借书',sender_identity:member,${extra}})`);
+  const current = render("reason:'refractory',score:0,threshold:0,factors:{guard:'refractory'}");
+  assert.match(current.textContent, /refractory/);
+  assert.doesNotMatch(current.textContent, /0.00 \/ 0.00/);
+  const old = render("score:0.5,threshold:0.8,factors:{base:0.1}");
+  assert.match(old.textContent, /0.50 \/ 0.80/);
+});

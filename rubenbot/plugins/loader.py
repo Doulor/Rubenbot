@@ -506,10 +506,6 @@ class PluginManager:
             if isinstance(result, str) and result:
                 adapter = ctx.adapters.get(event.platform)
                 if adapter is not None:
-                    # TODO（动量，2026-11-22 与 Orange 定）：命令是硬触发（/命令），下次动这里时，
-                    # 发送成功后补调 decision_engine.note_bot_reply(chat_key, now, addressed=True)，
-                    # 发送失败不喂——与 send_reply 全失败不记发言一致（tests/test_momentum_feed.py）。
-                    # 现在先不动：ctx 目前拿不到 decision_engine，得先把引擎接进插件上下文。
                     try:
                         await adapter.send(event.chat_id, [Segment.text(result)], chat_type=event.chat_type)
                     except Exception as exc:  # noqa: BLE001
