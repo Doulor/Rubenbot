@@ -295,7 +295,7 @@ class ReplyConfig:
     # 段间打字延迟开关；关掉后所有段落连发，行为与拆分前一致
     segment_delay_enabled: bool = True
     # 每字毫秒数：下一段有多少个非空白字符就等多少毫秒
-    segment_delay_per_char_ms: float = 60.0
+    segment_delay_per_char_ms: float = 100.0
     # 单次段间停顿的上下限（毫秒）：太短没有停顿感，太长拖慢整条回复
     segment_delay_min_ms: float = 150.0
     segment_delay_max_ms: float = 1500.0
@@ -305,7 +305,7 @@ class ReplyConfig:
         self.max_segments = max(1, _as_int(self.max_segments, 3, minimum=1))
         self.segment_delay_enabled = self.segment_delay_enabled is not False
         self.segment_delay_per_char_ms = max(
-            0.0, _as_float(self.segment_delay_per_char_ms, 60.0)
+            0.0, _as_float(self.segment_delay_per_char_ms, 100.0)
         )
         self.segment_delay_min_ms = max(0.0, _as_float(self.segment_delay_min_ms, 150.0))
         self.segment_delay_max_ms = max(0.0, _as_float(self.segment_delay_max_ms, 1500.0))
