@@ -100,6 +100,8 @@ SnowLuma 适配器（OneBot v11）：
 - 正向 WebSocket 连 SnowLuma 的 WS 服务收事件（地址、access_token 可配置）
 - HTTP API 发消息（send_group_msg / send_private_msg）
 - 心跳与断线重连
+- 媒体出站一律内联：语音（record）、图片本体、附件都发 `base64://` 字节，不依赖协议端读取 bot 主机的临时文件——2026-11-23 实测协议端在容器内，传路径报 `ENOENT`。
+- 原生转写 `fetch_ptt_text` 的实测边界：较早的群语音可转出文字；刚发起的自聊语音返回 `ptt translate failed: error=9`，另有群语音 20 秒内收不到结果推送。它是可选快路径，必须由 HTTP 转写后端兜底，不能当作稳定能力宣传。
 
 另做一个 `ConsoleAdapter`（stdin/stdout）用于本地调试和测试，不依赖任何真实平台。
 
@@ -135,7 +137,7 @@ SnowLuma 适配器（OneBot v11）：
 | `fetch_url` | 可访问本机或内网的 HTTP(S) 地址 | 每跳解析后校验全部地址，固定连接到校验过的公网 IP；Host 与 HTTPS 证书验证仍用原域名，不继承代理或凭据 |
 | `send_file` | 真机文件 | 仅本人工作区文件；上传已读取的文件快照，不让协议端重新解析访客路径 |
 
-`send_file` 不接受目标账号或群号，只回到发起操作的当前会话（**在群里发送是群内可见，不是私发**）。Telegram 上传文档，SnowLuma 调用 OneBot 私聊/群文件上传（需要协议端可以读取临时快照），Console 留下本地附件段。不支持通用附件的平台明确报失败，不以文本占位冒充上传。
+`send_file` 不接受目标账号或群号，只回到发起操作的当前会话（**在群里发送是群内可见，不是私发**）。Telegram 上传文档，SnowLuma 调用 OneBot 私聊/群文件上传、附件按 `base64://` 内联字节提交（协议端在容器里读不到 bot 主机路径，实测传路径报 `ENOENT`），Console 留下本地附件段。不支持通用附件的平台明确报失败，不以文本占位冒充上传。
 
 每次调用（包括禁止、参数错误、上传失败）在 bot 的 SQLite 库写一条 `computer_audit`：时间、平台账号、`host`/`sandbox`、工具、参数数量与输入字节数、成败和耗时。审计不保存命令、文件名、URL、正文或输出。设置 → 操作电脑可配置开关、白名单和限额，查看最近操作；只读端点 `GET /api/computer/audit` 沿用 WebUI 会话鉴权，关停工具后仍能查历史。
 
@@ -330,6 +332,7 @@ loader 加载时校验 manifest：缺失或字段不全的插件拒绝加载并�
 - 跨平台消息约定：适配器在入站边界把平台原生表情段统一为 `sticker`，平台原始段数据放入该段的 `data.native_ref`；core 只识别统一类型，不感知 `mface` 等协议名。发送侧由适配器从 `native_ref` 还原平台原生段，行为不变。
 - 存储层平台无关：图片本体按内容哈希去重；同一条表情记录的 `native_refs` 按平台分别挂载，互不覆盖。没有图片本体时也允许只保存原生引用。
 - 能力层新增 `send_sticker` 原语：发送只经这一能力完成——目标平台有原生引用则直发，没有则用图片字节上传；发送成功后把平台返回的原生引用回填该平台的 `native_refs`。适配器各自翻译——SnowLuma/QQ 走 mface 或图片段，Telegram 走原生 sendSticker（file_id），QQ 官方走图片兜底，Console 走文本占位。不支持的平台抛 `CapabilityNotSupported`，按既有能力降级惯例处理。
+- SnowLuma 的图片段一律内联：表情库有本地本体就发 `base64://` 字节并保留 `summary` 等描述字段；库里没有本体、只剩 QQ 多媒体链接时，该链接带一次性 `rkey`，交回协议端下载实测报 `HTTP download failed: 400`，因此不拿它冒充可发送来源。原生 `mface` 段照常直发。2026-11-23 真机实测：库内真实表情（含 4 MB 动图）经此路径自聊实发成功、读回为 image 段后撤回。
 - 新平台接入只需两点：①入站表情段归一化为 `sticker` 并按约定保存 `native_ref`；②实现 `send_sticker`。core 无需修改。
 - core 表情行为（本节的交付主体）：负责收集（群里出现的表情自动入库、去重）、打标签、决定何时发哪张。只经能力层行事，不感知平台差异；行为默认关闭，配置位于主 config 的 stickers 段。
 - 同批顺带修适配器装配线缺口：`build_adapters` 目前只装配 console 与 snowluma，Telegram 与 QQ 官方适配器类已存在但从未接线——补齐装配分支、配置示例与装配测试（生产只用 SnowLuma，此缺口不影响线上，但框架完整性要补）。

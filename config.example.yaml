@@ -155,6 +155,8 @@ voice:
   # 首选后端：siliconflow（SenseVoiceSmall）、openai_compatible（任意兼容 base_url）、
   # qq_native（QQ 官方转写，仅 SnowLuma 适配器可用）。首选失败/空文本时自动顺延
   # 到其余已配置的 HTTP 后端，全失败才留 [语音] 占位。
+  # 实测提醒：qq_native 只部分语音可用（较早的群语音可转，刚发的自聊语音报上游
+  # error=9，个别群语音 20 秒无结果）。用它时建议另配一个 HTTP 后端兜底。
   stt_provider: "siliconflow"
   stt_api_key: "${RUBENBOT_STT_KEY}"
   stt_base_url: ""                  # 仅 openai_compatible 用，例如 https://host/v1；填了才启用
