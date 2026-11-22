@@ -42,10 +42,14 @@ class ExpressionDecision:
     # 裁定理由摘要（进 decision_log 的 factors，便于审计）
     reason: str = ""
     capabilities: tuple[str, ...] = ()
+    # 缺报、非法值或策划失败都没有提供依据，不能默认为常识。
+    basis: str = "guess"
 
     def prompt_block(self) -> str:
+        uncertainty = "没把握就明说不确定，不把推测写成事实。" if self.basis == "guess" else ""
         return (
             "【表达决策书·内部回复指导】发出去的只有聊天正文。\n"
+            f"依据：{self.basis}。{uncertainty}只有 ledger 或 settled 有对应记录才可说自己的动作、所有物或经历。\n"
             f"意图：{self.intent}；长度档：{self.length_band}（{BUDGETS[self.length_band]}）。\n"
             f"这次想接的那一点：{self.increment or '简短回应'}\n"
             "已经说过的部分（背景）："
@@ -107,6 +111,9 @@ def parse_plan(raw: str, band: str, recent: list[str], notes: tuple[CapabilityNo
         data = None
     if not isinstance(data, dict):
         return ExpressionDecision("短附和", "碎片", "", repetition_list(recent), "fallback")
+    basis = data.get('basis')
+    if basis not in ('ledger', 'settled', 'common', 'guess'):
+        basis = 'guess'
     speak = coerce_speak(data.get('speak'))
     intent = data.get('intent')
     # 有些旧裁定用空意图表示「看过就划走」；明确的 false 仍是有效裁定。
@@ -126,6 +133,6 @@ def parse_plan(raw: str, band: str, recent: list[str], notes: tuple[CapabilityNo
     reason = ' '.join(reason.split())[:MAX_REASON] if isinstance(reason, str) else ''
     return ExpressionDecision(intent, '碎片' if intent == '短附和' else band, increment,
                               repetition_list(recent, data.get('avoid_repetition')),
-                              speak=speak, reason=reason,
+                              basis=basis, speak=speak, reason=reason,
                               capabilities=tuple(n.title for n in notes if isinstance(data.get('capabilities'), list)
                                                  and n.title in data['capabilities']))

@@ -46,6 +46,20 @@ def test_exact_evidence_and_idempotent_alias_counts(store):
     assert store.search_raw_messages('%', platform='qq', chat_id='g') == []
 
 
+def test_bot_messages_never_contribute_to_entity_ledger(store):
+    ledger = EntityLedger(store)
+    human = message(store, '有人听过星驰吗？', sender='a', ts=1)
+    before, = observe(ledger, human, EntityCandidate('星驰'))
+
+    # 即使重放到未标为已处理的 bot 流水，也不能把自述变成提及、别名或说明。
+    bot = message(store, '星驰也叫小星，我用过', sender='__bot__', ts=2)
+    ledger.record_known_mentions(platform='qq', chat_id='g', message=bot)
+    assert not observe(ledger, bot, EntityCandidate('星驰', bot.text, aliases=('小星',)))
+
+    assert ledger.lookup('qq', 'g', '星驰') == before
+    assert ledger.lookup('qq', 'g', '小星') is None
+
+
 @pytest.mark.parametrize('context', ['private', 'other_group', '__bot__', '__tool__', 'privacy', 'norecord'])
 def test_ineligible_source_cannot_seed_entity_or_supply_gloss(store, context):
     ledger = EntityLedger(store)

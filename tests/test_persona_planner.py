@@ -102,7 +102,7 @@ def make_bot(config: Config, store, persona: Persona, llm=None) -> tuple[RubenBo
 
 
 def plan(**fields) -> str:
-    return json.dumps(fields, ensure_ascii=False)
+    return json.dumps({"basis": "settled", **fields}, ensure_ascii=False)
 
 
 # ----------------------------------------------------------------------
@@ -266,7 +266,7 @@ def test_old_empty_intent_silence_is_audited(config, store, tmp_path, mentioned)
     assert adapter.texts == (["在"] if mentioned else [])
     assert len(llm.calls) == (2 if mentioned else 1)
     factors = store.list_decision_logs()[0]["factors"]
-    assert factors["planner"] == {"speak": False, "reason": "在看"}
+    assert factors["planner"] == {"basis": "settled", "speak": False, "reason": "在看"}
     assert factors["expression_decision"]["intent"] == "沉默"
     if mentioned:
         assert factors["planner_override"] == "mentioned"
@@ -302,7 +302,7 @@ def test_speak_false_stops_before_stage2(config, store, tmp_path):
     assert [c["role"] for c in llm.calls] == ["fast"]
     entry = store.list_decision_logs()[0]
     assert entry["should_reply"] is False and entry["reason"] == "planner_silence"
-    assert entry["factors"]["planner"] == {"speak": False, "reason": ""}
+    assert entry["factors"]["planner"] == {"basis": "settled", "speak": False, "reason": ""}
 
 
 def test_speak_false_does_not_stop_must_reply(config, store, tmp_path):
@@ -328,7 +328,7 @@ def test_speak_true_generates(config, store, tmp_path):
     asyncio.run(bot.handle_event(group_event()))
     assert adapter.texts == ["累就别硬撑"]
     entry = store.list_decision_logs()[0]
-    assert entry["factors"]["planner"] == {"speak": True, "reason": "正好能接"}
+    assert entry["factors"]["planner"] == {"basis": "settled", "speak": True, "reason": "正好能接"}
 
 
 def test_two_stage_persona_swap(config, store, tmp_path):

@@ -32,9 +32,9 @@ def test_config_defaults():
     assert cfg.decision.groups == {}
     assert cfg.reply.max_segments == 3
     assert cfg.reply.segment_delay_enabled is True
-    assert cfg.reply.segment_delay_per_char_ms == 60.0
-    assert cfg.reply.segment_delay_min_ms == 150.0
-    assert cfg.reply.segment_delay_max_ms == 1500.0
+    assert cfg.reply.segment_delay_per_char_ms == 130.0
+    assert cfg.reply.segment_delay_min_ms == 1500.0
+    assert cfg.reply.segment_delay_max_ms == 4000.0
     assert cfg.chat.strip_action_parens is False
     assert cfg.enabled_adapters == []
 

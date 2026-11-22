@@ -178,9 +178,9 @@ def test_reply_config_defaults():
     reply = Config().reply
     assert reply.max_segments == 3
     assert reply.segment_delay_enabled is True
-    assert reply.segment_delay_per_char_ms == 60
-    assert reply.segment_delay_min_ms == 150
-    assert reply.segment_delay_max_ms == 1500
+    assert reply.segment_delay_per_char_ms == 130
+    assert reply.segment_delay_min_ms == 1500
+    assert reply.segment_delay_max_ms == 4000
 
 
 def test_reply_config_from_raw():

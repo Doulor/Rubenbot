@@ -98,8 +98,17 @@ GUIDANCE_TIMEOUT_CAP = 15.0
 TOPIC_GAP_SECONDS = 10 * 60
 GUIDANCE_TASK_PROMPT = (
     "读到这里，以你现在的状态，你会有什么反应？是心里有了句想说的话，还是看一眼就划过去？"
-    "把这一刻的反应记成一个 JSON 对象：speak、intent、length_band、increment、avoid_repetition，可选 reason。\n"
-    "speak：想说出声是 true；默默看着是 false，对应 intent=沉默。被点名、@、私聊时也照实填。\n"
+    "用 JSON 先报想说的那一点有什么依据，再决定开不开口：basis、speak、intent、length_band、increment、avoid_repetition，可选 reason。\n"
+    "basis 四选一：ledger＝实体账或记忆有对应事实或群友原话（只见过名字不是释义）；"
+    "settled＝在场者刚刚给出或说定的事实；common＝通用确知的常识；guess＝猜测、没把握或顺着话头推断。"
+    "群友拿服务类比提问，不等于已定的服务原理。自己的旧发言、被引用或被转述的自述都不是 ledger 或 settled。\n"
+    "你是赛博生命，没有现实生活。声称自己做过某事、拥有什么或有过某种经历，"
+    "只能用 ledger 或 settled，而且记录须能对上本人和具体事项；common 和 guess 都不能证明亲历。"
+    "例如群友的记录能印证『上次群里聊过这个』；求点邀请不是你点过，别人没小号不是你攒过号，"
+    "听过注册掉号不是你踩过坑，见人比较也不是你亲自评测过。无据就换成有据的非亲历说法，或沉默。\n"
+    "同一话题在场者尤其机主刚给出的事实优先，不得用 guess 覆盖 settled。被纠正时先认账，不辩解，也不预言对方迟早出问题来挽尊。\n"
+    "speak：guess 且本轮没有直接叫到你，一律 false；直接叫到（含私聊）也只可明说不确定。"
+    "有依据仍可默默看着：speak=false，对应 intent=沉默。\n"
     "intent 从接梗、补充新信息、反驳、提问、短附和、沉默中选。"
     "length_band 用本轮已掷的档：碎片最多10字，短句11-25字，展开26-60字。"
     "increment 用一句话写下想接的那一点，沉默时留空。"
@@ -1256,7 +1265,7 @@ class RubenBot:
         await self.prepare_voice(event)
         visual_id = await self._record(event, now)
 
-        if event.is_group and self.decision_engine.is_hard_trigger(event):
+        if event.is_group and event.sender_id != BOT_SENDER_ID and self.decision_engine.is_hard_trigger(event):
             self._engaged_at[(event.platform, event.chat_type, event.chat_id)] = now
         # 视觉描述回写原始流水，不等待视觉模型，也不把描述冒充发言正文。
         await self.sticker_behavior.on_message(self.context, event, raw_id=visual_id)
@@ -1528,8 +1537,9 @@ class RubenBot:
         if expression is not None:
             factor_data["expression_decision"] = expression.to_dict()
             # 新路径的审计字段：策划步裁定与理由摘要（表结构不变，塞进 factors）
-            if expression.speak is not None or expression.reason:
+            if expression.speak is not None or expression.reason or self.config.planner_gate:
                 factor_data["planner"] = {
+                    "basis": expression.basis,
                     "speak": expression.speak,
                     "reason": expression.reason,
                 }
@@ -1958,7 +1968,14 @@ class RubenBot:
         snippet = self._truncate(target.text, self.QUOTE_SNIPPET_CHARS)
         return f"（引用 [{name}]：{snippet}）"
 
-    def render_history(self, messages: list) -> list[dict[str, str]]:
+    def _speaker_basis(self, msg: RawMessage | MessageEvent) -> str:
+        """标明依据的来源，而不把该人整条消息（包括提问、猜测和引用）都当成事实。"""
+        if msg.sender_id == BOT_SENDER_ID:
+            return "自己说过的话（不作数）"
+        speaker = "机主" if computer.is_host(self.config.computer, msg) else "在场者"
+        return f"{speaker}原话·事实部分已定"
+
+    def render_history(self, messages: list, *, label_basis: bool = False) -> list[dict[str, str]]:
         """把流水渲染成对话消息：别人的是 ``[HH:MM] [昵称] 正文``，bot 自己的只要正文。
 
         bot 的历史就是它说过的话，必须是干净正文：带上 ``[HH:MM] [我]`` 前缀后，
@@ -1980,7 +1997,8 @@ class RubenBot:
                 content = msg.text
             else:
                 name = msg.sender_name or msg.sender_id
-                content = f"[{self._format_clock(msg.ts)}] [{name}] {msg.text}"
+                source = f"〔{self._speaker_basis(msg)}〕" if label_basis else ""
+                content = f"[{self._format_clock(msg.ts)}] [{name}] {source}{msg.text}"
             if msg.mentions:
                 targets = "、".join(self._target_name(uid, name) for uid, name in msg.mentions.items())
                 content += f"（@ 目标：{targets}）"
@@ -2093,9 +2111,11 @@ class RubenBot:
         if batch and len(batch) > 1:
             batch_ids = {item.raw_message_id for item in batch}
             history = [msg for msg in history if msg.id not in batch_ids]
-        messages.extend(self.render_history(history))
+        label_basis = stage == "planner"
+        messages.extend(self.render_history(history, label_basis=label_basis))
         if batch and len(batch) > 1:
-            lines = [f"{self._direction(item)}：{item.text}" for item in batch]
+            lines = [f"{self._direction(item)}：" + (f"〔{self._speaker_basis(item)}〕" if label_basis else "")
+                     + item.text for item in batch]
             messages.append({"role": "user", "content": "【本批消息·按到达顺序】\n" + "\n".join(lines) + "\n【本批结束】"})
         return messages
 
@@ -2361,7 +2381,7 @@ class RubenBot:
                  f"聊天后端的配置名是 {backend}。群友比较模型时，测评说的是那些模型；"
                  "有人点我说话时，我以自己的身份接话。"
                  f"\n本话题已发言：{count} 条（最近对话窗口内，间隔 {TOPIC_GAP_SECONDS // 60} 分钟分界）"
-                 f"\n距上次发言：{elapsed}\n最近 5 条自己的发言（原文，按时间先后）：{texts}")
+                 f"\n距上次发言：{elapsed}\n最近 5 条自己说过的话（不作数）（原文，按时间先后）：{texts}")
         feeling = self.states.planner_text(event.platform, event.chat_type, event.chat_id, now=now)
         if feeling:
             block += "\n" + feeling
@@ -2413,8 +2433,13 @@ class RubenBot:
                            + f"\n本轮原话：{json.dumps(event.text, ensure_ascii=False)}；"
                            + "这句话里，哪部分是在问通用的做法，哪部分要靠本群的近况才接得上？\n")
         notes = self.capability_notes(event)
-        prompt = f"{GUIDANCE_TASK_PROMPT}\n本轮已掷档：{band}。{capability_index(notes)}\n\n{local_facts}{state}"
-        request = [*messages, {"role": "user", "content": prompt}]
+        addressed = willingness.hard_trigger is not None
+        prompt = (f"{GUIDANCE_TASK_PROMPT}\n本轮直接叫到你：{'是' if addressed else '否'}；"
+                  f"本轮已掷档：{band}。{capability_index(notes)}\n\n{local_facts}{state}")
+        # 只在策划请求里标自己的历史，正文生成仍读干净的 assistant 消息，不模仿转录标签。
+        request = [{**msg, "content": "〔自己说过的话（不作数）〕" + msg["content"]}
+                   if msg["role"] == "assistant" else msg for msg in messages]
+        request.append({"role": "user", "content": prompt})
         try:
             raw = await asyncio.wait_for(
                 self.llm.complete(
@@ -2429,8 +2454,11 @@ class RubenBot:
         if raw and raw.strip() and parse_generation_output(raw, self.config.decision.veto_marker).vetoed:
             return ExpressionDecision("沉默", band, "", repetition_list(recent),
                                       speak=False, reason="veto_marker")
-        # 短附和快捷路径没有问过模型，不冒充开口裁定（speak=None）
-        return parse_plan(raw or "", band, recent, notes)
+        plan = parse_plan(raw or "", band, recent, notes)
+        if planned and plan.basis == "guess" and not addressed:
+            # 机主优先查看、投入窗口均不等于被叫到；无据也不降级成短附和。
+            return replace(plan, speak=False, intent="沉默")
+        return plan
 
     def guidance_timeout(self) -> float:
         """第一段的等待上限：不超过客户端超时，也不超过固定上限。"""
@@ -2856,8 +2884,6 @@ class RubenBot:
         self, event: MessageEvent, text: str, message_id: str | None
     ) -> None:
         """把 bot 自己发出的一条话写进流水与自我时间线（失败只记日志）。"""
-        if event.is_group:
-            self._engaged_at[(event.platform, event.chat_type, event.chat_id)] = time.time()
         # 记入流水，供后续上下文使用；标记已处理，不参与记忆抽取。
         # 平台回执的消息 id 一并落库，后续引用解析与自我时间线依赖它。
         self.store.add_raw_message(
