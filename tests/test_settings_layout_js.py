@@ -116,7 +116,7 @@ console.log(JSON.stringify(fields));
     assert "不是回复概率" in fields["attention.talk_value"]["hint"]
 
 
-@pytest.mark.parametrize("key", ["exclude_bot_momentum", "refractory_enabled", "proactive_window_enabled"])
+@pytest.mark.parametrize("key", ["refractory_enabled", "proactive_window_enabled"])
 def test_guard_controls_are_switches(key):
     source = APP_JS.read_text(encoding="utf-8")
     definition, = (line for line in source.splitlines() if f'path: "decision.{key}", label:' in line)

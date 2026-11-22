@@ -368,17 +368,12 @@ def test_proactive_window_caps_active_replies_and_slides():
     assert engine.evaluate(group_event(mentions=True), now=180.0).should_reply
 
 
-def test_bot_momentum_can_be_disabled_without_counting_message_history():
-    engine = make_engine(
-        base=0.0, threshold=0.5, threshold_noise=0.0,
-        momentum_bonus=1.0, cooldown_seconds=0.0,
-        refractory_enabled=False, exclude_bot_momentum=False,
-    )
-    engine.note_reply("test:g1", 100.0)
-    engine._last_momentum_at["test:g1"] = 100.0
-    assert engine.evaluate(group_event(), now=100.0).factors.momentum == pytest.approx(1.0)
-    engine.config.exclude_bot_momentum = True
-    assert engine.evaluate(group_event(), now=100.0).factors.momentum == pytest.approx(1.0)
+def test_only_addressed_outbound_adds_momentum():
+    engine = make_engine(momentum_bonus=1.0, refractory_enabled=False)
+    engine.note_bot_reply("test:g1", 100.0, proactive=True)
+    assert engine.evaluate(group_event(), now=100.0).factors.momentum == 0
+    engine.note_bot_reply("test:g1", 101.0, addressed=True)
+    assert engine.evaluate(group_event(), now=101.0).factors.momentum == pytest.approx(1.0)
 
 
 def test_cooldown_penalizes_recent_reply():

@@ -1052,7 +1052,7 @@ def _validate_decision(section: dict[str, Any], v: _Validator) -> dict[str, Any]
             number = v.number(section[key], f"decision.{key}", minimum=minimum, maximum=maximum)
             if number is not None:
                 out[key] = float(number)
-    for key in ("exclude_bot_momentum", "refractory_enabled", "proactive_window_enabled"):
+    for key in ("refractory_enabled", "proactive_window_enabled"):
         if key in section:
             value = v.boolean(section[key], f"decision.{key}")
             if value is not None:

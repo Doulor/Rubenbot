@@ -123,7 +123,6 @@ def read_yaml(path: Path) -> dict:
     ("chat", "strip_action_parens", True),
     ("decision", "batch_max_seconds", 8),
     ("decision", "urgent_seconds", 1.5),
-    ("decision", "exclude_bot_momentum", False),
     ("decision", "refractory_enabled", False),
     ("decision", "proactive_window_enabled", False),
 ])
@@ -200,7 +199,6 @@ def test_structured_config_covers_every_field(config):
             "cooldown_seconds",
             "cooldown_penalty",
             "min_reply_interval_seconds",
-            "exclude_bot_momentum",
             "refractory_enabled",
             "refractory_seconds",
             "proactive_window_enabled",

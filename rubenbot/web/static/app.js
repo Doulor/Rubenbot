@@ -4683,7 +4683,6 @@ function settingsCardSpecs(draft, secrets, pluginsAvailable, groupIdentities = {
             { path: "decision.cooldown_seconds", label: "软冷却（秒）", kind: "number", step: "1", min: 0, hint: "发言后这段时间内降低意愿（仅旧裁定路径）" },
             { path: "decision.cooldown_penalty", label: "冷却最大减分", kind: "number", step: "0.1", min: 0, max: 10, hint: "冷却期内最多减多少分（仅旧裁定路径）" },
             { path: "decision.min_reply_interval_seconds", label: "最小发言间隔（秒）", kind: "number", step: "1", min: 0, hint: "新路径护栏：刚说过话的间隔内不接普通消息；@/私聊不受限" },
-            { path: "decision.exclude_bot_momentum", label: "bot 不计入自身动量", kind: "switch", hint: "关闭后保留旧的动量来源语义" },
             { path: "decision.refractory_enabled", label: "启用发言不应期", kind: "switch", hint: "普通消息在不应期内不触发；硬触发不受影响" },
             { path: "decision.refractory_seconds", label: "不应期（秒）", kind: "number", step: "1", min: 0, hint: "默认 45 秒" },
             { path: "decision.proactive_window_enabled", label: "启用主动发言窗口上限", kind: "switch", hint: "普通群消息的主动开口受限；硬触发不计入" },

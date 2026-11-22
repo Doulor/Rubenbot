@@ -495,7 +495,6 @@ class DecisionConfig:
     # 新路径护栏：两次开口之间的最小间隔（普通消息；@/私聊等必回不受影响）
     min_reply_interval_seconds: float = 20.0
     # 活人感节奏闸门：普通消息在不应期内直接不触发；窗口内主动发言封顶
-    exclude_bot_momentum: bool = True
     refractory_enabled: bool = True
     refractory_seconds: float = 45.0
     proactive_window_enabled: bool = True
