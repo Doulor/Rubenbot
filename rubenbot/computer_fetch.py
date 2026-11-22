@@ -26,7 +26,8 @@ def _public(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     )
 
 
-async def _pinned_url(url: httpx.URL) -> httpx.URL:
+async def pinned_public_url(url: httpx.URL) -> httpx.URL:
+    """为出站请求固定已核验的公网地址；调用端保留原始 Host 与 TLS 域名。"""
     host = url.raw_host.decode("ascii")
     if "%" in host:
         raise ValueError("访客不能使用带区域标识的地址")
@@ -127,7 +128,7 @@ async def fetch_url(url: str, *, sandbox: bool, output_limit: int, timeout: floa
                             or target.userinfo or len(str(target)) > _MAX_URL
                             or (target.port is not None and not 1 <= target.port <= 65535)):
                         raise ValueError("需要不含登录凭据的 HTTP(S) 网页地址")
-                    destination = await _pinned_url(target) if sandbox else target
+                    destination = await pinned_public_url(target) if sandbox else target
                     request = httpx.Request(
                         "GET", destination,
                         headers={b"Host": target.netloc, b"Accept-Encoding": b"gzip, deflate"},

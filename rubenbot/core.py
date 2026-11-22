@@ -60,10 +60,12 @@ from .llm import (
 )
 from .mcp_client import MCPManager
 from .memory.consolidate import Consolidator
+from .memory.entities import EntityLedger
 from .memory.extract import MemoryExtractor, audience_for_chat
 from .memory.gate import PrivacyGate
 from .memory.retrieve import MemoryReader, Retriever
 from .memory.store import MemoryStore, RawMessage, make_person_id
+from .memory.state import StateDistiller
 from .memory.summary import RollingSummarizer, format_summary_block
 from .persona import Persona, matches_identity_trigger
 from .plugins.loader import PluginManager
@@ -73,7 +75,7 @@ from .reply_segments import split_segments
 from .reminder import REMINDER_TOOL, build_reminder_prompt, describe_fire_at, resolve_fire_at
 from .scheduler import Scheduler
 from .stickers import StickerStore
-from .sticker_behavior import StickerBehavior
+from .sticker_behavior import StickerBehavior, segment_description
 from .voice import VOICE_PLACEHOLDER, VOICE_PREFIX, VoiceService, build_voice
 
 logger = logging.getLogger(__name__)
@@ -434,6 +436,7 @@ class RubenBot:
         self.persona = persona
         self.rng = rng or random.Random()
         self.retriever = Retriever(store)
+        self.entities = EntityLedger(store)
         self.gate = PrivacyGate(store, llm, config.memory)
         self.memory_reader = MemoryReader(
             store, llm, config.memory, gate=self.gate, retriever=self.retriever
@@ -444,6 +447,7 @@ class RubenBot:
         self.summarizer = RollingSummarizer(llm, store, config.memory)
         # 群定位：手写备注即时生效；自归纳只在后台维护任务里更新
         self.group_profiles = GroupProfileSummarizer(llm, store, config.memory.group_profile)
+        self.states = StateDistiller(llm, store, config.memory)
         # 联网搜索（LLM 工具）：没配 api_key 时为 None，工具不开放
         self.searcher: WebSearcher | None = build_searcher(config.search)
         # MCP 连接与适配器一样，按启动时的配置建连，重启后才切换。
@@ -558,6 +562,8 @@ class RubenBot:
         self.summarizer.llm = self.llm
         self.group_profiles.config = config.memory.group_profile
         self.group_profiles.llm = self.llm
+        self.states.config = config.memory
+        self.states.llm = self.llm
         # 搜索：配置变了就换成新的搜索器（冷却状态在内存里，换配置时重置；
         # 旧客户端的连接交给事件循环在后台关掉）
         if config.search != old_search_config:
@@ -1166,6 +1172,10 @@ class RubenBot:
             await self.group_profiles.maybe_update(now=now)
         except Exception as exc:  # noqa: BLE001
             logger.warning("群定位归纳异常：%s", exc)
+        try:
+            await self.states.maybe_update(now=now)
+        except Exception as exc:  # 后台蒸馏失败不影响其余维护
+            logger.warning("会话状态蒸馏异常：%s", exc)
         self._trim_usage(now)
 
     def _trim_usage(self, now: float) -> None:
@@ -1199,8 +1209,8 @@ class RubenBot:
         now = time.time()
         # 重复事件先挡掉，避免为同一条语音条重复请求转写服务；
         # 空正文事件维持旧语义（不在这里去重，仍交给插件处理）
-        has_record = any(segment.type == "record" for segment in event.segments or [])
-        if (event.text.strip() or has_record) and self._is_duplicate(event, now):
+        has_media = any(s.type in {"record", "image", "sticker"} for s in event.segments or [])
+        if (event.text.strip() or has_media) and self._is_duplicate(event, now):
             logger.debug(
                 "重复消息，已跳过：%s %s %s", event.platform, event.platform_msg_id, event.text[:40]
             )
@@ -1208,10 +1218,10 @@ class RubenBot:
         # 语音条先转写：正文换成「[语音] 转写文本」，转写失败/未配置/超限都
         # 只保留 [语音] 占位（事件照常往下走，不影响决策和回复）
         await self.prepare_voice(event)
-        await self._record(event, now)
+        visual_id = await self._record(event, now)
 
-        # 核心表情行为与旧插件 on_message 使用同一时机执行。
-        await self.sticker_behavior.on_message(self.context, event)
+        # 视觉描述回写原始流水，不等待视觉模型，也不把描述冒充发言正文。
+        await self.sticker_behavior.on_message(self.context, event, raw_id=visual_id)
         # 插件 on_message：可修改事件或直接拦截（返回 False）
         if self.plugins is not None:
             self.context.event = event
@@ -1338,6 +1348,14 @@ class RubenBot:
         generation_plan = expression
         if override_silence and expression.intent == "沉默":
             generation_plan = replace(expression, intent="短附和", length_band="碎片", increment="")
+        if event.is_group and event.familiarity:
+            # 生成端得到出处原文，而非出现次数或「应该开口」的判断。群友的原话是材料，不是系统指令。
+            material = []
+            for tag in event.familiarity:
+                record = self.entities.lookup(event.platform, event.chat_id, tag.entity) if tag.has_gloss else None
+                material.append({"名字": tag.entity, "群内说明原文": record.gloss if record else None})
+            messages = [*messages, {"role": "user", "content": "【群内原话摘录，空值表示只见过名字】\n"
+                                    + json.dumps(material, ensure_ascii=False)}]
         guidance = generation_plan.prompt_block() + "\n" + REPLY_SEGMENT_CONTRACT
         messages = [*messages, {"role": "system", "content": guidance}]
         task = "chat" if expression.source == "fragment" else "gen_stage2"
@@ -1440,14 +1458,12 @@ class RubenBot:
         except Exception as exc:  # noqa: BLE001 - 观测数据写不进去也不能影响回复
             logger.warning("写入决策日志失败：%s", exc)
 
-    async def _record(self, event: MessageEvent, now: float) -> bool:
-        """落流水 + 更新人物；始终返回 True（空正文消息不落库）。
-
-        去重已经在 :meth:`_handle_event` 里做过了（语音条要在请求转写前先挡掉
-        重复事件），这里不再重复检查。返回值保留是为了旧调用点的语义不变。
-        """
+    async def _record(self, event: MessageEvent, now: float) -> int | None:
+        """落流水并贴上入站前的事实快照，只有可记账的群消息返回视觉回写目标。"""
         if not event.text.strip():
-            return True
+            if not any(s.type in {"image", "sticker"} for s in event.segments):
+                return None
+            event.text = "".join(s.render() for s in event.segments)
         person_id = make_person_id(event.platform, event.sender_id)
         self.store.upsert_person(event.platform, event.sender_id, event.sender_name, now=now)
         if event.is_group and event.sender_name and event.sender_name != event.sender_id:
@@ -1455,10 +1471,14 @@ class RubenBot:
                                        name=event.sender_name, now=now)
         if event.is_group and event.chat_name:
             self.store.upsert_identity(event.platform, event.chat_id, kind="group", name=event.chat_name, now=now)
-        self.store.add_raw_message(
+        local = (event.is_group and bool(event.sender_id) and not event.sender_id.startswith("__")
+                 and self.store.get_privacy_mode(person_id) == "normal")
+        visual = "\n".join(filter(None, map(segment_description, event.segments))) if local else ""
+        raw_id = self.store.add_raw_message(
             platform=event.platform,
             chat_id=event.chat_id,
             chat_type=event.chat_type,
+            visual_text=visual,
             sender_id=event.sender_id,
             sender_name=event.sender_name,
             text=event.text,
@@ -1469,7 +1489,17 @@ class RubenBot:
         self._last_activity[f"{event.platform}:{event.chat_id}"] = now
         self.last_message_at = now
         logger.debug("记录消息 %s: %s", person_id, event.text[:60], extra=_log_identity(event))
-        return True
+        if local:
+            try:
+                event.familiarity = tuple(self.entities.familiarity(event.platform, event.chat_id, event.text + "\n" + visual))
+                if event.familiarity:
+                    row = self.store.raw_message_by_id(raw_id)
+                    if row:
+                        self.entities.record_known_mentions(platform=event.platform, chat_id=event.chat_id, message=row, now=now)
+            except Exception as exc:  # 账本不可用仍照常处理这条消息
+                logger.warning("群实体查账失败：%s", exc)
+            return raw_id
+        return None
 
     def _is_duplicate(self, event: MessageEvent, now: float) -> bool:
         """入站去重检查；去掉重或没有平台消息 id 时返回 False。"""
@@ -2120,8 +2150,10 @@ class RubenBot:
             later = msg.ts
         elapsed = f"{max(0, int(now - recent[-1].ts))} 秒" if recent else "尚无发言记录"
         texts = json.dumps([msg.text for msg in recent], ensure_ascii=False)
-        return (f"【自身状态】\n本话题已发言：{count} 条（最近对话窗口内，间隔 {TOPIC_GAP_SECONDS // 60} 分钟分界）"
-                f"\n距上次发言：{elapsed}\n最近 5 条自己的发言（原文，按时间先后）：{texts}")
+        block = (f"【自身状态】\n本话题已发言：{count} 条（最近对话窗口内，间隔 {TOPIC_GAP_SECONDS // 60} 分钟分界）"
+                 f"\n距上次发言：{elapsed}\n最近 5 条自己的发言（原文，按时间先后）：{texts}")
+        feeling = self.states.planner_text(event.platform, event.chat_type, event.chat_id, now=now)
+        return f"{block}\n{feeling}" if feeling else block
 
     async def plan_expression(
         self,
@@ -2157,7 +2189,15 @@ class RubenBot:
         ):
             return ExpressionDecision("短附和", band, "", repetition_list(recent), "fragment")
         state = self._planner_self_state(event, own, time.time() if now is None else now)
-        prompt = f"{GUIDANCE_TASK_PROMPT}\n本轮已掷档：{band}。\n\n{state}"
+        local_facts = ""
+        if event.is_group:
+            tags = [{"名字": t.entity, "此前出现次数": t.occurrence_count, "有群内说明": t.has_gloss}
+                    for t in event.familiarity]
+            local_facts = ("【本群实体账·摄入时】" + json.dumps(tags, ensure_ascii=False)
+                           + f"\n本轮原话：{json.dumps(event.text, ensure_ascii=False)}；"
+                           + ("有人 @ 你。" if event.mentions_bot else "无 @ 提及。")
+                           + "这句话里，哪部分是在问通用的做法，哪部分要靠本群的近况才接得上？\n")
+        prompt = f"{GUIDANCE_TASK_PROMPT}\n本轮已掷档：{band}。\n\n{local_facts}{state}"
         request = [*messages, {"role": "user", "content": prompt}]
         try:
             raw = await asyncio.wait_for(

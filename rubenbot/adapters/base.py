@@ -15,7 +15,10 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Iterable, Mapping
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Iterable, Mapping
+
+if TYPE_CHECKING:
+    from ..memory.entities import FamiliarityTag
 
 from .platform import PlatformEvent
 
@@ -167,6 +170,8 @@ class MessageEvent:
     segments: list[Segment] = field(default_factory=list)
     platform_msg_id: str | None = None
     chat_name: str = ""  # 仅用于展示，不作为会话或授权标识
+    # 仅由本地摄入层填写，不能把平台 raw 里的同名字段当作账本证据。
+    familiarity: tuple[FamiliarityTag, ...] = ()
 
     @property
     def is_private(self) -> bool:

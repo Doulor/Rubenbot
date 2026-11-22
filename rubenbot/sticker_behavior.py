@@ -20,13 +20,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
-import ipaddress
 import json
 import logging
 import math
 import os
 import random
-import socket
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
@@ -35,10 +33,11 @@ from typing import Any
 import httpx
 
 from .adapters.base import SEND_STICKER
+from .computer_fetch import pinned_public_url
 from .http_body import CompressedBodyError, read_compressed_body
 from .llm import parse_json_payload
 from .memory.retrieve import tokenize
-from .stickers import KIND_PHOTO, KIND_STICKER, infer_ref_kind
+from .stickers import KIND_PHOTO, KIND_STICKER, infer_ref_kind, sniff_image_suffix
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +121,12 @@ class StickerBehavior:
         return self._store
 
     async def aclose(self) -> None:
-        """关闭自建的 HTTP 客户端；后台任务失败不影响调用方。"""
+        """先收回后台任务，避免关库后再回写；随后关闭自建客户端。"""
+        pending = list(self._bg_tasks)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         if self._embed_client is not None and not self._embed_client.is_closed:
             await self._embed_client.aclose()
         self._embed_client = None
@@ -131,35 +135,76 @@ class StickerBehavior:
     # 收集
     # ------------------------------------------------------------------
 
-    async def on_message(self, runtime: Any, event: Any) -> None:
-        """在 core 的消息预处理时机收集群聊里的表情/图片段。"""
+    async def on_message(self, runtime: Any, event: Any, *, raw_id: int | None = None) -> None:
+        """收集表情与记录图片所见是两件事：普通照片可以只留下文字，不进选图库。"""
+        if not getattr(event, "is_group", False):
+            return
+        segments = [s for s in event.segments if s.type in COLLECTABLE_SEGMENTS]
+        if not segments:
+            return
         try:
-            if not self.enabled or not getattr(self.config, "collect", False) or not getattr(event, "is_group", False):
-                return
-            store = self.store
-            if store is None:
-                return
-            platform = str(getattr(event, "platform", "") or "")
-            tags = topic_tags(getattr(event, "text", "") or "")
-            segments = list(getattr(event, "segments", None) or [])
-            if not segments:
-                return
-            # 同一事件里的多张图并行取，避免一条多图消息串行等多次下载超时
-            results = await asyncio.gather(
-                *(self._collect_segment(store, platform, segment, tags) for segment in segments),
-                return_exceptions=True,
-            )
-            for sticker in results:
+            store = self.store if self.enabled and self.config.collect else None
+            results = await asyncio.gather(*(
+                self._collect_segment(store, event.platform, s, topic_tags(event.text)) for s in segments
+            ), return_exceptions=True) if store is not None else [None] * len(segments)
+            # 普通图片只有明确配置了 vision 才送去识图；适配器自带的描述已同步入库。
+            perceive = raw_id is not None and runtime.config.llm.models.get("vision")
+            missing = []
+            for index, (segment, sticker) in enumerate(zip(segments, results)):
                 if isinstance(sticker, BaseException):
-                    # 单个段失败不影响其他段
-                    logger.debug("表情包收集异常（跳过该段）：%s", sticker)
-                    continue
-                if sticker is not None and getattr(sticker, "file", ""):
-                    # 普通图片不参与选图，没必要花视觉模型额度给它写描述
-                    if getattr(sticker, "kind", KIND_STICKER) == KIND_STICKER:
-                        self._schedule_description(runtime, store, sticker)
+                    logger.debug("表情包收集异常：%s", sticker)
+                    sticker = None
+                collecting_sticker = sticker is not None and sticker.file and sticker.kind == KIND_STICKER
+                if raw_id is not None and (perceive or collecting_sticker) and not segment_description(segment):
+                    missing.append((index, sticker))
+                elif collecting_sticker:
+                    self._schedule_description(runtime, store, sticker)
+            if missing:
+                task = asyncio.create_task(self._describe_message(runtime, raw_id, segments, missing, store))
+                self._bg_tasks.add(task)
+                task.add_done_callback(self._finish_chain)
         except Exception as exc:  # noqa: BLE001
             logger.debug("表情包收集异常：%s", exc)
+
+    async def _describe_message(self, runtime, raw_id, segments, missing, store) -> None:
+        """视觉只记录可见内容；无本体、坏图或超时都不拿猜测填空。"""
+        descriptions = [segment_description(s) for s in segments]
+        llm = _resolve_llm(runtime)
+        if llm is None:
+            return
+        # 同一条消息只排一个任务，保持多图顺序；读已收集本体可省一次下载。
+        for index, sticker in missing:
+            segment = segments[index]
+            try:
+                path = store.path_of(sticker) if sticker is not None else None
+                data = path.read_bytes() if path else await self._image_bytes(segment.data)
+                suffix = sniff_image_suffix(data)
+                if not suffix or len(data) > self.max_file_bytes:
+                    continue
+                raw = await vision_request(llm, data, _MIME_BY_SUFFIX[suffix],
+                    '用一句中文记录画面中可直接看到的内容，逐字抄下清晰的专名和说明。'
+                    '不清晰的文字留空。返回 JSON：{"description":"画面所见","emotions":[]}', 'image_description')
+                payload = parse_json_payload(raw)
+                if isinstance(payload, Mapping) and isinstance(payload.get('description'), str):
+                    descriptions[index] = payload['description'].strip()[:500]
+                    if descriptions[index] and sticker is not None and sticker.kind == KIND_STICKER and not sticker.description:
+                        store.update_metadata(sticker.id, description=descriptions[index], emotions=payload.get('emotions') or [])
+            except Exception as exc:  # 一张图失败，其余图仍可留证
+                logger.debug("图片感知失败（流水 %s）：%s", raw_id, type(exc).__name__)
+        text = "\n".join(filter(None, descriptions))
+        if text:
+            runtime.store.set_raw_visual_text(raw_id, text)
+
+    async def _image_bytes(self, payload: Mapping) -> bytes | None:
+        native = payload.get("native_ref")
+        encoded = payload.get("base64")
+        if not encoded and str(payload.get("file", "")).startswith(("base64://", "data:")):
+            encoded = payload["file"]
+        if encoded:
+            if len(encoded) > 4 * self.max_file_bytes // 3 + 128:
+                return None
+            return _decode_base64(encoded)
+        return await self._download_image(_candidate_url(payload, native))
 
     async def _collect_segment(self, store: Any, platform: str, segment: Any, tags: list[str]) -> Any:
         kind = str(getattr(segment, "type", "") or (segment.get("type") if isinstance(segment, Mapping) else ""))
@@ -191,9 +236,7 @@ class StickerBehavior:
             )
             return None
 
-        raw = _decode_base64(payload.get("base64"))
-        if raw is None:
-            raw = await self._download_image(_candidate_url(payload, native_ref))
+        raw = await self._image_bytes(payload)
         if raw is None and not refs:
             return None
         return store.add(
@@ -277,18 +320,7 @@ class StickerBehavior:
             logger.warning("读取表情图片失败（%s）：%s", sticker_id, exc)
             return
         mime = _MIME_BY_SUFFIX.get(path.suffix.lower(), "image/png")
-        encoded = base64.b64encode(data).decode("ascii")
-        messages = [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": DESCRIBE_PROMPT},
-                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}},
-            ],
-        }]
-        raw = await asyncio.wait_for(
-            llm.complete(messages, role="vision", task="sticker_description", json_mode=True),
-            timeout=DESCRIBE_TIMEOUT,
-        )
+        raw = await vision_request(llm, data, mime, DESCRIBE_PROMPT, "sticker_description")
         parsed = parse_json_payload(raw)
         if isinstance(parsed, Mapping):
             description = str(parsed.get("description") or parsed.get("desc") or "").strip()
@@ -654,6 +686,28 @@ class StickerBehavior:
                     logger.warning("描述生成连续失败，本进程内暂停描述生成")
                     break
 
+
+def segment_description(segment: Any) -> str:
+    """适配器带来的可见文字；通用占位符、文件名和地址不是图片说明。"""
+    if segment.type in COLLECTABLE_SEGMENTS:
+        for key in ("description", "alt", "summary"):
+            value = segment.data.get(key)
+            if isinstance(value, str) and value.strip() not in {"", "[图片]", "[动画表情]", "[表情]"}:
+                return value.strip()[:500]
+    return ""
+
+
+async def vision_request(llm, data: bytes, mime: str, prompt: str, task: str) -> str:
+    """表情感知和群图共用同一视觉角色、字节传输和超时。"""
+    encoded = base64.b64encode(data).decode("ascii")
+    messages = [{"role": "user", "content": [
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}},
+    ]}]
+    return await asyncio.wait_for(llm.complete(messages, role="vision", task=task, json_mode=True),
+                                  timeout=DESCRIBE_TIMEOUT)
+
+
 def _has_local_file(store: Any, sticker: Any) -> bool:
     try:
         return store.path_of(sticker) is not None
@@ -715,18 +769,20 @@ async def _default_download(url: str, limit: int) -> bytes | None:
     async with httpx.AsyncClient(
         timeout=DOWNLOAD_TIMEOUT, follow_redirects=False, trust_env=False, limits=limits,
     ) as client:
-        target = url
+        target = httpx.URL(url)
         for _ in range(4):
-            if not await _public_url(target):
-                raise ValueError("图片地址不是公网地址")
+            if target.scheme not in {"http", "https"} or not target.raw_host or target.userinfo:
+                raise ValueError("需要不含凭据的公网图片地址")
+            pinned = await pinned_public_url(target)
             async with client.stream(
-                "GET", target, headers={"Accept-Encoding": "gzip, deflate"},
+                "GET", pinned, headers={b"Host": target.netloc, b"Accept-Encoding": b"gzip, deflate"},
+                extensions={"sni_hostname": target.raw_host.decode("ascii")},
             ) as response:
                 if response.status_code in (301, 302, 303, 307, 308):
                     location = response.headers.get("location")
                     if not location:
                         raise ValueError("图片重定向缺少目标")
-                    target = str(httpx.URL(target).join(location))
+                    target = target.join(location)
                     continue
                 if response.status_code >= 400:
                     raise ValueError(f"图片返回 HTTP {response.status_code}")
@@ -745,37 +801,6 @@ async def _default_download(url: str, limit: int) -> bytes | None:
                     body.extend(chunk)
                 return bytes(body) or None
     raise ValueError("图片重定向次数过多")
-
-
-async def _public_url(url: str) -> bool:
-    """只允许访问公网地址：字形 IP 直接判断，域名解析后逐个判断。"""
-    try:
-        parsed = httpx.URL(url)
-        host = parsed.host
-    except Exception:  # noqa: BLE001
-        return False
-    if not host or parsed.scheme not in ("http", "https"):
-        return False
-    try:
-        addresses = [ipaddress.ip_address(host)]
-    except ValueError:
-        try:
-            answers = await asyncio.get_running_loop().getaddrinfo(
-                host, parsed.port or (443 if parsed.scheme == "https" else 80),
-                type=socket.SOCK_STREAM,
-            )
-        except OSError:
-            return False
-        addresses = []
-        for answer in answers:
-            try:
-                addresses.append(ipaddress.ip_address(answer[4][0]))
-            except ValueError:
-                return False
-    return bool(addresses) and all(
-        address.is_global and not address.is_multicast and not address.is_reserved
-        for address in addresses
-    )
 
 
 def _resolve_llm(runtime: Any) -> Any:

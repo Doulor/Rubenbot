@@ -100,6 +100,20 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_person_ts ON events(person_id, ts);
 CREATE INDEX IF NOT EXISTS idx_events_compressed ON events(compressed, ts);
+CREATE INDEX IF NOT EXISTS idx_events_chat_ts ON events(source_chat, audience, ts);
+
+-- 时间线之上的可重建渲染缓存。群号与私聊账号即使同号也各自独立。
+CREATE TABLE IF NOT EXISTS conversation_reflections (
+    platform    TEXT NOT NULL,
+    chat_type   TEXT NOT NULL,
+    chat_id     TEXT NOT NULL,
+    state       TEXT NOT NULL,
+    atmosphere  TEXT NOT NULL,
+    subjects    TEXT NOT NULL,  -- 本次素材涉及的人，供清空记忆时撤下整段合成结果
+    evidence_ts REAL NOT NULL,
+    updated_at  REAL NOT NULL,
+    PRIMARY KEY (platform, chat_type, chat_id)
+);
 
 -- 分寸裁定：本人对「某类目/某件事」的可说与否；判断逻辑在读取侧，这张表只存结论
 CREATE TABLE IF NOT EXISTS rulings (
@@ -140,6 +154,9 @@ CREATE TABLE IF NOT EXISTS raw_messages (
     text        TEXT NOT NULL,
     ts          REAL NOT NULL,
     processed   INTEGER NOT NULL DEFAULT 0,
+    -- 图片等视觉描述由感知侧写入；没有描述时保持空串。
+    visual_text TEXT NOT NULL DEFAULT '',
+    entity_blocked INTEGER NOT NULL DEFAULT 0,
     -- 平台消息 id 与它引用的消息 id（入站/出站都记，用于引用解析与自我时间线）
     platform_msg_id TEXT NOT NULL DEFAULT '',
     reply_to_id     TEXT NOT NULL DEFAULT ''
@@ -147,6 +164,24 @@ CREATE TABLE IF NOT EXISTS raw_messages (
 CREATE INDEX IF NOT EXISTS idx_raw_chat ON raw_messages(chat_id, ts);
 CREATE INDEX IF NOT EXISTS idx_raw_pending ON raw_messages(processed, sender_id);
 CREATE INDEX IF NOT EXISTS idx_raw_platform_msg ON raw_messages(platform, platform_msg_id);
+
+-- 每群一本专名账；说明与别名挂在实际提及的原文证据上，可随发送者清空。
+CREATE TABLE IF NOT EXISTS entities (
+    id INTEGER PRIMARY KEY, platform TEXT NOT NULL, chat_id TEXT NOT NULL,
+    canonical_name TEXT NOT NULL, UNIQUE(platform, chat_id, canonical_name)
+);
+CREATE TABLE IF NOT EXISTS entity_mentions (
+    entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    message_key TEXT NOT NULL, person_id TEXT NOT NULL, ts REAL NOT NULL,
+    surface TEXT NOT NULL, gloss TEXT NOT NULL DEFAULT '', gloss_msg_id TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY(entity_id, message_key)
+);
+CREATE INDEX IF NOT EXISTS idx_mentions_person ON entity_mentions(person_id);
+CREATE TABLE IF NOT EXISTS entity_aliases (
+    entity_id INTEGER NOT NULL, message_key TEXT NOT NULL, alias TEXT NOT NULL,
+    PRIMARY KEY(entity_id, message_key, alias), FOREIGN KEY(entity_id, message_key)
+        REFERENCES entity_mentions(entity_id, message_key) ON DELETE CASCADE
+);
 
 CREATE TABLE IF NOT EXISTS memory_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -469,6 +504,7 @@ class RawMessage:
     ts: float
     platform_msg_id: str = ""
     reply_to_id: str = ""
+    visual_text: str = ""
 
 
 @dataclass
@@ -816,6 +852,116 @@ class MemoryStore:
             self._conn.commit()
             mem_id = int(cur.lastrowid)
         return self.get_memory(mem_id)  # type: ignore[return-value]
+
+    # ------------------------------------------------------------------
+    # entities（群/会话实体账）
+    # ------------------------------------------------------------------
+
+    def entity_source_allowed(self, message: RawMessage) -> bool:
+        """只接受当前仍可记账的群成员流水；清空或更改隐私后旧快照也失效。"""
+        with self._lock:
+            return self._conn.execute(
+                """SELECT 1 FROM raw_messages r LEFT JOIN privacy_settings p
+                   ON p.person_id = r.platform || ':' || r.sender_id
+                   WHERE r.id = ? AND r.platform = ? AND r.chat_id = ? AND r.sender_id = ?
+                     AND r.chat_type = 'group' AND r.entity_blocked = 0
+                     AND r.sender_id <> '' AND substr(r.sender_id,1,2) <> '__'
+                     AND COALESCE(p.mode,'normal') = 'normal'""",
+                (message.id, message.platform, message.chat_id, message.sender_id),
+            ).fetchone() is not None
+
+    def _forget_entities(self, person_id: str) -> None:
+        """按证据撤下贡献；不需要保留原始流水也能追溯到发送者。"""
+        platform, _, sender = person_id.partition(":")
+        self._conn.execute(
+            "UPDATE raw_messages SET entity_blocked=1, visual_text='' WHERE platform=? AND sender_id=?",
+            (platform, sender),
+        )
+        ids = self._conn.execute("SELECT DISTINCT entity_id FROM entity_mentions WHERE person_id=?", (person_id,)).fetchall()
+        self._conn.execute("DELETE FROM entity_mentions WHERE person_id=?", (person_id,))
+        # 只有别名幸存时，旧规范名也不能从已清空的证据里猜回来。
+        self._conn.executemany(
+            """DELETE FROM entities WHERE id=? AND NOT EXISTS
+               (SELECT 1 FROM entity_mentions m WHERE m.entity_id=entities.id AND m.surface=entities.canonical_name)""",
+            ids,
+        )
+
+    def put_entity_mention(self, message: RawMessage, name: str, aliases: tuple[str, ...],
+                           gloss: str, gloss_id: str) -> None:
+        """只保存调用方核实的本条来源；同消息的模型重放和本地命中共享唯一键。"""
+        with self._lock, self._conn:
+            if not self.entity_source_allowed(message):
+                return
+            place = (message.platform, message.chat_id)
+            def resolve(surface: str):
+                return self._conn.execute(
+                    """SELECT e.id, e.canonical_name FROM entities e WHERE e.platform=? AND e.chat_id=? AND
+                       (e.canonical_name=? OR EXISTS (SELECT 1 FROM entity_aliases a
+                       WHERE a.entity_id=e.id AND a.alias=?)) ORDER BY (e.canonical_name=?) DESC, e.id LIMIT 1""",
+                    (*place, surface, surface, surface),
+                ).fetchone()
+
+            existing = resolve(name)
+            if not existing:
+                # 模型这次以别名作规范名时，利用同条共现的已知名字收敛到旧账。
+                existing = next((row for alias in aliases if (row := resolve(alias))), None)
+            canonical = existing['canonical_name'] if existing else name
+            entity_id = existing['id'] if existing else self._conn.execute(
+                "INSERT INTO entities(platform,chat_id,canonical_name) VALUES(?,?,?)", (*place, name)
+            ).lastrowid
+            # 已独立成账的同名词不强并；共现只合并有单一指向的别名。
+            aliases = tuple(alias for alias in {name, *aliases} if alias != canonical
+                            and ((owner := resolve(alias)) is None or owner['id'] == entity_id))
+            key = 'p:' + message.platform_msg_id if message.platform_msg_id else 'r:' + str(message.id)
+            self._conn.execute(
+                """INSERT INTO entity_mentions(entity_id,message_key,person_id,ts,surface,gloss,gloss_msg_id)
+                   VALUES(?,?,?,?,?,?,?) ON CONFLICT(entity_id,message_key) DO UPDATE SET
+                   gloss=excluded.gloss, gloss_msg_id=excluded.gloss_msg_id
+                   WHERE entity_mentions.gloss='' AND excluded.gloss<>''""",
+                (entity_id, key, make_person_id(message.platform, message.sender_id), message.ts, name, gloss, gloss_id),
+            )
+            self._conn.executemany("INSERT OR IGNORE INTO entity_aliases VALUES(?,?,?)",
+                                   ((entity_id, key, alias) for alias in aliases))
+
+    def entity_rows(self, platform: str, chat_id: str, *, text: str | None = None,
+                    name: str | None = None, limit: int = -1) -> list[dict]:
+        """先用本群名称索引选出命中项，再聚合其证据；熟悉度不限全群排名。"""
+        clause = "e.platform=? AND e.chat_id=?"
+        args: list[Any] = [platform, chat_id]
+        if text is not None or name is not None:
+            test = 'instr(?, {}) > 0' if text is not None else '{} = ?'
+            clause += f" AND ({test.format('e.canonical_name')} OR EXISTS (SELECT 1 FROM entity_aliases a WHERE a.entity_id=e.id AND {test.format('a.alias')}))"
+            args.extend([text if text is not None else name] * 2)
+        with self._lock:
+            rows = self._conn.execute(f"""
+                SELECT e.*, COUNT(*) AS occurrence_count, MIN(m.ts) AS first_seen, MAX(m.ts) AS last_seen,
+                       COALESCE(g.gloss,'') AS gloss, COALESCE(g.gloss_msg_id,'') AS gloss_msg_id,
+                       (SELECT json_group_array(DISTINCT a.alias) FROM entity_aliases a WHERE a.entity_id=e.id) AS aliases
+                FROM entities e JOIN entity_mentions m ON m.entity_id=e.id
+                LEFT JOIN entity_mentions g ON g.rowid=(SELECT gm.rowid FROM entity_mentions gm
+                    WHERE gm.entity_id=e.id AND gm.gloss<>'' ORDER BY gm.ts DESC, gm.rowid DESC LIMIT 1)
+                WHERE {clause} GROUP BY e.id ORDER BY occurrence_count DESC, last_seen DESC, e.id LIMIT ?""",
+                (*args, limit),
+            ).fetchall()
+        return [{**row, 'aliases': tuple(json.loads(row['aliases']))} for row in rows]
+
+    def set_raw_visual_text(self, raw_id: int, text: str) -> bool:
+        """描述有变化才重新排队；快照处理完毕时再比对描述以避免竞态。"""
+        value = str(text or '').strip()
+        if not value:
+            return False
+        with self._lock, self._conn:
+            return bool(self._conn.execute(
+                """UPDATE raw_messages SET visual_text=?,processed=0 WHERE id=? AND visual_text<>?
+                   AND chat_type='group' AND entity_blocked=0 AND substr(sender_id,1,2)<>'__' AND NOT EXISTS
+                   (SELECT 1 FROM privacy_settings p WHERE p.person_id=raw_messages.platform || ':' || raw_messages.sender_id
+                   AND p.mode<>'normal')""", (value, raw_id, value),
+            ).rowcount)
+
+    def mark_extraction_snapshot(self, messages: Iterable[RawMessage]) -> None:
+        with self._lock, self._conn:
+            self._conn.executemany("UPDATE raw_messages SET processed=1 WHERE id=? AND visual_text=?",
+                                   ((m.id, m.visual_text) for m in messages))
 
     def get_memory(self, memory_id: int) -> Memory | None:
         with self._lock:
@@ -1235,6 +1381,46 @@ class MemoryStore:
             rows = self._conn.execute(sql, params).fetchall()
         return [Event.from_row(row) for row in rows]
 
+    def conversation_events(self, source_chat: str, audience: str, *, since: float, now: float) -> list[Event]:
+        """状态蒸馏只读本地、近期的真人事件；自己的旧回复不是蒸馏素材。"""
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT e.* FROM events e LEFT JOIN privacy_settings p USING (person_id)
+                   WHERE source_chat = ? AND audience = ? AND ts BETWEEN ? AND ?
+                   AND compressed = 0 AND e.person_id <> ? AND e.sensitivity = 'normal'
+                   AND coalesce(p.mode, 'normal') = 'normal'
+                   ORDER BY ts DESC, e.id DESC LIMIT 16""",
+                (source_chat, audience, since, now, SELF_PERSON_ID),
+            ).fetchall()
+        return [Event.from_row(row) for row in rows]
+
+    def get_conversation_state(self, platform: str, chat_type: str, chat_id: str) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM conversation_reflections WHERE platform=? AND chat_type=? AND chat_id=?",
+                (platform, chat_type, chat_id),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def set_conversation_state(
+        self, platform: str, chat_type: str, chat_id: str, *, state: str, atmosphere: str,
+        subjects: list[str], evidence_ts: float, now: float,
+    ) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT OR REPLACE INTO conversation_reflections
+                   (platform, chat_type, chat_id, state, atmosphere, subjects, evidence_ts, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (platform, chat_type, chat_id, state, atmosphere, json.dumps(subjects), evidence_ts, now),
+            )
+
+    def _invalidate_states_for_person(self, person_id: str) -> None:
+        """一段合成正文无法按人拆删；失去来源时整段失效，由后台重新生成。"""
+        self._conn.execute(
+            "DELETE FROM conversation_reflections WHERE ? IN (SELECT value FROM json_each(subjects))",
+            (person_id,),
+        )
+
     def count_events(self, person_id: str | None = None, since: float | None = None) -> int:
         sql = "SELECT COUNT(*) AS c FROM events WHERE 1=1"
         params: list = []
@@ -1451,6 +1637,9 @@ class MemoryStore:
                 """,
                 (person_id, mode, now),
             )
+            if mode != "normal":
+                self._forget_entities(person_id)
+                self._invalidate_states_for_person(person_id)
             self._conn.commit()
         return mode
 
@@ -1589,14 +1778,16 @@ class MemoryStore:
         processed: bool = False,
         platform_msg_id: str = "",
         reply_to_id: str = "",
+        visual_text: str = "",
     ) -> int:
         ts = time.time() if ts is None else ts
         with self._lock:
+            blocked = self.get_privacy_mode(make_person_id(platform, sender_id)) != "normal"
             cur = self._conn.execute(
                 """
                 INSERT INTO raw_messages(platform, chat_id, chat_type, sender_id, sender_name, text, ts, processed,
-                                         platform_msg_id, reply_to_id)
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                         visual_text, entity_blocked, platform_msg_id, reply_to_id)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     platform,
@@ -1607,6 +1798,8 @@ class MemoryStore:
                     text,
                     ts,
                     1 if processed else 0,
+                    "" if blocked else str(visual_text or ""),
+                    int(blocked),
                     str(platform_msg_id or ""),
                     str(reply_to_id or ""),
                 ),
@@ -1637,6 +1830,12 @@ class MemoryStore:
         with self._lock:
             row = self._conn.execute(sql, params).fetchone()
         return row is not None
+
+    def raw_message_by_id(self, raw_id: int) -> RawMessage | None:
+        """按内部流水 id 读取消息，供异步视觉回写与抽取竞态检查使用。"""
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM raw_messages WHERE id = ?", (int(raw_id),)).fetchone()
+        return self._row_to_raw(row) if row else None
 
     def message_by_platform_id(
         self,
@@ -1711,8 +1910,8 @@ class MemoryStore:
                 SELECT platform, chat_id, chat_type, sender_id,
                        MAX(sender_name) AS sender_name, COUNT(*) AS count
                 FROM raw_messages
-                WHERE processed = 0 AND sender_id <> '' AND text <> ''
-                GROUP BY platform, chat_id, sender_id
+                WHERE processed = 0 AND sender_id <> '' AND (text <> '' OR visual_text <> '')
+                GROUP BY platform, chat_type, chat_id, sender_id
                 ORDER BY count DESC
                 """
             ).fetchall()
@@ -1725,12 +1924,17 @@ class MemoryStore:
         sender_id: str,
         limit: int = 100,
         since: float | None = None,
+        *,
+        chat_type: str | None = None,
     ) -> list[RawMessage]:
         sql = """
             SELECT * FROM raw_messages
             WHERE processed = 0 AND platform = ? AND chat_id = ? AND sender_id = ?
         """
         params: list = [platform, str(chat_id), str(sender_id)]
+        if chat_type is not None:
+            sql += " AND chat_type = ?"
+            params.append(chat_type)
         if since is not None:
             sql += " AND ts >= ?"
             params.append(since)
@@ -1810,6 +2014,23 @@ class MemoryStore:
                 (str(conversation_id), summary, int(covered_until_msg_id), now),
             )
             self._conn.commit()
+
+    def search_raw_messages(self, query: str, *, platform: str, chat_id: str, chat_type: str = 'group',
+                            limit: int = 50) -> list[RawMessage]:
+        """按当前场合逐字检索消息及图片描述；不改变 recall 的记忆审查路径。"""
+        term = query.strip()
+        if not term:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT r.* FROM raw_messages r LEFT JOIN privacy_settings p
+                   ON p.person_id=r.platform || ':' || r.sender_id
+                   WHERE platform=? AND chat_id=? AND chat_type=? AND r.entity_blocked=0
+                   AND COALESCE(p.mode,'normal')='normal' AND substr(sender_id,1,2)<>'__'
+                   AND (instr(text,?) OR instr(visual_text,?)) ORDER BY ts DESC,id DESC LIMIT ?""",
+                (platform, chat_id, chat_type, term, term, max(1, limit)),
+            ).fetchall()
+        return [self._row_to_raw(row) for row in rows]
 
     def raw_messages_after(
         self,
@@ -1946,6 +2167,7 @@ class MemoryStore:
             ts=row["ts"],
             platform_msg_id=row["platform_msg_id"] or "",
             reply_to_id=row["reply_to_id"] or "",
+            visual_text=row["visual_text"] if "visual_text" in row.keys() else "",
         )
 
     def active_senders(
@@ -2035,7 +2257,9 @@ class MemoryStore:
                     ),
                     "affinity": 1 if self.get_affinity(person_id) is not None else 0,
                 }
+                self._forget_entities(person_id)
                 self._conn.execute("DELETE FROM memories WHERE person_id = ?", (person_id,))
+                self._invalidate_states_for_person(person_id)
                 self._conn.execute("DELETE FROM events WHERE person_id = ?", (person_id,))
                 self._conn.execute("DELETE FROM profile_evidence WHERE person_id = ?", (person_id,))
                 self._conn.execute("DELETE FROM profiles WHERE person_id = ?", (person_id,))
@@ -2892,6 +3116,8 @@ def make_person_id(platform: str, platform_uid: str) -> str:
 _RAW_MESSAGE_MIGRATIONS: dict[str, str] = {
     "platform_msg_id": "TEXT NOT NULL DEFAULT ''",
     "reply_to_id": "TEXT NOT NULL DEFAULT ''",
+    "visual_text": "TEXT NOT NULL DEFAULT ''",
+    "entity_blocked": "INTEGER NOT NULL DEFAULT 0",
 }
 
 

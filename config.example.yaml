@@ -14,7 +14,8 @@ llm:
   models: {}
   #   fast: "deepseek-chat"        # 小任务（标题、轻判断等）
   #   summary: "deepseek-chat"     # 滚动摘要
-  #   vision: "qwen-vl-plus"       # 看图
+  #   vision: "qwen-vl-plus"       # 显式配置后，普通群图也在后台识图留文字；不要求收藏照片。
+  # 未配置时普通群图仅保存适配器已有的文字描述；已收藏的表情仍沿用原有视觉回退链。
   temperature: 0.8
   timeout: 60          # 单次请求超时（秒）
   max_retries: 2       # 失败重试次数：408/429/5xx 退避重试，间隔 1s / 3s

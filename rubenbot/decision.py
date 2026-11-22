@@ -94,6 +94,7 @@ class MergedRound:
             mentions_bot=any(e.mentions_bot for e in self.events),
             raw=raw,
             segments=segments,
+            familiarity=tuple({tag.entity: tag for e in self.events for tag in e.familiarity}.values()),
         )
 
 

@@ -477,8 +477,9 @@ def test_llm_client_records_usage_with_task_labels(config, store):
 
     # 私聊必回 → chat 任务
     asyncio.run(bot.handle_event(private_event("在吗")))
-    # 抽取任务
-    store.add_raw_message(platform="recording", chat_id="u1", sender_id="u1", sender_name="阿花", text="我住在杭州")
+    # 同一私聊批次只花一次抽取费用；同号群聊是另一批，不混作同一会话。
+    store.add_raw_message(platform="recording", chat_type="private", chat_id="u1", sender_id="u1",
+                          sender_name="阿花", text="我住在杭州")
     asyncio.run(bot.extractor.maybe_extract(force=True))
     asyncio.run(client.close())
 
