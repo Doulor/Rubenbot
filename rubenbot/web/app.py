@@ -36,6 +36,8 @@
 - ``GET  /api/logs``            运行日志尾部
 - ``GET  /api/config``          查看 config.yaml
 - ``PUT  /api/config``          编辑并校验后保存，返回需重启提示
+- ``GET  /api/models/pool``     模型池视图：每角色模型列表、实际策略与来源
+- ``PUT  /api/models/pool``     保存模型池（整表替换，热生效，严格校验）
 - ``GET  /api/persona``         查看人格文件内容与当前实际生效的人格
 - ``PUT  /api/persona``         保存人格并热加载到运行中的 bot
 - ``POST /api/persona/reset``   恢复默认人格（同样热加载）
@@ -46,6 +48,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import asdict
+import json
 import logging
 import sqlite3
 import time
@@ -59,7 +62,7 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from ..adapters.base import MessageEvent
-from ..config import Config, GroupDecisionConfig, is_loopback_host
+from ..config import Config, GroupDecisionConfig, MODEL_ROLES, is_loopback_host
 from ..core import format_scene
 from ..decision import parse_quiet_hours
 from ..identity import IdentityService, avatar_url
@@ -97,6 +100,18 @@ from .state import (
 logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).parent / "static"
+
+# 模型池管理接口里的角色显示名（与设置页的模型池编辑器保持一致）
+MODEL_ROLE_LABELS = {
+    "chat": "对话",
+    "fast": "快速档（小任务）",
+    "summary": "滚动摘要",
+    "vision": "看图",
+    "gate": "分寸审查",
+    "distill": "画像提炼",
+    "extract": "记忆抽取",
+    "consolidate": "记忆归纳",
+}
 
 MEMORY_SOURCES = {"extracted", "user", "system"}
 MEMORY_CATEGORIES = {
@@ -1411,6 +1426,116 @@ def create_app(state: WebState):
             "backup": str(backup) if backup else None,
         }
 
+    # ------------------------------------------------------------------
+    # 模型池（结构化设置页之外的轻量管理接口）
+    # ------------------------------------------------------------------
+
+    def _pool_snapshot(config) -> dict[str, Any]:
+        """当前模型池视图：角色顺序、模型列表与实际策略。"""
+        roles = list(MODEL_ROLES) + [role for role in config.llm.models if role not in MODEL_ROLES]
+        return {
+            "strategy": config.llm.model_strategy,
+            "strategies": dict(config.llm.model_strategies),
+            "roles": [
+                {
+                    "role": role,
+                    "label": MODEL_ROLE_LABELS.get(role, role),
+                    "models": config.llm.models_for(role),
+                    "configured": role in config.llm.models,
+                    "strategy": config.llm.strategy_for(role),
+                    "has_override": role in config.llm.model_strategies,
+                }
+                for role in roles
+            ],
+        }
+
+    def _write_pool_config(state, config):
+        """把模型池相关的三个字段写进 config.yaml 的 llm 段。
+
+        只动 ``models`` / ``model_strategy`` / ``model_strategies``，其余键
+        （含 ``${ENV}`` 形式的 api_key 原文）原样保留，绝不把展开后的密钥写盘。
+        """
+        import yaml
+
+        raw = _read_raw_config(state.config_path)
+        llm = raw.get("llm")
+        llm = dict(llm) if isinstance(llm, dict) else {}
+        llm["models"] = {
+            role: (list(models) if isinstance(models, list) else models)
+            for role, models in config.llm.models.items()
+        }
+        llm["model_strategy"] = config.llm.model_strategy
+        llm["model_strategies"] = dict(config.llm.model_strategies)
+        raw["llm"] = llm
+        path = state.config_path
+        try:
+            backup = save_config_text(path, yaml.safe_dump(raw, allow_unicode=True, sort_keys=False))
+        except ValueError as exc:
+            raise ApiError(422, f"配置校验失败：{exc}") from exc
+        return backup
+
+    @app.get("/api/models/pool")
+    async def get_model_pool(request: Request):
+        require_session(request)
+        return {"ok": True, **_pool_snapshot(state.config)}
+
+    @app.put("/api/models/pool")
+    async def put_model_pool(request: Request):
+        require_session(request)
+        body = await _json_body(request)
+        payload = {
+            "models": body.get("models") if "models" in body else None,
+            "model_strategy": body.get("strategy", body.get("model_strategy")),
+            "model_strategies": body.get("strategies", body.get("model_strategies")),
+        }
+        if "models" not in body and "strategy" not in body and "strategies" not in body:
+            raise ApiError(400, "至少要提交 models / strategy / strategies 之一")
+        try:
+            update = validate_structured(
+                {"llm": {key: value for key, value in payload.items() if value is not None}}
+            )
+            # 合并完整配置再校验一次：模型池里的模型名等约束以最终配置为准，
+            # 避免旧文件里别的段有问题时被这里悄悄带过去。
+            candidate = Config.from_raw(merge_config(_read_raw_config(state.config_path), update))
+        except ConfigValidationError as exc:
+            logger.warning("模型池保存被拒绝：%s", exc)
+            raise ApiError(422, f"模型池校验失败：{exc}", fields=exc.fields) from exc
+        except (TypeError, ValueError) as exc:
+            logger.warning("模型池保存被拒绝：%s", exc)
+            raise ApiError(
+                422, f"模型池校验失败：{exc}", fields=[{"field": "llm", "message": str(exc)}]
+            ) from exc
+
+        before = _config_snapshot(state.config)
+        backup = _write_pool_config(state, candidate)
+        requires_restart = state.apply_config(candidate)
+        after = _config_snapshot(candidate)
+        # 只有 llm 段会变：策略/列表都随 LLM 客户端重建热生效
+        changed = [
+            key
+            for key in sorted(set(before) | set(after))
+            if key.startswith("llm.") and before.get(key) != after.get(key)
+        ]
+        logger.info(
+            "WebUI 保存模型池：%s（热生效：%s）",
+            json.dumps(
+                {role: value for role, value in candidate.llm.models.items()},
+                ensure_ascii=False,
+            ),
+            ", ".join(changed) or "无变化",
+        )
+        return {
+            "ok": True,
+            # applied 用段名（与结构化保存一致，前端提示「模型与接口」已立即生效）；
+            # changed 给出具体改了哪些 llm 叶子字段，方便排查
+            "applied": ["llm"] if changed else [],
+            "changed": changed,
+            "requires_restart": requires_restart,
+            "message": _save_message(["llm"] if changed else [], requires_restart),
+            "backup": str(backup) if backup else None,
+            **_pool_snapshot(candidate),
+        }
+
     @app.post("/api/restart")
     async def restart(request: Request):
         require_session(request)
@@ -1711,8 +1836,15 @@ def _config_snapshot(config: Config) -> dict[str, Any]:
             else:
                 flat[path] = item
     # 「留空」在这几个字段上有两种等价写法（None 与空串），比较时统一，
-    # 否则「打开设置直接保存」会被误判为改过；``llm.models`` 也是整段比较
-    for path in ("llm.extract_model", "llm.consolidate_model", "llm.gate_model", "llm.models"):
+    # 否则「打开设置直接保存」会被误判为改过；``llm.models`` 与
+    # ``llm.model_strategies`` 也是整段比较
+    for path in (
+        "llm.extract_model",
+        "llm.consolidate_model",
+        "llm.gate_model",
+        "llm.models",
+        "llm.model_strategies",
+    ):
         if flat.get(path) is None:
             flat[path] = ""
     return flat

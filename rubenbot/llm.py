@@ -1,9 +1,15 @@
 """OpenAI 兼容的 LLM 客户端。
 
 只实现 chat/completions 这一条路径，够用且不引入额外依赖。
-``complete(role=...)`` 里的 role 决定使用哪个模型（chat / extract / consolidate，
-以及 fast / summary / vision 等预置角色），回退规则见 :class:`LLMConfig.model_for`。
+``complete(role=...)`` 里的 role 决定使用哪个模型池（chat / extract / consolidate，
+以及 fast / summary / vision 等预置角色），回退规则见 :class:`LLMConfig.model_for`，
+模型池与策略见 :meth:`LLMConfig.models_for` / :meth:`LLMConfig.strategy_for`。
 ``task=`` 是给用量统计用的标签，默认取 role；插件可传自定义名字。
+
+模型池（Q14）：一个角色可以配多个模型。``failover`` 按顺序调、失败切下一个；
+``round_robin`` 每次调用轮换起点；``random`` 每次均匀随机。列表里只有一个模型
+时三种策略与旧行为完全一致（沿用 ``max_retries`` 的退避重试）；多个模型时最多
+按列表走一遍、不额外退避，全部失败抛出最后一次的错误。
 
 可选的 ``usage_recorder`` 在每次调用尝试后回调一条用量记录；上游没给 usage
 时 token 记 ``None``（落库为 NULL），不猜不编。记录失败只记 debug，不影响主流程。
@@ -21,6 +27,7 @@ import asyncio
 import inspect
 import json
 import logging
+import random
 import re
 import time
 from dataclasses import dataclass
@@ -151,6 +158,8 @@ class LLMClient:
         self._client: httpx.AsyncClient | None = None
         # 探测到不支持工具后置 True，后续不再白试（省一次失败请求）
         self._tools_unsupported = False
+        # 轮询策略的调用计数：只放内存，重启/重建客户端后从头开始（规格允许）
+        self._round_robin: dict[str, int] = {}
 
     @property
     def supports_tools(self) -> bool:
@@ -186,19 +195,15 @@ class LLMClient:
         """调用 chat/completions，返回第一条回复的文本内容。
 
         ``task`` 只用于用量打标；默认与 ``role`` 相同。每次尝试都会记一条
-        用量（失败记 ok=0，token 为 NULL）。
+        用量（失败记 ok=0，token 为 NULL）；记录里的 model 是这次实际用的模型。
         """
-        model = self.config.model_for(role)
         task_name = (task or role or "chat").strip() or "chat"
-        payload: dict[str, Any] = {
-            "model": model,
-            "messages": messages,
-            "temperature": (
-                self.config.chat_temperature
-                if role == "chat" and temperature is None and self.config.chat_temperature is not None
-                else self.config.temperature if temperature is None else temperature
-            ),
-        }
+        temperature_value = (
+            self.config.chat_temperature
+            if role == "chat" and temperature is None and self.config.chat_temperature is not None
+            else self.config.temperature if temperature is None else temperature
+        )
+        payload: dict[str, Any] = {"messages": messages, "temperature": temperature_value}
         if role == "chat" and self.config.chat_frequency_penalty:
             payload["frequency_penalty"] = self.config.chat_frequency_penalty
         if max_tokens is not None:
@@ -206,49 +211,22 @@ class LLMClient:
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
 
-        client = await self._get_client()
-        last_error: Exception | None = None
-        for attempt in range(self.config.max_retries + 1):
-            started = time.perf_counter()
-            try:
-                resp = await client.post("/chat/completions", json=payload)
-            except httpx.HTTPError as exc:
-                # 网络/超时层失败：这次尝试没有响应，token 记 NULL
-                await self._record_usage(task_name, model, None, started, ok=False)
-                last_error = exc
-            else:
-                try:
-                    data: Any = resp.json()
-                except ValueError:
-                    data = None
-                if resp.status_code >= 400:
-                    # 429/5xx 也可能带 usage 计费信息，能读到就记上
-                    await self._record_usage(task_name, model, data, started, ok=False)
-                    error = LLMResponseError(
-                        f"LLM 返回 {resp.status_code}: {resp.text[:300]}", status=resp.status_code
-                    )
-                    if not is_retryable_status(resp.status_code):
-                        # 401/404 这类配置错误重试也没用，直接失败
-                        raise error
-                    last_error = error
-                else:
-                    choices = (data.get("choices") if isinstance(data, dict) else None) or []
-                    if not choices:
-                        await self._record_usage(task_name, model, data, started, ok=False)
-                        last_error = LLMError(f"LLM 响应缺少 choices: {str(data)[:300]}")
-                    else:
-                        content = choices[0].get("message", {}).get("content") or ""
-                        await self._record_usage(task_name, model, data, started, ok=True)
-                        # 普通生成路径用不到工具，残留的 DSML 文本只剥不留
-                        return strip_dsml(content)
-            if attempt >= self.config.max_retries:
-                break
-            delay = retry_delay(attempt, self._retry_delays)
-            logger.warning(
-                "LLM 调用失败（第 %s 次），%.1fs 后重试：%s", attempt + 1, delay, last_error
-            )
-            await asyncio.sleep(delay)
-        raise LLMError(f"LLM 调用最终失败: {last_error}") from last_error
+        def on_success(data: Any) -> str:
+            choices = (data.get("choices") if isinstance(data, dict) else None) or []
+            if not choices:
+                # 已经被 _call_single 的 choices 检查拦下来，这里只是兜底
+                return ""
+            content = choices[0].get("message", {}).get("content") or ""
+            # 普通生成路径用不到工具，残留的 DSML 文本只剥不留
+            return strip_dsml(content)
+
+        return await self._call_pool(
+            role,
+            task_name,
+            payload,
+            on_success=on_success,
+            allow_tool_unsupported=False,
+        )
 
     async def chat_with_tools(
         self,
@@ -264,50 +242,178 @@ class LLMClient:
 
         只做一次往返，工具循环由调用方控制（core 里最多两轮）。中转或模型不
         支持工具调用时抛 :class:`ToolUnsupported`，由调用方退化为普通生成。
-        与 ``complete`` 一样按 ``task``（默认取 role）记一条用量。
+        与 ``complete`` 一样按 ``task``（默认取 role）记一条用量，并且同样
+        支持模型池的故障转移（工具调用失败时切下一个模型）。
         """
         if getattr(self, "_tools_unsupported", False):
             raise ToolUnsupported("已探测到当前模型不支持工具调用")
-        model = self.config.model_for(role)
         task_name = (task or role or "chat").strip() or "chat"
         payload: dict[str, Any] = {
-            "model": model,
             "messages": messages,
             "temperature": self.config.temperature if temperature is None else temperature,
             "tools": tools,
             "tool_choice": tool_choice,
         }
+
+        def on_success(data: Any) -> dict[str, Any]:
+            choices = (data.get("choices") if isinstance(data, dict) else None) or []
+            message = choices[0].get("message") or {}
+            # 上游可能把工具调用写成 content 里的 DSML 文本；统一转成结构化 tool_calls，
+            # 让调用方走同一条执行通道（权限/审计/回喂都一样）。
+            return normalize_dsml_message(message)
+
+        return await self._call_pool(
+            role,
+            task_name,
+            payload,
+            on_success=on_success,
+            allow_tool_unsupported=True,
+        )
+
+    async def _call_pool(
+        self,
+        role: str,
+        task: str,
+        payload: dict[str, Any],
+        *,
+        on_success: Callable[[Any], Any],
+        allow_tool_unsupported: bool,
+    ) -> Any:
+        """按角色的模型池与策略发请求；返回 ``on_success`` 的结果。
+
+        - 单模型列表：完全沿用旧行为——``max_retries`` 次退避重试，最终失败
+          抛 ``LLM 调用最终失败``。
+        - 多模型列表：按策略排好的顺序最多走一遍；可重试的失败切下一个模型，
+          400/401/403/404 这类换模型也救不了的错误直接抛（不重试、不降级）。
+          全部失败时抛出最后一次的错误（包成 ``LLM 调用最终失败: ...``）。
+        """
+        models = self.config.models_for(role)
+        strategy = self.config.strategy_for(role)
+        order = self._model_order(role, models, strategy)
         client = await self._get_client()
-        started = time.perf_counter()
-        try:
-            resp = await client.post("/chat/completions", json=payload)
-        except httpx.HTTPError:
-            await self._record_usage(task_name, model, None, started, ok=False)
-            raise
-        try:
-            data: Any = resp.json()
-        except ValueError:
-            data = None
-        if resp.status_code >= 400:
-            # 400/422 且错误里提到 tools/tool 时视为不支持，标记后走退化路径
-            await self._record_usage(task_name, model, data, started, ok=False)
-            text = resp.text[:300]
-            lowered = text.lower()
-            if resp.status_code in (400, 404, 422, 501) and (
-                "tool" in lowered or "function" in lowered or "unsupported" in lowered
-            ):
-                self._tools_unsupported = True
-                raise ToolUnsupported(f"模型不支持工具调用：{text}")
-            raise LLMError(f"LLM 返回 {resp.status_code}: {text}")
-        choices = (data.get("choices") if isinstance(data, dict) else None) or []
-        if not choices:
-            await self._record_usage(task_name, model, data, started, ok=False)
-            raise LLMError(f"LLM 响应缺少 choices: {str(data)[:300]}")
-        await self._record_usage(task_name, model, data, started, ok=True)
-        message = choices[0].get("message") or {}
-        # 上游可能把工具调用写成 content 里的 DSML 文本；统一转成结构化 tool_calls，
-        # 让调用方走同一条执行通道（权限/审计/回喂都一样）。
-        return normalize_dsml_message(message)
+
+        if len(order) == 1:
+            return await self._call_single(
+                client, order[0], task, payload, on_success=on_success,
+                allow_tool_unsupported=allow_tool_unsupported,
+                # 工具调用一直只做一次往返，不因 max_retries 变成多次
+                retries=0 if allow_tool_unsupported else None,
+            )
+
+        # 按顺序尝试模型池，返回第一个成功的结果。可重试的失败切下一个；
+        # 全部失败抛最后一次的错误（保留原异常类型，不吞上游信息）。
+        last_error: Exception | None = None
+        for index, model in enumerate(order):
+            try:
+                return await self._call_single(
+                    client, model, task, payload, on_success=on_success,
+                    allow_tool_unsupported=allow_tool_unsupported, retries=0,
+                )
+            except ToolUnsupported:
+                raise
+            except LLMResponseError as exc:
+                if not is_retryable_status(exc.status):
+                    # 401/403/404/400：换模型也救不了，直接报，不做无谓切换
+                    raise
+                last_error = exc
+            except LLMError as exc:
+                # 网络/超时/空响应这类换模型可能有用，试下一个；
+                # 去掉单次调用那层「最终失败」包装，留下真正的错误原因
+                cause = exc.__cause__
+                last_error = cause if isinstance(cause, Exception) else exc
+            except httpx.HTTPError as exc:
+                last_error = exc
+            if last_error is not None and index + 1 < len(order):
+                logger.warning(
+                    "模型 %s 调用失败（%s），切换到下一个：%s", model, strategy, last_error
+                )
+        assert last_error is not None
+        # 全部失败时沿用与单模型一致的错误形状（信息里带最后一次的模型/状态），
+        # 网络错误和空响应都包成 LLMError，调用方统一按 LLM 失败处理。
+        raise LLMError(f"LLM 调用最终失败: {last_error}") from last_error
+
+    def _model_order(self, role: str, models: list[str], strategy: str) -> list[str]:
+        """按策略给出本次调用的尝试顺序。
+
+        - ``failover``：原顺序，依次尝试；
+        - ``round_robin``：以内存计数为起点轮换，计数只增不减（重启可重置）；
+        - ``random``：均匀随机起点，后续仍按列表顺序（全部试到）。
+        """
+        if len(models) <= 1 or strategy == "failover":
+            return list(models)
+        key = str(role or "chat").strip() or "chat"
+        if strategy == "round_robin":
+            start = self._round_robin.get(key, 0) % len(models)
+            self._round_robin[key] = start + 1
+        else:  # random
+            start = random.randrange(len(models))
+        return models[start:] + models[:start]
+
+    async def _call_single(
+        self,
+        client: httpx.AsyncClient,
+        model: str,
+        task: str,
+        payload: dict[str, Any],
+        *,
+        on_success: Callable[[Any], Any],
+        allow_tool_unsupported: bool,
+        retries: int | None = None,
+    ) -> Any:
+        """用指定模型调一次（失败时按 ``retries`` 退避重试，默认 ``max_retries``）。
+
+        ``allow_tool_unsupported`` 为 True 时把「不支持工具」的 4xx 转成
+        :class:`ToolUnsupported` 并记住，后续不再白试。
+        """
+        body = {**payload, "model": model}
+        retries = self.config.max_retries if retries is None else retries
+        last_error: Exception | None = None
+        for attempt in range(retries + 1):
+            started = time.perf_counter()
+            try:
+                resp = await client.post("/chat/completions", json=body)
+            except httpx.HTTPError as exc:
+                # 网络/超时层失败：这次尝试没有响应，token 记 NULL
+                await self._record_usage(task, model, None, started, ok=False)
+                last_error = exc
+            else:
+                try:
+                    data: Any = resp.json()
+                except ValueError:
+                    data = None
+                if resp.status_code >= 400:
+                    # 429/5xx 也可能带 usage 计费信息，能读到就记上
+                    await self._record_usage(task, model, data, started, ok=False)
+                    text = resp.text[:300]
+                    if allow_tool_unsupported and resp.status_code in (400, 404, 422, 501):
+                        lowered = text.lower()
+                        if "tool" in lowered or "function" in lowered or "unsupported" in lowered:
+                            self._tools_unsupported = True
+                            raise ToolUnsupported(f"模型不支持工具调用：{text}")
+                    error: Exception = LLMResponseError(
+                        f"LLM 返回 {resp.status_code}: {text}", status=resp.status_code
+                    )
+                    if not is_retryable_status(resp.status_code):
+                        # 401/404 这类配置错误重试也没用，直接失败
+                        raise error
+                    last_error = error
+                else:
+                    choices = (data.get("choices") if isinstance(data, dict) else None) or []
+                    if not choices:
+                        await self._record_usage(task, model, data, started, ok=False)
+                        last_error = LLMError(f"LLM 响应缺少 choices: {str(data)[:300]}")
+                    else:
+                        result = on_success(data)
+                        await self._record_usage(task, model, data, started, ok=True)
+                        return result
+            if attempt >= retries:
+                break
+            delay = retry_delay(attempt, self._retry_delays)
+            logger.warning(
+                "LLM 调用失败（第 %s 次），%.1fs 后重试：%s", attempt + 1, delay, last_error
+            )
+            await asyncio.sleep(delay)
+        raise LLMError(f"LLM 调用最终失败: {last_error}") from last_error
 
     async def _record_usage(
         self,

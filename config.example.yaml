@@ -11,13 +11,21 @@ llm:
   gate_model: ""
   # 可扩展的角色 → 模型映射：预置 fast / summary / vision（未配回退 chat_model），
   # 也可写自定义角色名（gate / distill 等）；同一角色写了这里就优先于上面的旧字段。
+  # 值可以是一个模型名，也可以是按优先级排的模型名列表（模型池）。
   models: {}
   #   fast: "deepseek-chat"        # 小任务（标题、轻判断等）
   #   summary: "deepseek-chat"     # 滚动摘要
   #   vision: "qwen-vl-plus"       # 看图
+  #   chat: ["deepseek-chat", "deepseek-chat-backup"]  # 模型池：主模型挂了自动切备选
+  # 模型池策略：failover（按顺序故障转移）/ round_robin（轮询）/ random（随机）
+  # 单模型列表时三种策略行为一致；配了多个模型时按策略最多走一遍、不额外退避。
+  model_strategy: "failover"
+  # 每角色覆盖全局策略；没写的角色跟随 model_strategy
+  model_strategies: {}
+  #   chat: "round_robin"
   temperature: 0.8
   timeout: 60          # 单次请求超时（秒）
-  max_retries: 2       # 失败重试次数：408/429/5xx 退避重试，间隔 1s / 3s
+  max_retries: 2       # 失败重试次数：408/429/5xx 退避重试，间隔 1s / 3s（仅单模型时）
 
 persona:
   path: "data/SOUL.md"
