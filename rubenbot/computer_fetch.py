@@ -85,7 +85,10 @@ async def _body(response: httpx.Response, output_limit: int) -> str:
                 clipped = True
                 break
     else:
-        data = await read_compressed_body(response.aiter_raw(), encoding, cap)
+        # 抓页只要正文前段：压缩正文解压到额度就截断，不因整页更大而放弃。
+        was_clipped = clipped
+        data = await read_compressed_body(response.aiter_raw(), encoding, cap, allow_truncated=True)
+        clipped = was_clipped or len(data) >= cap
     charset = (response.charset_encoding or "utf-8").lower()
     if charset not in {"utf-8", "us-ascii", "iso-8859-1", "windows-1252", "gbk",
                        "gb2312", "gb18030", "big5", "shift_jis"}:

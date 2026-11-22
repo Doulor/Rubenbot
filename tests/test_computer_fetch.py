@@ -181,20 +181,21 @@ def test_decodes_compressed_html(network, encoding, wbits):
 
 
 @pytest.mark.parametrize(('encoding', 'wbits'), [('gzip', 31), ('deflate', 15), ('deflate', -15)])
-def test_compressed_body_stops_at_decoded_limit(network, check_inflate_budget, encoding, wbits):
-    packed = zlib.compress(b'x' * 65536, wbits=wbits)
+def test_compressed_body_clips_at_decoded_limit(network, check_inflate_budget, encoding, wbits):
+    """解压后超过读取额度：按截断返回前段，不整页放弃（实测资讯站普遍 35–100 KiB）。"""
+    packed = zlib.compress(b'<p>' + b'x' * 65536 + b'</p>', wbits=wbits)
     assert len(packed) < 256
 
     def reply():
-        yield f'HTTP/1.1 200 OK\r\nContent-Encoding: {encoding}\r\n\r\n'.encode()
+        yield f'HTTP/1.1 200 OK\r\nContent-Encoding: {encoding}\r\nContent-Type: text/html\r\n\r\n'.encode()
         yield packed[:32]
         yield packed[32:]
         pytest.fail('超过正文读取上限后仍在读取响应')
 
     sizes = check_inflate_budget(8192)
     network.replies = [reply()]
-    with pytest.raises(ValueError, match='正文过大'):
-        fetch(sandbox=False, output_limit=256)
+    text = fetch(sandbox=False, output_limit=256)
+    assert text.startswith('x') and text.endswith('[已截断]') and len(text.encode()) <= 256
     assert sum(sizes) == 8193 and network.connections[0][2].closed
 
 

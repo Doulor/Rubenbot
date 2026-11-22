@@ -9,7 +9,6 @@ import asyncio
 import base64
 import json
 import logging
-from pathlib import Path
 
 import httpx
 import pytest
@@ -740,14 +739,15 @@ def test_voice_capability_disabled_in_config_sends_text(config, store):
 # ----------------------------------------------------------------------
 
 
-def test_snowluma_voice_capability_sends_record_file():
+def test_snowluma_voice_capability_sends_inline_record():
+    """协议端读不到本机路径（实测 ENOENT），语音按 base64:// 内联发送。"""
     calls = []
-    sent_paths = []
+    sent_sources = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content)
         calls.append((request.url.path, payload))
-        sent_paths.append(payload["message"][0]["data"]["file"])
+        sent_sources.append(payload["message"][0]["data"]["file"])
         return httpx.Response(200, json={"status": "ok", "data": {"message_id": 7}})
 
     client = httpx.AsyncClient(
@@ -767,9 +767,8 @@ def test_snowluma_voice_capability_sends_record_file():
     assert path == "/send_group_msg"
     assert payload["group_id"] == 55555
     assert payload["message"][0]["type"] == "record"
-    assert sent_paths[0].endswith(".amr")
-    # 临时文件发送后清理，不留垃圾
-    assert not Path(sent_paths[0]).exists()
+    assert sent_sources[0].startswith("base64://")
+    assert base64.b64decode(sent_sources[0][len("base64://"):]) == b"amr-bytes"
     assert result == {"message_id": 7}
     assert "message.voice" in SnowLumaAdapter.capabilities
 

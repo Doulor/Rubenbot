@@ -397,14 +397,40 @@ def test_sticker_segment_prefers_native_mface():
 
 
 def test_sticker_segment_falls_back_to_image_file(tmp_path):
+    """本地文件内联为 base64://：协议端在容器里读不到 bot 主机路径（实测 ENOENT）。"""
+    import base64
+
     from rubenbot.adapters.snowluma import sticker_segment_for_onebot
 
     path = tmp_path / "cat.png"
     path.write_bytes(b"png")
-    assert sticker_segment_for_onebot({"file": str(path)}) == {
-        "type": "image",
-        "data": {"file": str(path)},
+    segment = sticker_segment_for_onebot({"file": str(path)})
+    assert segment["type"] == "image"
+    source = segment["data"]["file"]
+    assert source.startswith("base64://")
+    assert base64.b64decode(source[len("base64://"):]) == b"png"
+
+
+def test_sticker_segment_inlines_library_file_over_native_url(tmp_path):
+    """库里有本地本体时用字节，不留协议端下载不到的 rkey URL（实测 400）。"""
+    from rubenbot.adapters.base import sticker_native_ref
+    from rubenbot.adapters.snowluma import sticker_segment_for_onebot
+
+    path = tmp_path / "cat.png"
+    path.write_bytes(b"png")
+    reference = {
+        "file": str(path),
+        "native_refs": {"snowluma": {"kind": "image", "data": {
+            "file": "abc.jpg", "url": "https://multimedia.nt.qq.com.cn/download?rkey=x",
+            "summary": "[动画表情]",
+        }}},
     }
+    assert sticker_native_ref(reference, "snowluma")["kind"] == "image"
+    segment = sticker_segment_for_onebot(reference)
+    assert segment["type"] == "image"
+    assert segment["data"]["summary"] == "[动画表情]"
+    assert segment["data"]["file"].startswith("base64://")
+    assert "url" not in segment["data"]
 
 
 def test_sticker_segment_without_source_is_none():
@@ -477,12 +503,11 @@ def test_call_capability_send_sticker_private_and_image_fallback(tmp_path):
         await adapter._client.aclose()
 
     asyncio.run(scenario())
-    assert calls == [
-        (
-            "/send_private_msg",
-            {"user_id": 12345, "message": [{"type": "image", "data": {"file": str(path)}}]},
-        )
-    ]
+    path_, payload = calls[0]
+    assert path_ == "/send_private_msg"
+    assert payload["user_id"] == 12345
+    segment = payload["message"][0]
+    assert segment["type"] == "image" and segment["data"]["file"].startswith("base64://")
 
 
 def test_call_capability_send_sticker_without_source_raises():

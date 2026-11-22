@@ -11,12 +11,10 @@ sender 里有 user_id / nickname，message 可能是字符串或消息段数组�
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
-import mimetypes
-import os
 import re
-import tempfile
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -308,16 +306,13 @@ class SnowLumaAdapter(BaseAdapter):
         return message_id
 
     async def send_file(self, chat_id: str, filename: str, content: bytes, *, chat_type: str) -> None:
-        # 与语音上传相同，OneBot 实现须能读取 bot 的临时目录。只暴露快照，
-        # 不传执行上下文的原路径，避免校验后协议端重新打开另一份文件。
-        with tempfile.NamedTemporaryFile(prefix="rubenbot-upload-") as snapshot:
-            snapshot.write(content)
-            snapshot.flush()
-            private = chat_type == "private"
-            await self.call_api("upload_private_file" if private else "upload_group_file", {
-                "user_id" if private else "group_id": _to_id(chat_id),
-                "name": filename, "file": snapshot.name,
-            })
+        # 协议端（SnowLuma 容器）读不到本机路径，实测传路径报 ENOENT；
+        # 用 base64 内联来源，实测 upload_private_file 可成功发布为 file 段。
+        private = chat_type == "private"
+        await self.call_api("upload_private_file" if private else "upload_group_file", {
+            "user_id" if private else "group_id": _to_id(chat_id),
+            "name": filename, "file": _inline_bytes(content),
+        })
 
     async def heartbeat(self) -> bool:
         """可选 HTTP 心跳探测：get_status 是否可用。"""
@@ -463,11 +458,11 @@ class SnowLumaAdapter(BaseAdapter):
         return payload.get("data", payload)
 
     async def _send_voice(self, kwargs: dict[str, Any]) -> Any:
-        """message.voice：把音频字节落成临时文件，用 record 段发出去。
+        """message.voice：把音频字节内联成 record 段发出去。
 
-        OneBot 的 record 段 ``file`` 接受本地路径；临时文件在发送完成后删除
-        （协议端可能异步读取，所以放到 finally 里删）。没有音频字节直接报错，
-        由上层降级为发文字。
+        协议端与 bot 不共享文件系统（SnowLuma 在容器里，实测传本机路径
+        报 ``ENOENT``），所以这里一律发 ``base64://`` 内联来源；协议端
+        自己落临时文件再转码。音频本身仍在本地不落盘。
         """
         data = kwargs.get("audio") or kwargs.get("data") or b""
         if isinstance(data, str):
@@ -478,30 +473,20 @@ class SnowLumaAdapter(BaseAdapter):
         if chat_id in (None, ""):
             raise CapabilityError("message.voice 需要 chat_id")
         chat_type = str(kwargs.get("chat_type") or "group")
-        # 扩展名按 MIME 推断（TTS 默认是 mp3）；协议端按扩展名识别音频格式
-        mime = str(kwargs.get("mime") or kwargs.get("mime_type") or "")
-        suffix = str(kwargs.get("suffix") or kwargs.get("format") or "").lstrip(".")
-        if not suffix:
-            suffix = (mimetypes.guess_extension(mime.split(";")[0].strip()) or ".amr").lstrip(".")
-        fd, path = tempfile.mkstemp(prefix="rubenbot-voice-", suffix=f".{suffix}")
+        action = "send_private_msg" if chat_type == "private" else "send_group_msg"
+        key = "user_id" if chat_type == "private" else "group_id"
         try:
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(data)
-            action = "send_private_msg" if chat_type == "private" else "send_group_msg"
-            key = "user_id" if chat_type == "private" else "group_id"
             payload = await self.call_api(
                 action,
-                {key: _to_id(str(chat_id)), "message": [{"type": "record", "data": {"file": path}}]},
+                {
+                    key: _to_id(str(chat_id)),
+                    "message": [{"type": "record", "data": {"file": _inline_bytes(data)}}],
+                },
             )
         except CapabilityError:
             raise
         except Exception as exc:  # noqa: BLE001 - 能力失败不能打断调用方
             raise CapabilityError(f"message.voice 失败：{exc}") from exc
-        finally:
-            try:
-                Path(path).unlink(missing_ok=True)
-            except OSError:  # pragma: no cover - 删不掉不致命
-                pass
         return payload.get("data", payload) if isinstance(payload, dict) else payload
 
     async def _transcribe_ptt(self, kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -574,10 +559,15 @@ def _ptt_text(payload: Any) -> str:
 
 
 def sticker_segment_for_onebot(sticker: Any) -> dict[str, Any] | None:
-    """表情引用 -> OneBot 发送段（mface 优先，退 image）；没有可用来源返回 None。
+    """表情引用 -> OneBot 发送段（mface 优先，退图片）；没有可用来源返回 None。
 
     原生引用约定为 ``{"kind": "mface"|"image", "data": {...}}``；也接受直接
     给段 ``data`` 的旧写法（没有 ``kind`` 时按 mface 处理）。纯函数，便于单测。
+
+    图片段的本体一律内联成 ``base64://``：SnowLuma 在容器里，读不到 bot 主机
+    的路径；QQ 多媒体 URL 又带一次性 ``rkey``，交回协议端自己下载会被 400
+    （2026-11-23 实测：带 rkey 与去掉查询都一样）。所以表情库有本地文件就用
+    库里的字节，没有才退回 URL。
     """
     native = sticker_native_ref(sticker, "snowluma")
     if isinstance(native, Mapping):
@@ -589,15 +579,24 @@ def sticker_segment_for_onebot(sticker: Any) -> dict[str, Any] | None:
             raw = {key: value for key, value in native.items() if key != "kind"}
         data = {str(k): v for k, v in raw.items() if v not in (None, "")}
         if data:
+            if kind == "image":
+                inline = _local_inline(_library_file(sticker))
+                if inline:
+                    # 保留 summary 等描述字段，只换掉协议端读不到的来源
+                    data = {k: v for k, v in data.items() if k not in ("file", "url")}
+                    return {"type": "image", "data": {**data, "file": inline}}
             return {"type": kind, "data": data}
     file = _sticker_file(sticker)
-    if file:
+    if file.startswith(("http://", "https://", "base64://", "data:")):
         return {"type": "image", "data": {"file": file}}
+    inline = _local_inline(file)
+    if inline:
+        return {"type": "image", "data": {"file": inline}}
     return None
 
 
 def _sticker_file(sticker: Any) -> str:
-    """表情引用里的图片本体：绝对路径优先，其次 URL（占位段里可能有）。"""
+    """表情引用里的图片本体：本地文件优先，其次 URL（占位段里可能有）。"""
     if not isinstance(sticker, Mapping):
         return ""
     for key in ("file", "url"):
@@ -605,6 +604,32 @@ def _sticker_file(sticker: Any) -> str:
         if value:
             return str(value)
     return ""
+
+
+def _library_file(sticker: Any) -> str:
+    """表情引用里的本地文件路径；只有 URL 时返回空串（URL 不可靠，见上）。"""
+    if not isinstance(sticker, Mapping):
+        return ""
+    value = sticker.get("file")
+    return str(value) if value else ""
+
+
+def _local_inline(path_value: str) -> str:
+    """本地文件 -> ``base64://`` 内联来源；不是可读文件时返回空串。"""
+    if not path_value or path_value.startswith(("http://", "https://", "base64://", "data:")):
+        return ""
+    try:
+        candidate = Path(path_value)
+        if candidate.is_file() and candidate.stat().st_size > 0:
+            return _inline_bytes(candidate.read_bytes())
+    except OSError:
+        return ""
+    return ""
+
+
+def _inline_bytes(data: bytes) -> str:
+    """音频/图片字节 -> OneBot ``file`` 字段接受的内联来源。"""
+    return "base64://" + base64.b64encode(data).decode("ascii")
 
 
 def _to_id(value: str | int) -> int | str:

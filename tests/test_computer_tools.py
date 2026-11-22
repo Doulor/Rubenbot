@@ -3,7 +3,6 @@
 import asyncio
 import json
 from dataclasses import replace
-from pathlib import Path
 
 import pytest
 
@@ -184,20 +183,24 @@ def test_audit_survives_restart_without_argument_values(bot, tmp_path):
 @pytest.mark.parametrize(('chat_type', 'action', 'key'), [
     ('group', 'upload_group_file', 'group_id'), ('private', 'upload_private_file', 'user_id'),
 ])
-def test_onebot_uploads_snapshot_then_removes_it(monkeypatch, chat_type, action, key):
+def test_onebot_uploads_inline_bytes(monkeypatch, chat_type, action, key):
+    """协议端读不到本机路径（实测 ENOENT），附件按 base64 内联上传。"""
+    import base64
+
     adapter = SnowLumaAdapter()
-    snapshots = []
+    calls = []
 
     async def upload(method, args):
         assert (method, args[key], args['name']) == (action, 123, 'report.txt')
-        snapshot = Path(args['file'])
-        assert snapshot.read_bytes() == b'report'
-        snapshots.append(snapshot)
+        source = args['file']
+        assert source.startswith('base64://')
+        assert base64.b64decode(source[len('base64://'):]) == b'report'
+        calls.append(source)
         return {'status': 'ok'}
 
     monkeypatch.setattr(adapter, 'call_api', upload)
     asyncio.run(adapter.send_file('123', 'report.txt', b'report', chat_type=chat_type))
-    assert len(snapshots) == 1 and not snapshots[0].exists()
+    assert len(calls) == 1
 
 
 def test_attachment_errors_do_not_expose_protocol_details(bot, monkeypatch):
