@@ -297,7 +297,7 @@ class ReplyConfig:
     # 每字毫秒数：下一段有多少个非空白字符就等多少毫秒
     segment_delay_per_char_ms: float = 130.0
     # 单次段间停顿的上下限（毫秒）：太短没有停顿感，太长拖慢整条回复
-    segment_delay_min_ms: float = 600.0
+    segment_delay_min_ms: float = 1500.0
     segment_delay_max_ms: float = 4000.0
 
     def __post_init__(self) -> None:
@@ -307,7 +307,7 @@ class ReplyConfig:
         self.segment_delay_per_char_ms = max(
             0.0, _as_float(self.segment_delay_per_char_ms, 130.0)
         )
-        self.segment_delay_min_ms = max(0.0, _as_float(self.segment_delay_min_ms, 600.0))
+        self.segment_delay_min_ms = max(0.0, _as_float(self.segment_delay_min_ms, 1500.0))
         self.segment_delay_max_ms = max(0.0, _as_float(self.segment_delay_max_ms, 4000.0))
 
 
