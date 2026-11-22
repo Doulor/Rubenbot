@@ -63,6 +63,14 @@ ROLE_FALLBACKS: dict[str, tuple[str, ...]] = {
 # 预置角色表；`models` 里写别的角色名也允许，只是回退链只有 chat
 MODEL_ROLES: tuple[str, ...] = tuple(ROLE_FALLBACKS)
 
+# 模型池策略：全局默认值 + 每角色可用同名字段覆盖。
+# - failover：按列表顺序调，失败（超时/连接错误/429/5xx）自动切下一个；
+# - round_robin：每次调用按顺序轮换起点，计数只在内存里；
+# - random：每次调用在列表里均匀随机挑起点。
+# 列表只有一个模型时三种策略完全等价（等于旧行为）。
+MODEL_STRATEGIES: tuple[str, ...] = ("failover", "round_robin", "random")
+DEFAULT_MODEL_STRATEGY = "failover"
+
 
 @dataclass
 class LLMConfig:
@@ -71,10 +79,16 @@ class LLMConfig:
     角色表有两代写法，同时兼容：
 
     - ``models``：可扩展映射 ``{角色: 模型名}``，例如 ``fast: 小模型``；
+      值也可以写成按优先级排的模型名列表（模型池），例如
+      ``chat: [主模型, 备模型]``；
     - ``chat_model`` / ``extract_model`` / ``consolidate_model``：旧字段。
 
     解析顺序是「精确角色 → 回退链 → chat → 默认模型」；``models`` 优先于
     旧字段。旧配置不写 ``models`` 时行为与以前完全一致。
+
+    模型池策略由 ``model_strategy``（全局默认）与 ``model_strategies``
+    （每角色覆盖）决定，见 :data:`MODEL_STRATEGIES`。列表里只有一个模型时
+    三种策略完全等价。
     """
 
     base_url: str = "https://api.openai.com/v1"
@@ -91,38 +105,79 @@ class LLMConfig:
     chat_frequency_penalty: float = 0.3
     timeout: float = 60.0
     max_retries: int = 2
-    # 角色 → 模型名。预置角色见 MODEL_ROLES，也可写自定义角色。
+    # 角色 → 模型名（单个字符串）或按优先级排的模型名列表（模型池）。
     # 放在末尾是为了不改变旧字段的位置参数顺序。
-    models: dict[str, str] = field(default_factory=dict)
+    models: dict[str, str | list[str]] = field(default_factory=dict)
+    # 全局默认策略；每角色可用 ``model_strategies`` 覆盖
+    model_strategy: str = DEFAULT_MODEL_STRATEGY
+    model_strategies: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        """把 ``models`` 归一化成「非空字符串 → 字符串」的字典。"""
+        """归一化模型池与策略：模型名去空白、去重、空列表视为未配置。
+
+        未知策略在加载配置时不报错（保持旧的宽松加载），回落到默认策略并
+        记 warning；WebUI 提交走严格校验，不会写进文件。
+        """
         raw = self.models if isinstance(self.models, dict) else {}
-        cleaned: dict[str, str] = {}
+        cleaned: dict[str, str | list[str]] = {}
         for key, value in raw.items():
             name = str(key).strip()
             if not name or value is None:
                 continue
-            model = str(value).strip()
-            if model:
-                cleaned[name] = model
+            models = _normalize_models(value)
+            if not models:
+                # 空列表、全是空名字的列表在文件里写错了：忽略这个角色并说清楚，
+                # 不让它悄悄变成「跟随回退链」还不留痕迹
+                if value not in ("", [], ()):
+                    logger.warning("角色 %s 的模型列表为空或模型名为空，已忽略：%r", name, value)
+                continue
+            cleaned[name] = models[0] if len(models) == 1 else models
         self.models = cleaned
 
-    def _explicit_model(self, role: str) -> str | None:
+        strategy = str(self.model_strategy or "").strip().lower()
+        if strategy not in MODEL_STRATEGIES:
+            if strategy:
+                logger.warning("未知的模型池策略 %r，回落到 %s", self.model_strategy, DEFAULT_MODEL_STRATEGY)
+            strategy = DEFAULT_MODEL_STRATEGY
+        self.model_strategy = strategy
+
+        raw_strategies = self.model_strategies if isinstance(self.model_strategies, dict) else {}
+        strategies: dict[str, str] = {}
+        for key, value in raw_strategies.items():
+            role = str(key).strip()
+            if not role or value is None:
+                continue
+            name = str(value).strip().lower()
+            if not name:
+                continue
+            if name not in MODEL_STRATEGIES:
+                logger.warning("角色 %s 的模型池策略 %r 未知，已忽略", role, value)
+                continue
+            strategies[role] = name
+        self.model_strategies = strategies
+
+    def _explicit_models(self, role: str) -> list[str] | None:
         """只看这个角色自己配没配，不沿着回退链走。"""
         mapped = self.models.get(role)
         if mapped:
-            return mapped
+            return [mapped] if isinstance(mapped, str) else list(mapped)
         # 旧字段：保持完全兼容
         if role == "extract":
-            return self.extract_model or None
-        if role == "consolidate":
-            return self.consolidate_model or None
-        if role == "gate":
-            return self.gate_model or None
-        if role == "chat":
-            return self.chat_model or None
-        return None
+            value = self.extract_model
+        elif role == "consolidate":
+            value = self.consolidate_model
+        elif role == "gate":
+            value = self.gate_model
+        elif role == "chat":
+            value = self.chat_model
+        else:
+            value = None
+        return [value] if value else None
+
+    def _explicit_model(self, role: str) -> str | None:
+        """只看这个角色自己配没配，返回首选模型。"""
+        models = self._explicit_models(role)
+        return models[0] if models else None
 
     def _resolve_model(self, role: str, seen: set[str]) -> str | None:
         if role in seen:
@@ -138,14 +193,56 @@ class LLMConfig:
                 return resolved
         return None
 
+    def _resolve_models(self, role: str, seen: set[str]) -> list[str] | None:
+        """沿回退链取整个模型池；顺序与单个模型解析规则一致。"""
+        if role in seen:
+            return None
+        seen.add(role)
+        explicit = self._explicit_models(role)
+        if explicit:
+            return explicit
+        for fallback in ROLE_FALLBACKS.get(role, ("chat",)):
+            resolved = self._resolve_models(fallback, seen)
+            if resolved:
+                return resolved
+        return None
+
     def model_for(self, role: str = "chat") -> str:
-        """按用途取模型：精确角色 → 回退链 → chat → 默认模型。
+        """按用途取首选模型：精确角色 → 回退链 → chat → 默认模型。
 
         记忆 v2 的 ``gate`` 走 ``gate_model``；``distill`` 未配置时沿用
         ``consolidate`` 的回退链（归纳模型 → chat）。
         """
-        name = str(role or "chat").strip() or "chat"
+        name = _role_name(role)
         return self._resolve_model(name, set()) or self.chat_model or DEFAULT_CHAT_MODEL
+
+    def models_for(self, role: str = "chat") -> list[str]:
+        """按用途取按优先级排的模型池；未配置时回退到单个 ``model_for``。"""
+        name = _role_name(role)
+        return self._resolve_models(name, set()) or [self.model_for(name)]
+
+    def strategy_for(self, role: str = "chat") -> str:
+        """这个角色该用哪种模型池策略：每角色覆盖优先，否则全局默认。"""
+        return self.model_strategies.get(_role_name(role), self.model_strategy)
+
+
+def _role_name(role: str | None) -> str:
+    return str(role or "chat").strip() or "chat"
+
+
+def _normalize_models(value: Any) -> list[str]:
+    """把配置里的模型名/模型列表归一化成去重后的非空字符串列表。"""
+    if value is None or isinstance(value, bool):
+        return []
+    items = value if isinstance(value, (list, tuple)) else [value]
+    result: list[str] = []
+    for item in items:
+        if item is None or isinstance(item, bool):
+            continue
+        text = str(item).strip()
+        if text and text not in result:
+            result.append(text)
+    return result
 
 
 @dataclass

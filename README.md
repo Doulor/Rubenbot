@@ -3,6 +3,7 @@
 RubenBot 是一个以**记忆**为核心的拟人社交聊天 bot 框架。它面向群聊/私聊场景，目标不是做一个随叫随到的问答助手，而是像一个住在群里的普通人：有自己的性格和节奏，会记得你说过的事，也会在合适的时候插一句嘴。
 
 - **记忆优先**：按人建档，消息先落流水，再由模型提炼耐久事实；检索时按稀有词加权，定期归纳去冗。
+- **模型池与故障转移**：每个角色可配多个模型，按角色选故障转移 / 轮询 / 随机；中转超时或限流自动切下一个，用量按实际出结果的模型记账。
 - **有心情、有远近**：每个人的好感度和 bot 当前情绪由代码按规则累积与衰减，变化可查；生成时只作一句背景提醒，不硬控说话内容。
 - **轻量**：Python 3.12，核心依赖只有 `httpx`、`websockets`、`PyYAML`，存储用标准库 SQLite。
 - **适配器模式**：主循环不感知平台。已内置 Console（本地调试）与 SnowLuma（OneBot v11）。
@@ -151,7 +152,7 @@ bot 对每个人的好感度、以及自己当下的心情，都由确定性规�
 | --- | --- |
 | `rubenbot/config.py` | 读取 YAML 配置，展开 `${ENV_VAR}`，未知键忽略，缺文件走默认值 |
 | `rubenbot/persona.py` | 加载人格：五文件目录（`data/persona/`）优先，缺目录时回退单文件 SOUL.md |
-| `rubenbot/llm.py` | OpenAI 兼容客户端；按角色（`chat` / `extract` / `consolidate` / `fast` / `summary` / `vision` 及自定义）选模型；408/429/5xx 指数退避重试；每次调用写用量表 |
+| `rubenbot/llm.py` | OpenAI 兼容客户端；按角色（`chat` / `extract` / `consolidate` / `fast` / `summary` / `vision` 及自定义）选模型，支持模型池（故障转移 / 轮询 / 随机）；408/429/5xx 指数退避重试；每次调用写用量表（按实际出结果的模型记） |
 | `rubenbot/core.py` | 消息主循环、合并窗口调度、决策、上下文拼装、拆条发送、后台维护 |
 | `rubenbot/search.py` | Tavily / DeepSeek 渠道回退、结果链接归一、按会话冷却 |
 | `rubenbot/verification.py` | 限时读取结果页，用隔离的阅读步骤选原句与出处；无法核对就不作答 |
@@ -283,8 +284,9 @@ WebUI 的「群组与意愿」可按名字或 ID 查会话，每个群展开后�
 | --- | --- | --- |
 | `llm` | `base_url` `api_key` `chat_model` | 任意 OpenAI 兼容接口 |
 | | `extract_model` `consolidate_model` | 留空则跟随 `chat_model` |
-| `models` | 可扩展的角色 → 模型映射（如 `fast` / `summary` / `vision`，未配的角色回退 `chat_model`），优先于上面两个旧字段 |
-| `timeout` `max_retries` | 单次请求超时（秒）与失败重试次数（408/429/5xx，间隔 1s / 3s） |
+| `models` | 可扩展的角色 → 模型映射，值为模型名或按优先级排的模型名列表（模型池，如 `chat: [主模型, 备模型]`；`fast` / `summary` / `vision` 未配的角色回退 `chat_model`），优先于上面两个旧字段 |
+| | `model_strategy` `model_strategies` | 模型池策略：`failover`（默认，按顺序故障转移）/ `round_robin`（轮询）/ `random`（随机）；每角色可在 `model_strategies` 覆盖。单模型时三种等价；多模型时最多按列表走一遍、不额外退避 |
+| `timeout` `max_retries` | 单次请求超时（秒）与失败重试次数（408/429/5xx，间隔 1s / 3s；仅单模型时生效） |
 | `persona` | `path` | 人格文件，默认 `data/SOUL.md` |
 | `decision` | `min_reply_interval_seconds` | 新路径护栏：同一会话两次开口的最小间隔（默认 20 秒，必回不受限） |
 | | `dir` | 五文件人设目录，默认取 `path` 同级的 `persona/`；目录里有 `persona.md` 就按五文件加载 |

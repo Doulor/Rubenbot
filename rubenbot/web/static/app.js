@@ -3303,51 +3303,217 @@ function listEditor(values, onChange, { placeholder = "输入后回车或点添�
   return chips;
 }
 
-/** 模型角色表：预置角色 + 自定义角色名，值留空表示跟随对话模型。 */
+/** 模型池策略：与后端 rubenbot.config.MODEL_STRATEGIES 保持一致。 */
+const MODEL_POOL_STRATEGIES = ["failover", "round_robin", "random"];
+const MODEL_POOL_STRATEGY_LABELS = {
+  failover: "故障转移（按顺序）",
+  round_robin: "轮询",
+  random: "随机",
+};
+
+/** 配置里的模型值可能是单个字符串（旧写法）或模型列表（模型池）。 */
+function modelPoolValue(value) {
+  if (Array.isArray(value)) return value.filter((item) => typeof item === "string");
+  if (typeof value === "string" && value.trim()) return [value];
+  return [];
+}
+
+/** 写回模型池：0 个删掉角色、单个非空模型写回字符串（保持旧格式）、其余写列表。
+ * 单个空名也写成列表 ``[""]``，让后端按「模型名不能为空」报错，而不是被
+ * 当成「这个角色没配」悄悄清掉。
+ */
+function setModelPool(draft, role, list) {
+  draft.llm = draft.llm || {};
+  const models = draft.llm.models && typeof draft.llm.models === "object" ? { ...draft.llm.models } : {};
+  const cleaned = list.filter((item) => item !== undefined && item !== null);
+  if (cleaned.length === 0) delete models[role];
+  else if (cleaned.length === 1 && cleaned[0].trim()) models[role] = cleaned[0];
+  else models[role] = cleaned;
+  draft.llm.models = models;
+}
+
+/** 模型池编辑器：每角色一条模型列表（可增删、调顺序）与策略覆盖。 */
 function modelsEditor(draft) {
   const ROLES = [
+    ["chat", "对话"],
     ["fast", "快速档（小任务）"],
     ["summary", "滚动摘要"],
     ["vision", "看图"],
     ["gate", "分寸审查"],
     ["distill", "画像提炼"],
   ];
-  const models = () => {
-    const current = draft.llm && draft.llm.models;
-    return current && typeof current === "object" ? current : {};
-  };
-  const field = (role, label) =>
-    h(
-      "div",
-      { class: "settings-field" },
-      h("span", { class: "field-label" }, `${label}（${role}）`),
-      h("input", {
-        class: "input mono",
-        type: "text",
-        value: models()[role] || "",
-        placeholder: "留空跟随对话模型",
-        "aria-label": `${label} 模型`,
-        oninput: (event) => {
-          const next = { ...models() };
-          const value = event.target.value.trim();
-          if (value) next[role] = value;
-          else delete next[role];
-          draft.llm = draft.llm || {};
-          draft.llm.models = next;
-        },
-      })
+  draft.llm = draft.llm || {};
+  const models = () => (draft.llm.models && typeof draft.llm.models === "object" ? draft.llm.models : {});
+  const strategies = () =>
+    draft.llm.model_strategies && typeof draft.llm.model_strategies === "object"
+      ? draft.llm.model_strategies
+      : {};
+  const listFor = (role) => modelPoolValue(models()[role]);
+
+  const body = h("div", { style: { display: "grid", gap: "14px" } });
+
+  function roleRow(role, label) {
+    const list = listFor(role);
+    const strategy = strategies()[role] || "";
+    const rows = list.map((model, index) =>
+      h(
+        "div",
+        { class: "model-pool-row", dataset: { motionKey: `${role}-${index}`, role, index: String(index) } },
+        h("span", { class: "model-pool-order" }, String(index + 1)),
+        h("input", {
+          class: "input mono",
+          type: "text",
+          value: model,
+          "aria-label": `${label} 第 ${index + 1} 个模型`,
+          oninput: (event) => {
+            const next = listFor(role).slice();
+            next[index] = event.target.value;
+            setModelPool(draft, role, next);
+          },
+        }),
+        h(
+          "button",
+          {
+            class: "icon-btn-sm",
+            type: "button",
+            title: "上移",
+            "aria-label": `${label} 第 ${index + 1} 个模型上移`,
+            disabled: index === 0,
+            onclick: () => {
+              const next = listFor(role).slice();
+              [next[index - 1], next[index]] = [next[index], next[index - 1]];
+              setModelPool(draft, role, next);
+              render();
+            },
+          },
+          icon("caret", "icon up")
+        ),
+        h(
+          "button",
+          {
+            class: "icon-btn-sm",
+            type: "button",
+            title: "下移",
+            "aria-label": `${label} 第 ${index + 1} 个模型下移`,
+            disabled: index === list.length - 1,
+            onclick: () => {
+              const next = listFor(role).slice();
+              [next[index + 1], next[index]] = [next[index], next[index + 1]];
+              setModelPool(draft, role, next);
+              render();
+            },
+          },
+          icon("caret", "icon down")
+        ),
+        h(
+          "button",
+          {
+            class: "icon-btn-sm danger",
+            type: "button",
+            title: "删除",
+            "aria-label": `删除 ${label} 的第 ${index + 1} 个模型`,
+            onclick: () => {
+              const next = listFor(role).slice();
+              next.splice(index, 1);
+              setModelPool(draft, role, next);
+              render();
+            },
+          },
+          icon("trash")
+        )
+      )
     );
 
-  const extraRoles = Object.keys(models()).filter((role) => !ROLES.some(([name]) => name === role));
+    const input = h("input", {
+      class: "input mono",
+      type: "text",
+      placeholder: list.length ? "再加一个备选模型" : "留空跟随回退链；填模型名启用模型池",
+      "aria-label": `${label} 新增模型`,
+    });
+    const add = () => {
+      const value = input.value.trim();
+      if (!value) {
+        toast("先填模型名再添加", "error");
+        return;
+      }
+      if (listFor(role).includes(value)) {
+        toast("这个模型已经在列表里了", "error");
+        return;
+      }
+      setModelPool(draft, role, listFor(role).concat(value));
+      render();
+    };
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        add();
+      }
+    });
 
+    return h(
+      "div",
+      { class: "model-pool-item", dataset: { role } },
+      h(
+        "div",
+        { class: "model-pool-head" },
+        h("span", { class: "field-label" }, `${label}（${role}）`),
+        selectField(
+          strategy,
+          [
+            { value: "", label: "跟随全局策略" },
+            ...MODEL_POOL_STRATEGIES.map((name) => ({
+              value: name,
+              label: `${name}（${MODEL_POOL_STRATEGY_LABELS[name]}）`,
+            })),
+          ],
+          (value) => {
+            draft.llm = draft.llm || {};
+            const next = { ...strategies() };
+            if (value) next[role] = value;
+            else delete next[role];
+            draft.llm.model_strategies = next;
+          }
+        )
+      ),
+      h(
+        "div",
+        { class: "model-pool-list" },
+        rows.length
+          ? rows
+          : [h("div", { class: "field-hint" }, "未配置：跟随回退链（未配置的角色回退到对话模型）。")]
+      ),
+      h(
+        "div",
+        { class: "model-pool-add" },
+        input,
+        h("button", { class: "btn btn-sm btn-ghost", type: "button", onclick: add }, icon("plus"), "添加")
+      )
+  );
+  }
+
+  function render() {
+    const extraRoles = Object.keys(models()).filter((role) => !ROLES.some(([name]) => name === role));
+    body.replaceChildren(
+      ...ROLES.map(([role, label]) => roleRow(role, label)),
+      ...extraRoles.map((role) => roleRow(role, role))
+    );
+  }
+
+  render();
   return h(
     "div",
     { style: { display: "grid", gap: "12px" } },
-    h("div", { class: "settings-fields" }, ...ROLES.map(([role, label]) => field(role, label)),
-      ...extraRoles.map((role) => field(role, role))),
-    h("span", { class: "field-hint" }, "留空即跟随对话模型；配置里写过的自定义角色名会原样保留在下面（刷新页面后可见）。")
+    body,
+    h(
+      "span",
+      { class: "field-hint" },
+      "每个角色的模型按顺序排：故障转移遇超时/限流/5xx 自动试下一个；" +
+        "轮询每次按顺序换起点；随机每次均匀挑一个。只有一个模型时三种策略等价，" +
+        "配了模型池的角色优先于上面的旧模型字段；空模型名与空列表不允许保存。"
+    )
   );
 }
+
 
 /** 任意键 → 数值 的表（目前用于 emotion.threshold_adjust 的「心情 → 微调」）。 */
 function mapEditor(draft, path, { keyPlaceholder = "键", valuePlaceholder = "值" } = {}) {
@@ -4071,14 +4237,24 @@ function settingsCardSpecs(draft, secrets, pluginsAvailable, groupIdentities = {
     },
     {
       path: "llm.models",
-      node: card("模型角色与审查模型", {
-        hint: "「角色 → 模型名」；角色配了就用，没配回退对话模型",
+      node: card("模型池与审查模型", {
+        hint: "每个角色可以配多个模型，按策略调用；配了就用，没配回退对话模型",
         body: h(
           "div",
           { style: { display: "grid", gap: "16px" } },
           fieldGrid(
             [
               { path: "llm.gate_model", label: "分寸审查模型", hint: "记忆分寸审查用；留空跟随对话模型", mono: true },
+              {
+                path: "llm.model_strategy",
+                label: "默认调用策略",
+                kind: "select",
+                options: MODEL_POOL_STRATEGIES.map((name) => ({
+                  value: name,
+                  label: `${name}（${MODEL_POOL_STRATEGY_LABELS[name]}）`,
+                })),
+                hint: "模型池的默认策略；每个角色可以单独覆盖",
+              },
             ],
             draft
           ),

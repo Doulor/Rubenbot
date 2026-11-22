@@ -24,12 +24,14 @@ from dataclasses import asdict
 from typing import Any
 
 from ..config import (
-    COMPUTER_LIMITS, SEARCH_PROVIDERS, STT_PROVIDERS, TTS_MODES, TTS_PROVIDERS,
+    COMPUTER_LIMITS, DEFAULT_MODEL_STRATEGY, MODEL_STRATEGIES, SEARCH_PROVIDERS,
+    STT_PROVIDERS, TTS_MODES, TTS_PROVIDERS,
     ComputerConfig, Config, MCPConfig, MCPServerConfig,
 )
 from ..decision import parse_quiet_hours
 
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+MODEL_NAME_MAX_LEN = 120
 ADAPTER_NAMES = ("console", "snowluma")
 
 SNOWLUMA_DEFAULTS = {
@@ -51,8 +53,14 @@ SECRET_PATHS = (
     "webui.password",
 )
 
-# 合并时整段替换、不与旧值递归合并的路径
-_REPLACE_PATHS = {("decision", "groups")}
+# 合并时整段替换、不与旧值递归合并的路径。
+# 模型池与策略是「整张表」语义：表单提交的是完整视图，删掉的角色必须真的
+# 从 YAML 里消失（空字典也替换），不能沿用旧值。
+_REPLACE_PATHS = {
+    ("decision", "groups"),
+    ("llm", "models"),
+    ("llm", "model_strategies"),
+}
 
 
 # ----------------------------------------------------------------------
@@ -95,7 +103,7 @@ SETTINGS_GROUPS: tuple[dict[str, Any], ...] = (
         "title": "设置",
         "sub": "模型、搜索、主动触达、适配器与运行环境",
         "pages": (
-            {"id": "model", "title": "模型", "sub": "接口、密钥、模型角色与重试"},
+            {"id": "model", "title": "模型", "sub": "接口、密钥、模型池与重试"},
             {"id": "search", "title": "搜索", "sub": "web_search 的渠道顺序与密钥"},
             {"id": "computer", "title": "操作电脑", "sub": "真机授权、访客限额与最近操作记录"},
             {"id": "mcp", "title": "MCP 工具", "sub": "外部服务器、连接超时与工具调用限制"},
@@ -242,9 +250,11 @@ def structured_config(config: Config) -> dict[str, Any]:
     llm["extract_model"] = llm.get("extract_model") or ""
     llm["consolidate_model"] = llm.get("consolidate_model") or ""
     llm["gate_model"] = llm.get("gate_model") or ""
-    # 角色表统一成「角色 → 模型名」，没配的角色不出现
+    # 角色表统一成「角色 → 模型名或模型名列表」，没配的角色不出现
     models = llm.get("models")
     llm["models"] = dict(models) if isinstance(models, dict) else {}
+    strategies = llm.get("model_strategies")
+    llm["model_strategies"] = dict(strategies) if isinstance(strategies, dict) else {}
     webui = asdict(config.webui)
     password = webui.pop("password", "")
     search = asdict(config.search)
@@ -448,27 +458,78 @@ def _prune_secret(container: dict[str, Any], key: str) -> None:
         container.pop(key, None)
 
 
-def _validate_models(value: Any, v: _Validator) -> dict[str, str] | None:
-    """校验 ``llm.models`` 角色映射：角色名非空，模型名填了就保留、空串表示未配。"""
+def _validate_models(value: Any, v: _Validator) -> dict[str, Any] | None:
+    """校验 ``llm.models`` 角色映射：值可以是模型名或模型池列表。
+
+    - 角色名非空；空角色名直接忽略，不算错误；
+    - 单个字符串照旧表示「这个角色用这个模型」；
+    - 列表表示按优先级排的模型池，空列表、空模型名一律拒绝（报清楚哪个角色）；
+    - 空串/None 表示这个角色未配（回退链照旧），不写进结果。
+    """
     if value is None:
         return {}
     if not isinstance(value, dict):
-        v.fail("llm.models", "应为「角色 → 模型名」的对象")
+        v.fail("llm.models", "应为「角色 → 模型名或模型名列表」的对象")
         return None
-    result: dict[str, str] = {}
+    result: dict[str, Any] = {}
     for raw_role, raw_model in value.items():
         role = str(raw_role).strip()
         if not role:
             continue  # 空角色名直接忽略，不算错误
         if raw_model is None:
             continue
-        if not isinstance(raw_model, str):
-            v.fail(f"llm.models.{role}", "必须填模型名或留空")
+        field = f"llm.models.{role}"
+        if isinstance(raw_model, str):
+            # 单个字符串照旧：空串表示这个角色未配，不算错误
+            model = raw_model.strip()
+            if len(model) > MODEL_NAME_MAX_LEN:
+                v.fail(field, f"模型名太长（最多 {MODEL_NAME_MAX_LEN} 字）")
+                continue
+            if model:
+                result[role] = model
             continue
-        model = raw_model.strip()
-        if model:
-            result[role] = model
+        if not isinstance(raw_model, (list, tuple)):
+            v.fail(field, "必须填模型名、模型名列表或留空")
+            continue
+        models: list[str] = []
+        for index, item in enumerate(raw_model):
+            if not isinstance(item, str):
+                v.fail(f"{field}.{index}", "模型名必须是文本")
+                continue
+            model = _model_name(item, f"{field}.{index}", v)
+            if model and model not in models:
+                models.append(model)
+        if not models:
+            # 空列表（或全是空串）会让这个角色「配了却没模型」，明确拒绝
+            if not raw_model:
+                v.fail(field, "模型池不能为空；不需要这个角色就直接删掉整项")
+            continue
+        result[role] = models[0] if len(models) == 1 else models
     return result
+
+
+def _model_name(value: str, field: str, v: _Validator) -> str:
+    """校验单个模型名：非空、不是纯空白、不长到离谱。"""
+    model = str(value).strip()
+    if not model:
+        v.fail(field, "模型名不能为空；不需要这个角色就直接删掉整项")
+        return ""
+    if len(model) > MODEL_NAME_MAX_LEN:
+        v.fail(field, f"模型名太长（最多 {MODEL_NAME_MAX_LEN} 字）")
+        return ""
+    return model
+
+
+def _validate_strategy(value: Any, v: _Validator, field: str) -> str | None:
+    """校验模型池策略名：只认 :data:`MODEL_STRATEGIES`。"""
+    if not isinstance(value, str):
+        v.fail(field, "策略必须是文本")
+        return None
+    strategy = value.strip().lower()
+    if strategy not in MODEL_STRATEGIES:
+        v.fail(field, f"未知策略 {value!r}；只能是 {' / '.join(MODEL_STRATEGIES)} 之一")
+        return None
+    return strategy
 
 
 def _validate_llm(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
@@ -499,6 +560,38 @@ def _validate_llm(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
         models = _validate_models(section["models"], v)
         if models is not None:
             out["models"] = models
+    if "model_strategy" in section:
+        value = section["model_strategy"]
+        if value is None or (isinstance(value, str) and not value.strip()):
+            # 清空表示回默认策略
+            out["model_strategy"] = DEFAULT_MODEL_STRATEGY
+        else:
+            strategy = _validate_strategy(value, v, "llm.model_strategy")
+            if strategy is not None:
+                out["model_strategy"] = strategy
+    if "model_strategies" in section:
+        value = section["model_strategies"]
+        if value is None:
+            out["model_strategies"] = {}
+        elif not isinstance(value, dict):
+            v.fail("llm.model_strategies", "应为「角色 → 策略」的对象")
+        else:
+            strategies: dict[str, str] = {}
+            for raw_role, raw_strategy in value.items():
+                role = str(raw_role).strip()
+                if not role:
+                    continue
+                if raw_strategy is None or (
+                    isinstance(raw_strategy, str) and not raw_strategy.strip()
+                ):
+                    # 空值表示「跟随全局策略」，不写覆盖
+                    continue
+                strategy = _validate_strategy(
+                    raw_strategy, v, f"llm.model_strategies.{role}"
+                )
+                if strategy is not None:
+                    strategies[role] = strategy
+            out["model_strategies"] = strategies
     if "temperature" in section:
         number = v.number(section["temperature"], "llm.temperature", minimum=0, maximum=2)
         if number is not None:

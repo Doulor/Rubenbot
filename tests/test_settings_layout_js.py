@@ -92,7 +92,7 @@ def test_attention_card_defines_two_number_inputs():
 const card = (_, spec) => spec, fieldGrid = defs => defs;
 const h = () => null, groupsEditor = h, pluginEditor = h, modelsEditor = h,
       adaptersEditor = h, mcpServerEditor = h, mapEditor = h;
-const LOG_LEVELS = [], MOOD_NAMES = [];
+const LOG_LEVELS = [], MOOD_NAMES = [], MODEL_POOL_STRATEGIES = [], MODEL_POOL_STRATEGY_LABELS = {};
 const fields = settingsCardSpecs({}, {}, []).filter(c => pageOf(LAYOUT, c.path) === 'expression')
   .flatMap(c => c.node.body).filter(f => f?.path?.startsWith('attention.'));
 console.log(JSON.stringify(fields));

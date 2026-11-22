@@ -152,7 +152,7 @@ SnowLuma 适配器（OneBot v11）：
 
 单个 YAML（`config.yaml`，仓库给 `config.example.yaml`）：
 
-- llm：base_url、api_key、chat_model、extract_model、consolidate_model（后两者缺省跟随 chat）
+- llm：base_url、api_key、chat_model、extract_model、consolidate_model（后两者缺省跟随 chat）；`models` 按角色配模型，值可以是单个模型名或按优先级排的模型名列表（模型池）；`model_strategy`（`failover` / `round_robin` / `random`）是全局默认策略，`model_strategies` 按角色覆盖。故障转移只在超时 / 连接错误 / 429 / 5xx 时切下一个，400/401/403/404 直接报；单模型时行为与旧版一致
 - persona：人格文件路径（默认 `data/SOUL.md`，给一个默认 Ruben 人格示例）
 - memory：extract_every_n、inject_limit、consolidate_new_threshold、consolidate_interval_hours
 - chat：history_size、历史上下文参数；reply：多段回复的段数上限与段间打字延迟

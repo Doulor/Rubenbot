@@ -424,6 +424,46 @@ def test_put_structured_models_map_written_and_resent_unchanged(client, config_p
     assert again.json()["applied"] == []
 
 
+def test_put_structured_model_pool_written_and_hot_applied(bot_state, config_path):
+    """模型池与策略保存后热生效：新客户端带着列表，无需重启。"""
+    bot = bot_state.bot
+    client = TestClient(create_app(bot_state))
+    response = client.put(
+        "/api/config",
+        json={
+            "config": {
+                "llm": {
+                    "models": {"chat": ["m-a", "m-b"], "fast": "m-fast"},
+                    "model_strategy": "round_robin",
+                    "model_strategies": {"fast": "random"},
+                }
+            }
+        },
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert "llm" in body["applied"]
+    assert body["resolution"]["llm.models.chat"] == "hot"
+    written = read_yaml(config_path)["llm"]
+    assert written["models"] == {"chat": ["m-a", "m-b"], "fast": "m-fast"}
+    assert written["model_strategy"] == "round_robin"
+    assert written["model_strategies"] == {"fast": "random"}
+    # 热应用：LLM 客户端已重建，池与策略立即生效
+    from rubenbot.llm import LLMClient
+
+    assert isinstance(bot.llm, LLMClient)
+    assert bot.llm.config.models_for("chat") == ["m-a", "m-b"]
+    assert bot.llm.config.strategy_for("chat") == "round_robin"
+    assert bot.llm.config.strategy_for("fast") == "random"
+
+    # 原样再存一次不应报变化
+    view = client.get("/api/config").json()["structured"]
+    view.pop("secrets")
+    again = client.put("/api/config", json={"config": view})
+    assert again.status_code == 200, again.text
+    assert again.json()["applied"] == []
+
+
 def test_validate_structured_accepts_string_numbers():
     update = validate_structured(
         {
