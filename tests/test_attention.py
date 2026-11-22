@@ -82,24 +82,25 @@ def test_priority_batch_no_attention_draw(config, store, msg):
     assert bot.rng.random.call_count == 1  # 只有长度档掷点
 
 
-@pytest.mark.parametrize('cause', ['被点名', '实际出站'])
-def test_engagement_expires_without_crossing_conversations(config, store, monkeypatch, cause):
+@pytest.mark.parametrize('direct', [event('Ruben？'), event('在吗', mentions_bot=True),
+                                    event('在吗', reply_to_id='42', reply_sender_id='__bot__')])
+def test_engagement_expires_without_crossing_conversations(config, store, monkeypatch, direct):
     bot, llm = build(config, store, 0)
     now = 1000.0
     monkeypatch.setattr('rubenbot.core.time.time', lambda: now)
     config.decision.min_reply_interval_seconds = 0
     config.decision.refractory_enabled = False
-    if cause == '被点名':
-        # 不配置适配器以确保只有点名、没有成功出站，也能进入投入状态。
-        bot.adapters.clear()
-        asyncio.run(bot.handle_event(event('Ruben？')))
-    else:
-        asyncio.run(bot.send_reply(event('早'), '早呀'))
+    asyncio.run(bot.send_reply(event('早'), '早呀'))
+    assert bot.effective_talk_value(event('普通消息'), now) == 0  # 成功出站也不能打开窗口
+    asyncio.run(bot.handle_event(direct))
     now += 119.9
     assert bot.effective_talk_value(event('问候', room='隔壁'), now) == 0
     llm.calls.clear()
     asyncio.run(bot.handle_event(event('还有一件事')))
     assert llm.calls and llm.calls[0]['task'] == 'gen_stage1'
+    asyncio.run(bot.send_reply(event('普通消息'), '知道了'))  # 自己发言不续期
+    now += 0.2
+    assert bot.effective_talk_value(event('普通消息'), now) == 0
     assert bot.effective_talk_value(event('私聊', kind='private'), now) == 1
     assert bot.effective_talk_value(event('私聊', kind='private'), now + 9999) == 1
     assert bot.effective_talk_value(event('后来'), 1120.0) == 0

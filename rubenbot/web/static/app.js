@@ -4345,7 +4345,7 @@ function settingsCardSpecs(draft, secrets, pluginsAvailable, groupIdentities = {
         hint: "先查看一批消息，再决定要不要开口。私聊和硬触发消息始终会查看。",
         body: fieldGrid([
           { path: "attention.talk_value", label: "普通群聊查看概率", kind: "number", min: 0, max: 1, step: "0.01", hint: "这是查看概率，不是回复概率。0.75 表示平均每四批普通群消息查看三批。" },
-          { path: "attention.engaged_window_seconds", label: "保持投入的时间（秒）", kind: "number", min: 0, step: "any", hint: "在本会话发言、被点名或被 @ 后，这段时间里每批都查看。" },
+          { path: "attention.engaged_window_seconds", label: "保持投入的时间（秒）", kind: "number", min: 0, step: "any", hint: "在本群被点名、被 @ 或被回复后，这段时间里每批都查看。自己发言不续期。" },
         ], draft),
       }),
     },
