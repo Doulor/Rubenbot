@@ -1,14 +1,17 @@
-"""实测台的对话场景。只报告出站计数与决策字段，不回显模型或日志正文。"""
+"""实测台的对话场景。四件合成回放保留实际出站原话；不输出完整提示词或响应体。"""
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
 
 from rubenbot.agreement import is_repetitive_agreement
 from rubenbot.config import Config
+from rubenbot.decision import BOT_SENDER_ID
 from rubenbot.expression import BUDGETS, INTENTS
+from rubenbot.memory.entities import EntityCandidate
 
 
 _RHYTHM_CHAT = "e2e-rhythm"
@@ -25,7 +28,7 @@ def configure(config: Config) -> None:
     cfg.proactive_window_limit = 1
 
 
-async def _turn(ctx, text, *, chat, group=False, mention=False, sender="guest", ts=None):
+async def _turn(ctx, text, *, chat, group=False, mention=False, sender="guest", ts=None, mentions=None):
     """取本次入站对应的新决策，避免把同会话的旧记录当作证据。"""
     query = dict(platform=ctx.console.name, chat_id=chat, chat_type="group" if group else "private", limit=1)
     try:
@@ -33,7 +36,7 @@ async def _turn(ctx, text, *, chat, group=False, mention=False, sender="guest", 
     except Exception:
         raise AssertionError("无法读取发送前的决策记录") from None
     try:
-        reply = await ctx.send(text, chat=chat, group=group, mention=mention, sender=sender, ts=ts)
+        reply = await ctx.send(text, chat=chat, group=group, mention=mention, sender=sender, ts=ts, mentions=mentions)
     except Exception:
         raise AssertionError("本轮驱动消息或读取出站文本失败") from None
     try:
@@ -189,3 +192,101 @@ async def decision(ctx) -> str:
     if not isinstance(increment, str) or not increment.strip():
         raise AssertionError("决策书增量点缺失或为空")
     return f"本轮已出站，决策书已落库：意图为{intent}，长度档为{band}，增量点非空（{len(increment.strip())} 字符）"
+
+
+def _history(ctx, chat, sender, text, seconds=60):
+    """准备已发生的群历史，不为铺垫再触发一次策划或发言冷却。"""
+    return ctx.store.add_raw_message(platform=ctx.console.name, chat_id=chat, sender_id=sender,
+                                     sender_name='机主' if sender == 'console:me' else sender,
+                                     text=text, ts=time.time() - seconds, processed=True)
+
+
+def _planner_messages(ctx):
+    return next((messages for messages in ctx.prompts
+                 if '【本群实体账·摄入时】' in messages[-1]['content']), [])
+
+
+def _verdict(ctx, reply, row, checks, problem='', *, direct=False, require_raw_basis=False):
+    """先证明确实走到目标分支，再判语义。降级、空生成、未经证实的静默都不计通过。"""
+    plan = row['factors'].get('expression_decision', {})
+    reason = row['reason']
+    evidence = (f'出站={json.dumps(reply, ensure_ascii=False) if reply else "（沉默）"}；'
+                f'reason={reason}, hard_trigger={row["hard_trigger"] or "无"}, source={plan.get("source")}, '
+                f'stage1(basis/speak)={ctx.stage1.get("basis")}/{ctx.stage1.get("speak")}, '
+                f'finish={ctx.stage1.get("finish")}, 落库={plan.get("basis")}/{plan.get("speak")}, intent={plan.get("intent")}；'
+                + '，'.join(f'{name}={"有" if seen else "无"}' for name, seen in checks.items()))
+    if not all(checks.values()):
+        problem = '策划或生成未收到所需事实／指引'
+    if (plan.get('source') != 'fast' or (require_raw_basis and 'basis' not in ctx.stage1)
+            or bool(row['hard_trigger']) != direct or (not reply and reason not in ('planner_silence', 'veto_marker'))):
+        problem = '未取得有效策划或目标触发路径的证据，不以降级或故障静默验收'
+    if problem:
+        raise AssertionError(f'{problem}；{evidence}')
+    return evidence
+
+
+async def xingchi(ctx):
+    chat = 'e2e-xingchi'
+    rid = _history(ctx, chat, '甲', '星驰')
+    ctx.bot.entities.observe_message(platform=ctx.console.name, chat_id=chat, message=ctx.store.raw_message_by_id(rid),
+                                     candidates=[EntityCandidate('星驰')])
+    reply, row = await _turn(ctx, '星驰关站了', chat=chat, group=True, sender='console:me')
+    messages = _planner_messages(ctx)
+    seen = bool(messages) and '{"名字": "星驰", "此前出现次数": 1, "有群内说明": false}' in messages[-1]['content']
+    # 正向识别询问含义或承认陌生；不把任意带问号的附和当成提问。
+    unknown = re.search(r'是什么|是啥|什么站|啥站|什么来头|干[啥嘛什么]|没听[说过]|没见过|不(?:太)?(?:清楚|知道|熟|了解)|只见过', reply)
+    problem = '已见低熟悉度事实，但出站没有明确询问或承认陌生' if reply and not unknown else ''
+    if re.search(r'跟上瘾一样|又关|我(?:以前|也常|也用)', reply):
+        problem = '已见低熟悉度事实，仍作熟悉的跟评'
+    return _verdict(ctx, reply, row, {'星驰此前一次且无说明': seen}, problem)
+
+
+async def panda(ctx):
+    chat = 'e2e-panda'
+    _history(ctx, chat, '甲', '下载 YouTube 视频可以用 yt-dlp。')
+    reply, row = await _turn(ctx, '怎么下载 YouTube 视频？', chat=chat, group=True, sender='panda', mention=True,
+                             mentions={BOT_SENDER_ID: ''})
+    messages = _planner_messages(ctx)
+    planner = '\n'.join(m['content'] for m in messages)
+    generation = '\n'.join(m['content'] for call in ctx.prompts if call is not messages for m in call)
+    direct = re.search(r'\byt-dlp\b', reply, re.I) and not re.search(r'[?？]|哪个平台|不用 yt-dlp|别用 yt-dlp', reply)
+    return _verdict(ctx, reply, row, {'群友答案': 'yt-dlp' in planner,
+                                      '策划区分通用做法': '区分通用的做法' in planner,
+                                      '被点名给做法': '先把能用的那一步递过去' in planner,
+                                      '生成直答指引': '被问到会的做法' in generation},
+                    '' if direct else '已给问题、工具名和直答指引，但未直接回答', direct=True)
+
+
+async def argon(ctx):
+    chat = 'e2e-argon'
+    _history(ctx, chat, '阿乙', '我在比 Gemini 4 Argon、GPT 和 Claude 的前端表现。')
+    reply, row = await _turn(ctx, '你觉得 Argon 前端比另两个强吗？', chat=chat, group=True,
+                             sender='甲', mentions={'阿乙': '阿乙'})
+    messages = _planner_messages(ctx)
+    prompt = messages[-1]['content'] if messages else ''
+    anchor = ctx.bot.persona.identity_anchor()
+    return _verdict(ctx, reply, row, {'常驻身份与群友角色': bool(anchor) and anchor in prompt and '我是本群的一名群友' in prompt,
+                                      '明确问阿乙': '@ 目标：阿乙；回复对象：无' in prompt},
+                    '已见身份和指向，仍插入他人的定向测评对话' if reply else '')
+
+
+async def basis_gate(ctx):
+    chat = 'e2e-basis'
+    old, fact = '是卡在收验证邮件。', 'muse 禁止访问 muse.ai。'
+    _history(ctx, chat, BOT_SENDER_ID, old, 90)
+    _history(ctx, chat, 'console:me', fact)
+    reply, row = await _turn(ctx, '那 muse 到底能不能访问 muse.ai？', chat=chat, group=True, sender='丙')
+    messages = _planner_messages(ctx)
+    checks = {'旧自述不作数': any(m['role'] == 'assistant' and '不作数' in m['content'] and old in m['content'] for m in messages),
+              '机主定论': any(m['role'] == 'user' and '机主原话·事实部分已定' in m['content'] and fact in m['content'] for m in messages)}
+    basis = ctx.stage1.get('basis')
+    problem = ''
+    if basis not in ('settled', 'guess', 'ledger'):
+        problem = '本地已定事实不是通用常识，依据不符'
+    elif reply:
+        # 只认可明确的禁止口径。「不能收邮件，但可以访问」也有“不能”，不能据此放行。
+        denied = re.search(r'(?:禁止|不准|不让|不能|不允许)(?:.{0,8})(?:访问|打开|上这个站)|访问不了|^(?:不能|不行|不让|禁了)[。！! ]*$', reply)
+        contradicts = re.search(r'邮件|(?:可以|允许|照常|还能|仍能)访问|不是不能|没有禁止|没禁止|能不能', reply)
+        if basis == 'guess' or not denied or contradicts:
+            problem = '无据仍开口，或未按机主定论作答'
+    return _verdict(ctx, reply, row, checks, problem, require_raw_basis=True)

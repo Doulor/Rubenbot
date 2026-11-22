@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import random
+import re
 import sys
 import tempfile
 import time
@@ -37,9 +38,9 @@ from rubenbot.adapters.base import render_segments  # noqa: E402
 from rubenbot.adapters.console import ConsoleAdapter  # noqa: E402
 from rubenbot.config import Config, LLMConfig  # noqa: E402
 from rubenbot.core import RubenBot  # noqa: E402
-from rubenbot.llm import LLMClient, make_usage_recorder  # noqa: E402
+from rubenbot.llm import LLMClient, make_usage_recorder, strip_dsml  # noqa: E402
 from rubenbot.memory.store import MemoryStore  # noqa: E402
-from rubenbot.persona import Persona  # noqa: E402
+from rubenbot.persona import Persona, load_persona  # noqa: E402
 from rubenbot.plugins.loader import PluginManager  # noqa: E402
 from tools import _e2e_computer, _e2e_dialog, _e2e_fixtures  # noqa: E402
 
@@ -50,6 +51,8 @@ SCENARIOS = (
     ('MCP 真调用', _e2e_fixtures.mcp), ('访客沙盒', _e2e_computer.sandbox),
     ('白名单真机', _e2e_computer.host), ('链接插件', _e2e_fixtures.link),
     ('决策书落盘', _e2e_dialog.decision), ('社交信号泛化', _e2e_dialog.social_signal),
+    ('星驰装熟', _e2e_dialog.xingchi), ('panda 绕答', _e2e_dialog.panda),
+    ('Argon 自领属性', _e2e_dialog.argon), ('破甲／依据门', _e2e_dialog.basis_gate),
 )
 
 
@@ -116,6 +119,31 @@ class Context:
     prompts: list = field(default_factory=list)
     statuses: list[int] = field(default_factory=list)
 
+    # 仅四案挂载此观察器；保留裁定前模型自报的枚举，不保存上游响应正文。
+    stage1: dict = field(default_factory=dict)
+
+    async def observe_stage1(self, resp):
+        if not resp.is_success or not resp.request.url.path.endswith('/chat/completions'):
+            return
+        messages = json.loads(resp.request.content)['messages']
+        if '【本群实体账·摄入时】' not in messages[-1]['content']:
+            return
+        await resp.aread()
+        try:
+            choice = resp.json()['choices'][0]
+            finish = choice.get('finish_reason')
+            self.stage1['finish'] = finish if finish in ('stop', 'length', 'content_filter') else None
+            content = strip_dsml(choice['message']['content'] or '').strip()
+            fence = re.match(r'```(?:json)?\s*(.*?)\s*```', content, re.S | re.I)
+            plan, _ = json.JSONDecoder().raw_decode(fence[1] if fence else content)
+            if isinstance(plan, dict):
+                if plan.get('basis') in ('ledger', 'settled', 'common', 'guess'):
+                    self.stage1['basis'] = plan['basis']
+                if isinstance(plan.get('speak'), bool):
+                    self.stage1['speak'] = plan['speak']
+        except (ValueError, KeyError, IndexError, AttributeError, TypeError):
+            pass  # 非法/缺失的裁定不得被归一化后的 guess 冒充。
+
     async def request(self, req):
         if req.url.path.endswith('/chat/completions'):
             self.prompts.append(json.loads(req.content)['messages'])
@@ -123,10 +151,11 @@ class Context:
     async def response(self, resp):
         self.statuses.append(resp.status_code)
 
-    async def send(self, text, *, chat='e2e', sender='guest', group=False, mention=False, ts=None):
+    async def send(self, text, *, chat='e2e', sender='guest', group=False, mention=False, ts=None, mentions=None):
         event = self.console.parse_line(f'[{chat}|访客] {text}' if group else text)
         event.chat_id, event.sender_id = chat, sender
         event.sender_name = '机主' if sender == 'console:me' else sender
+        event.mentions = mentions or {}
         event.mentions_bot = mention or not group
         start = len(self.console.sent)
         # 入站、合并、决策、发送使用同一个时间；不改变 asyncio、HTTP 或 MCP 的时钟。
@@ -161,15 +190,21 @@ async def instance(root, llm_cfg, scenario):
         stack.push_async_callback(llm.close)
         plugins = PluginManager(cfg, store)
         plugins.load_all()
-        bot = RubenBot(cfg, store, llm, Persona('小测', '你是小测，一个群友。问题有用就回答，需要工具时实际调用，不编造结果。'),
-                       plugins=plugins, rng=random.Random(17))
-        console = ConsoleAdapter(stdout=io.StringIO(), bot_name='小测')
+        persona = Persona('小测', '你是小测，一个群友。问题有用就回答，需要工具时实际调用，不编造结果。')
+        if scenario in (9, 10, 11, 12):
+            # 只用仓库版本的五文件人设，不读部署现场的人格和历史。
+            persona = load_persona(ROOT / 'data/SOUL.md', examples_enabled=False)
+            cfg.chat.bot_name = persona.name
+        bot = RubenBot(cfg, store, llm, persona, plugins=plugins, rng=random.Random(17))
+        console = ConsoleAdapter(stdout=io.StringIO(), bot_name=cfg.chat.bot_name)
         bot.register_adapter(console)
         console.bind(bot.handle_event)
         ctx = Context(root, cfg, bot, console, store)
         client = await llm._get_client()
         client.event_hooks['request'].append(ctx.request)
         client.event_hooks['response'].append(ctx.response)
+        if scenario in (9, 10, 11, 12):
+            client.event_hooks['response'].append(ctx.observe_stage1)
         stack.push_async_callback(bot.shutdown)
         stack.push_async_callback(bot.mcp.stop)
         await bot.mcp.start()

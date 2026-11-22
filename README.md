@@ -291,9 +291,13 @@ WebUI 当前包含概览、机器人/人设、模型、记忆、人物、群组�
 .venv/bin/python tools/e2e_live.py --config config.yaml --only 3 4 --results /tmp/e2e-tools.md
 # 让实测模型独立裁定 Q19 的六个未静音案例
 .venv/bin/python tools/e2e_live.py --config config.yaml --only 8 --results /tmp/e2e-social.md
+# 星驰 / panda / Argon / 破甲：每案独立建库，保留单次回放，不覆写上次报告
+.venv/bin/python tools/e2e_live.py --config config.yaml --only 9 10 11 12 --results "$(mktemp /tmp/replay-XXXXXX.md)"
 ```
 
 中转须提供 `workbuddy-deepseek-v4.1-flash`；脚本只取配置中的 LLM 连接信息，每个场景新建临时数据库和 Console，不接真实聊天平台。完整报告默认写入 `~/workspace/rubenbot-night/e2e-results.md`，只要一项 FAIL 就以状态码 1 退出。模型口头称已执行工具不算审计证据；本地页面被公网限制拦截时，报告会把抓取失败和缓存对照的隔离标注分开。其他凭据来源见 `--help`。
+
+四件回放使用仓库五文件人设、合成群历史与真实策划，报告列出实际出站原话和关键决策字段。`source=fallback` 的沉默不算通过，落库 `guess` 也不等于模型亲口报了 `guess`。2026-11-23 单次实测：Argon 旁听通过；panda 直接给了 `yt-dlp` 命令，但首跑采证误判 FAIL；星驰和破甲均因策划降级未验实。未重跑。
 
 ---
 
