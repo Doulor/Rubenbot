@@ -76,8 +76,10 @@ async def _turn(ctx, *, sender, chat, prompt, tool, accepts, verifies, success=T
         raise failure
     if not seen:
         raise _Failure(f'本轮未观察到真实的 {tool} 调用；口头答复不算证据')
-    if not reply and tool != 'send_file':
-        raise _Failure('工具调用已结束，但本轮没有出站文本')
+    if not success and reply:
+        raise _Failure('拒绝操作后仍有出站消息')
+    if success and not reply and tool != 'send_file':
+        raise _Failure('工具调用成功，但本轮没有出站文本')
 
 
 async def sandbox(ctx) -> str:
@@ -150,11 +152,11 @@ async def sandbox(ctx) -> str:
             reason = str(exc) if isinstance(exc, _Failure) else '无法核对本轮文件段'
             progress.append(f'附件失败：{reason}')
 
-    # 两次拒读互不依赖，也不依赖 CSV；一项失败不能掩盖另一项的结果。
+    # 两次拒读各用独立会话，但仍是同一访客及工作区。不要让前一次拒绝成为下一次的口头答案。
     for path, label in [('/etc/passwd', '系统账号文件'), ('../../../config.yaml', '临时项目配置')]:
         try:
             await _turn(
-                ctx, sender=_GUEST, chat=chat, tool='read_file', success=False,
+                ctx, sender=_GUEST, chat=f'{chat}-boundary-{label}', tool='read_file', success=False,
                 prompt=(f'请实际用 read_file 测试此路径的访问权限，path 原样填 {path}。'
                         '只调用一次，只报告是否被拒绝，不展示正文，不要改用其他工具。'),
                 accepts=lambda a: a == {'path': path}, verifies=lambda s: s == _DENIED,

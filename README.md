@@ -272,11 +272,13 @@ WebUI 当前包含概览、机器人/人设、模型、记忆、人物、群组�
 
 **Q19 泛化回放**：六个合成场景共用同一个未静音账号，使用独立会话，均送达策划步。独立模型盲评中，天气播报、签到提醒、资讯推送均沉默；真人约同伴还书时旁听，直接求助与邀大家庆祝时开口，与基线提示的三条真人对照一致。pytest 重放新裁定，核对决策日志与实际出站；这不等同于所有部署模型都有相同表现。换模型后可用下方 `--only 8` 实测。
 
+**群聊电脑任务回放**：`python -m pytest tests/test_chat_computer_routing.py` 会从 Console 入站，核对 `list_dir → write_file → send_file` 的三条审计、落盘字节和原群收到的附件，而不是只看聊天回复。开启 `computer.enabled`、配置真实平台账号白名单、使用支持工具调用的模型，并保持 `memory.recall_tool_max_rounds > 0`。机主可直接委托或 @ bot；授予机主权限不等于每句话都要接。机主操作默认最多 4 轮（`computer.max_task_rounds`）；访客只能用自己的沙盒，不能借同群机主调用真机、MCP 或平台原始接口。
+
 **手动真实中转自测**（会计费，不由 pytest 启动）：
 
 ```bash
 .venv/bin/python tools/e2e_live.py --config config.yaml
-# 只复查 MCP 与访客沙盒；另存诊断报告，不覆盖全量结果
+# 只复查 MCP 与访客沙盒：比对随机回执、CSV、附件，并验证两次越界读均未发言且有拒绝审计；不覆盖全量报告
 .venv/bin/python tools/e2e_live.py --config config.yaml --only 3 4 --results /tmp/e2e-tools.md
 # 让实测模型独立裁定 Q19 的六个未静音案例
 .venv/bin/python tools/e2e_live.py --config config.yaml --only 8 --results /tmp/e2e-social.md
@@ -528,7 +530,7 @@ WebUI 的「插件」分两页：「插件市场」在同一列表里发现、�
     「你记得我什么」是本人查看本人画像，不属于跨场合披露；若也走 gate，隐私模式/高敏感默认扣下会让本人看不到自己的东西，和规格相反。群聊里不自查（避免档案被围观），`/隐私` 在群里也只报档位、画像只在私聊摊开。
 
 21. **recall 工具的退化是常态**
-    `chat_with_tools` 只做一次往返，循环在 core（最多 `recall_tool_max_rounds` 轮，默认 2）。中转返回「不支持 tools」时记 `ToolUnsupported` 并记住不再尝试；网络错误、模型不用工具、工具结果异常都只是退化为原来的单次生成，不影响回复。隐私模块开启时，工具结果与普通召回走同一个审查口。
+    `chat_with_tools` 只做一次往返，循环在 core（最多 `recall_tool_max_rounds` 轮，默认 2）。中转返回「不支持 tools」时记 `ToolUnsupported` 并记住不再尝试；网络错误、模型不用工具、普通回忆工具异常可退化为单次生成。机主电脑委托例外：使用 `computer.max_task_rounds` 的预算，不以无工具生成代替执行结果。隐私模块开启时，工具结果与普通召回走同一个审查口。
 
 22. **注入预算的裁剪顺序是硬约定**
     `inject_budget_tokens` 超了只砍「事实 → 时间线 → 跨会话 → 自我 → 索引 → 被提及者画像」，说话人核心画像不参与裁剪。宁可少给背景，也不让主对话对象的关键信息被挤掉。
