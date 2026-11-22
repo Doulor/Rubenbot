@@ -71,6 +71,18 @@ def test_frontend_uses_backend_rules():
     assert all(page for page in pages), "每个字段都应归到一个二级页面"
 
 
+def test_model_fields_belong_only_to_models_page():
+    """两张卡的所有字段（包括模型池逐角色策略）只归模型页。"""
+    from rubenbot.config import Config
+    from rubenbot.web.config_schema import config_layout, field_paths, structured_config
+
+    layout = config_layout()
+    paths = [p for p in field_paths(structured_config(Config())) if p.startswith("llm.")]
+    paths += ["llm.models.fast", "llm.model_strategies.fast"]
+    assert set(run_page_of(layout, paths)) == {"models"}
+    assert [g["route"] for g in layout["groups"] if any(p["id"] == "models" for p in g["pages"])] == ["models"]
+
+
 def test_frontend_prefix_behavior():
     """最长前缀 + 按段匹配：``chatty`` 不能被 ``chat`` 规则吃掉。"""
     from rubenbot.web.config_schema import config_layout
@@ -118,6 +130,6 @@ def test_settings_menu_is_rendered_before_config_request():
     """慢配置接口不能阻塞机器人/设置页的二级菜单和页头。"""
     source = APP_JS.read_text(encoding="utf-8")
     render_start = source.index("async function renderSettingsGroup")
-    menu_render = source.index("const menuHost = settingsMenuSkeleton", render_start)
+    menu_render = source.index("settingsMenuSkeleton(", render_start)
     config_request = source.index('const data = await api.get("/api/config")', render_start)
     assert menu_render < config_request

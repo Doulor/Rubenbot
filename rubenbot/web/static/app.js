@@ -291,9 +291,6 @@ function overviewSkeleton() {
 function settingsSkeleton(page, param) {
   const plugin = page === "plugins";
   const bot = page === "bot" || page === "persona";
-  // 分类由后端提供，占位只估计菜单项的宽度，不维护第二份分类表。
-  const menu = skBox("settings-menu", skBox("settings-menu-group", plugin ? "已安装插件" : bot ? "机器人" : "设置"),
-    skItems(bot ? 8 : 7, i => skBox("settings-menu-item", skeletonBar(i % 3 === 0 ? "52px" : "26px"))));
   const fields = () => card(skeletonBar("90px", "1lh"), { body: skBox(plugin ? "plugin-config-fields" : "settings-fields",
     skItems(4, () => skBox("settings-field", skeletonBar("38%"), skeletonBar("100%", "40px")))) });
   let body;
@@ -309,7 +306,12 @@ function settingsSkeleton(page, param) {
     body = [skBox("settings-savebar", skeletonBar("26%", "40px"), skBox("spacer"),
       skeletonBar("92px", "40px"), skeletonBar("118px", "40px")), skBox("settings-stack", fields(), fields())];
   }
-  return skBox("settings-layout", menu, skBox("settings-content", body));
+  const content = skBox("settings-content", body);
+  if (page === "models") return content;
+  // 分类由后端提供，占位只估计菜单项的宽度，不维护第二份分类表。
+  const menu = skBox("settings-menu", skBox("settings-menu-group", plugin ? "已安装插件" : bot ? "机器人" : "设置"),
+    skItems(bot ? 8 : plugin ? 7 : 6, i => skBox("settings-menu-item", skeletonBar(i % 3 === 0 ? "52px" : "26px"))));
+  return skBox("settings-layout", menu, content);
 }
 
 function pluginSkeleton(param) {
@@ -330,7 +332,7 @@ function routeSkeleton(page, param = "") {
   let body;
   switch (page) {
     case "overview": body = overviewSkeleton(); break;
-    case "bot": case "persona": case "settings": body = settingsSkeleton(page, param); break;
+    case "bot": case "persona": case "models": case "settings": body = settingsSkeleton(page, param); break;
     case "plugins": body = pluginSkeleton(param); break;
     case "people":
       body = skBox("split", skBox("card", skBox("toolbar", search()), skeleton(5)),
@@ -562,6 +564,7 @@ async function pollHealth() {
 const PAGES = {
   overview: { title: "概览", sub: "运行状态与最近动静", render: renderOverview },
   bot: { title: "机器人", sub: "人设、聊天、表达、记忆、情绪、语音与表情", render: renderBot },
+  models: { title: "模型", sub: "接口、模型池与各角色模型", render: renderModels },
   // 旧链接 #/persona 仍然打开人设编辑器（已并入「机器人」选项卡）
   persona: { title: "机器人", sub: "人设", render: renderLegacyPersona },
   memory: { title: "记忆", sub: "按人浏览、搜索与维护记忆库", render: renderMemory },
@@ -569,7 +572,7 @@ const PAGES = {
   groups: { title: "群组与意愿", sub: "每群活跃度、静默时段与决策记录", render: renderGroups },
   plugins: { title: "插件", sub: "发现与管理插件，或调整已安装插件的配置", render: renderPlugins },
   logs: { title: "日志", sub: "最近的运行日志", render: renderLogs },
-  settings: { title: "设置", sub: "模型、搜索、主动触达、适配器与运行环境", render: renderSettings },
+  settings: { title: "设置", sub: "搜索、主动触达、适配器与运行环境", render: renderSettings },
 };
 
 const state = {
@@ -598,6 +601,7 @@ function rememberPage(key, entry) {
 
 function currentRoute() {
   const raw = location.hash.replace(/^#\/?/, "");
+  if (raw === "settings/model") return { page: "models", param: "" };
   const [page, ...rest] = raw.split("/");
   return { page: PAGES[page] ? page : "overview", param: rest.join("/") };
 }
@@ -4994,7 +4998,7 @@ function systemExtras(data) {
 }
 
 /**
- * 「机器人」与「设置」共用的分组渲染：一级选项卡 + 左侧二级菜单。
+ * 配置页共用的分组渲染：「机器人」与「设置」有分类菜单，「模型」直接展示卡片。
  *
  * 分组、页面与字段归属都来自后端 ``/api/config`` 的 ``layout``；
  * 这里只负责按当前页面筛卡片并渲染。
@@ -5012,28 +5016,29 @@ function settingsMenuSkeleton(title) {
 
 async function renderSettingsGroup(view, groupId, sub, entry = {}) {
   // 此处构建本次加载的分类菜单，外层路由负责首屏骨架和缓存切换。
-  const groupTitle = groupId === "bot" ? "机器人" : "设置";
-  const menuHost = settingsMenuSkeleton(groupTitle);
+  const menuHost = groupId === "models" ? null : settingsMenuSkeleton(PAGES[groupId].title);
   const content = h(
     "div",
     { class: "settings-content" },
     h("div", { class: "card" }, h("div", { class: "card-body" }, skeleton(3)))
   );
-  view.replaceChildren(h("div", { class: "settings-layout" }, menuHost, content));
+  view.replaceChildren(menuHost ? h("div", { class: "settings-layout" }, menuHost, content) : content);
 
   const data = await api.get("/api/config");
   const layout = data.layout || { groups: [] };
   const { group, page } = findPage(layout, groupId, sub);
   if (!group || !page) {
-    menuHost.replaceChildren();
+    menuHost?.replaceChildren();
     content.replaceChildren(emptyState("warning", "没有这个分类", "刷新页面后再试"));
     return;
   }
-  entry.header = [`${group.title} · ${page.title}`, page.sub || group.sub];
-  const menu = settingsMenu(layout, group, page);
-  menuHost.replaceChildren(...menu.childNodes);
-  menuHost.setAttribute("aria-label", `${group.title}分类`);
-  menuHost.removeAttribute("aria-busy");
+  if (menuHost) {
+    entry.header = [`${group.title} · ${page.title}`, page.sub || group.sub];
+    const menu = settingsMenu(layout, group, page);
+    menuHost.replaceChildren(...menu.childNodes);
+    menuHost.setAttribute("aria-label", `${group.title}分类`);
+    menuHost.removeAttribute("aria-busy");
+  }
 
   // 人设页是 SOUL 编辑器，不走结构化表单；保存、备份与热重载保持原样
   if (page.id === "tools" && group.id === "bot") {
@@ -5176,6 +5181,10 @@ async function renderSettingsGroup(view, groupId, sub, entry = {}) {
 
 async function renderBot(view, sub, entry) {
   return renderSettingsGroup(view, "bot", sub, entry);
+}
+
+async function renderModels(view, sub, entry) {
+  return renderSettingsGroup(view, "models", sub, entry);
 }
 
 async function renderSettings(view, sub, entry) {

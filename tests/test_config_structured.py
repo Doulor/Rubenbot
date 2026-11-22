@@ -253,8 +253,8 @@ def test_settings_layout_pages_and_groups():
         "emoji",
         "tools",
     ]
+    assert [page["id"] for page in groups["models"]["pages"]] == ["models"]
     assert [page["id"] for page in groups["settings"]["pages"]] == [
-        "model",
         "search",
         "computer",
         "mcp",
@@ -279,7 +279,7 @@ def test_settings_layout_prefix_resolution():
     assert resolve_page("generation.two_stage.enabled") == "expression"
     assert resolve_page("decision.threshold") == "chat"
     assert resolve_page("decision.groups.123.base") == "chat"
-    assert resolve_page("llm.models.fast") == "model"
+    assert resolve_page("llm.models.fast") == "models"
     assert resolve_page("market.index_url") == "system"
     assert resolve_page("persona.path") == "system"
     assert resolve_page("database_path") == "system"
@@ -292,7 +292,7 @@ def test_settings_layout_api_exposes_rules(client):
     """前端只按 /api/config 的 layout 渲染，后端不能再让前端维护第二份清单。"""
     body = client.get("/api/config").json()
     layout = body["layout"]
-    assert {group["id"] for group in layout["groups"]} == {"bot", "settings"}
+    assert {group["id"] for group in layout["groups"]} == {"bot", "models", "settings"}
     assert layout["rules"]
     paths = field_paths(body["structured"])
     covered = [path for path in paths if resolve_page(path)]
