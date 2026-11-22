@@ -2150,7 +2150,14 @@ class RubenBot:
             later = msg.ts
         elapsed = f"{max(0, int(now - recent[-1].ts))} 秒" if recent else "尚无发言记录"
         texts = json.dumps([msg.text for msg in recent], ensure_ascii=False)
-        block = (f"【自身状态】\n本话题已发言：{count} 条（最近对话窗口内，间隔 {TOPIC_GAP_SECONDS // 60} 分钟分界）"
+        role = "我是本群的一名群友" if event.is_group else "我是眼前这段私聊的对话方"
+        # 人格、会话角色、推理后端是三件事；模型名来自配置，不由聊天内容推断。
+        identity = f"我叫 {self.persona.name}。{self.persona.identity_anchor()}{role}。"
+        backend = self.config.llm.model_for("chat")
+        block = (f"【自身状态】\n自身身份：{identity}\n内部运行事实：我通过 RubenBot 收发消息，"
+                 f"聊天后端的配置名是 {backend}。群友比较模型时，测评说的是那些模型；"
+                 "有人点我说话时，我以自己的身份接话。"
+                 f"\n本话题已发言：{count} 条（最近对话窗口内，间隔 {TOPIC_GAP_SECONDS // 60} 分钟分界）"
                  f"\n距上次发言：{elapsed}\n最近 5 条自己的发言（原文，按时间先后）：{texts}")
         feeling = self.states.planner_text(event.platform, event.chat_type, event.chat_id, now=now)
         return f"{block}\n{feeling}" if feeling else block

@@ -122,6 +122,19 @@ class Persona:
             return self.text
         return self.parts.get(name, "")
 
+    def identity_anchor(self) -> str:
+        """只摘机主写下的常驻事实；旧人设没有此节时不替它编出身。"""
+        lines: list[str] = []
+        inside = False
+        for line in self.file_text("identity").splitlines():
+            if line.strip() == "## 常驻身份":
+                inside = True
+            elif inside and line.lstrip().startswith("#"):
+                break
+            elif inside and line.strip():
+                lines.append(line.strip())
+        return " ".join(lines)
+
     def _stage_body(self, stage: str) -> str:
         """按阶段拼出人格正文。
 
