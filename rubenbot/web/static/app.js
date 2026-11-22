@@ -316,8 +316,12 @@ function applyTheme(mode) {
   localStorage.setItem("rubenbot.theme", mode);
   const use = $("#theme-icon use");
   if (use) use.setAttribute("href", resolved === "dark" ? "#i-moon" : "#i-sun");
-  const button = $("#theme-toggle");
-  if (button) button.setAttribute("aria-label", resolved === "dark" ? "切换到亮色" : "切换到暗色");
+  for (const button of [$("#theme-toggle"), $("#mobile-theme-toggle")]) {
+    if (!button) continue;
+    button.setAttribute("aria-label", resolved === "dark" ? "切换到亮色" : "切换到暗色");
+    const iconUse = button.querySelector("use");
+    if (iconUse) iconUse.setAttribute("href", resolved === "dark" ? "#i-moon" : "#i-sun");
+  }
   const segmented = document.querySelectorAll("[data-theme-choice]");
   const group = segmented[0]?.parentElement;
   const from = Motion.selection(group);
@@ -327,10 +331,12 @@ function applyTheme(mode) {
 
 function setupTheme() {
   applyTheme(localStorage.getItem("rubenbot.theme") || "auto");
-  $("#theme-toggle").addEventListener("click", () => {
-    const current = document.documentElement.dataset.theme;
-    applyTheme(current === "dark" ? "light" : "dark");
-  });
+  for (const button of [$("#theme-toggle"), $("#mobile-theme-toggle")]) {
+    button?.addEventListener("click", () => {
+      const current = document.documentElement.dataset.theme;
+      applyTheme(current === "dark" ? "light" : "dark");
+    });
+  }
   const media = window.matchMedia("(prefers-color-scheme: dark)");
   media.addEventListener("change", () => {
     if ((localStorage.getItem("rubenbot.theme") || "auto") === "auto") applyTheme("auto");
@@ -373,10 +379,59 @@ function setupLogin() {
 /* ------------------------------------------------------------------ */
 
 function setSidebarStatus(text, state) {
-  const textNode = $("#sidebar-status-text");
-  const dot = $("#sidebar-status .live-dot");
-  if (textNode) textNode.textContent = text;
-  if (dot) dot.dataset.state = state;
+  for (const textNode of [$("#sidebar-status-text"), $("#mobile-sidebar-status-text")]) {
+    if (textNode) textNode.textContent = text;
+  }
+  for (const dot of [$("#sidebar-status .live-dot"), $("#mobile-sidebar-status .live-dot")]) {
+    if (dot) dot.dataset.state = state;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* 移动端抽屉：桌面导航的完整副本，窄屏才显示。                        */
+/* ------------------------------------------------------------------ */
+
+let mobileDrawerTimer = null;
+function setMobileDrawer(open) {
+  const layer = $("#mobile-drawer-layer");
+  const drawer = $("#mobile-drawer");
+  const button = $("#mobile-menu-button");
+  if (!layer || !drawer) return;
+  clearTimeout(mobileDrawerTimer);
+  if (open) {
+    layer.hidden = false;
+    requestAnimationFrame(() => layer.classList.add("is-open"));
+    drawer.setAttribute("aria-hidden", "false");
+    button?.setAttribute("aria-expanded", "true");
+    document.body.classList.add("mobile-drawer-open");
+  } else {
+    layer.classList.remove("is-open");
+    drawer.setAttribute("aria-hidden", "true");
+    button?.setAttribute("aria-expanded", "false");
+    document.body.classList.remove("mobile-drawer-open");
+    mobileDrawerTimer = setTimeout(() => { layer.hidden = true; }, 360);
+  }
+}
+
+function setupMobileDrawer() {
+  $("#mobile-menu-button")?.addEventListener("click", () => setMobileDrawer(true));
+  $("#mobile-scrim")?.addEventListener("click", () => setMobileDrawer(false));
+  $("#mobile-drawer-close")?.addEventListener("click", () => setMobileDrawer(false));
+  $("#mobile-drawer")?.querySelectorAll(".nav-item").forEach(item => {
+    item.addEventListener("click", () => setMobileDrawer(false));
+  });
+  window.addEventListener("keydown", event => {
+    if (event.key === "Escape" && !$("#mobile-drawer-layer")?.hidden) setMobileDrawer(false);
+  });
+
+  let startX = null;
+  $("#mobile-drawer")?.addEventListener("pointerdown", event => {
+    if (event.isPrimary) startX = event.clientX;
+  });
+  $("#mobile-drawer")?.addEventListener("pointerup", event => {
+    if (event.isPrimary && startX !== null && event.clientX - startX < -48) setMobileDrawer(false);
+    startX = null;
+  });
 }
 
 async function pollHealth() {
@@ -444,12 +499,15 @@ async function renderRoute() {
   state.param = route.param;
   // 旧路由 #/persona 已并入机器人选项卡，侧栏高亮跟着「机器人」
   const navPage = route.page === "persona" ? "bot" : route.page;
-  const nav = $(".nav");
-  if (nav.querySelector(".active")?.dataset.page !== navPage) {
-    const from = Motion.selection(nav);
-    nav.querySelectorAll(".nav-item").forEach(item => item.classList.toggle("active", item.dataset.page === navPage));
-    Motion.moveSelection(nav, from);
+  for (const nav of document.querySelectorAll(".nav")) {
+    if (nav.querySelector(".active")?.dataset.page !== navPage) {
+      const from = Motion.selection(nav);
+      nav.querySelectorAll(".nav-item").forEach(item => item.classList.toggle("active", item.dataset.page === navPage));
+      Motion.moveSelection(nav, from);
+    }
   }
+  const mobileTitle = $("#mobile-page-title");
+  if (mobileTitle) mobileTitle.textContent = PAGES[route.page].title;
   if (state.pollTimer) {
     clearInterval(state.pollTimer);
     state.pollTimer = null;
@@ -4787,6 +4845,7 @@ async function main() {
     Motion.dialogMotion(event.currentTarget, false);
   });
   setupTheme();
+  setupMobileDrawer();
   setupLogin();
   window.addEventListener("hashchange", () => {
     if (!$("#app").hidden) renderRoute();

@@ -14,6 +14,7 @@ class TestNode {
     this.dataset = {};
     this.style = {};
     this.value = '';
+    this.hidden = false;
   }
   append(...children) {
     for (const child of children) {
