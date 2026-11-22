@@ -8,7 +8,7 @@
       "cooldown_seconds": 0,
       "params": {
         "user_id": {"type": "integer", "description": "对方的 QQ 号"},
-        "message": {"type": "string", "description": "消息内容；消息段数组也可以"},
+        "message": {"type": ["string", "object", "array"], "description": "文本、单个消息段或消息段数组"},
         "auto_escape": {"type": "boolean", "description": "是否不解析 CQ 码"}
       },
       "required": ["user_id", "message"]
@@ -20,7 +20,7 @@
       "cooldown_seconds": 0,
       "params": {
         "group_id": {"type": "integer", "description": "群号"},
-        "message": {"type": "string", "description": "消息内容；消息段数组也可以"},
+        "message": {"type": ["string", "object", "array"], "description": "文本、单个消息段或消息段数组"},
         "auto_escape": {"type": "boolean", "description": "是否不解析 CQ 码"}
       },
       "required": ["group_id", "message"]
@@ -34,7 +34,8 @@
         "message_type": {"type": "string", "description": "private 或 group"},
         "user_id": {"type": "integer", "description": "私聊时的对方 QQ 号"},
         "group_id": {"type": "integer", "description": "群聊时的群号"},
-        "message": {"type": "string", "description": "消息内容"}
+        "message": {"type": ["string", "object", "array"], "description": "文本、单个消息段或消息段数组"},
+        "auto_escape": {"type": "boolean", "description": "是否不解析 CQ 码"}
       },
       "required": ["message"]
     },
@@ -68,18 +69,18 @@
     },
     {
       "name": "send_like",
-      "summary": "给某人的资料卡点赞（拍一拍）",
+      "summary": "给某人的资料卡点赞（不是戳一戳）",
       "risk": "safe",
       "cooldown_seconds": 300,
       "params": {
         "user_id": {"type": "integer", "description": "要点赞的 QQ 号"},
-        "times": {"type": "integer", "description": "点赞次数，默认 10，上限 20"}
+        "times": {"type": "integer", "description": "点赞次数，默认 1，实际限额由 QQ 决定"}
       },
       "required": ["user_id"]
     },
     {
       "name": "set_msg_emoji_like",
-      "summary": "给消息贴一个表情回应（SnowLuma 扩展）",
+      "summary": "给群消息贴一个表情回应（SnowLuma 扩展，不支持私聊）",
       "risk": "safe",
       "cooldown_seconds": 60,
       "params": {
@@ -106,7 +107,7 @@
       "params": {
         "flag": {"type": "string", "description": "申请事件里的 flag，原样带回"},
         "approve": {"type": "boolean", "description": "true 同意，false 拒绝"},
-        "remark": {"type": "string", "description": "同意时给对方设置的备注"}
+        "remark": {"type": "string", "description": "此版本不处理备注，请勿依赖"}
       },
       "required": ["flag", "approve"]
     },
@@ -198,8 +199,9 @@
       "proactive": false,
       "params": {
         "group_id": {"type": "integer", "description": "群号"},
-        "message_seq": {"type": "integer", "description": "从哪条消息往前拉，0 表示最新"},
-        "count": {"type": "integer", "description": "拉几条，默认 20"}
+        "message_id": {"type": "integer", "description": "锚点消息 id，0 表示最新"},
+        "reverse_order": {"type": "boolean", "description": "翻页方向，非零锚点生效，默认 true"},
+        "count": {"type": "integer", "description": "拉几条，默认 20，最多 200"}
       },
       "required": ["group_id"]
     },
@@ -274,8 +276,7 @@
       "summary": "退出群聊",
       "risk": "sensitive",
       "params": {
-        "group_id": {"type": "integer", "description": "群号"},
-        "is_dismiss": {"type": "boolean", "description": "是否解散群（一般不用）"}
+        "group_id": {"type": "integer", "description": "群号，仅退出，不能用于解散群"}
       },
       "required": ["group_id"]
     },
@@ -370,7 +371,10 @@
       "risk": "sensitive",
       "cooldown_seconds": 600,
       "params": {
-        "content": {"type": "string", "description": "说说正文"}
+        "content": {"type": "string", "description": "说说正文"},
+        "ugc_right": {"type": "integer", "description": "1 所有人可见（默认），4 好友，16 部分好友，64 仅自己，128 部分好友不可见"},
+        "target_uins": {"type": "array", "description": "16 或 128 时必须指定的账号列表"},
+        "images": {"type": "array", "description": "图片来源字符串列表"}
       },
       "required": ["content"]
     },
@@ -387,7 +391,7 @@
     },
     {
       "name": "set_group_anonymous",
-      "summary": "开启/关闭群匿名聊天",
+      "summary": "群匿名开关（SnowLuma 2.1.1-node 仅返回成功，不生效）",
       "risk": "sensitive",
       "params": {
         "group_id": {"type": "integer", "description": "群号"},

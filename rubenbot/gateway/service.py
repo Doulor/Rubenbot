@@ -24,7 +24,7 @@ from typing import Any
 from ..adapters.base import ActionNotSupported, BaseAdapter
 from ..config import Config
 from .catalog import RISK_DENIED, RISK_SENSITIVE, ActionCatalog, ActionEntry, catalog_for
-from .gatekeeper import GateDecision, Gatekeeper, object_id_from_params
+from .gatekeeper import CREDENTIAL_ACTIONS, GateDecision, Gatekeeper, object_id_from_params
 
 logger = logging.getLogger(__name__)
 
@@ -222,6 +222,7 @@ class GatewayService:
     ) -> str:
         """闸门 → 执行 → 审计；永远返回给模型看的文本，不抛异常。"""
         action = str(action or "").strip()
+        credential_action = action in CREDENTIAL_ACTIONS
         chat_key = self._chat_key(adapter, chat_id)
         params = params if isinstance(params, dict) else {}
         if adapter is None:
@@ -278,7 +279,7 @@ class GatewayService:
                 sensitive=entry.risk == RISK_SENSITIVE,
                 now=now,
             )
-            return f"参数不对：{problem}"
+            return "凭据接口参数不对。" if credential_action else f"参数不对：{problem}"
 
         decision: GateDecision = self.gatekeeper.check(
             entry,
@@ -310,13 +311,16 @@ class GatewayService:
                 chat_type=chat_type,
                 params=params,
                 ok=False,
-                reject_reason=str(exc),
+                reject_reason="不支持此动作" if credential_action else str(exc),
                 sensitive=entry.risk == RISK_SENSITIVE,
                 now=now,
             )
             return f"当前适配器不支持动作 {action}。"
         except Exception as exc:  # noqa: BLE001 - 失败原因回给模型供其重试
-            summary = _truncate(str(exc) or exc.__class__.__name__, ERROR_MAX_CHARS)
+            summary = (
+                "凭据接口错误详情已省略" if credential_action
+                else _truncate(str(exc) or exc.__class__.__name__, ERROR_MAX_CHARS)
+            )
             self.gatekeeper.note_failure(entry, now=now)
             self.gatekeeper.audit(
                 action=action,
@@ -333,7 +337,8 @@ class GatewayService:
             return f"{action} 调用失败：{summary}"
 
         self.gatekeeper.note_success(entry, chat_key=chat_key, object_id=object_id_from_params(params), now=now)
-        summary = _summarize_result(result)
+        # 事件调用方只把返回文本写日志，不消费凭据；模型工具仍拿原有结果摘要。
+        summary = "" if credential_action and source == "event" else _summarize_result(result)
         self.gatekeeper.audit(
             action=action,
             source=source,
@@ -375,10 +380,10 @@ def validate_params(entry: ActionEntry, params: dict[str, Any]) -> str | None:
     for key, spec in entry.params.items():
         if key not in params:
             continue
-        expected = str((spec or {}).get("type") or "").lower() if isinstance(spec, dict) else ""
-        value = params[key]
-        if not _type_ok(expected, value):
-            return f"参数 {key} 应该是 {expected}。"
+        expected = spec.get("type") if isinstance(spec, dict) else None
+        types = expected if isinstance(expected, list) else [expected or "any"]
+        if not any(_type_ok(kind, params[key]) for kind in types):
+            return f"参数 {key} 应该是 {' / '.join(types)}。"
     return None
 
 

@@ -312,16 +312,47 @@ def test_service_call_success_and_audit():
     assert audit[0]["chat_id"] == "g1"
 
 
-def test_service_denied_action_rejected_and_not_listed():
-    service, store = make_service(enabled=True)
+@pytest.mark.parametrize("action", ["delete_friend", "set_group_dismiss", "set_restart", "clean_cache", "set_online_status"])
+def test_service_denied_action_rejected_and_not_listed(action):
+    service, store = make_service(enabled=True, allow_sensitive=True)
     adapter = ActionAdapter()
-    text = run(service.call(adapter, "delete_friend", {}, chat_id="g1"))
+    assert not service.gatekeeper.check(service.catalog_for(adapter).get(action), chat_key="snowluma:g1").allowed
+    text = run(service.call(adapter, action, {}, chat_id="g1"))
     assert "禁止" in text
     assert adapter.calls == []
-    assert "delete_friend" not in service.list_actions(adapter, keyword="")
-    assert "没有名为" in service.describe_action(adapter, "delete_friend")
-    audit = store.list_gateway_audit()
-    assert audit[0]["ok"] == 0 and audit[0]["sensitive"] == 1
+    assert service.list_actions(adapter, keyword=action).startswith("没有匹配")
+    assert "没有名为" in service.describe_action(adapter, action)
+    row, = store.list_gateway_audit()
+    assert row["action"] == action and row["ok"] == 0 and row["sensitive"] == 1
+    assert row["reject_reason"] == text
+
+
+@pytest.mark.parametrize("action,target", [("send_msg", "user_id"), ("send_private_msg", "user_id"), ("send_group_msg", "group_id")])
+def test_message_schema_accepts_segments(snowluma_catalog, action, target):
+    entry = snowluma_catalog.get(action)
+    segment = {"type": "text", "data": {"text": "验收"}}
+    for message in ("验收", segment, [segment]):
+        assert validate_params(entry, {target: 1, "message": message}) is None
+    assert validate_params(entry, {target: 1, "message": 123})
+    assert "string / object / array" in entry.describe()
+
+
+@pytest.mark.parametrize("action,params", [
+    ("set_friend_add_request", {"flag": "test-flag", "approve": False}),
+    ("set_group_add_request", {"flag": "test-flag", "approve": False, "sub_type": "add"}),
+])
+def test_request_manual_tool_dispatch_and_audit(store, action, params):
+    # 仅用假适配器核验人工处理通道，不向真机提交虚构的申请。
+    bot, adapter = make_bot(store, ScriptedLLM(), enabled=True)
+    args = {"action": action, "params": params}
+    assert "敏感" in run(bot._gateway_tool("adapter_call", args, group_event()))
+    assert not adapter.calls
+    bot.config.gateway.allow_sensitive = True
+    assert "成功" in run(bot._gateway_tool("adapter_call", args, group_event()))
+    assert adapter.calls == [(action, params)]
+    assert [(row["action"], row["ok"], row["sensitive"]) for row in store.list_gateway_audit()] == [
+        (action, 1, 1), (action, 0, 1),
+    ]
 
 
 def test_service_unknown_action_rejected():

@@ -86,6 +86,8 @@ class ActionEntry:
         for key, spec in self.params.items():
             spec = spec if isinstance(spec, dict) else {}
             type_name = spec.get("type") or "any"
+            if isinstance(type_name, list):
+                type_name = " / ".join(type_name)
             required = "必填" if key in self.required else "可选"
             desc = str(spec.get("description") or "").strip()
             tail = f" - {desc}" if desc else ""

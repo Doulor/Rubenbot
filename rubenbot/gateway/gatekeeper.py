@@ -29,6 +29,9 @@ from .catalog import RISK_DENIED, RISK_SENSITIVE, ActionEntry
 
 logger = logging.getLogger(__name__)
 
+# 这两个动作返回登录凭据；记录边界按动作名判断，不依赖目录风险等级或字段名。
+CREDENTIAL_ACTIONS = frozenset({"get_cookies", "get_csrf_token"})
+
 # 对象上限：同一人 1 小时内最多几次主动动作
 OBJECT_WINDOW_SECONDS = 3600.0
 OBJECT_MAX_PER_WINDOW = 3
@@ -206,6 +209,10 @@ class Gatekeeper:
         now: float | None = None,
     ) -> None:
         """写审计；失败只记日志（审计写不进去不能反过来打断调用）。"""
+        credential_action = action in CREDENTIAL_ACTIONS
+        if credential_action:
+            # 拒绝原因也可能回显参数或上游错误正文；只留判定元数据。
+            params, result, reject_reason = None, "", ""
         platform, chat_id = _split_chat_key(chat_key)
         try:
             self.store.add_gateway_audit(
@@ -222,7 +229,7 @@ class Gatekeeper:
                 now=now,
             )
         except Exception as exc:  # noqa: BLE001 - 审计失败不影响主流程
-            logger.warning("写网关审计失败：%s", exc)
+            logger.warning("写网关审计失败：%s", action if credential_action else exc)
 
     # ------------------------------------------------------------------
     # 内部：状态读写
