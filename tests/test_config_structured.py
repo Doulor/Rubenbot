@@ -108,6 +108,35 @@ def read_yaml(path: Path) -> dict:
 # ----------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(("section", "key", "value"), [
+    ("memory", "distill_new_threshold", 16),
+    ("memory", "distill_interval_hours", 5.5),
+    ("memory", "distill_max_events", 60),
+    ("memory", "distill_max_facts", 55),
+    ("memory", "status_expiry_min_days", 2),
+    ("memory", "status_expiry_max_days", 45),
+    ("memory", "timeline_compress_after_days", 4.5),
+    ("memory", "timeline_prune_after_days", 70.5),
+    ("memory", "timeline_prune_keep_salience", 0.85),
+    ("memory", "self_event_max_chars", 160),
+    ("chat", "dedupe_ttl_seconds", 0),
+    ("chat", "strip_action_parens", True),
+    ("decision", "batch_max_seconds", 8),
+    ("decision", "urgent_seconds", 1.5),
+    ("decision", "exclude_bot_momentum", False),
+    ("decision", "refractory_enabled", False),
+    ("decision", "proactive_window_enabled", False),
+])
+def test_edited_control_survives_save_and_reload(client, config_path, section, key, value):
+    draft = client.get("/api/config").json()["structured"]
+    assert draft[section][key] != value
+    draft[section][key] = value
+    response = client.put("/api/config", json={"config": draft})
+    assert response.is_success, response.text
+    assert read_yaml(config_path)[section][key] == value
+    assert client.get("/api/config").json()["structured"][section][key] == value
+
+
 def test_structured_config_covers_every_field(config):
     view = structured_config(config)
     for section, keys in {

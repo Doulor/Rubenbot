@@ -635,6 +635,12 @@ def _validate_memory(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
         "consolidate_max_memories": 1,
         "consolidate_remove_min": 1,
         "raw_keep_per_chat": 1,
+        "distill_new_threshold": 1,
+        "distill_max_events": 1,
+        "distill_max_facts": 1,
+        "status_expiry_min_days": 1,
+        "status_expiry_max_days": 1,
+        "self_event_max_chars": 1,
         # 记忆 v2 读取侧
         "index_max_members": 1,
         "index_identity_chars": 8,
@@ -654,6 +660,10 @@ def _validate_memory(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
         "dedupe_threshold": (0, 1),
         "consolidate_interval_hours": (0.1, None),
         "consolidate_remove_ratio": (0, 1),
+        "distill_interval_hours": (0.1, None),
+        "timeline_compress_after_days": (0.1, None),
+        "timeline_prune_after_days": (0.1, None),
+        "timeline_prune_keep_salience": (0, 1),
         # 记忆 v2 读取侧
         "index_active_days": (0.1, None),
         "index_ttl_seconds": (0, None),
@@ -875,7 +885,11 @@ def _validate_chat(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
             number = v.number(section[key], f"chat.{key}", minimum=minimum, integer=True)
             if number is not None:
                 out[key] = int(number)
-    for key in ("history_ttl_hours",):
+    if "strip_action_parens" in section:
+        flag = v.boolean(section["strip_action_parens"], "chat.strip_action_parens")
+        if flag is not None:
+            out["strip_action_parens"] = flag
+    for key in ("history_ttl_hours", "dedupe_ttl_seconds"):
         if key in section:
             number = v.number(section[key], f"chat.{key}", minimum=0)
             if number is not None:
@@ -1014,6 +1028,8 @@ def _validate_decision(section: dict[str, Any], v: _Validator) -> dict[str, Any]
     number_fields = {
         "merge_window_seconds": (0, None),
         "hard_merge_window_seconds": (0, None),
+        "batch_max_seconds": (0, None),
+        "urgent_seconds": (0, None),
         "base": (0, 1),
         "threshold": (0, 1),
         "threshold_noise": (0, 1),

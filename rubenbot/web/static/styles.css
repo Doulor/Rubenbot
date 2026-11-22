@@ -1993,6 +1993,7 @@ button {
 
 .settings-content {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 18px;
   min-width: 0;
 }
@@ -2118,6 +2119,20 @@ button {
   .settings-savebar {
     position: static;
     flex-wrap: wrap;
+  }
+  .settings-savebar .row-main {
+    flex: 1 0 100%;
+    min-width: 0;
+  }
+  .settings-savebar .row-title {
+    white-space: nowrap;
+  }
+  .settings-savebar .row-sub {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .settings-savebar .spacer {
+    display: none;
   }
 }
 

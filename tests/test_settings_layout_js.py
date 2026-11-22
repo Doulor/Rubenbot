@@ -116,6 +116,13 @@ console.log(JSON.stringify(fields));
     assert "不是回复概率" in fields["attention.talk_value"]["hint"]
 
 
+@pytest.mark.parametrize("key", ["exclude_bot_momentum", "refractory_enabled", "proactive_window_enabled"])
+def test_guard_controls_are_switches(key):
+    source = APP_JS.read_text(encoding="utf-8")
+    definition, = (line for line in source.splitlines() if f'path: "decision.{key}", label:' in line)
+    assert 'kind: "switch"' in definition
+
+
 def test_frontend_script_is_syntactically_valid():
     """整份 app.js 能被 node 解析（没有构建链，语法错误只能靠这一步抓）。"""
     result = subprocess.run(
