@@ -12,11 +12,13 @@ function navEntries(html) {
   return nav.map(block => [...block.matchAll(/href="([^"]+)" data-page="([^"]+)"/g)].map(match => match.slice(1)));
 }
 
-test('移动端抽屉保留桌面导航的全部八个入口', () => {
+test('移动端抽屉与桌面侧栏顺序一致，模型紧跟机器人', () => {
   const navs = navEntries(index);
   assert.equal(navs.length, 2);
   assert.deepEqual(navs[0], navs[1]);
-  assert.equal(navs[0].length, 8);
+  assert.deepEqual(navs[0].map(([, page]) => page),
+    ['overview', 'bot', 'models', 'memory', 'people', 'groups', 'plugins', 'logs', 'settings']);
+  assert.equal(navs[0][2][0], '#/models');
 });
 
 test('移动端不再使用底部 dock，并提供抽屉关闭与滚动锁定逻辑', () => {

@@ -40,6 +40,29 @@ test('首次进市场显示市场骨架，切回时同步显示旧商品；刷�
   assert.equal(hasSkeleton(view), false);
 });
 
+test('模型页首访显示两张卡的骨架，旧设置链接回切复用模型页缓存', async () => {
+  const {route, run, view} = setup();
+  const first = route('#/models');
+  const cards = () => view.querySelector('.settings-stack').childNodes;
+  assert.equal(cards().length, 2);
+  assert.ok(hasSkeleton(view));
+  assert.equal(view.querySelector('.settings-menu'), null);
+  run(`const config = {layout: {groups: [{id: 'models', title: '模型', pages: [{id: 'models'}]}],
+    rules: [{prefix: 'llm', page: 'models'}]}, structured: {llm: {chat_model: 'test-chat'}, mcp: {servers: []}, decision: {groups: {}}}};
+    pending['/api/config'].resolve(config);`);
+  await first;
+  assert.ok(view.querySelector('.settings-stack'), view.textContent);
+  assert.deepEqual(cards().map(n => n.querySelector('h2').textContent), ['模型与接口', '模型池与审查模型']);
+  assert.equal(run(`$('#page-title').textContent`), '模型');
+  assert.equal(view.querySelector('.settings-menu'), null);
+  const stack = view.querySelector('.settings-stack');
+  await route('#/groups');
+  const revisit = route('#/settings/model');
+  assert.equal(view.querySelector('.settings-stack'), stack);
+  run(`pending['/api/config'].resolve(config)`); await revisit;
+  assert.equal(hasSkeleton(view), false);
+});
+
 test('缓存中开始编辑的表单不被后台结果覆盖；下次访问不带回草稿', async () => {
   const {route, run, view} = setup();
   const edit = () => route('#/plugins/config/demo');
