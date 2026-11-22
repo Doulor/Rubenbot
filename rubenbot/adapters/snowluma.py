@@ -121,6 +121,11 @@ class SnowLumaAdapter(BaseAdapter):
     # 生命周期
     # ------------------------------------------------------------------
 
+    @property
+    def connected(self) -> bool:
+        """只读连接状态；重连等待期间不把已断开的 WS 算作在线。"""
+        return self._ws is not None and self._ws.state.name == "OPEN"
+
     async def start(self, on_event: EventCallback) -> None:
         """连接并持续收事件；返回意味着已 stop。"""
         self._on_event = on_event

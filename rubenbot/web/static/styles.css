@@ -561,6 +561,26 @@ button {
   }
 }
 
+/* ---------------- 关于：版本标头与只读运行清单 ---------------- */
+
+.about-meta, .about-release, .about-update, .about-name {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px 16px;
+}
+.about-meta, .about-release { justify-content: space-between; }
+.about-meta, .about-release, .about-pool { color: var(--muted); font-size: 12.5px; }
+.about-link { color: var(--text-soft); text-decoration: underline; text-underline-offset: 0.2em; }
+.about-name { margin: 14px 0; font-size: 28px; line-height: 1.2; }
+.about-name small { font-size: 14px; color: var(--muted); }
+.about-page .card { min-width: 0; }
+.about-release { padding-top: 14px; border-top: 1px solid var(--hairline); align-items: center; }
+.about-page .kv .k { max-width: 50%; overflow-wrap: anywhere; }
+.about-pool { display: block; margin-top: 2px; }
+.about-license summary { cursor: pointer; font-size: 13px; }
+.about-license pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.65 var(--font-mono); }
+
 /* ---------------- 概览英雄卡 ---------------- */
 
 /* 平整的 tonal 表面卡：没有任何装饰，只借用 .card 的表面与圆角；

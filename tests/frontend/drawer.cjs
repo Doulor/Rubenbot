@@ -17,7 +17,8 @@ test('移动端抽屉与桌面侧栏顺序一致，模型紧跟机器人', () =>
   assert.equal(navs.length, 2);
   assert.deepEqual(navs[0], navs[1]);
   assert.deepEqual(navs[0].map(([, page]) => page),
-    ['overview', 'bot', 'models', 'memory', 'people', 'groups', 'plugins', 'logs', 'settings']);
+    ['overview', 'bot', 'models', 'memory', 'people', 'groups', 'plugins', 'logs', 'settings', 'about']);
+  assert.equal(navs[0].at(-1)[0], '#/about');
   assert.equal(navs[0][2][0], '#/models');
 });
 

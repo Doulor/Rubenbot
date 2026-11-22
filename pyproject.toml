@@ -27,9 +27,10 @@ rubenbot = "rubenbot.__main__:main"
 [tool.setuptools.packages.find]
 include = ["rubenbot*"]
 
-# 网关接口目录是数据文件（JSON），打包时要跟着走
+# 普通 wheel 安装也必须能挂载 WebUI，否则只读 API 会在创建应用时失败。
 [tool.setuptools.package-data]
 "rubenbot.gateway" = ["catalogs/*.json"]
+"rubenbot.web" = ["static/*", "static/fonts/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

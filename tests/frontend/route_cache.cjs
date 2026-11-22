@@ -63,6 +63,71 @@ test('模型页首访显示两张卡的骨架，旧设置链接回切复用模�
   assert.equal(hasSkeleton(view), false);
 });
 
+const sha = 'abcdef0'.padEnd(40, '1');
+const repository = 'https://github.com/Doulor/Rubenbot';
+const about = {
+  project: {name: 'RubenBot', version: '1.2.3', repository_url: repository, commit_source: 'deploy', commit: sha, commit_url: `${repository}/commit/${sha}`},
+  license: {name: 'MIT', text: 'MIT License\n\nCopyright (c) test'},
+  runtime: {models: {chat_model: 'base-chat', gate_model: null}, roles: {chat: {model: 'pool-first', count: 2, strategy: 'round_robin'}},
+    model_count: 2, model_strategy: 'failover', adapters: ['console', 'snowluma'], snowluma_status: 'connected', plugins: {total: 6, enabled: 0}},
+};
+
+async function loadAbout(ctx, data = about) {
+  const first = ctx.route('#/about');
+  ctx.run(`pending['/api/about'].resolve(${JSON.stringify(data)})`);
+  await first;
+}
+
+test('关于首访与实页布局同构，回切先读缓存，随后可展示未知提交及其原因', async () => {
+  const {route, run, view} = setup();
+  const first = route('#/about');
+  const layout = () => view.walk().filter(n => n.matches('section')).map(n => n.className);
+  const skeleton = layout();
+  assert.ok(hasSkeleton(view));
+  assert.equal(skeleton.length, 4);
+  run(`pending['/api/about'].resolve(${JSON.stringify(about)})`);
+  await first;
+  assert.deepEqual(layout(), skeleton);
+  assert.equal(run(`$('#page-title').textContent`), '关于');
+  for (const text of ['v1.2.3', 'abcdef0', 'base-chat', 'pool-first', '2 个 · 轮询', '已连接', '已发现 6 · 已启用 0']) {
+    assert.ok(view.textContent.includes(text), text);
+  }
+  assert.equal(view.querySelector('pre').textContent, about.license.text);
+  const links = view.walk().filter(n => n.matches('a'));
+  assert.deepEqual(links.map(n => n.getAttribute('href')), [repository, `${repository}/commit/${sha}`]);
+  assert.equal(links[1].getAttribute('title'), `部署盖戳 · ${sha}`);
+  assert.ok(links.every(n => n.getAttribute('target') === '_blank' && n.getAttribute('rel').includes('noopener')));
+  assert.equal(run(`'/api/about/update' in pending`), false);
+  const cached = view.querySelector('.about-page');
+  await route('#/groups');
+  const revisit = route('#/about');
+  assert.equal(view.querySelector('.about-page'), cached);
+  const unknown = {...about, project: {...about.project, commit: null, commit_url: null, commit_source: 'unknown', commit_reason: '无盖戳，Git 不可用'}};
+  run(`pending['/api/about'].resolve(${JSON.stringify(unknown)})`);
+  await revisit;
+  assert.match(view.textContent, /未知（无盖戳，Git 不可用）/);
+  assert.ok(!view.walk().some(n => n.getAttribute('href')?.includes('/commit/')));
+});
+
+test('更新仅由按钮触发，可重试；最新、可更新和失败都不替换其余信息', async () => {
+  const ctx = setup();
+  const {run, view} = ctx;
+  await loadAbout(ctx);
+  const btn = view.querySelector('button'), result = view.querySelector('.about-result'), license = view.querySelector('details');
+  for (const [status, expected] of [['current', '已是最新'], ['available', '有更新：abcdef0'], ['error', '检查失败，请稍后再试'], ['offline', '检查失败，请稍后再试']]) {
+    const check = btn.fire('click');
+    assert.equal(btn.disabled, true);
+    assert.equal(result.textContent, '正在检查…');
+    if (status === 'offline') run(`pending['/api/about/update'].reject(Error('内部详情'))`);
+    else run(`pending['/api/about/update'].resolve(${JSON.stringify({status, message: expected, latest_commit: sha, commit_url: `${repository}/commit/${sha}`})})`);
+    await check;
+    assert.equal(result.textContent, expected);
+    if (status === 'available') assert.equal(result.querySelector('a').getAttribute('href'), `${repository}/commit/${sha}`);
+    assert.equal(btn.disabled, false);
+    assert.equal(view.querySelector('details'), license);
+  }
+});
+
 test('缓存中开始编辑的表单不被后台结果覆盖；下次访问不带回草稿', async () => {
   const {route, run, view} = setup();
   const edit = () => route('#/plugins/config/demo');

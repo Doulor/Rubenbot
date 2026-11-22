@@ -332,6 +332,7 @@ function routeSkeleton(page, param = "") {
   let body;
   switch (page) {
     case "overview": body = overviewSkeleton(); break;
+    case "about": body = aboutLayout(); break;
     case "bot": case "persona": case "models": case "settings": body = settingsSkeleton(page, param); break;
     case "plugins": body = pluginSkeleton(param); break;
     case "people":
@@ -573,6 +574,7 @@ const PAGES = {
   plugins: { title: "插件", sub: "发现与管理插件，或调整已安装插件的配置", render: renderPlugins },
   logs: { title: "日志", sub: "最近的运行日志", render: renderLogs },
   settings: { title: "设置", sub: "搜索、主动触达、适配器与运行环境", render: renderSettings },
+  about: { title: "关于", sub: "项目版本、开源许可与当前运行环境", render: renderAbout },
 };
 
 const state = {
@@ -1112,7 +1114,76 @@ async function renderOverview(view, param, entry = {}) {
 }
 
 function kvRow(key, value) {
-  return h("div", { class: "kv" }, h("span", { class: "k" }, key), h("span", { class: "v" }, String(value)));
+  return h("div", { class: "kv" }, h("span", { class: "k" }, key), h("span", { class: "v" }, value));
+}
+
+/* ------------------------------------------------------------------ */
+/* 关于：首访骨架与真实内容共用布局，更新检查只改按钮旁的结果。       */
+/* ------------------------------------------------------------------ */
+
+function aboutLink(url, label, title) {
+  return h("a", { class: "about-link", href: url, target: "_blank", rel: "noopener noreferrer", title }, label);
+}
+
+function updateCheck() {
+  const result = h("span", { class: "about-result", role: "status" });
+  const button = h("button", { type: "button", class: "btn btn-sm", onclick: async () => {
+    if (button.disabled) return;
+    button.disabled = true;
+    result.textContent = "正在检查…";
+    try {
+      const update = await api.get("/api/about/update");
+      if (update.status === "available") {
+        result.replaceChildren("有更新：", aboutLink(update.commit_url, update.latest_commit.slice(0, 7), update.latest_commit));
+      } else {
+        result.textContent = update.message;
+      }
+    } catch (err) {
+      if (!(err instanceof Unauthorized)) result.textContent = "检查失败，请稍后再试";
+    } finally { button.disabled = false; }
+  } }, icon("refresh"), "检查更新");
+  return h("div", { class: "about-update" }, button, result);
+}
+
+function aboutLayout(data) {
+  const p = data?.project, runtime = data?.runtime;
+  const bar = () => skeletonBar("8ch");
+  const strategy = name => MODEL_POOL_STRATEGY_LABELS[name] || name;
+  const states = { connected: "已连接", disconnected: "未连接", disabled: "未启用", not_running: "未运行" };
+  const roleNames = { chat: "对话", extract: "事实抽取", consolidate: "记忆归纳", gate: "分寸审查",
+    fast: "快速任务", summary: "滚动摘要", vision: "看图", distill: "画像提炼" };
+  const source = p?.commit_source === "deploy" ? "部署盖戳" : "Git HEAD";
+  const commit = !p ? bar() : p.commit ? aboutLink(p.commit_url, p.commit.slice(0, 7), `${source} · ${p.commit}`)
+    : `未知（${p.commit_reason}）`;
+  const project = h("section", { class: "card card-pad" },
+    h("div", { class: "about-meta" }, "项目", p ? aboutLink(p.repository_url, "GitHub 仓库 ↗") : bar()),
+    h("h2", { class: "about-name" }, p ? p.name : skeletonBar("7ch", "1em"),
+      h("small", { class: "mono" }, p ? `v${p.version}` : bar())),
+    h("div", { class: "about-release" }, h("span", {}, "当前提交 · ", commit), data ? updateCheck() : skeletonBar("96px", "32px")));
+  const roles = runtime ? Object.entries(runtime.roles) : Object.keys(roleNames).map(role => [role, null]);
+  const pools = card("角色模型池", { hint: "首选模型 / 池内数量与策略", body: roles.map(([role, pool]) =>
+    kvRow(Object.hasOwn(roleNames, role) ? roleNames[role] : role, pool ? [pool.model || "未配置",
+      h("small", { class: "about-pool" }, `${pool.count} 个 · ${strategy(pool.strategy)}`)] : [bar(), h("small", { class: "about-pool" }, bar())])) });
+  const info = card("运行信息", { body: [
+    kvRow("当前对话首选", runtime ? runtime.roles.chat.model || "未配置" : bar()),
+    ...["chat", "extract", "consolidate", "gate"].map(role => {
+      const key = `${role}_model`;
+      return kvRow(key, runtime ? runtime.models[key] || "未单独配置" : bar());
+    }),
+    kvRow("默认策略", runtime ? strategy(runtime.model_strategy) : bar()),
+    kvRow("模型总数（去重）", runtime ? runtime.model_count : bar()),
+    kvRow("运行适配器", runtime ? runtime.adapters.map(platformName).join("、") || "无" : bar()),
+    kvRow("SnowLuma 连接", runtime ? states[runtime.snowluma_status] : bar()),
+    kvRow("本地插件", runtime ? `已发现 ${runtime.plugins.total} · 已启用 ${runtime.plugins.enabled}` : bar()),
+  ] });
+  const license = card("开源许可", { body: !data ? skeletonBar("14ch") : data.license.text
+    ? h("details", { class: "about-license" }, h("summary", {}, `${data.license.name} · 查看许可全文`), h("pre", {}, data.license.text))
+    : `${data.license.name} · 未能读取许可文件` });
+  return h("div", { class: "grid about-page" }, project, h("div", { class: "grid grid-2" }, pools, info), license);
+}
+
+async function renderAbout(view) {
+  view.replaceChildren(aboutLayout(await api.get("/api/about")));
 }
 
 /* ------------------------------------------------------------------ */

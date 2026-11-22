@@ -20,7 +20,7 @@ llm:
   # 模型池策略：failover（按顺序故障转移）/ round_robin（轮询）/ random（随机）
   # 单模型列表时三种策略行为一致；配了多个模型时按策略最多走一遍、不额外退避。
   model_strategy: "failover"
-  # 每角色覆盖全局策略；没写的角色跟随 model_strategy
+  # 每角色覆盖全局策略；没写的角色跟随 model_strategy。WebUI「关于」可核对生效的首选模型、池大小和策略。
   model_strategies: {}
   #   chat: "round_robin"
   temperature: 0.8

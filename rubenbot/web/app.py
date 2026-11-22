@@ -74,6 +74,7 @@ from ..persona import (
     personafile_path,
 )
 from ..stickers import KIND_PHOTO, KIND_STICKER
+from .about import check_update, project_info, runtime_info
 from .auth import COOKIE_NAME, BindSecurityError, check_bind_security, mask_secret
 from .config_schema import (
     ConfigValidationError,
@@ -571,6 +572,21 @@ def create_app(state: WebState):
         response = JSONResponse({"ok": True})
         response.delete_cookie(COOKIE_NAME, path="/")
         return response
+
+    # ------------------------------------------------------------------
+    # 关于（本地信息与按需检查更新）
+    # ------------------------------------------------------------------
+
+    @app.get("/api/about")
+    async def about(request: Request):
+        require_session(request)
+        project = await asyncio.to_thread(project_info)
+        return {**project, "runtime": runtime_info(state)}
+
+    @app.get("/api/about/update")
+    async def about_update(request: Request):
+        require_session(request)
+        return await check_update()
 
     # ------------------------------------------------------------------
     # 概览
