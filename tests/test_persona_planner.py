@@ -17,7 +17,7 @@ from conftest import RecordingAdapter, ScriptedLLM
 from rubenbot.adapters.base import MessageEvent
 from rubenbot.config import Config
 from rubenbot.core import RubenBot
-from rubenbot.decision import DecisionConfig, DecisionEngine
+from rubenbot.decision import BOT_SENDER_ID, DecisionConfig, DecisionEngine
 from rubenbot.expression import coerce_speak, parse_plan
 from rubenbot.opener_guard import OpenerGuard, opening_pattern
 from rubenbot.persona import (
@@ -221,6 +221,54 @@ def test_owner_not_injected_for_group_even_when_named(tmp_path, store):
 # ----------------------------------------------------------------------
 # 2. 开口裁定并入 stage1
 # ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("with_history", [False, True])
+def test_planner_self_state_is_scoped_and_planner_only(config, store, tmp_path, monkeypatch, with_history):
+    now = 100_000
+    monkeypatch.setattr(time, "time", lambda: now)
+    texts = ["前个话题", "另一句", "带引号的\"原文\"\n第二行", "长" * 220, "接上句", "最后一句"]
+
+    def record(text, ts, *, platform="recording", kind="group", chat="g1", sender=BOT_SENDER_ID):
+        store.add_raw_message(platform=platform, chat_type=kind, chat_id=chat,
+                              sender_id=sender, sender_name=sender, text=text, ts=ts)
+
+    if with_history:
+        for text, age in zip(texts, [1000, 900, 30, 25, 20, 15], strict=True):
+            record(text, now - age)
+    record("同号私聊", now - 4, kind="private")
+    record("其他群", now - 3, chat="g2")
+    record("另一平台", now - 2, platform="other")
+    record("刚才的群友", now - 1, sender="user")
+
+    llm = ScriptedLLM({"fast": [plan(speak=True, intent="提问", increment="问地点")], "chat": ["在哪啊"]})
+    bot, _ = make_bot(config, store, multi_persona(tmp_path), llm)
+    asyncio.run(bot.handle_event(group_event()))
+    stage1, stage2 = llm.calls
+    assert stage1["task"] == "gen_stage1" and stage1["json_mode"]
+    prompt = stage1["messages"][-1]["content"]
+    state = prompt.split("【自身状态】")[1]
+    assert json.loads(state.split("按时间先后）：")[1]) == (texts[-5:] if with_history else [])
+    assert f"本话题已发言：{4 if with_history else 0} 条" in state
+    assert ("距上次发言：15 秒" if with_history else "距上次发言：尚无发言记录") in state
+    assert stage2["task"] == "gen_stage2"
+    assert all("【自身状态】" not in msg["content"] for msg in stage2["messages"])
+
+
+@pytest.mark.parametrize("mentioned", [False, True])
+def test_old_empty_intent_silence_is_audited(config, store, tmp_path, mentioned):
+    # 对照实验用空 intent 表示沉默；仍然保留布尔裁定与原理由。
+    llm = ScriptedLLM({"fast": [plan(speak=False, intent="", reason="在看")], "chat": ["在"]})
+    bot, adapter = make_bot(config, store, multi_persona(tmp_path), llm)
+    asyncio.run(bot.handle_event(group_event(mentions=mentioned)))
+    assert adapter.texts == (["在"] if mentioned else [])
+    assert len(llm.calls) == (2 if mentioned else 1)
+    factors = store.list_decision_logs()[0]["factors"]
+    assert factors["planner"] == {"speak": False, "reason": "在看"}
+    assert factors["expression_decision"]["intent"] == "沉默"
+    if mentioned:
+        assert factors["planner_override"] == "mentioned"
+        assert "意图：短附和" in llm.calls[1]["messages"][-1]["content"]
 
 
 def test_plan_parses_speak_and_reason():
@@ -455,9 +503,9 @@ def test_opener_guard_correction_is_one_round(tmp_path, store):
     bot.opener_guard = guard
     asyncio.run(bot.handle_event(group_event()))
     stage2 = llm.calls[1]["messages"]
-    assert "这轮别用「草」开头" in stage2[0]["content"]
+    assert "最近有 3 条以「草」开头。这轮换个说法" in stage2[0]["content"]
     # 纠偏只在生成步提示里出现，不写进人设文件
-    assert "这轮别用" not in Path(tmp_path / "persona" / "persona.md").read_text(encoding="utf-8")
+    assert "这轮换个说法" not in Path(tmp_path / "persona" / "persona.md").read_text(encoding="utf-8")
     # 真实回复记账后模式计数更新（开头 2 字作模式）
     assert "换个" in guard._states["recording:g1"].patterns
 

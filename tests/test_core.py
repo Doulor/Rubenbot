@@ -325,7 +325,7 @@ def test_prompt_tells_model_veto_marker(config, store):
     asyncio.run(bot.handle_event(private_event("在吗")))
     system = llm.chat_messages[0][0]["content"]
     assert marker in system
-    assert "没必要接话" in system
+    assert f"如果你只是默默看着，整条回复就是 {marker}" in system
 
 
 def test_topic_relevance_from_memories(config, store):

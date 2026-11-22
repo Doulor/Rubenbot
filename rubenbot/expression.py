@@ -28,10 +28,10 @@ class ExpressionDecision:
 
     def prompt_block(self) -> str:
         return (
-            "【表达决策书·内部回复指导】只发正文，不要复述这份指导。\n"
+            "【表达决策书·内部回复指导】发出去的只有聊天正文。\n"
             f"意图：{self.intent}；长度档：{self.length_band}（{BUDGETS[self.length_band]}）。\n"
-            f"增量点：{self.increment or '无，不展开'}\n"
-            "禁复述清单（不要重复这些观点和措辞）："
+            f"这次想接的那一点：{self.increment or '简短回应'}\n"
+            "已经说过的部分（背景）："
             + json.dumps(self.avoid_repetition, ensure_ascii=False)
         )
 
@@ -88,16 +88,21 @@ def parse_plan(raw: str, band: str, recent: list[str]) -> ExpressionDecision:
         data = json.loads(raw) if len(raw) <= MAX_PLAN_CHARS else None
     except ValueError:
         data = None
-    if not isinstance(data, dict) or data.get('intent') not in INTENTS:
+    if not isinstance(data, dict):
         return ExpressionDecision("短附和", "碎片", "", repetition_list(recent), "fallback")
-    intent = data['intent']
+    speak = coerce_speak(data.get('speak'))
+    intent = data.get('intent')
+    # 有些旧裁定用空意图表示「看过就划走」；明确的 false 仍是有效裁定。
+    if speak is False and intent in (None, ''):
+        intent = '沉默'
+    if intent not in INTENTS:
+        return ExpressionDecision("短附和", "碎片", "", repetition_list(recent), "fallback")
     increment = data.get('increment')
     increment = ' '.join(increment.split())[:MAX_INCREMENT] if isinstance(increment, str) else ''
     if increment.strip('。.!！ ') in ('无', '没有', '无增量', '没有新信息', '无新信息'):
         increment = ''
     if not increment and intent != '短附和':
         intent = '沉默'
-    speak = coerce_speak(data.get('speak'))
     if speak is None:
         speak = False if intent == '沉默' else True
     reason = data.get('reason')

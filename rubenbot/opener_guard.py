@@ -4,7 +4,7 @@
 
 - 按会话保留 bot 最近 ``window`` 条回复的开头模式（首个语气词，或开头 2 字）；
 - 同一模式在窗口里出现 ``threshold`` 次及以上时，下一轮生成提示尾部临时
-  加一句纠偏（例如「这轮别用『草』开头，换个说法」）；
+  加一句纠偏（说明近期重复的开头，并提示从内容起头）；
 - 纠偏只注入一轮：发过之后要等新回复进来、且模式仍然超标才会再次触发。
 
 状态全在内存里，进程重启后从零开始；表情条等非文字回复不参与统计。
@@ -104,9 +104,9 @@ class OpenerGuard:
         hit = self.dominant(key)
         if hit is None:
             return None
-        pattern, _count = hit
+        pattern, count = hit
         state.corrected_at = state.notes
-        state.pending_note = f"这轮别用「{pattern}」开头，换个说法。"
+        state.pending_note = f"最近有 {count} 条以「{pattern}」开头。这轮换个说法，从想说的内容起头。"
         return state.pending_note
 
     def clear_pending(self, key: str) -> None:

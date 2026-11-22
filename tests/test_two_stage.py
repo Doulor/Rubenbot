@@ -118,7 +118,9 @@ def test_guidance_generated_and_injected(config, store):
     assert last["role"] == "system"
     assert "内部回复指导" in last["content"]
     assert "问问是哪件事累着了" in last["content"]
-    assert "不要复述" in last["content"]
+    assert "只有聊天正文" in last["content"]
+    assert "一个完整的意思" in last["content"] and "自然停顿处换行" in last["content"]
+    assert "延续、补充、递进或转折" in last["content"]
     # 指导在历史之后：前面仍是原来的上下文
     assert stage2["messages"][: len(stage1["messages"]) - 1] == stage1["messages"][:-1]
 

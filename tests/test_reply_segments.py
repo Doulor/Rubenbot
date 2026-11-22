@@ -152,6 +152,16 @@ def test_newline_reply_sent_as_multiple_messages(config, store):
     assert bot_texts == ["确实", "不过这也太离谱了"]
 
 
+def test_continued_thought_keeps_its_pauses_and_order(config, store):
+    # 用一个因果相接的三段样本回放发送链；真实模型是否写得连贯另做对照评估。
+    parts = ["我还以为赶得上末班车", "结果跑到门口", "刚好看它开走"]
+    llm = ScriptedLLM({"chat": ["\n".join(parts)]})
+    bot, adapter = make_bot(config, store, llm)
+    asyncio.run(bot.handle_event(private_event("昨天怎么回去的")))
+    assert REPLY_SEGMENT_CONTRACT in llm.chat_messages[0][-1]["content"]
+    assert adapter.texts == parts
+
+
 def test_max_segments_one_sends_single_message(config, store):
     config.reply.max_segments = 1
     bot, adapter = make_bot(config, store, ScriptedLLM({"chat": ["一\n二"]}))
