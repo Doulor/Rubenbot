@@ -26,7 +26,7 @@ from typing import Any
 from ..config import (
     COMPUTER_LIMITS, DEFAULT_MODEL_STRATEGY, MODEL_STRATEGIES, SEARCH_PROVIDERS,
     STT_PROVIDERS, TTS_MODES, TTS_PROVIDERS,
-    ComputerConfig, Config, MCPConfig, MCPServerConfig, PrivacyConfig,
+    ComputerConfig, Config, MCPConfig, MCPServerConfig, PrivacyConfig, normalize_muted_senders,
 )
 from ..decision import parse_quiet_hours
 
@@ -370,7 +370,7 @@ class _Validator:
             return None
         try:
             number = float(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             self.fail(field, "必须是数字")
             return None
         if number != number or number in (float("inf"), float("-inf")):
@@ -998,6 +998,8 @@ def _validate_decision(section: dict[str, Any], v: _Validator) -> dict[str, Any]
         "min_reply_interval_seconds": (0, None),
         "refractory_seconds": (0, None),
         "proactive_window_seconds": (0, None),
+        "fatigue_window_seconds": (0, None),
+        "fatigue_cooldown_seconds": (0, None),
     }
     for key, (minimum, maximum) in number_fields.items():
         if key in section:
@@ -1009,14 +1011,20 @@ def _validate_decision(section: dict[str, Any], v: _Validator) -> dict[str, Any]
             value = v.boolean(section[key], f"decision.{key}")
             if value is not None:
                 out[key] = value
-    if "proactive_window_limit" in section:
-        number = v.number(section["proactive_window_limit"], "decision.proactive_window_limit", minimum=0, integer=True)
-        if number is not None:
-            out["proactive_window_limit"] = int(number)
+    for key in ("proactive_window_limit", "fatigue_reply_limit"):
+        if key in section:
+            number = v.number(section[key], f"decision.{key}", minimum=0, integer=True)
+            if number is not None:
+                out[key] = int(number)
     if "aliases" in section:
         aliases = v.string_list(section["aliases"], "decision.aliases")
         if aliases is not None:
             out["aliases"] = aliases
+    if "muted_senders" in section:
+        try:
+            out["muted_senders"] = normalize_muted_senders(section["muted_senders"])
+        except ValueError as exc:
+            v.fail("decision.muted_senders", str(exc))
     if "veto_marker" in section:
         value = v.text(section["veto_marker"], "decision.veto_marker", max_len=40)
         if value is not None:

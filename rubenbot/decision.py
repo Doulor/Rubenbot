@@ -35,6 +35,28 @@ _DEFAULT_ALIASES = ("Ruben",)
 # 除了配置里的 veto_marker，也接受几种常见写法，避免模型自由发挥时漏判
 _VETO_ALIASES = {"不回复", "（不回复）", "(不回复)", "【不回复】", "[[不回复]]"}
 
+# 相似度只比较归一化后的短文本：数字、时刻的小变化不是新模板。
+_TEMPLATE_VARIABLE = re.compile(r"\d+(?:[.:/-]\d+)*")
+
+
+def _template(text: str) -> str:
+    text = "".join(text[:512].lower().split())
+    text = _TEMPLATE_VARIABLE.sub("#", text)
+    # 纯数字、表情占位和「好」「哈哈」等短接话不能单独证明存在模板。
+    if sum(ch.isalpha() for ch in text) < 4 or text in {"[图片]", "[表情]", "[sticker]"}:
+        return ""
+    return text
+
+
+def _similar_template(a: str, b: str) -> bool:
+    if a == b:
+        return True
+    # 字三元组重合度，线性开销；短文本有一处实质差别就宁可放行。
+    left = {a[i:i+3] for i in range(len(a) - 2)}
+    right = {b[i:i+3] for i in range(len(b) - 2)}
+    return len(left & right) >= 0.85 * len(left | right)
+
+
 _QUIET_RE = re.compile(r"\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*")
 
 
@@ -247,6 +269,8 @@ class ReplyDecision:
     hard_trigger: str | None = None
     factors: OpenerFactors | None = None
     effective_talk_value: float | None = None
+    # 裁定当时该发送者的画面快照；不读回稍后才完成的视觉结果冒充当时所见。
+    visual_note: str = ""
 
     def log_text(self) -> str:
         verdict = "回" if self.should_reply else "不回"
@@ -368,6 +392,57 @@ class DecisionEngine:
         self.set_aliases(aliases)
         self._last_reply_at: dict[str, float] = {}
         self._active_replies: dict[str, list[float]] = {}
+        # 每笔为一次实际发出的跟评；合批中的同人多条原文仍只算一笔。
+        self._source_replies: dict[tuple[str, str, str], list[tuple[float, set[str]]]] = {}
+        self._source_cooldowns: dict[tuple[str, str, str], float] = {}
+        self._next_source_sweep = 0.0
+
+    def _fatigue_enabled(self) -> bool:
+        cfg = self.config
+        return cfg.fatigue_window_seconds > 0 and cfg.fatigue_reply_limit > 0 and cfg.fatigue_cooldown_seconds > 0
+
+    def note_source_reply(self, event: MessageEvent, events: list[MessageEvent], now: float) -> None:
+        """只在本轮实际发言后调用；不把次要发言人的话误记为被跟评对象。"""
+        if not event.is_group or not self._fatigue_enabled():
+            return
+        templates = {t for e in events if e.sender_id == event.sender_id and (t := _template(e.text))}
+        if not templates:
+            return
+        key = (event.platform, event.chat_id, event.sender_id)
+        cutoff = now - self.config.fatigue_window_seconds
+        if now >= self._next_source_sweep:
+            # 人员流动时也淘汰过期正文，不等待同一账号再次出现。
+            self._source_replies = {k: rows for k, rows in self._source_replies.items() if rows[-1][0] > cutoff}
+            self._next_source_sweep = now + 60
+        recent = self._source_replies.get(key, [])
+        self._source_replies[key] = [(ts, texts) for ts, texts in recent if ts > cutoff] + [(now, templates)]
+
+    def source_guard(self, event: MessageEvent, now: float) -> str | None:
+        """逐个真实来源检查；解除也返回一次状态，以便调用方审计后继续裁定。"""
+        if event.sender_id in self.config.muted_senders:
+            return "muted_sender"
+        if not event.is_group:
+            return None
+        key = (event.platform, event.chat_id, event.sender_id)
+        enabled = self._fatigue_enabled()
+        until = self._source_cooldowns.get(key)
+        if until is not None:
+            if enabled and now < until:
+                return "fatigue_cooldown"
+            del self._source_cooldowns[key]
+            return "fatigue_released"
+        if not enabled or key not in self._source_replies:
+            return None
+        template = _template(event.text)
+        if template:
+            cutoff = now - self.config.fatigue_window_seconds
+            count = sum(1 for ts, texts in self._source_replies[key] if ts > cutoff
+                        and any(_similar_template(template, t) for t in texts))
+            if count >= self.config.fatigue_reply_limit:
+                self._source_cooldowns[key] = now + self.config.fatigue_cooldown_seconds
+                del self._source_replies[key]
+                return "fatigue_triggered"
+        return None
 
     def set_aliases(self, aliases: Iterable[str]) -> None:
         """替换硬触发的名字/别名（配置热更新用）。"""

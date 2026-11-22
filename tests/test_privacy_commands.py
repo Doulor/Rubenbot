@@ -138,6 +138,16 @@ def test_privacy_purge_removes_everything(tmp_path):
     assert store.get_profile("recording:u1") is None
 
 
+@pytest.mark.parametrize(('enabled', 'command'), [(False, '/清空我的数据'), (True, '/隐私 清空')])
+def test_muted_account_can_still_purge_without_reply(tmp_path, enabled, command):
+    bot, adapter, store = make_bot(tmp_path, enabled=enabled)
+    seed_profile(store)
+    bot.config.decision.muted_senders = ['u1']
+    asyncio.run(bot.handle_event(private(command)))
+    assert store.get_profile('recording:u1') is None
+    assert not bot.llm.calls and not adapter.sent
+
+
 def test_privacy_help_for_unknown_args(tmp_path):
     bot, adapter, store = make_bot(tmp_path)
     asyncio.run(bot.handle_event(private("/隐私 啥")))

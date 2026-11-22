@@ -25,7 +25,7 @@ def configure(config: Config) -> None:
     cfg.proactive_window_limit = 1
 
 
-async def _turn(ctx, text, *, chat, group=False, sender="guest", ts=None):
+async def _turn(ctx, text, *, chat, group=False, mention=False, sender="guest", ts=None):
     """取本次入站对应的新决策，避免把同会话的旧记录当作证据。"""
     query = dict(platform=ctx.console.name, chat_id=chat, chat_type="group" if group else "private", limit=1)
     try:
@@ -33,7 +33,7 @@ async def _turn(ctx, text, *, chat, group=False, sender="guest", ts=None):
     except Exception:
         raise AssertionError("无法读取发送前的决策记录") from None
     try:
-        reply = await ctx.send(text, chat=chat, group=group, sender=sender, ts=ts)
+        reply = await ctx.send(text, chat=chat, group=group, mention=mention, sender=sender, ts=ts)
     except Exception:
         raise AssertionError("本轮驱动消息或读取出站文本失败") from None
     try:
@@ -48,6 +48,31 @@ async def _turn(ctx, text, *, chat, group=False, sender="guest", ts=None):
     if not isinstance(reply, str) or bool(reply.strip()) != row["should_reply"]:
         raise AssertionError("本轮实际出站与落库的回／不回结论不一致")
     return reply.strip(), row
+
+
+# 同类素材配正反例：要分辨说话对象与意图，而非识别某个账号或词表。
+_SOCIAL_CASES = (
+    ('天气播报', '北岸逐时预报｜09:00 多云 18℃；10:00 晴 20℃。下次更新 11:00。', False),
+    ('签到提醒', '今日签到通道已开放。连续记录 7 日，进度 7/30。', False),
+    ('资讯推送', '今日简讯｜市图书馆增设三个阅览区，周五起开放。详情见本期目录。', False),
+    ('真人闲聊', '小夏，刚说的那本书我明天带给你，咱俩到时候见。', False),
+    ('点名提问', '小测，我明天要淋雨骑车，书装进帆布包之前怎么防水？', True),
+    ('群友报喜', '我终于把驾照考下来了！蹲了三个月，快来跟我击个掌！', True),
+)
+
+
+async def social_signal(ctx) -> str:
+    """各用一个新群、相同的未静音账号，不让名单、疲劳或节奏跳过冒充策划沉默。"""
+    for i, (label, text, expected) in enumerate(_SOCIAL_CASES):
+        reply, row = await _turn(ctx, text, chat=f'e2e-social-{i}', group=True, mention=label == '点名提问')
+        plan = row['factors'].get('planner', {})
+        if plan.get('speak') is not expected or bool(reply) != expected:
+            raise AssertionError(f'{label}：策划裁定或实际出站与预期不符')
+        if not expected and row['reason'] != 'planner_silence':
+            raise AssertionError(f'{label}：没有策划主动沉默的记录')
+        if row['factors'].get('expression_decision', {}).get('source') != 'fast':
+            raise AssertionError(f'{label}：策划降级，不能作为模型判断的证据')
+    return '天气、签到、资讯均由策划静默；真人对照保留旁听、应答与祝贺'
 
 
 async def rhythm(ctx) -> str:

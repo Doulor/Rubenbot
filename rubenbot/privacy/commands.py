@@ -47,6 +47,22 @@ class PrivacyCommands:
         self.last_ask: dict[str, tuple[int, float]] = {}
         self.last_delivered: dict[str, float] = {}
 
+    def purge_if_requested(self, runtime, event) -> str | None:
+        """本人删除权不依赖是否允许互动；由调用方决定要不要发回执。"""
+        prefix = runtime.config.plugins.command_prefix
+        text = (event.text or "").strip()
+        if not is_command(text, prefix):
+            return None
+        parts = text[len(prefix):].split()
+        if parts != ["清空我的数据"] and not (
+            runtime.config.privacy.enabled and len(parts) >= 2
+            and parts[0] == "隐私" and parts[1] in ("清空", "删除", "clear")
+        ):
+            return None
+        from ..memory.store import make_person_id
+
+        return self._purge(runtime, make_person_id(event.platform, event.sender_id))
+
     async def handle(self, runtime, event) -> bool:
         """命中命令或待确认短答复时返回 True，普通消息留给聊天管线。"""
         prefix = runtime.config.plugins.command_prefix
@@ -56,12 +72,11 @@ class PrivacyCommands:
         person_id = make_person_id(event.platform, event.sender_id)
         if is_command(text, prefix):
             parts = text[len(prefix):].split()
-            if parts == ["清空我的数据"]:
-                reply = self._purge(runtime, person_id)
-            elif parts and parts[0] == "隐私" and runtime.config.privacy.enabled:
+            reply = self.purge_if_requested(runtime, event)
+            if reply is None:
+                if not (parts and parts[0] == "隐私" and runtime.config.privacy.enabled):
+                    return False
                 reply = self._command(runtime, event, person_id, parts[1:])
-            else:
-                return False
             await _send_safe(runtime, event, reply)
             return True
         if not runtime.config.privacy.enabled or not event.is_private:
@@ -102,8 +117,6 @@ class PrivacyCommands:
         head = parts[0]
         if head in ("模式", "mode"):
             return _set_mode(store, person_id, parts[1] if len(parts) > 1 else "")
-        if head in ("清空", "删除", "clear"):
-            return self._purge(runtime, person_id)
         if parts in (["可以"], ["不行"]):
             if not event.is_private:
                 return "请在收到询问的私聊里答复。"

@@ -6,7 +6,7 @@ import json
 import re
 from dataclasses import asdict, dataclass
 
-INTENTS = ("接梗", "补充新信息", "反驳", "提问", "短附和", "沉默")
+INTENTS = ("接梗", "补充新信息", "反驳", "提问", "短附和", "表情回应", "沉默")
 BUDGETS = {"碎片": "≤10 字", "短句": "11–25 字", "展开": "26–60 字"}
 MAX_PLAN_CHARS = 500
 MAX_INCREMENT = 50
@@ -125,7 +125,7 @@ def parse_plan(raw: str, band: str, recent: list[str], notes: tuple[CapabilityNo
     increment = ' '.join(increment.split())[:MAX_INCREMENT] if isinstance(increment, str) else ''
     if increment.strip('。.!！ ') in ('无', '没有', '无增量', '没有新信息', '无新信息'):
         increment = ''
-    if not increment and intent != '短附和':
+    if not increment and intent not in ('短附和', '表情回应'):
         intent = '沉默'
     if speak is None:
         speak = False if intent == '沉默' else True

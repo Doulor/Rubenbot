@@ -214,6 +214,12 @@ decision:
   urgent_seconds: 2
   # 叫到这些名字/别名就算硬触发；留空则用 chat.bot_name
   aliases: []
+  # 静音名单先于私聊、点名、插件和合批；按账号精确匹配，[] 表示不静音任何人
+  muted_senders: ["4012701880"]
+  # 群内同源模板的主动跟评只计成功发送的轮次；以下任一项为 0 则关闭刹车
+  fatigue_window_seconds: 3600
+  fatigue_reply_limit: 2          # 已跟评这么多轮后，再遇到相似模板就静音该来源
+  fatigue_cooldown_seconds: 1800  # 冷却不续期，到期后重新裁定
 
   min_reply_interval_seconds: 20  # 普通群消息两次开口间的最小间隔
   refractory_enabled: true

@@ -485,6 +485,12 @@ class DecisionConfig:
     # 叫到这些名字/别名视为硬触发；为空时使用 chat.bot_name
     aliases: list[str] = field(default_factory=list)
 
+    # 名单按发送者账号精确匹配；空列表关闭。疲劳参数任一为 0 时不启用刹车。
+    muted_senders: list[str] = field(default_factory=lambda: ["4012701880"])
+    fatigue_window_seconds: float = 3600.0
+    fatigue_reply_limit: int = 2
+    fatigue_cooldown_seconds: float = 1800.0
+
     # 两次开口之间的最小间隔（普通消息；硬触发不受影响）
     min_reply_interval_seconds: float = 20.0
     # 活人感节奏闸门：普通消息在不应期内直接不触发；窗口内主动发言封顶
@@ -1501,11 +1507,35 @@ def _load_search(data: dict[str, Any]) -> SearchConfig:
     return config
 
 
+def normalize_muted_senders(value: Any) -> list[str]:
+    """仅显式空列表关闭名单；兼容 YAML 中未加引号的整数账号。"""
+    if not isinstance(value, list) or any(type(uid) not in (str, int) or not str(uid).strip() for uid in value):
+        raise ValueError("应为非空发送者账号的列表；仅用 [] 关闭")
+    return list(dict.fromkeys(str(uid).strip() for uid in value))
+
+
 def _load_decision(data: dict[str, Any]) -> DecisionConfig:
     """只读取现役合批与护栏配置，忽略旧 YAML 里的未知键。"""
     if not isinstance(data, dict):
         return DecisionConfig()
-    return DecisionConfig(**{k: v for k, v in data.items() if _has(DecisionConfig, k)})
+    cfg = DecisionConfig(**{k: v for k, v in data.items() if _has(DecisionConfig, k)})
+    defaults = DecisionConfig()
+    try:
+        cfg.muted_senders = normalize_muted_senders(cfg.muted_senders)
+    except ValueError as exc:
+        logger.warning("忽略无效 decision.muted_senders，使用默认名单：%s", exc)
+        cfg.muted_senders = defaults.muted_senders
+    for key in ("fatigue_window_seconds", "fatigue_reply_limit", "fatigue_cooldown_seconds"):
+        value = getattr(cfg, key)
+        try:
+            number = float(value) if not isinstance(value, bool) else float("nan")
+            if not math.isfinite(number) or number < 0 or (key == "fatigue_reply_limit" and not number.is_integer()):
+                raise ValueError
+            setattr(cfg, key, int(number) if key == "fatigue_reply_limit" else number)
+        except (ValueError, TypeError, OverflowError):
+            logger.warning("忽略无效 decision.%s，使用默认值", key)
+            setattr(cfg, key, getattr(defaults, key))
+    return cfg
 
 
 def _load_emotion(data: dict[str, Any]) -> EmotionConfig:

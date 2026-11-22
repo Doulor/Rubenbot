@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import random
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -424,3 +425,18 @@ def test_nonverbal_reply_through_handle_event(config, store, tmp_path, scenario)
     assert adapter.texts == expected_text
     assert len(bot.llm.chat_messages) == len(expected_text)
     assert [msg.text for msg in bot_messages(store)] == (expected_text or ["[表情]"])
+
+
+@pytest.mark.parametrize('intent,send_sticker', [('表情回应', True), ('短附和', False)])
+def test_pure_sticker_respects_planned_medium(config, store, tmp_path, intent, send_sticker):
+    bot, adapter = sticker_bot(config, store, tmp_path, intent=intent)
+    config.stickers.send_probability = 1.0  # 选了文字，也不因补发概率为一强行贴图。
+    config.stickers.nonverbal_probability = 0.01
+    bot.sticker_behavior.rng = random.Random(0)  # 若对策划选中的表情二次掷点，必定落空。
+    bot.stickers.add(png(b'cat'), tags=['猫猫'])
+    incoming = event('[表情]')
+    incoming.segments = [Segment.sticker(description='难过的小猫')]
+    asyncio.run(bot.handle_event(incoming))
+    assert 'intent=表情回应' in bot.llm.calls[0]['messages'][-1]['content']
+    assert adapter.call_capability.await_count == int(send_sticker)
+    assert adapter.texts == ([] if send_sticker else ['路过一只'])

@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from conftest import ScriptedLLM
+from conftest import RecordingAdapter, ScriptedLLM
 from rubenbot.adapters.base import MessageEvent, Segment
 from rubenbot.core import RubenBot
 from rubenbot.decision import MergedRound
@@ -131,7 +131,9 @@ def test_real_timeout_leaves_recognition_running(bot, store, monkeypatch):
             await asyncio.wait_for(bot.process_round(MergedRound('recording', 'g', 'group', '甲', '甲',
                                    [event], first_at=NOW - 4.99, hard=True)), timeout=1)
             call, = [call for call in bot.llm.calls if call['task'] == 'gen_stage1']
-            assert any(part['content'].endswith('[图片]') for part in call['messages'])
+            assert any('[图片]〔视觉描述缺失〕' in part['content'] for part in call['messages'])
+            audit, = store.list_decision_logs()
+            assert audit['text'] == '[图片]〔视觉描述缺失〕'
             assert not store.raw_message_by_id(event.raw_message_id).visual_text
         finally:
             resume.set()
@@ -155,3 +157,57 @@ def test_timeout_proceeds_with_placeholder(bot, monkeypatch, elapsed):
         assert wait.await_args.kwargs['timeout'] == pytest.approx(max(0, 5 - elapsed), abs=0.00001)
     assert any(part.endswith('[图片]') for part in contents)
     assert not any('非发言' in part for part in contents)
+
+
+@pytest.mark.parametrize('intent,draft,reason', [
+    ('沉默', '', 'planner_silence'),
+    ('短附和', '抱抱', 'private'),
+    ('短附和', '图也不说是吧', 'image_behavior_veto'),
+    ('短附和', '发图不说话', 'image_behavior_veto'),
+    ('短附和', '这张图里的猫怎么哭成这样', 'private'),
+    ('表情回应', '', 'sticker_unavailable'),
+])
+def test_crying_sticker_replay(bot, store, intent, draft, reason):
+    # 相同私聊贴纸可以接住情绪，也能只看不回；普通文字不被随机替换成表情。
+    adapter = RecordingAdapter()
+    bot.register_adapter(adapter)
+    bot.llm.responses = {'fast': ['{"basis":"settled","intent":"%s","increment":"接住委屈"}' % intent],
+                         'chat': [draft]}
+    msg = MessageEvent('recording', 'private', 'g', '甲', '甲', '',
+                       segments=[Segment.sticker(description='小猫眼角挂着两串泪珠')])
+    asyncio.run(bot.handle_event(msg))
+    planner, = [call for call in bot.llm.calls if call['task'] == 'gen_stage1']
+    note = '[表情]〔图片视觉描述·非发言：小猫眼角挂着两串泪珠〕'
+    assert any(note in part['content'] for part in planner['messages'])
+    audit, = store.list_decision_logs()
+    assert audit['text'] == note and audit['reason'] == reason
+    assert adapter.texts == ([draft] if reason == 'private' else [])
+    assert bool(bot.llm.chat_messages) == bool(draft)
+
+
+def test_captioned_question_keeps_normal_direct_override(bot, store):
+    adapter = RecordingAdapter()
+    bot.register_adapter(adapter)
+    bot.llm.responses = {'fast': ['{"basis":"settled","speak":false,"intent":"沉默"}'],
+                         'chat': ['看起来是猫']}
+    msg = message('@Ruben 这是什么？[图片]', mentions_bot=True,
+                  segments=[Segment.text('@Ruben 这是什么？'), Segment('image', {'description': '一只猫'})])
+    asyncio.run(bot.handle_event(msg))
+    assert adapter.texts == ['看起来是猫']
+    assert store.list_decision_logs()[0]['factors']['planner_override'] == 'mentioned'
+
+
+def test_image_scold_is_not_sent_for_a_mixed_batch(bot, store):
+    adapter = RecordingAdapter()
+    bot.register_adapter(adapter)
+    bot.llm.responses = {'fast': ['{"basis":"settled","intent":"短附和"}'], 'chat': ['发图不说话是吧']}
+    bot.merger.window = bot.merger.hard_window = 10
+
+    async def run():
+        await bot.handle_event(message('', segments=[Segment.sticker(description='红红的眼睛')]))
+        await bot.handle_event(message('诶'))
+        await bot.flush_merger(all_rounds=True)
+
+    asyncio.run(run())
+    assert adapter.texts == []
+    assert store.list_decision_logs()[0]['reason'] == 'image_behavior_veto'

@@ -85,7 +85,8 @@ from .voice import VOICE_PLACEHOLDER, VOICE_PREFIX, VoiceService, build_voice
 logger = logging.getLogger(__name__)
 
 # 护栏拦截原因（写进 decision_log 的 factors.guard，便于统计）
-_GUARD_REASONS = frozenset({"min_interval", "refractory", "proactive_window"})
+_GUARD_REASONS = frozenset({"min_interval", "refractory", "proactive_window", "muted_sender",
+                            "fatigue_triggered", "fatigue_cooldown"})
 
 # 适配器异常后的重启退避（秒）
 ADAPTER_RESTART_MIN = 1.0
@@ -100,7 +101,9 @@ VISUAL_WAIT_BUDGET = 5.0
 # 流水没有话题 ID；连续讨论中断十分钟就另起一段。仅用于展示计数。
 TOPIC_GAP_SECONDS = 10 * 60
 GUIDANCE_TASK_PROMPT = (
-    "读到这里，以你现在的状态，你会有什么反应？是心里有了句想说的话，还是看一眼就划过去？"
+    "先看这条消息里有没有值得回应的人和社交信号：谁在向谁求助、分享心情，或递来一个话头？"
+    "你的注意力给人，机器自行流过的数据只是背景；有人拿它来说事，才去接那个人的话。"
+    "光是能挤出一句评论，不是开口的理由。没有值得接的内容就选沉默（speak=false）。\n"
     "用 JSON 先报想说的那一点有什么依据，再决定开不开口：basis、speak、intent、length_band、increment、avoid_repetition，可选 reason。\n"
     "basis 四选一：ledger＝实体账或记忆有对应事实或群友原话（只见过名字不是释义）；"
     "settled＝在场者刚刚给出或说定的事实；common＝通用确知的常识；guess＝猜测、没把握或顺着话头推断。"
@@ -215,6 +218,25 @@ def chat_tools(config: Config) -> list[dict[str, Any]]:
 # ----------------------------------------------------------------------
 # 文本后处理（发送节奏与多段拆分见 reply_segments.py）
 # ----------------------------------------------------------------------
+
+# 只认直接揶揄对方「光发图、不说话」的句式，不因正文提到了图就否决。
+_IMAGE_SCOLD_RE = re.compile(
+    r"(?:[只光就又]?发(?:了)?(?:一?[张个])?(?:图(?:片)?|表情(?:包)?)|(?:^|[，。！？\s])(?:图|表情包))"
+    r"[，,、\s]*(?:也|都|又|咋|怎么)?(?:不说(?:话|是吧|一句)|不吱声|一(?:句|声)不[说吭])"
+    r"|(?:咋|怎么|为啥)(?:又|老是|光|只)+发(?:图|表情)"
+)
+
+
+def _visual_only(events: list[MessageEvent]) -> bool:
+    """只对真的视觉段放开必回覆盖；带文字的图片提问仍是普通提问。"""
+    return bool(events) and all(
+        any(seg.type in VISUAL_SEGMENTS for seg in item.segments)
+        and all(seg.type in VISUAL_SEGMENTS | {"reply", "at"} or
+                (seg.type == "text" and not seg.render().strip()) for seg in item.segments)
+        and item.text.strip() in {render_segments(item.segments).strip(), ""}
+        for item in events
+    )
+
 
 # 括号动作清理：只删「短、纯中文、命中动作/语气词」的括号内容。
 # 含数字/英文/符号（例如颜文字）、或拿不准的一律保留。
@@ -542,7 +564,7 @@ class RubenBot:
         aliases = config.decision.aliases or [config.chat.bot_name]
         self.decision_engine = DecisionEngine(config.decision, aliases=aliases, rng=self.rng)
         self.last_decision: dict[str, ReplyDecision] = {}
-        # 开头反重复：只跟踪 bot 最近几条回复的开场模式，命中才临时纠偏一轮
+        # 按会话跟踪最近成功发出的文字；重复开头、收尾或短语只提醒生成端。
         self.opener_guard = OpenerGuard()
         # 启动时间与最近一次处理消息的时间，供 WebUI 概览使用
         self.started_at: float = time.time()
@@ -1271,6 +1293,10 @@ class RubenBot:
                 "重复消息，已跳过：%s %s %s", event.platform, event.platform_msg_id, event.text[:40]
             )
             return
+        # 来源逐条过滤：不能将名单消息混进其他人的批次、唤起插件或刷新互动状态。
+        if self._source_blocked(event, now):
+            self.privacy_commands.purge_if_requested(self.context, event)
+            return
         # 语音条先转写：正文换成「[语音] 转写文本」，转写失败/未配置/超限都
         # 只保留 [语音] 占位（事件照常往下走，不影响决策和回复）
         await self.prepare_voice(event)
@@ -1316,9 +1342,18 @@ class RubenBot:
 
     async def process_round(self, round_: MergedRound) -> None:
         """对合并后的一轮消息做决策与生成。异常只记录，不向上抛。"""
-        event = round_.to_event()
         lock = self._chat_locks.setdefault(round_.key, asyncio.Lock())
         async with lock:
+            # 排队期间可能已有上一轮成功跟评，或名单刚热更新。只移除被拦的来源。
+            now = time.time()
+            remaining = [item for item in round_.events if not self._source_blocked(item, now)]
+            if not remaining:
+                return
+            if len(remaining) != len(round_.events):
+                round_.events = remaining
+                round_.hard = any(self.decision_engine.is_hard_trigger(e) or computer.is_host(self.config.computer, e)
+                                  for e in remaining)
+            event = round_.to_event()
             try:
                 self._observe_batch(round_.events)
                 flight = ReplyFlight(event.sender_id)
@@ -1330,14 +1365,27 @@ class RubenBot:
                     round_.events.extend(flight.updates)
                     flight.updates.clear()
                     flight.collecting = False
-                    self.opener_guard.clear_pending(self.decision_engine.chat_key(event))
+                    self.opener_guard.clear_pending(round_.key)
                     await self._process_round_locked(round_, round_.to_event(), flight, retry=True)
             except Exception as exc:  # noqa: BLE001 - 单轮失败不能带死循环
                 # 这一轮的纠偏没兑现（异常中断），允许下一轮重新提醒
-                self.opener_guard.clear_pending(self.decision_engine.chat_key(event))
+                self.opener_guard.clear_pending(round_.key)
                 logger.exception("处理合并消息异常：%s", exc)
             finally:
                 self._flights.pop(round_.key, None)
+
+    def _source_blocked(self, event: MessageEvent, now: float) -> bool:
+        reason = self.decision_engine.source_guard(event, now)
+        if reason is None:
+            return False
+        decision = ReplyDecision(False, reason=reason)
+        decision.visual_note = self._decision_visual_note(event, [event], self._visual_snapshots([event]))
+        self._log_decision(event, decision, now)
+        # 解除是一条独立审计记录，不当作当前消息的裁定，也不保证本轮一定回复。
+        if reason == "fatigue_released":
+            return False
+        self.last_decision[self.decision_engine.chat_key(event)] = decision
+        return True
 
     def _observe_batch(self, events: list[MessageEvent]) -> None:
         # 同一人的补充仍算一个对话轮，不能把甲受到的称呼或赞骂记到乙名下。
@@ -1373,6 +1421,7 @@ class RubenBot:
             extra=_log_identity(event),
         )
         if not decision.should_reply:
+            decision.visual_note = self._decision_visual_note(event, round_.events, self._visual_snapshots(round_.events))
             self._log_decision(event, decision, now)
             return
 
@@ -1383,7 +1432,10 @@ class RubenBot:
         remaining = max(0.0, VISUAL_WAIT_BUDGET - max(0.0, time.time() - round_.first_at))
         if raw_ids:
             await self.sticker_behavior.wait_for_visuals(raw_ids, timeout=remaining)
-        messages = await self.build_context(event, now=now, stage="planner", batch=round_.events)
+        visual_snapshots = self._visual_snapshots(round_.events)
+        decision.visual_note = self._decision_visual_note(event, round_.events, visual_snapshots)
+        messages = await self.build_context(event, now=now, stage="planner", batch=round_.events,
+                                            visual_snapshots=visual_snapshots)
         # 让模型知道「可以不接话」的出口
         marker = self.config.decision.veto_marker
         messages[0]["content"] += (
@@ -1398,8 +1450,9 @@ class RubenBot:
         expression = await self.plan_expression(messages, event, decision, now=now)
         if flight.updates:
             return
-        # 初裁允许硬触发覆盖沉默；发送前复核不再覆盖。
-        if expression.speak is False and (retry or not hard):
+        # 单纯传来画面不是文字提问，即使来自私聊也不替策划强行开口。
+        visual_only = _visual_only(round_.events)
+        if expression.speak is False and (retry or visual_only or not hard):
             decision.should_reply, decision.reason = False, "planner_silence"
             self._log_decision(event, decision, now, expression)
             return
@@ -1412,12 +1465,19 @@ class RubenBot:
             return
 
         proactive = event.is_group and decision.hard_trigger is None
-        if await self.try_sticker_reply(
+        if (not visual_only or expression.intent == '表情回应') and await self.try_sticker_reply(
             event, expression, proactive=proactive, now=now, begin_send=flight.begin_send,
         ):
+            if proactive:
+                self.decision_engine.note_source_reply(event, round_.events, time.time())
             self._log_decision(event, decision, now, expression, must=hard)
             return
         if flight.updates:
+            return
+        if expression.intent == '表情回应':
+            # 本来只想用表情回应；无图、未启用或发送失败都不换成硬挤一句话。
+            decision.should_reply, decision.reason = False, 'sticker_unavailable'
+            self._log_decision(event, decision, now, expression, must=hard)
             return
         # 生成步换成人格 + 回复风格；场景/记忆/工具说明原样保留。
         # 策划步的前缀按同一规则重新组装（确定性，正常必定一致）；万一
@@ -1431,9 +1491,7 @@ class RubenBot:
                 "策划步人格前缀已变（插件注入？），生成步沿用当前系统提示：%s/%s",
                 event.platform, event.chat_id,
             )
-        # 开头反重复：同一开场模式连出太多次，下一轮临时纠偏一句
-        key = self.decision_engine.chat_key(event)
-        correction = self.opener_guard.correction(key)
+        correction = self.opener_guard.correction(round_.key)
         if correction:
             messages[0]["content"] += "\n\n" + correction
         generation_plan = expression
@@ -1464,10 +1522,12 @@ class RubenBot:
                 return
             if isinstance(raw, WebReply):
                 # 原文一条直发，既不做附和重写，也不让表情/插件拿它去做下一轮素材。
-                await self.send_reply(event, raw, now=now, proactive=proactive,
-                                      begin_send=flight.begin_send)
+                sent = await self.send_reply(event, raw, now=now, proactive=proactive,
+                                             begin_send=flight.begin_send)
+                if sent and proactive:
+                    self.decision_engine.note_source_reply(event, round_.events, time.time())
                 self._log_decision(event, decision, now, expression, must=hard)
-                self.opener_guard.clear_pending(self.decision_engine.chat_key(event))
+                self.opener_guard.clear_pending(round_.key)
                 return
             body = clean_reply_patterns(strip_transcript_prefix(raw))
             if self.config.chat.strip_action_parens:
@@ -1476,6 +1536,9 @@ class RubenBot:
             if parsed.vetoed:
                 decision.should_reply, decision.reason = False, parsed.reason
                 logger.info("生成后否决(%s)：%s/%s", parsed.reason, event.platform, event.chat_id, extra=_log_identity(event))
+                break
+            if visual_snapshots and _IMAGE_SCOLD_RE.search(parsed.text):
+                decision.should_reply, decision.reason = False, "image_behavior_veto"
                 break
             if not is_repetitive_agreement(event.text, parsed.text):
                 break
@@ -1490,22 +1553,25 @@ class RubenBot:
         if not decision.should_reply:
             self._log_decision(event, decision, now, expression, must=hard)
             # 没发出去：本轮纠偏没兑现，下轮可以继续提醒
-            self.opener_guard.clear_pending(self.decision_engine.chat_key(event))
+            self.opener_guard.clear_pending(round_.key)
             return
         reply = parsed.text
 
-        await self.send_reply(
+        sent = await self.send_reply(
             event,
             reply,
             now=now,
             proactive=proactive,
             begin_send=flight.begin_send,
         )
+        if sent and proactive:
+            self.decision_engine.note_source_reply(event, round_.events, time.time())
         if flight.updates:
             return
         self._log_decision(event, decision, now, expression, must=hard)
-        self.opener_guard.note_reply(self.decision_engine.chat_key(event), reply)
-        await self.sticker_behavior.on_after_reply(self.context, event, reply)
+        self.opener_guard.clear_pending(round_.key)
+        if not visual_only:
+            await self.sticker_behavior.on_after_reply(self.context, event, reply)
         await self.privacy_commands.after_reply(self.context, event)
         if self.plugins is not None:
             try:
@@ -1544,7 +1610,9 @@ class RubenBot:
                 chat_type=event.chat_type,
                 sender_id=event.sender_id,
                 sender_name=event.sender_name,
-                text=event.text,
+                text=event.text + (decision.visual_note or self._decision_visual_note(
+                    event, [event], self._visual_snapshots([event]),
+                )),
                 should_reply=decision.should_reply,
                 reason=decision.reason,
                 hard_trigger=decision.hard_trigger or "",
@@ -1901,10 +1969,22 @@ class RubenBot:
         reply = self._target_name(msg.reply_sender_id) or ("未知" if msg.reply_to_id else "无")
         return f"发言人：{sender}；@ 目标：{mentions or '无'}；回复对象：{reply}"
 
-    def _visual_note(self, msg: RawMessage | None, limit: int = 1000) -> str:
+    def _visual_snapshots(self, events: list[MessageEvent]) -> dict[int, RawMessage | None]:
+        """只读本批视觉流水：策划与审计共用同一时刻的描述，超时后不追改。"""
+        return {item.raw_message_id: self.store.raw_message_by_id(item.raw_message_id) for item in events
+                if item.raw_message_id is not None and any(seg.type in VISUAL_SEGMENTS for seg in item.segments)}
+
+    def _decision_visual_note(self, event: MessageEvent, batch: list[MessageEvent],
+                              snapshots: dict[int, RawMessage | None]) -> str:
+        # 日志归属单个发送者，不能把同批别人的画面记在其名下。
+        return ''.join(self._visual_note(snapshots.get(item.raw_message_id), 160, expected=True)
+                       for item in batch if item.sender_id == event.sender_id
+                       and any(seg.type in VISUAL_SEGMENTS for seg in item.segments))
+
+    def _visual_note(self, msg: RawMessage | None, limit: int = 1000, *, expected: bool = False) -> str:
         """单独标来源，图中可见文字既不是发送者的原话，也不是指令。"""
         if not msg or not msg.visual_text:
-            return ""
+            return "〔视觉描述缺失〕" if expected else ""
         return f"〔图片视觉描述·非发言：{self._truncate(msg.visual_text, limit)}〕"
 
     def _quote_suffix(self, msg: RawMessage | MessageEvent, target: RawMessage | None) -> str:
@@ -1999,6 +2079,7 @@ class RubenBot:
         now: float | None = None,
         stage: str = "single",
         batch: list[MessageEvent] | None = None,
+        visual_snapshots: dict[int, RawMessage | None] | None = None,
     ) -> list[dict[str, str]]:
         """人格 + 记忆 + 本会话早期摘要 + 场景 + 上下文要求 + 最近历史。
 
@@ -2095,7 +2176,7 @@ class RubenBot:
             logger.warning("原话查账不可用：%s", type(exc).__name__)
         snapshots = {msg.id: msg for msg in history}
         # 单条通常已在历史尾部；视觉等待期间若被更新的消息挤出，也要显式呈现本轮。
-        explicit_batch = batch and (len(batch) > 1 or (
+        explicit_batch = batch and (visual_snapshots or len(batch) > 1 or (
             batch[0].raw_message_id is not None and batch[0].raw_message_id not in snapshots
         ))
         if explicit_batch:
@@ -2106,12 +2187,17 @@ class RubenBot:
         if explicit_batch:
             lines = []
             for item in batch:
-                snapshot = snapshots.get(item.raw_message_id)
-                if snapshot is None and item.raw_message_id is not None:
-                    snapshot = self.store.raw_message_by_id(item.raw_message_id)
+                has_visual = any(seg.type in VISUAL_SEGMENTS for seg in item.segments)
+                if has_visual and visual_snapshots is not None:
+                    snapshot = visual_snapshots.get(item.raw_message_id)
+                else:
+                    snapshot = snapshots.get(item.raw_message_id)
+                    if snapshot is None and item.raw_message_id is not None:
+                        snapshot = self.store.raw_message_by_id(item.raw_message_id)
                 source = f"〔{self._speaker_basis(item)}〕" if label_basis else ""
                 quote = self._quote_suffix(item, self._reply_target(item))
-                lines.append(f"{self._direction(item)}：{source}{item.text}{self._visual_note(snapshot)}{quote}")
+                note = self._visual_note(snapshot, expected=has_visual)
+                lines.append(f"{self._direction(item)}：{source}{item.text}{note}{quote}")
             messages.append({"role": "user", "content": "【本批消息·按到达顺序】\n" + "\n".join(lines) + "\n【本批结束】"})
         return messages
 
@@ -2408,10 +2494,14 @@ class RubenBot:
                     for t in event.familiarity]
             local_facts = ("【本群实体账·摄入时】" + json.dumps(tags, ensure_ascii=False)
                            + f"\n本轮原话：{json.dumps(event.text, ensure_ascii=False)}；"
-                           + "这句话里，哪部分是在问通用的做法，哪部分要靠本群的近况才接得上？\n")
+                           + "如果有人在问，再区分通用的做法和需要本群近况才能回答的部分。\n")
         notes = self.capability_notes(event)
+        sticker_option = ""
+        if (self.sticker_behavior.enabled and self.config.stickers.nonverbal_probability > 0
+                and not self._capability_block_reason(self.adapters.get(event.platform), SEND_STICKER)):
+            sticker_option = "本轮也可选 intent=表情回应，表示你想用一张表情代替文字。\n"
         addressed = decision.hard_trigger is not None
-        prompt = (f"{GUIDANCE_TASK_PROMPT}\n本轮直接叫到你：{'是' if addressed else '否'}；"
+        prompt = (f"{GUIDANCE_TASK_PROMPT}\n{sticker_option}本轮直接叫到你：{'是' if addressed else '否'}；"
                   f"本轮已掷档：{band}。{capability_index(notes)}\n\n{local_facts}{state}")
         # 只在策划请求里标自己的历史，正文生成仍读干净的 assistant 消息，不模仿转录标签。
         request = [{**msg, "content": "〔自己说过的话（不作数）〕" + msg["content"]}
@@ -2748,18 +2838,19 @@ class RubenBot:
         self, event: MessageEvent, expression: ExpressionDecision | None, *, proactive: bool, now: float,
         begin_send: Callable[[], bool] | None = None,
     ) -> bool:
-        """接梗或短附和时尝试只发表情；未发出就交还文字生成路径。"""
-        if expression is None or expression.intent not in ("接梗", "短附和"):
+        """执行策划选中的表情意图；普通接梗、短附和仍可按配置尝试非文字回应。"""
+        if expression is None or expression.intent not in ("接梗", "短附和", "表情回应"):
             return False
+        probability = self.config.stickers.nonverbal_probability
+        if expression.intent == '表情回应' and probability > 0:
+            probability = 1.0  # 明确选择的表达方式不再掷意愿；零概率仍视为禁用。
         if not await self.sticker_behavior.try_send(
-            self.context, event, probability=self.config.stickers.nonverbal_probability,
+            self.context, event, probability=probability,
             emotion_hint=_sticker_emotion_hint(expression), begin_send=begin_send,
         ):
             return False
         reply = "[表情]"
         self._record_bot_message(event, reply, None)
-        # 表情条也是 bot 的一条真实回复：记账给开头反重复，卡片/纯图不算
-        self.opener_guard.note_reply(self.decision_engine.chat_key(event), reply)
         self.decision_engine.note_bot_reply(
             self.decision_engine.chat_key(event), now, proactive=proactive,
         )
@@ -2780,7 +2871,7 @@ class RubenBot:
         now: float | None = None,
         proactive: bool = False,
         begin_send: Callable[[], bool] | None = None,
-    ) -> None:
+    ) -> bool:
         """拆条发送，并把 bot 自己的话写进流水（``processed=True``，不参与记忆抽取）。
 
         ``reply`` 可以是纯文本（换行分段 + 标点处概率合并），也可以是一组
@@ -2788,12 +2879,12 @@ class RubenBot:
         多条之间有按下一段字数估算的打字停顿（第一段立即发），可用
         ``reply.segment_delay_enabled`` 关闭。
 
-        至少发出一条才记冷却，拆条连发只记一次。
+        至少发出一条才返回 True 并记冷却，拆条连发只算一轮。
         """
         adapter = self.adapters.get(event.platform)
         if adapter is None:
             logger.warning("没有平台 %s 的适配器，无法回复", event.platform)
-            return
+            return False
         strip_actions = bool(getattr(self.config.chat, "strip_action_parens", False))
         # 语音回复：只对「没被拆开的单条短回复」生效；拆条/长文一律发文字
         voice_audio: bytes | None = None
@@ -2815,20 +2906,21 @@ class RubenBot:
             parts = [segments] if segments else []
         if not parts:
             # 拆条后什么都不剩（例如动作括号清理后为空）：不发，也不记发言
-            return
+            return False
         if begin_send and not begin_send():
-            return
+            return False
         if voice_audio:
             # 语音回复：成功就不再补发文字；平台不支持或失败都照常发文字
             text = render_segments(parts[0])
             ok, sent_id = await self._send_voice(adapter, event, text, voice_audio, voice_mime)
             if ok:
                 self._record_bot_message(event, text, sent_id)
+                self.opener_guard.note_reply((event.platform, event.chat_type, event.chat_id), text)
                 self.decision_engine.note_bot_reply(
                     self.decision_engine.chat_key(event), time.time() if now is None else now,
                     proactive=proactive,
                 )
-                return
+                return True
         sent_any = False
         for index, segments in enumerate(parts):
             if index > 0:
@@ -2844,10 +2936,14 @@ class RubenBot:
             sent_any = True
             # 流水保留回执、发言计数和回复关系，但摘要、自我时间线与实体账都拿不到网页。
             self._record_bot_message(event, RECORD_PLACEHOLDER if isinstance(reply, WebReply) else text, message_id)
+            # 以真正送达的文字条为准，不把网页引文、图片占位或失败的草稿当成自己的措辞。
+            if not isinstance(reply, WebReply):
+                spoken = "".join(s.render() for s in segments if s.type == "text")
+                self.opener_guard.note_reply((event.platform, event.chat_type, event.chat_id), spoken)
         if not sent_any:
             # 全部分条都发失败：当作没说过话——不进不应期、不记情绪
             logger.warning("发送全部失败（%s），不记本次发言", event.platform)
-            return
+            return False
         # 发言时间交给决策引擎：发言后冷却与主动发言窗口都依赖它（拆条只记一次）
         self.decision_engine.note_bot_reply(
             self.decision_engine.chat_key(event), time.time() if now is None else now,
@@ -2855,6 +2951,7 @@ class RubenBot:
         )
         # 情绪侧：刚说过话 = 有人理；群里热闹就兴奋一下
         self.note_emotion_after_reply(event, now=now)
+        return True
 
     def _record_bot_message(
         self, event: MessageEvent, text: str, message_id: str | None

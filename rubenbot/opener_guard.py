@@ -1,19 +1,11 @@
-"""开头反重复：跟踪 bot 最近几条回复的开头模式，必要时给一句临时纠偏。
-
-只做程序侧治理，不往人设文件里写禁令：
-
-- 按会话保留 bot 最近 ``window`` 条回复的开头模式（首个语气词，或开头 2 字）；
-- 同一模式在窗口里出现 ``threshold`` 次及以上时，下一轮生成提示尾部临时
-  加一句纠偏（说明近期重复的开头，并提示从内容起头）；
-- 纠偏只注入一轮：发过之后要等新回复进来、且模式仍然超标才会再次触发。
-
-状态全在内存里，进程重启后从零开始；表情条等非文字回复不参与统计。
-"""
+"""按会话观察 bot 最近发出的文字；给生成端频次事实，不拦截或改写回复。"""
 
 from __future__ import annotations
 
+import re
 from collections import Counter, deque
-from dataclasses import dataclass, field
+from collections.abc import Hashable, Iterator
+from dataclasses import dataclass
 
 # 首个语气词/口头禅：命中就以它作为开头模式（长词优先匹配）
 TONE_OPENINGS: tuple[str, ...] = (
@@ -21,6 +13,8 @@ TONE_OPENINGS: tuple[str, ...] = (
     "？", "?", "6", "哈", "唉", "哎",
 )
 _TONE_SORTED = tuple(sorted(TONE_OPENINGS, key=len, reverse=True))
+_WORD = re.compile(r"[㐀-鿿]+|[A-Za-z]+")
+_ENDING = re.compile(r"([㐀-鿿])[\s。，、；！？…!?.~～]*\Z")
 
 
 def opening_pattern(text: str) -> str:
@@ -29,94 +23,95 @@ def opening_pattern(text: str) -> str:
     if not body:
         return ""
     if body.startswith("[") and body.endswith("]") and len(body) <= 8:
-        # 「[表情]」「[图片]」这类占位不是自然的开头
         return ""
     for word in _TONE_SORTED:
         if body.startswith(word):
             return word
-    # 没有明显语气词时用开头 2 个字；只剩一个字就用这一个字
     return body[:2]
+
+
+def _fragments(text: str) -> Iterator[str]:
+    """不预设口头禅词库。中文找重复的连续短片段，其余按完整词计。"""
+    for word in _WORD.findall(text):
+        if "㐀" <= word[0] <= "鿿":
+            for length in range(2, min(6, len(word)) + 1):
+                for start in range(len(word) - length + 1):
+                    yield word[start:start + length]
+        elif 2 <= len(word) <= 16:
+            yield word
 
 
 @dataclass
 class _State:
-    patterns: deque[str] = field(default_factory=lambda: deque(maxlen=10))
-    notes: int = 0
-    # 上一次纠偏时所记录的回复条数（-1 表示从没纠偏过）
-    corrected_at: int = -1
-    # 已经加进提示、但对应回复还没发出来的纠偏行（避免同一轮重复注入）
+    replies: deque[str]
     pending_note: str = ""
 
 
 class OpenerGuard:
-    """按会话统计开场模式，返回可注入的一行纠偏。"""
+    """在短滚动窗口内统计开头和不限位置的短语，只向下一轮生成报告。"""
 
     def __init__(self, *, window: int = 10, threshold: int = 3):
         self.window = max(1, int(window))
         self.threshold = max(2, int(threshold))
-        self._states: dict[str, _State] = {}
+        self._states: dict[Hashable, _State] = {}
 
-    def _state(self, key: str) -> _State:
-        state = self._states.get(key)
-        if state is None:
-            state = _State(patterns=deque(maxlen=self.window))
-            self._states[key] = state
-        return state
-
-    def note_reply(self, key: str, text: str) -> None:
-        """记录 bot 的一条真实回复（按会话）。"""
-        pattern = opening_pattern(text)
-        if not pattern:
+    def note_reply(self, key: Hashable, text: str) -> None:
+        """只记录 bot 实际发出的自然文字。"""
+        if not opening_pattern(text):
             return
-        state = self._state(key)
-        state.patterns.append(pattern)
-        state.notes += 1
-        # 纠偏对应的那条回复已经出来了，这一轮的「一次性」额度用掉
+        if key not in self._states:
+            self._states[key] = _State(deque(maxlen=self.window))
+        state = self._states[key]
+        state.replies.append(text)
         state.pending_note = ""
 
-    def pending_correction(self, key: str) -> str:
-        """本轮已加入提示的纠偏行（没有就是空串）；供日志/审计。"""
+    def pending_correction(self, key: Hashable) -> str:
         state = self._states.get(key)
         return state.pending_note if state is not None else ""
 
-    def dominant(self, key: str) -> tuple[str, int] | None:
-        """窗口里出现次数达标的开头模式；没有返回 None。"""
+    def correction(self, key: Hashable) -> str | None:
+        """只报告跨多条消息的重复；单条里重叠的字串不冒充多次口头禅。"""
         state = self._states.get(key)
-        if state is None or len(state.patterns) < self.threshold:
+        if state is None or state.pending_note or len(state.replies) < self.threshold:
             return None
-        pattern, count = Counter(state.patterns).most_common(1)[0]
+        lines = []
+        (opening, count), = Counter(map(opening_pattern, state.replies)).most_common(1)
         if count >= self.threshold:
-            return pattern, count
-        return None
+            lines.append(f"最近有 {count} 条以「{opening}」开头。这轮换个说法，从想说的内容起头。")
 
-    def correction(self, key: str) -> str | None:
-        """本轮要不要加纠偏；返回提示行。
+        counts: Counter[str] = Counter()
+        endings: Counter[str] = Counter()
+        for text in state.replies:
+            counts.update(set(_fragments(text)))
+            # 单字语尾也可能反复出现；只统计句末，不把正文里的普通单字算进口头禅。
+            if match := _ENDING.search(text):
+                endings[match[1]] += 1
+        # 同频时优先保留完整短语，不同时报「笑死我了」「笑死我」「笑死」。
+        repeated = sorted((p for p, n in counts.items() if n >= self.threshold),
+                          key=lambda p: (-counts[p], -len(p), p))
+        selected: list[str] = []
+        for phrase in repeated:
+            if (phrase == opening and count == counts[phrase]) or any(phrase in prior for prior in selected):
+                continue
+            selected.append(phrase)
+            if len(selected) == 3:
+                break
+        facts = [f"{counts[p]} 条用过「{p}」" for p in selected]
+        for ending, n in endings.most_common(1):
+            if n >= self.threshold and not any(p.endswith(ending) and counts[p] == n for p in selected):
+                facts.append(f"{n} 条以「{ending}」收尾")
+        if facts:
+            lines.append(f"本会话你最近 {len(state.replies)} 条发言里，{'，'.join(facts)}。留意口头禅和收尾，按这次想说的内容自然措辞。")
+        state.pending_note = "\n".join(lines)
+        return state.pending_note or None
 
-        同一轮（还没等到新回复）只给一次，避免多段/重试时反复叠加；
-        发出去的真实回复由 :meth:`note_reply` 记账，本轮没发出来则
-        :meth:`clear_pending` 清掉，下轮还能再提醒。
-        """
-        state = self._states.get(key)
-        if state is None:
-            return None
-        if state.pending_note:
-            return None
-        hit = self.dominant(key)
-        if hit is None:
-            return None
-        pattern, count = hit
-        state.corrected_at = state.notes
-        state.pending_note = f"最近有 {count} 条以「{pattern}」开头。这轮换个说法，从想说的内容起头。"
-        return state.pending_note
-
-    def clear_pending(self, key: str) -> None:
+    def clear_pending(self, key: Hashable) -> None:
         """本轮没生成出来（沉默/否决）时清掉待用纠偏，下轮还能再提醒。"""
         state = self._states.get(key)
         if state is not None:
             state.pending_note = ""
 
-    def reset(self, key: str | None = None) -> None:
-        """清空某个会话（或全部）的统计；配置热更新/测试用。"""
+    def reset(self, key: Hashable | None = None) -> None:
         if key is None:
             self._states.clear()
         else:

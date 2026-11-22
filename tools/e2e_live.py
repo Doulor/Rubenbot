@@ -49,7 +49,7 @@ SCENARIOS = (
     ('节奏守卫', _e2e_dialog.rhythm), ('附和闸门', _e2e_dialog.echo_gate),
     ('MCP 真调用', _e2e_fixtures.mcp), ('访客沙盒', _e2e_computer.sandbox),
     ('白名单真机', _e2e_computer.host), ('链接插件', _e2e_fixtures.link),
-    ('决策书落盘', _e2e_dialog.decision),
+    ('决策书落盘', _e2e_dialog.decision), ('社交信号泛化', _e2e_dialog.social_signal),
 )
 
 
@@ -257,14 +257,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--config', type=Path, help='仅取项目 YAML 的 llm 段')
     parser.add_argument('--results', type=Path, default=REPORT, help='Markdown 报告路径')
-    parser.add_argument('--only', nargs='+', type=int, choices=range(1, 8), help='诊断时只跑指定场景，需另指定报告')
+    parser.add_argument('--only', nargs='+', type=int, choices=range(1, len(SCENARIOS) + 1), help='诊断时只跑指定场景，需另指定报告')
     args = parser.parse_args()
     if args.only and args.results.resolve() == REPORT.resolve():
         parser.error('单项诊断请用 --results 指定另一份报告，以免覆盖完整结果')
     if not __debug__:
         parser.error('不能使用 -O：会禁用场景断言')
     logging.getLogger().addHandler(logging.NullHandler())
-    return asyncio.run(run(args.config, args.results, args.only or range(1, 8)))
+    return asyncio.run(run(args.config, args.results, args.only or range(1, len(SCENARIOS) + 1)))
 
 
 if __name__ == '__main__':

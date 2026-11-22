@@ -482,8 +482,7 @@ def test_opener_guard_correction_is_one_round(tmp_path, store):
     config = planner_config()
     guard = OpenerGuard()
     for _ in range(3):
-        guard.note_reply("recording:g1", "草 我不信")
-    guard.pending_note = ""  # 模拟上一轮已经注入并在之后被清掉
+        guard.note_reply(("recording", "group", "g1"), "草 我不信")
     llm = ScriptedLLM({"fast": [plan(speak=True, intent="接梗", increment="接一句")], "chat": ["换个说法"]})
     bot, _ = make_bot(config, store, multi_persona(tmp_path), llm)
     bot.opener_guard = guard
@@ -493,20 +492,71 @@ def test_opener_guard_correction_is_one_round(tmp_path, store):
     # 纠偏只在生成步提示里出现，不写进人设文件
     assert "这轮换个说法" not in Path(tmp_path / "persona" / "persona.md").read_text(encoding="utf-8")
     # 真实回复记账后模式计数更新（开头 2 字作模式）
-    assert "换个" in guard._states["recording:g1"].patterns
+    assert guard._states[("recording", "group", "g1")].replies[-1] == "换个说法"
 
 
 def test_opener_guard_cleared_when_silent(tmp_path, store):
     config = planner_config()
     guard = OpenerGuard()
     for _ in range(3):
-        guard.note_reply("recording:g1", "草 我不信")
+        guard.note_reply(("recording", "group", "g1"), "草 我不信")
     llm = ScriptedLLM({"fast": [plan(speak=False, intent="接梗", increment="没什么")]})
     bot, _ = make_bot(config, store, multi_persona(tmp_path), llm)
     bot.opener_guard = guard
     asyncio.run(bot.handle_event(group_event()))
     # 没生成出来：待用纠偏清掉，下一轮还能再提醒
-    assert guard.pending_correction("recording:g1") == ""
+    assert guard.pending_correction(("recording", "group", "g1")) == ""
+
+
+def test_repeated_unlisted_phrase_and_single_char_ending_age_out():
+    guard = OpenerGuard(window=3)
+    for text in ("今天，满格，走起咯", "改版满格以后再说咯", "电量满格就出发咯！"):
+        guard.note_reply("k", text)
+    fact = guard.correction("k")
+    assert "3 条用过「满格」" in fact and "3 条以「咯」收尾" in fact
+    guard.note_reply("k", "开饭了")
+    assert guard.correction("k") is None
+
+
+def test_feedback_counts_only_sent_text_and_keeps_audiences_separate(tmp_path, store, monkeypatch):
+    bot, adapter = make_bot(planner_config(), store, multi_persona(tmp_path))
+    private = private_event()
+    private.chat_id = "g1"  # 同平台群号和私聊号相同，仍不是同一受众。
+    for _ in range(3):
+        asyncio.run(bot.send_reply(private, "看着不错咯"))
+    group_key = ("recording", "group", "g1")
+    assert bot.opener_guard.correction(group_key) is None
+    assert bot.opener_guard.correction(("recording", "private", "g1"))
+
+    async def fail(*args, **kwargs):
+        raise RuntimeError("发送失败")
+
+    monkeypatch.setattr(adapter, "send", fail)
+    for _ in range(3):
+        asyncio.run(bot.send_reply(group_event(), "送不到咯"))
+    assert bot.opener_guard.correction(group_key) is None
+
+
+@pytest.mark.parametrize("heed_note", [True, False])
+def test_catchphrase_feedback_replay(tmp_path, store, heed_note):
+    # 两种生成器：一方收到统计便换说法，另一方仍按原习惯回复，均原样发送。
+    class FeedbackLLM(ScriptedLLM):
+        async def complete(self, messages, *, role="chat", task=None, temperature=None, json_mode=False):
+            response = await super().complete(messages, role=role, task=task, temperature=temperature, json_mode=json_mode)
+            if task == "gen_stage2" and heed_note:
+                if "3 条用过「笑死」" in messages[0]["content"]:
+                    return "这个转折没想到"
+            return response
+
+    llm = FeedbackLLM({"fast": [plan(speak=True, intent="接梗", increment="回应反转")], "chat": ["笑死"]})
+    bot, adapter = make_bot(planner_config(), store, multi_persona(tmp_path), llm)
+    event = private_event("结尾居然反过来了")
+    for reply in ("我笑死在座位上", "这也行，笑死", "怎么还在笑死啊"):
+        asyncio.run(bot.send_reply(event, reply))
+    asyncio.run(bot.handle_event(event))
+    assert "3 条用过「笑死」" in llm.chat_messages[-1][0]["content"]
+    assert adapter.texts[-1] == ("这个转折没想到" if heed_note else "笑死")
+    assert [c["task"] for c in llm.calls] == ["gen_stage1", "gen_stage2"]
 
 
 def test_opener_guard_reset():
