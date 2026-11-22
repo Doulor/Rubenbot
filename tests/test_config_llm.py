@@ -22,7 +22,7 @@ def test_config_defaults():
     assert cfg.llm.model_for("consolidate") == cfg.llm.chat_model
     assert cfg.memory.extract_every_n == 30
     assert cfg.memory.inject_limit == 20
-    assert cfg.decision.merge_window_seconds == 4.0
+    assert cfg.decision.merge_window_seconds == 2.5
     assert cfg.decision.hard_merge_window_seconds == 1.0
     assert cfg.decision.batch_max_seconds == 10.0
     assert cfg.decision.urgent_seconds == 2.0

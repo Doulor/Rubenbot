@@ -510,7 +510,7 @@ class RubenBot:
         self.started_at: float = time.time()
         self.last_message_at: float | None = None
         # 每个会话的消息处理锁，保证串行，避免同一会话并发回复混乱
-        self._chat_locks: dict[str, asyncio.Lock] = {}
+        self._chat_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
         self._bg_task: asyncio.Task | None = None
         self._merge_task: asyncio.Task | None = None
         # 定时任务与冷场开口：跟随主程序生命周期启停
@@ -1244,19 +1244,16 @@ class RubenBot:
                 return
 
         hard = self.decision_engine.is_hard_trigger(event)
-        ready = self.merger.add(
-            event,
-            now,
-            hard=hard is not None,
-            urgent=hard in ("mentioned", "reply_to_bot"),
-        )
+        # 主人按已配置的平台账号白名单识别，只提高查看优先级，不改必回规则。
+        priority = hard is not None or computer.is_host(self.config.computer, event)
+        ready = self.merger.add(event, now, hard=priority, urgent=priority)
         for round_ in ready:
             await self.process_round(round_)
 
     async def process_round(self, round_: MergedRound) -> None:
         """对合并后的一轮消息做决策与生成。异常只记录，不向上抛。"""
         event = round_.to_event()
-        lock = self._chat_locks.setdefault(f"{event.platform}:{event.chat_id}", asyncio.Lock())
+        lock = self._chat_locks.setdefault(round_.key, asyncio.Lock())
         async with lock:
             try:
                 await self._process_round_locked(round_, event)
@@ -1267,8 +1264,14 @@ class RubenBot:
 
     async def _process_round_locked(self, round_: MergedRound, event: MessageEvent) -> None:
         now = time.time()
-        self.observe_emotion(event, events=round_.events, now=now)
-        decision = self.decide(event, now=now)
+        # 同一人的补充仍算一个对话轮，不能把甲受到的称呼或赞骂记到乙名下。
+        by_sender: dict[str, list[MessageEvent]] = {}
+        for item in round_.events:
+            by_sender.setdefault(item.sender_id, []).append(item)
+        for items in by_sender.values():
+            self.observe_emotion(items[-1], events=items, now=now)
+        hard = next(filter(None, map(self.decision_engine.is_hard_trigger, round_.events)), None)
+        decision = self.decide(event, now=now) if not hard else ReplyDecision(True, reason=hard, hard_trigger=hard)
         self.last_decision[self.decision_engine.chat_key(event)] = decision
         logger.info(
             "决策 %s/%s %s：%s %s",
@@ -1285,9 +1288,9 @@ class RubenBot:
 
         planner_gate = self.config.planner_gate
         # 必回规则要在裁定之前算好：它既能覆盖 speak=false，也决定日志里的兜底字段
-        must = self.decision_engine.must_reply(event) if planner_gate else None
+        must = hard if planner_gate else None
         stage = "planner" if planner_gate else "legacy"
-        messages = await self.build_context(event, now=now, stage=stage)
+        messages = await self.build_context(event, now=now, stage=stage, batch=round_.events)
         # 让模型知道「可以不接话」的出口
         marker = self.config.decision.veto_marker
         messages[0]["content"] += (
@@ -1367,7 +1370,8 @@ class RubenBot:
         task = "chat" if expression.source == "fragment" else "gen_stage2"
         for attempt in range(2):
             # 重写只改文字，不能再给工具，否则可能重复设提醒或执行平台动作。
-            raw = await self.generate(messages, event=None if attempt else event,
+            # 多人批次没有可代表全体的授权账号，不能以主要发言人的权限执行工具。
+            raw = await self.generate(messages, event=None if attempt or len(by_sender) > 1 else event,
                                       task="gen_agreement_retry" if attempt else task)
             if isinstance(raw, WebReply):
                 # 原文一条直发，既不做附和重写，也不让表情/插件拿它去做下一轮素材。
@@ -1512,6 +1516,7 @@ class RubenBot:
             reply_sender_id=event.reply_sender_id,
             mentions=event.mentions,
         )
+        event.raw_message_id = raw_id
         self._last_activity[f"{event.platform}:{event.chat_id}"] = now
         self.last_message_at = now
         logger.debug("记录消息 %s: %s", person_id, event.text[:60], extra=_log_identity(event))
@@ -1928,6 +1933,7 @@ class RubenBot:
         *,
         now: float | None = None,
         stage: str | None = None,
+        batch: list[MessageEvent] | None = None,
     ) -> list[dict[str, str]]:
         """人格 + 记忆 + 本会话早期摘要 + 场景 + 上下文要求 + 最近历史。
 
@@ -1992,7 +1998,13 @@ class RubenBot:
             real_only=True,
             after_id=covered_until,
         )
+        if batch and len(batch) > 1:
+            batch_ids = {item.raw_message_id for item in batch}
+            history = [msg for msg in history if msg.id not in batch_ids]
         messages.extend(self.render_history(history))
+        if batch and len(batch) > 1:
+            lines = [f"{self._direction(item)}：{item.text}" for item in batch]
+            messages.append({"role": "user", "content": "【本批消息·按到达顺序】\n" + "\n".join(lines) + "\n【本批结束】"})
         return messages
 
     @staticmethod

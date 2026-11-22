@@ -2,7 +2,7 @@
 
 这个模块只做判断，不发消息、不碰适配器：
 
-- :class:`MessageMerger`：同一发送者短时间连发的消息先攒着，合并成一轮再决策。
+- :class:`MessageMerger`：同一群聊短时间连发的消息先攒着，合并成一轮再决策。
   纯逻辑、时钟外部传入，测试可以完全确定。
 - :class:`DecisionEngine`：硬触发直通（私聊、@、回复 bot、叫名字），普通群消息
   按意愿评分（基础值 + 动量 - 发言占比 - 冷却，阈值附近加随机扰动）。
@@ -17,6 +17,7 @@ import logging
 import random
 import re
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Sequence
 
@@ -44,7 +45,7 @@ _QUIET_RE = re.compile(r"\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*")
 
 @dataclass
 class MergedRound:
-    """攒在一起、等待决策的一轮消息（来自同一发送者）。"""
+    """攒在一起、等待决策的一轮消息（保留每条的真实发送者）。"""
 
     platform: str
     chat_id: str
@@ -61,24 +62,28 @@ class MergedRound:
 
     @property
     def key(self) -> tuple[str, str, str]:
-        return (self.platform, self.chat_id, self.sender_id)
+        return (self.platform, self.chat_type, self.chat_id)
 
     @property
     def text(self) -> str:
         return "\n".join(e.text for e in self.events if e.text and e.text.strip())
 
-    def to_event(self) -> MessageEvent:
-        """合并后的合成事件，供决策、上下文与插件使用。
+    @property
+    def primary_sender(self) -> str:
+        """按条数选主要发言人；并列时取最后发言的人。"""
+        counts = Counter(e.sender_id for e in self.events)
+        return max(reversed(self.events), key=lambda e: counts[e.sender_id]).sender_id
 
-        ``segments`` 按批次顺序拼起来，语音回复判断（对方这轮发过语音条）
-        与插件拿原始段都依赖它；``raw["has_voice"]`` 是同一信息的快速标记。
-        """
-        last = self.events[-1]
-        reply = next((e for e in reversed(self.events) if e.reply_to_id), None)
+    def to_event(self) -> MessageEvent:
+        """当前说话人的投影；不同人的正文、引用和身份绝不合成一人的请求。"""
+        sender = self.primary_sender
+        own = [e for e in self.events if e.sender_id == sender]
+        last = own[-1]
+        reply = next((e for e in reversed(own) if e.reply_to_id), None)
         raw = dict(last.raw or {})
         raw["merged_count"] = len(self.events)
-        segments = [segment for event in self.events for segment in (event.segments or [])]
-        has_voice = any(e.raw.get("has_voice") for e in self.events) or any(
+        segments = [segment for event in own for segment in (event.segments or [])]
+        has_voice = any(e.raw.get("has_voice") for e in own) or any(
             segment.type == "record" for segment in segments
         )
         if has_voice:
@@ -89,11 +94,11 @@ class MergedRound:
             chat_id=last.chat_id,
             sender_id=last.sender_id,
             sender_name=last.sender_name,
-            text=self.text,
+            text="\n".join(e.text for e in own if e.text.strip()),
             reply_to_id=reply.reply_to_id if reply else None,
             reply_sender_id=reply.reply_sender_id if reply else "",
-            mentions={uid: name for e in self.events for uid, name in e.mentions.items()},
-            mentions_bot=any(e.mentions_bot or is_reply_to_bot(e) for e in self.events),
+            mentions={uid: name for e in own for uid, name in e.mentions.items()},
+            mentions_bot=any(e.mentions_bot or is_reply_to_bot(e) for e in own),
             raw=raw,
             segments=segments,
             familiarity=tuple({tag.entity: tag for e in self.events for tag in e.familiarity}.values()),
@@ -105,9 +110,7 @@ class MessageMerger:
 
     规则：
 
-    - 同一会话里，新消息到达时把**其他发送者**尚未到期的轮次立刻放出来，
-      因为对方插话通常意味着前一个人这一段说完了；
-    - 同一发送者在窗口内继续发，延长截止时间并合并；
+    - 群聊按会话收集，谁发言都刷新静默窗口；私聊立即处理；
     - 硬触发消息使用短窗口（``hard_window``），设为 0 表示立即处理；
     - **整批上限**：批次从首条消息起最多等 ``batch_max`` 秒，到点必放出
       （0 表示不设上限）；
@@ -122,7 +125,7 @@ class MessageMerger:
 
     def __init__(
         self,
-        window: float = 4.0,
+        window: float = 2.5,
         hard_window: float = 1.0,
         *,
         batch_max: float = 10.0,
@@ -166,12 +169,7 @@ class MessageMerger:
         ``urgent`` 表示这条消息 @/回复了 bot，会把本批截止时间提前。
         """
         ready: list[MergedRound] = []
-        key = (event.platform, event.chat_id, event.sender_id)
-
-        # 同一会话里其他人说话了：先把他/她攒的那轮放出来
-        for other_key, other in list(self._pending.items()):
-            if other_key[0] == key[0] and other_key[1] == key[1] and other_key[2] != key[2]:
-                ready.append(self._pending.pop(other_key))
+        key = (event.platform, event.chat_type, event.chat_id)
 
         round_ = self._pending.get(key)
         if round_ is not None and round_.deadline <= now:
@@ -190,10 +188,9 @@ class MessageMerger:
             self._pending[key] = round_
         round_.events.append(event)
         round_.last_at = now
-        round_.sender_name = event.sender_name or round_.sender_name
         round_.hard = round_.hard or hard
         round_.urgent = round_.urgent or urgent
-        round_.deadline = self._deadline_for(round_, now, round_.hard, round_.urgent)
+        round_.deadline = now if event.is_private else self._deadline_for(round_, now, round_.hard, round_.urgent)
 
         # 窗口为 0（或硬窗口为 0 的硬触发）时立即放行
         if round_.deadline <= now:

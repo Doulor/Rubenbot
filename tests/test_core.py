@@ -293,8 +293,8 @@ def test_merge_window_combines_burst(config, store):
     assert any("今天遇到件事" in c for c in contents)
 
 
-def test_merge_window_other_sender_releases_round(config, store):
-    """别人插话时，前一个人攒的那轮立即处理。"""
+def test_merge_window_other_sender_joins_round(config, store):
+    """别人插话时，整批一并裁定，不把两人的话算给同一人。"""
     config.decision.merge_window_seconds = 4.0
     config.decision.base = 10.0
     llm = ScriptedLLM({"chat": ["收到"]})
@@ -302,8 +302,9 @@ def test_merge_window_other_sender_releases_round(config, store):
     asyncio.run(bot.handle_event(group_event("我先说", sender="u1")))
     assert adapter.sent == []
     event = group_event("我也来", sender="u2")
-    # 事件内部用真实时钟记录，这里直接驱动一次：u2 到达后 u1 的轮次应已放出
     asyncio.run(bot._handle_event(event))
+    assert not llm.calls
+    asyncio.run(bot.flush_merger(all_rounds=True))
     assert adapter.texts == ["收到"]
     assert len(llm.chat_messages) == 1
     assert any("我先说" in m["content"] for m in llm.chat_messages[0])

@@ -184,6 +184,8 @@ class MessageEvent:
     # 只保存协议明确给出的目标（账号 -> 当时的显示名）；__bot__ 表示自己。
     mentions: dict[str, str] = field(default_factory=dict)
     reply_sender_id: str = ""
+    # 本地流水主键，用于把本批消息与此前历史分开。
+    raw_message_id: int | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         if not self.mentions:

@@ -353,8 +353,8 @@ class GroupDecisionConfig:
 class DecisionConfig:
     """回复意愿系统参数（见 SPEC「回复决策」）。"""
 
-    # 消息合并窗口：普通消息攒 4 秒；硬触发走短窗口，0 表示立即处理
-    merge_window_seconds: float = 4.0
+    # 消息合并窗口：群聊静默 2.5 秒；硬触发走短窗口，0 表示立即处理
+    merge_window_seconds: float = 2.5
     hard_merge_window_seconds: float = 1.0
     # 整批上限：从首条消息算起最多等这么久就放出；0 表示不设上限
     batch_max_seconds: float = 10.0
