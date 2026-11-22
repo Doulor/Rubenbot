@@ -257,6 +257,71 @@ def test_parse_sticker_does_not_download_or_transform_native_ref():
     }
 
 
+@pytest.mark.parametrize("limit", [4, 3])
+def test_resolve_static_sticker_streams_with_limit_and_preserves_native_send(monkeypatch, caplog, limit):
+    monkeypatch.setattr("rubenbot.adapters.telegram.MAX_PHOTO_BYTES", limit)
+    caplog.set_level("INFO")
+    seen = []
+    calls = []
+
+    class Chunks(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            for chunk in (b"ab", b"cd"):
+                seen.append(chunk)
+                yield chunk
+            seen.append("end")
+
+        async def aclose(self):
+            seen.append("closed")
+
+    def handler(request):
+        if request.method == "GET":
+            assert request.url.path == f"/file/bot{TOKEN}/stickers/img.webp"
+            return httpx.Response(200, stream=Chunks())
+        method = request.url.path.rsplit("/", 1)[-1]
+        calls.append((method, _request_payload(request)))
+        if method == "getFile":
+            return _ok({"file_path": "stickers/img.webp"})
+        return _ok({"message_id": 7})
+
+    async def scenario():
+        async with httpx.AsyncClient(base_url="https://api.telegram.org", transport=httpx.MockTransport(handler)) as client:
+            adapter = TelegramAdapter(TOKEN, http_client=client)
+            event = await adapter.parse_update(make_update(make_message(sticker={"file_id": "STATIC_1"})))
+            assert not calls
+            native = event.segments[0].data["native_ref"]
+            source = await adapter.resolve_image_source(event.segments[0])
+            await adapter.call_capability("send_sticker", chat_id="123", sticker={"native_refs": {"telegram": native}})
+            return source
+
+    source = asyncio.run(scenario())
+    assert calls == [("getFile", {"file_id": "STATIC_1"}), ("sendSticker", {"chat_id": 123, "sticker": "STATIC_1"})]
+    if limit == 4:
+        assert source == {"base64": "YWJjZA==", "mime_type": "image/webp"}
+        assert seen == [b"ab", b"cd", "end", "closed"]
+    else:
+        assert source is None
+        assert seen == [b"ab", b"cd", "closed"]
+    assert TOKEN not in caplog.text
+
+
+@pytest.mark.parametrize("sticker", [
+    {"file_id": "ANIM_1", "is_animated": True}, {"file_id": "VID_1", "is_video": True},
+    {"file_id": "https://untrusted.example/x"}, {"file_id": "../secret"},
+])
+def test_resolve_only_static_platform_sticker_ids(sticker):
+    fake = FakeTelegram()
+    adapter = make_adapter(fake)
+
+    async def scenario():
+        event = await adapter.parse_update(make_update(make_message(sticker=sticker)))
+        assert await adapter.resolve_image_source(event.segments[0]) is None
+        await close(adapter)
+
+    asyncio.run(scenario())
+    assert not fake.requests
+
+
 def test_parse_channel_and_unhandled_kinds_are_ignored():
     adapter = make_adapter(FakeTelegram())
 

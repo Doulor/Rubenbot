@@ -951,7 +951,7 @@ class MemoryStore:
             ).fetchall()
         return [{**row, 'aliases': tuple(json.loads(row['aliases']))} for row in rows]
 
-    def set_raw_visual_text(self, raw_id: int, text: str) -> bool:
+    def set_raw_visual_text(self, raw_id: int, text: str, *, chat_type: str = 'group') -> bool:
         """描述有变化才重新排队；快照处理完毕时再比对描述以避免竞态。"""
         value = str(text or '').strip()
         if not value:
@@ -959,9 +959,9 @@ class MemoryStore:
         with self._lock, self._conn:
             return bool(self._conn.execute(
                 """UPDATE raw_messages SET visual_text=?,processed=0 WHERE id=? AND visual_text<>?
-                   AND chat_type='group' AND entity_blocked=0 AND substr(sender_id,1,2)<>'__' AND NOT EXISTS
+                   AND chat_type=? AND entity_blocked=0 AND substr(sender_id,1,2)<>'__' AND NOT EXISTS
                    (SELECT 1 FROM privacy_settings p WHERE p.person_id=raw_messages.platform || ':' || raw_messages.sender_id
-                   AND p.mode<>'normal')""", (value, raw_id, value),
+                   AND p.mode<>'normal')""", (value, raw_id, value, chat_type),
             ).rowcount)
 
     def mark_extraction_snapshot(self, messages: Iterable[RawMessage]) -> None:

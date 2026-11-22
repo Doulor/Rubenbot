@@ -629,6 +629,7 @@ def create_app(state: WebState):
             "ok": True,
             "name": "RubenBot WebUI",
             "running": state.is_running(),
+            "vision": getattr(getattr(state.bot, "sticker_behavior", None), "visual_counts", None),
             "auth_required": state.auth_required,
             "loopback_only": is_loopback_host(state.config.webui.host),
         }

@@ -91,7 +91,7 @@ def test_photo_perception_runs_after_ingest_without_collecting_photo(config, sto
     started, release = asyncio.Event(), asyncio.Event()
 
     class PausedVision(ScriptedLLM):
-        async def complete(self, messages, **kwargs):
+        async def complete(self, messages, *, max_tokens=None, **kwargs):
             if kwargs.get("role") == "vision":
                 started.set()
                 await release.wait()
@@ -102,12 +102,15 @@ def test_photo_perception_runs_after_ingest_without_collecting_photo(config, sto
     encoded = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"test").decode()
 
     async def scenario():
-        await asyncio.wait_for(bot.handle_event(event("", segments=[Segment("image", {"base64": encoded})])), 2)
+        handling = asyncio.create_task(bot.handle_event(event("", segments=[Segment("image", {"base64": encoded})])))
         await asyncio.wait_for(started.wait(), 2)
+        assert not handling.done()  # 流水已入库，本轮裁定仍在预算内等待
         row = store.recent_messages("room")[0]
         assert row.text == "[图片]" and not row.visual_text
         release.set()
-        await asyncio.gather(*bot.sticker_behavior._bg_tasks)
+        await asyncio.wait_for(handling, 2)
+        planner, = [c for c in llm.calls if c['task'] == 'gen_stage1']
+        assert any('屏幕写着星驰' in m['content'] for m in planner['messages'])
         assert store.search_raw_messages("星驰", platform="recording", chat_id="room")[0].id == row.id
         assert store.raw_message_by_id(row.id).visual_text == "屏幕写着星驰"
         assert bot._stickers is None

@@ -86,7 +86,7 @@ def test_parse_string_message_with_cq_codes():
         )
     )
     assert event.mentions_bot is True
-    assert event.text == "@10000 你好"
+    assert event.text == "@10000 你好[表情]"
 
 
 def test_parse_string_message_with_cq_reply():
@@ -125,6 +125,47 @@ def test_mface_is_normalized_to_sticker_with_native_ref():
     ]
 
 
+@pytest.mark.parametrize("as_cq", [False, True])
+def test_inbound_image_sources_and_mface_roundtrip(as_cq):
+    url = "https://cdn.example/img?a=1&b=x,y[z]"
+    data = {"file_id": "7137", "base64": "aW1n", "url": url}
+    face = {"emoji_id": "9", "url": url, "file": "base64://aW1n"}
+    message = [
+        {"type": "image", "data": data}, {"type": "text", "data": {"text": "和"}},
+        {"type": "mface", "data": face},
+    ]
+    if as_cq:
+        escaped = "https://cdn.example/img?a=1&amp;b=x&#44;y&#91;z&#93;"
+        message = (f"[CQ:image,file_id=7137,base64=aW1n,url={escaped}]和"
+                   f"[CQ:mface,emoji_id=9,url={escaped},file=base64://aW1n]")
+    event = parse_onebot_event(group_payload(message=message))
+    assert event.text == "[图片]和[表情]"
+    image, _, sticker = event.segments
+    assert image == Segment("image", data)
+    assert sticker.type == "sticker"
+    assert sticker.data["url"] == url
+    assert sticker.data["base64"] == "aW1n"
+    assert segment_to_onebot(sticker) == {"type": "mface", "data": face}
+
+
+@pytest.mark.parametrize("message", ["[CQ:face,id=14]", [{"type": "face", "data": {"id": 14}}]])
+def test_id_only_face_has_placeholder_not_an_image_source(message):
+    event = parse_onebot_event(group_payload(message=message))
+    assert event.text == "[表情]"
+    assert event.segments == [Segment.face(14)]
+
+
+@pytest.mark.parametrize("as_cq", [False, True])
+def test_face_with_explicit_image_source_keeps_it(as_cq):
+    url = "https://cdn.example/face.png"
+    message = (f"看[CQ:face,id=14,url={url}]" if as_cq else [
+        Segment.text("看"), {"type": "face", "data": {"id": 14, "url": url}},
+    ])
+    event = parse_onebot_event(group_payload(message=message))
+    assert event.text == "看[表情]"
+    assert event.segments[-1] == Segment("face", {"id": "14", "url": url})
+
+
 def test_segment_to_onebot():
     assert segment_to_onebot(Segment.text("hi")) == {"type": "text", "data": {"text": "hi"}}
 
@@ -143,6 +184,68 @@ def make_adapter(handler) -> SnowLumaAdapter:
     transport = httpx.MockTransport(handler)
     client = httpx.AsyncClient(base_url="http://127.0.0.1:3000", transport=transport)
     return SnowLumaAdapter(http_client=client)
+
+
+@pytest.mark.parametrize(("source", "expected"), [
+    ({"file": "/var/cache/onebot/photo.png", "base64": "aW1n"}, {"base64": "aW1n"}),
+    ({"file": "base64://aW1n"}, {"base64": "aW1n"}),
+    ({"file": "https://cdn.example/img"}, {"url": "https://cdn.example/img"}),
+    ({"url": "file:///etc/passwd", "file": "/var/cache/onebot/photo.png"}, None),
+    ({"url": "https://user:pass@cdn.example/img"}, None),
+    ({"base64": "file:///etc/passwd", "url": "https://cdn.example/img"}, {"url": "https://cdn.example/img"}),
+])
+def test_resolve_mface_get_image_filters_result(source, expected):
+    file = "0123456789abcdef0123456789abcdef.image"
+    segment = parse_onebot_event(group_payload(message=f"[CQ:mface,file={file}]")).segments[0]
+    calls = []
+
+    def handler(request):
+        calls.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json={"status": "ok", "data": source})
+
+    adapter = make_adapter(handler)
+    async def scenario():
+        async with adapter._client:
+            return await adapter.resolve_image_source(segment)
+
+    assert asyncio.run(scenario()) == expected
+    assert calls == [("/get_image", {"file": file})]
+
+
+def test_resolve_uses_platform_id_not_failed_url():
+    calls = []
+    def handler(request):
+        calls.append(json.loads(request.content))
+        return httpx.Response(503)
+
+    adapter = make_adapter(handler)
+    segment = Segment("image", {"file_id": "7137", "file": "https://untrusted.example/image"})
+    async def scenario():
+        async with adapter._client:
+            assert await adapter.resolve_image_source(segment) is None
+
+    asyncio.run(scenario())
+    assert calls == [{"file": "7137"}]
+
+
+def test_resolve_rejects_non_platform_identifiers_without_requests():
+    calls = []
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(500)
+
+    adapter = make_adapter(handler)
+    async def scenario():
+        async with adapter._client:
+            for value in ("http://localhost/x", "/etc/passwd", "secret.png", "config.yaml",
+                          "../abc.image", "a%2fb", r"C:\\temp\\a", "base64://aW1n"):
+                for key in ("file", "file_id"):
+                    assert await adapter.resolve_image_source(Segment("image", {key: value})) is None
+            for segment in (Segment.face(14), Segment.sticker(native_ref={"kind": "mface", "data": {"emoji_id": "123"}})):
+                assert await adapter.resolve_image_source(segment) is None
+
+    asyncio.run(scenario())
+    assert calls == []
 
 
 def test_send_group_and_private():

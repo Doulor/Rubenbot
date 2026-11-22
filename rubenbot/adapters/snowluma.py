@@ -250,6 +250,28 @@ class SnowLumaAdapter(BaseAdapter):
             raise RuntimeError(f"OneBot API {action} 失败：{payload}")
         return payload if isinstance(payload, dict) else {"data": payload}
 
+    async def resolve_image_source(self, segment: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        """用 OneBot 文件标识补取图源；不让协议端代抓 URL，也不读它的缓存路径。"""
+        seg = as_segment(segment)
+        data = seg.data
+        if seg.type == "sticker":
+            ref = data.get("native_ref")
+            if not isinstance(ref, Mapping) or ref.get("kind") != "mface":
+                return None
+            data = ref.get("data")
+        elif seg.type != "image":
+            return None
+        if not isinstance(data, Mapping) or (file_id := _onebot_image_id(data)) is None:
+            return None
+        try:
+            response = await self.call_api("get_image", {"file": file_id})
+        except (httpx.HTTPError, RuntimeError, ValueError):
+            return None
+        result = response.get("data")
+        if not isinstance(result, Mapping):
+            return None
+        return _inline_image_sources(result) or None
+
     async def call_action(self, name: str, params: dict[str, Any] | None = None) -> Any:
         """通用动作通道：动作名原样作为 OneBot 接口名，走现有 HTTP 通道。
 
@@ -673,10 +695,50 @@ def _image_source(data: dict[str, Any]) -> str:
     return ""
 
 
+def _onebot_image_id(data: Mapping[str, Any]) -> str | None:
+    """只接受数值文件 ID、摘要及 QQ 的摘要式图片名，不把普通文件名当标识。"""
+    for key in ("file_id", "file"):
+        value = data.get(key)
+        if type(value) is int and key == "file_id":
+            value = str(value)
+        if not isinstance(value, str):
+            continue
+        if key == "file_id" and re.fullmatch(r"[0-9]{1,20}", value):
+            return value
+        if re.fullmatch(r"[a-f0-9]{32}(?:\.(?:image|jpg|jpeg|png|gif|webp))?", value, re.ASCII | re.I):
+            return value
+    return None
+
+
+def _inline_image_sources(data: Mapping[str, Any]) -> dict[str, str]:
+    """只投影可内联的图源；HTTP(S) 由核心下载时逐跳校验、固定到公网 IP。"""
+    sources = {}
+    for key in ("base64", "url", "file"):
+        value = data.get(key)
+        if not isinstance(value, str):
+            continue
+        if key == "base64" or value.startswith(("base64://", "data:image/")):
+            encoded = value.removeprefix("base64://")
+            if encoded.startswith("data:image/"):
+                header, _, encoded = encoded.partition(",")
+                if not header.endswith(";base64"):
+                    continue
+            if len(encoded) % 4 == 0 and re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", encoded):
+                sources.setdefault("base64", encoded)
+        elif value.startswith(("https://", "http://")):
+            try:
+                url = httpx.URL(value)
+            except httpx.InvalidURL:
+                continue
+            if url.raw_host and not url.userinfo:
+                sources.setdefault("url", value)
+    return sources
+
+
 # OneBot 段类型 -> 保留的 data 字段
 _SEGMENT_FIELDS: dict[str, tuple[str, ...]] = {
     "text": ("text",),
-    "image": ("file", "url", "summary"),
+    "image": ("file", "file_id", "url", "base64", "mime_type", "summary"),
     "at": ("qq", "name"),
     "reply": ("id", "user_id", "qq", "sender_id"),
     "face": ("id",),
@@ -686,7 +748,7 @@ _SEGMENT_FIELDS: dict[str, tuple[str, ...]] = {
 }
 
 # 字符串形式消息里的 CQ 码：拆出 type 与 key=value 参数
-_CQ_CODE_RE = re.compile(r"\[CQ:(?P<type>[A-Za-z0-9_.-]+)(?P<params>(?:,[^,\]]*=[^,\]]*)*)\]")
+_CQ_CODE_RE = re.compile(r"\[CQ:(?P<type>[A-Za-z0-9_.-]+)(?P<params>(?:,[^,=\[\]]+=[^,\[\]]*)*)\]")
 _CQ_PARAM_RE = re.compile(r",([^,=\]]+)=([^,\]]*)")
 
 
@@ -706,42 +768,46 @@ def onebot_message_segments(message: Any) -> list[Segment]:
         raw_data = item.get("data") or {}
         if not isinstance(raw_data, dict):
             raw_data = {}
-        if seg_type == "mface":
-            # mface 是 OneBot/QQ 的原生商城表情段；入站边界统一为 sticker，
-            # 原生段按既有 native_ref 结构保留，发送时再由适配器还原。
-            segments.append(
-                Segment.sticker(native_ref={"kind": "mface", "data": dict(raw_data)})
-            )
-            continue
-        fields = _SEGMENT_FIELDS.get(seg_type)
-        if fields is None:
-            # 未知类型原样保留，便于插件/后续扩展按名处理
-            segments.append(Segment(seg_type, raw_data))
-            continue
-        data = {key: raw_data[key] for key in fields if raw_data.get(key) is not None}
-        if seg_type in ("at", "reply", "face"):
-            for key in data:
-                data[key] = str(data[key])
-        segments.append(Segment(seg_type, data))
+        segments.append(_inbound_segment(seg_type, raw_data))
     return segments
+
+
+def _inbound_segment(kind: str, raw_data: dict[str, Any]) -> Segment:
+    if kind == "mface":
+        # 平台原段供发送时还原；图源同时放在通用位置，核心无需认识 mface。
+        return Segment.sticker(
+            native_ref={"kind": kind, "data": dict(raw_data)}, **_inline_image_sources(raw_data)
+        )
+    fields = _SEGMENT_FIELDS.get(kind)
+    if fields is None:
+        return Segment(kind, raw_data)
+    data = {key: raw_data[key] for key in fields if raw_data.get(key) is not None}
+    if kind in ("at", "reply", "face"):
+        data = {key: str(value) for key, value in data.items()}
+    if kind == "face":
+        # 仅采用段里明示的图源；普通表情 id 不是可下载的文件 id。
+        data.update(_inline_image_sources(raw_data))
+    return Segment(kind, data)
 
 
 def _cq_string_to_segments(message: str) -> list[Segment]:
     """字符串形式（CQ 码）消息 -> 消息段列表。
 
-    字符串形式只在没有消息段数组时出现（部分实现）；这里仅识别 ``at``，
-    以及指明引用关系的 ``reply``，其余 CQ 码按历史行为剔除，避免 ``[CQ:...]``
-    原文进入模型上下文。
+    图片和表情与数组共用翻译；只有 ID 而无图源的表情也要保留，以便摄入时留痕。
     """
     segments: list[Segment] = []
     pos = 0
     for match in _CQ_CODE_RE.finditer(message):
         if match.start() > pos:
             segments.append(Segment.text(message[pos : match.start()]))
-        params = {key: value for key, value in _CQ_PARAM_RE.findall(match.group("params") or "")}
         kind = match.group("type").lower()
-        if kind in ("at", "reply"):
-            segments.append(Segment(kind, {k: params[k] for k in _SEGMENT_FIELDS[kind] if k in params}))
+        if kind in ("at", "reply", "image", "mface", "face"):
+            # 先按协议分隔，再反转义一次；URL 中编码的逗号不是参数分隔符。
+            params = {
+                key: value.replace("&#44;", ",").replace("&#91;", "[").replace("&#93;", "]").replace("&amp;", "&")
+                for key, value in _CQ_PARAM_RE.findall(match.group("params"))
+            }
+            segments.append(_inbound_segment(kind, params))
         pos = match.end()
     if pos < len(message):
         segments.append(Segment.text(message[pos:]))
@@ -750,8 +816,12 @@ def _cq_string_to_segments(message: str) -> list[Segment]:
 
 def onebot_to_segments(message: Any) -> str:
     """把 OneBot 的 message 字段渲染为纯文本（``MessageEvent.text`` 的投影）。"""
-    text = render_segments(onebot_message_segments(message))
-    if isinstance(message, str):
+    return _onebot_text(onebot_message_segments(message), isinstance(message, str))
+
+
+def _onebot_text(segments: list[Segment], from_cq: bool) -> str:
+    text = render_segments(segments)
+    if from_cq:
         # 字符串形式按旧行为归一空白
         text = re.sub(r"\s+", " ", text)
     return text.strip()
@@ -938,7 +1008,7 @@ def parse_onebot_event(data: dict[str, Any], *, self_id: str | None = None) -> M
 
     message = data.get("message", data.get("raw_message", ""))
     segments = onebot_message_segments(message)
-    text = onebot_to_segments(message)
+    text = _onebot_text(segments, isinstance(message, str))
     sender_name = str(sender.get("card") or sender.get("nickname") or user_id)
 
     if message_type == "private":

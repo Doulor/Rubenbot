@@ -26,13 +26,13 @@ import math
 import os
 import random
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
 import httpx
 
-from .adapters.base import SEND_STICKER
+from .adapters.base import SEND_STICKER, Segment
 from .computer_fetch import pinned_public_url
 from .http_body import CompressedBodyError, read_compressed_body
 from .llm import parse_json_payload
@@ -42,6 +42,9 @@ from .stickers import KIND_PHOTO, KIND_STICKER, infer_ref_kind, sniff_image_suff
 logger = logging.getLogger(__name__)
 
 COLLECTABLE_SEGMENTS = frozenset({"sticker", "image"})
+VISUAL_SEGMENTS = COLLECTABLE_SEGMENTS | {"face"}
+# 所有入库图片都排队，但不让一批多图同时占满下载连接和视觉通道。
+VISION_CONCURRENCY = 4
 MAX_TAGS = 8
 # 文本选择的候选上限：太长的编号列表会让模型乱选
 MAX_SELECT_CANDIDATES = 50
@@ -69,6 +72,11 @@ DESCRIBE_PROMPT = (
     "这是一张聊天表情包。请用一句中文描述画面内容与常见使用场景，"
     "并给出最多 5 个中文情绪/语气标签。"
     '只返回 JSON，例如 {"description": "猫咪大笑，用来接梗", "emotions": ["开心", "大笑"]}。'
+)
+
+IMAGE_PROMPT = (
+    '用一句中文记录画面中可直接看到的内容，逐字抄下清晰的专名和说明。'
+    '不清晰的文字留空。返回 JSON：{"description":"画面所见","emotions":[]}'
 )
 
 SELECT_PROMPT = (
@@ -104,6 +112,10 @@ class StickerBehavior:
         self._embed_client: httpx.AsyncClient | None = None
         # 后台任务与缓存状态；都只在事件循环里访问
         self._bg_tasks: set[asyncio.Task] = set()
+        self._visual_ready: dict[int, asyncio.Future[None]] = {}
+        self._vision_slots = asyncio.Semaphore(VISION_CONCURRENCY)
+        # 成功/失败按图片段；等待超时按本轮未就绪的流水计，不取消后台回写。
+        self.visual_counts = dict(success=0, failed=0, timeout=0)
         self._pending_descriptions: set[str] = set()
         self._vision_skip_logged = False
         self._vision_broken = False
@@ -136,65 +148,140 @@ class StickerBehavior:
     # 收集
     # ------------------------------------------------------------------
 
-    async def on_message(self, runtime: Any, event: Any, *, raw_id: int | None = None) -> None:
-        """收集表情与记录图片所见是两件事：普通照片可以只留下文字，不进选图库。"""
-        if not getattr(event, "is_group", False):
-            return
-        segments = [s for s in event.segments if s.type in COLLECTABLE_SEGMENTS]
+    def ingest(self, runtime: Any, event: Any, raw_id: int) -> None:
+        """同步登记流水的后台任务，任何网络 I/O 都不占用摄入或防抖窗口。"""
+        segments = [s for s in event.segments if s.type in VISUAL_SEGMENTS]
         if not segments:
             return
-        try:
-            store = self.store if self.enabled and self.config.collect else None
-            results = await asyncio.gather(*(
-                self._collect_segment(store, event.platform, s, topic_tags(event.text)) for s in segments
-            ), return_exceptions=True) if store is not None else [None] * len(segments)
-            # 普通图片只有明确配置了 vision 才送去识图；适配器自带的描述已同步入库。
-            perceive = raw_id is not None and runtime.config.llm.models.get("vision")
-            missing = []
-            for index, (segment, sticker) in enumerate(zip(segments, results)):
-                if isinstance(sticker, BaseException):
-                    logger.debug("表情包收集异常：%s", sticker)
-                    sticker = None
-                collecting_sticker = sticker is not None and sticker.file and sticker.kind == KIND_STICKER
-                if raw_id is not None and (perceive or collecting_sticker) and not segment_description(segment):
-                    missing.append((index, sticker))
-                elif collecting_sticker:
-                    self._schedule_description(runtime, store, sticker)
-            if missing:
-                task = asyncio.create_task(self._describe_message(runtime, raw_id, segments, missing, store))
-                self._bg_tasks.add(task)
-                task.add_done_callback(self._finish_chain)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("表情包收集异常：%s", exc)
-
-    async def _describe_message(self, runtime, raw_id, segments, missing, store) -> None:
-        """视觉只记录可见内容；无本体、坏图或超时都不拿猜测填空。"""
         descriptions = [segment_description(s) for s in segments]
-        llm = _resolve_llm(runtime)
-        if llm is None:
+        ready = sum(bool(text) for text in descriptions)
+        self.visual_counts["success"] += ready  # 适配器自带描述已经同步写入
+        collect = event.is_group and self.enabled and self.config.collect
+        if ready == len(segments) and not collect:
             return
-        # 同一条消息只排一个任务，保持多图顺序；读已收集本体可省一次下载。
-        for index, sticker in missing:
+        task = asyncio.create_task(self._ingest_images(
+            runtime, raw_id, event.platform, event.chat_type, segments, descriptions,
+            topic_tags(event.text) if collect else [], collect, self.clock(),
+        ))
+        self._bg_tasks.add(task)
+        if ready < len(segments):
+            self._visual_ready[raw_id] = asyncio.get_running_loop().create_future()
+        task.add_done_callback(lambda done: self._finish_ingest(raw_id, done))
+
+    def _release_visual(self, raw_id: int) -> None:
+        ready = self._visual_ready.pop(raw_id, None)
+        if ready is not None:
+            ready.set_result(None)
+
+    def _finish_ingest(self, raw_id: int, task: asyncio.Task) -> None:
+        self._bg_tasks.discard(task)
+        self._release_visual(raw_id)
+        if not task.cancelled() and (exc := task.exception()) is not None:
+            self._failure(raw_id, "ingest", exc)
+
+    async def wait_for_visuals(self, raw_ids: Iterable[int], *, timeout: float) -> None:
+        tasks = {ready: rid for rid in raw_ids if (ready := self._visual_ready.get(rid)) is not None}
+        if not tasks:
+            return
+        _, pending = await asyncio.wait(tasks, timeout=max(0, timeout))
+        for task in pending:
+            self.visual_counts["timeout"] += 1
+            logger.warning("图片感知 raw_id=%s type=planner_timeout", tasks[task])
+
+    def _failure(self, raw_id: int, stage: str, exc: Exception | None = None) -> None:
+        self.visual_counts["failed"] += 1
+        logger.warning("图片感知失败 raw_id=%s type=%s error=%s", raw_id, stage,
+                       type(exc).__name__ if exc is not None else "-")
+
+    async def _ingest_images(self, runtime, raw_id, platform, chat_type, segments, descriptions,
+                             tags, collect, started) -> None:
+        llm = _resolve_llm(runtime)
+        adapter = getattr(_resolve_bot(runtime), "adapters", {}).get(platform)
+        resolve = getattr(adapter, "resolve_image_source", None)
+        # 先处理缺描述的段；不让纯贴纸收集拖延已全部就绪的流水。
+        order = sorted(range(len(segments)), key=lambda i: bool(descriptions[i]))
+        for index in order:
             segment = segments[index]
-            try:
-                path = store.path_of(sticker) if sticker is not None else None
-                data = path.read_bytes() if path else await self._image_bytes(segment.data)
-                suffix = sniff_image_suffix(data)
-                if not suffix or len(data) > self.max_file_bytes:
+            if descriptions[index]:
+                self._release_visual(raw_id)
+            async with self._vision_slots:
+                ref = self._collection_ref(segment) if collect else None
+                if descriptions[index] and ref is None:
                     continue
-                raw = await vision_request(llm, data, _MIME_BY_SUFFIX[suffix],
-                    '用一句中文记录画面中可直接看到的内容，逐字抄下清晰的专名和说明。'
-                    '不清晰的文字留空。返回 JSON：{"description":"画面所见","emotions":[]}', 'image_description')
-                payload = parse_json_payload(raw)
-                if isinstance(payload, Mapping) and isinstance(payload.get('description'), str):
-                    descriptions[index] = payload['description'].strip()[:500]
-                    if descriptions[index] and sticker is not None and sticker.kind == KIND_STICKER and not sticker.description:
-                        store.update_metadata(sticker.id, description=descriptions[index], emotions=payload.get('emotions') or [])
-            except Exception as exc:  # 一张图失败，其余图仍可留证
-                logger.debug("图片感知失败（流水 %s）：%s", raw_id, type(exc).__name__)
-        text = "\n".join(filter(None, descriptions))
-        if text:
-            runtime.store.set_raw_visual_text(raw_id, text)
+                try:
+                    raw = await self._image_bytes(segment.data)
+                    if not sniff_image_suffix(raw) and resolve:
+                        source = await resolve(segment)
+                        if source:
+                            raw = await self._image_bytes(source)
+                except Exception as exc:
+                    logger.warning("图片取源失败 raw_id=%s type=image_source error=%s", raw_id, type(exc).__name__)
+                    raw = None
+                sticker = None
+                if ref is not None:
+                    try:
+                        sticker = self._store_segment(self.store, platform, segment, tags, raw, ref)
+                    except Exception as exc:  # 选图库写失败不妨碍本轮看图
+                        logger.warning("表情收集失败 raw_id=%s error=%s", raw_id, type(exc).__name__)
+                if descriptions[index]:
+                    if sticker and sticker.file and sticker.kind == KIND_STICKER:
+                        self._schedule_description(runtime, self.store, sticker)
+                    continue
+                if not raw:
+                    self._failure(raw_id, "image_bytes")
+                    continue
+                suffix = sniff_image_suffix(raw)
+                if not suffix or len(raw) > self.max_file_bytes:
+                    self._failure(raw_id, "invalid_image")
+                    continue
+                if llm is None:
+                    self._failure(raw_id, "no_model")
+                    continue
+                try:
+                    output = await vision_request(llm, raw, _MIME_BY_SUFFIX[suffix], IMAGE_PROMPT, 'image_description')
+                    payload = parse_json_payload(output)
+                except Exception as exc:
+                    self._failure(raw_id, "vision_model_timeout" if isinstance(exc, TimeoutError) else "vision_model", exc)
+                    continue
+                text = payload.get("description") if isinstance(payload, Mapping) else None
+                if not isinstance(text, str) or not text.strip():
+                    self._failure(raw_id, "invalid_description")
+                    continue
+                descriptions[index] = text.strip()[:500]
+                try:
+                    saved = runtime.store.set_raw_visual_text(raw_id, "\n".join(filter(None, descriptions)),
+                                                              chat_type=chat_type)
+                except Exception as exc:
+                    self._failure(raw_id, "writeback", exc)
+                    continue
+                if not saved:  # 流水被删除或隐私模式变更，不留视觉描述副本。
+                    self._failure(raw_id, "writeback_skipped")
+                    continue
+                self.visual_counts["success"] += 1
+                logger.info("图片感知完成 raw_id=%s part=%s elapsed_ms=%d", raw_id, index + 1,
+                            (self.clock() - started) * 1000)
+                if sticker and sticker.kind == KIND_STICKER and not sticker.description:
+                    try:
+                        self.store.update_metadata(sticker.id, description=descriptions[index],
+                                                   emotions=payload.get('emotions') or [])
+                    except Exception as exc:
+                        logger.warning("贴纸描述回填失败 raw_id=%s error=%s", raw_id, type(exc).__name__)
+
+    async def on_message(self, runtime: Any, event: Any) -> None:
+        """仅收集表情的入口（没有可回写的消息流水）。"""
+        if not event.is_group or not self.enabled or not self.config.collect:
+            return
+        for segment in event.segments:
+            ref = self._collection_ref(segment)
+            if ref is None:
+                continue
+            try:
+                raw = await self._image_bytes(segment.data)
+                sticker = self._store_segment(self.store, event.platform, segment, topic_tags(event.text), raw, ref)
+                if sticker and sticker.file and sticker.kind == KIND_STICKER:
+                    self._schedule_description(runtime, self.store, sticker)
+            except Exception as exc:
+                logger.warning("表情收集失败：%s", type(exc).__name__)
 
     async def _image_bytes(self, payload: Mapping) -> bytes | None:
         native = payload.get("native_ref")
@@ -207,47 +294,27 @@ class StickerBehavior:
             return _decode_base64(encoded)
         return await self._download_image(_candidate_url(payload, native))
 
-    async def _collect_segment(self, store: Any, platform: str, segment: Any, tags: list[str]) -> Any:
-        kind = str(getattr(segment, "type", "") or (segment.get("type") if isinstance(segment, Mapping) else ""))
-        if kind not in COLLECTABLE_SEGMENTS:
+    def _collection_ref(self, segment: Segment) -> Mapping | None:
+        if segment.type not in COLLECTABLE_SEGMENTS or not segment.data:
             return None
-        data = getattr(segment, "data", None)
-        if not isinstance(data, Mapping):
-            data = segment.get("data") if isinstance(segment, Mapping) else None
-        if not isinstance(data, Mapping) or not data:
+        ref = segment.data.get("native_ref") if segment.type == "sticker" else None
+        if not isinstance(ref, Mapping):
+            ref = {"kind": segment.type, "data": segment.data}
+        if infer_ref_kind(ref) == KIND_PHOTO and not getattr(self.config, "collect_photos", False):
+            logger.debug("跳过普通图片（默认只收表情；stickers.collect_photos 可放开）")
             return None
-        payload = {str(key): value for key, value in data.items() if value not in (None, "")}
-        if not payload:
-            return None
-        if kind == "sticker" and isinstance(payload.get("native_ref"), Mapping):
-            # 适配器已经把平台原生段放进 native_ref；存储层直接保留这份
-            # 约定结构，发送侧才能按平台还原原生段。
-            native_ref = payload["native_ref"]
-        else:
-            native_ref = {"kind": kind, "data": payload}
-        refs = {platform: native_ref} if platform else None
+        return ref
 
-        # 真表情与误收的普通图片分开：photo 默认不入库，只有显式打开
-        # stickers.collect_photos 才收（收进来也标记为 photo，永不参选）。
-        sticker_kind = infer_ref_kind(native_ref)
-        if sticker_kind == KIND_PHOTO and not getattr(self.config, "collect_photos", False):
-            logger.debug(
-                "跳过普通图片（默认只收表情；stickers.collect_photos 可放开）：%s",
-                payload.get("summary") or payload.get("file") or payload.get("url") or kind,
-            )
-            return None
-
-        raw = await self._image_bytes(payload)
-        if raw is None and not refs:
-            return None
+    def _store_segment(self, store, platform, segment, tags, raw, ref):
+        payload = segment.data
         return store.add(
             raw,
             tags=tags,
-            native_refs=refs,
+            native_refs={platform: ref} if platform else None,
             file_name=payload.get("filename") or payload.get("name") or None,
             mime_type=payload.get("mime_type") or payload.get("content_type") or None,
             max_file_bytes=self.max_file_bytes,
-            kind=sticker_kind,
+            kind=infer_ref_kind(ref),
         )
 
     async def _download_image(self, url: str) -> bytes | None:
@@ -260,7 +327,7 @@ class StickerBehavior:
                 return await self._downloader(url, limit)
             return await _default_download(url, limit)
         except Exception as exc:  # noqa: BLE001 - 下载失败不影响收集
-            logger.warning("表情图片下载失败（保留原生引用）：%s", exc)
+            logger.warning("表情图片下载失败：%s", type(exc).__name__)
             return None
 
     @property
@@ -705,7 +772,7 @@ class StickerBehavior:
 
 def segment_description(segment: Any) -> str:
     """适配器带来的可见文字；通用占位符、文件名和地址不是图片说明。"""
-    if segment.type in COLLECTABLE_SEGMENTS:
+    if segment.type in VISUAL_SEGMENTS:
         for key in ("description", "alt", "summary"):
             value = segment.data.get(key)
             if isinstance(value, str) and value.strip() not in {"", "[图片]", "[动画表情]", "[表情]"}:

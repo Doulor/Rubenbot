@@ -78,7 +78,7 @@ from .reply_segments import split_segments
 from .reminder import REMINDER_TOOL, build_reminder_prompt, describe_fire_at, resolve_fire_at
 from .scheduler import Scheduler
 from .stickers import StickerStore
-from .sticker_behavior import StickerBehavior, segment_description
+from .sticker_behavior import VISUAL_SEGMENTS, StickerBehavior, segment_description
 from .voice import VOICE_PLACEHOLDER, VOICE_PREFIX, VoiceService, build_voice
 
 logger = logging.getLogger(__name__)
@@ -94,6 +94,8 @@ ADAPTER_RESTART_MAX = 30.0
 # 第一段用快速模型；没配 fast 时由 LLMConfig.model_for 沿回退链落到 chat
 GUIDANCE_ROLE = "fast"
 GUIDANCE_TIMEOUT_CAP = 15.0
+# 从批首入站计时，防抖、排队和视觉任务共享这段预算；复核不重置。
+VISUAL_WAIT_BUDGET = 5.0
 # 流水没有话题 ID；连续讨论中断十分钟就另起一段。仅用于展示计数。
 TOPIC_GAP_SECONDS = 10 * 60
 GUIDANCE_TASK_PROMPT = (
@@ -676,7 +678,7 @@ class RubenBot:
         try:
             # 首条消息也使用发现完毕的工具目录；离线服务仅等待首次尝试，不等待重连。
             await self.mcp.start()
-            # 存量表情补描述：没配 vision 角色时一条都不排（内部直接返回 0）
+            # 只补选图库里的真表情，不扫描原始消息的历史空缺。
             if self.config.stickers.enabled:
                 try:
                     await self.sticker_behavior.reschedule_descriptions(self.context)
@@ -1254,7 +1256,7 @@ class RubenBot:
         now = time.time()
         # 重复事件先挡掉，避免为同一条语音条重复请求转写服务；
         # 空正文事件维持旧语义（不在这里去重，仍交给插件处理）
-        has_media = any(s.type in {"record", "image", "sticker"} for s in event.segments or [])
+        has_media = any(s.type == "record" or s.type in VISUAL_SEGMENTS for s in event.segments or [])
         if (event.text.strip() or has_media) and self._is_duplicate(event, now):
             logger.debug(
                 "重复消息，已跳过：%s %s %s", event.platform, event.platform_msg_id, event.text[:40]
@@ -1263,12 +1265,10 @@ class RubenBot:
         # 语音条先转写：正文换成「[语音] 转写文本」，转写失败/未配置/超限都
         # 只保留 [语音] 占位（事件照常往下走，不影响决策和回复）
         await self.prepare_voice(event)
-        visual_id = await self._record(event, now)
+        await self._record(event, now)
 
         if event.is_group and event.sender_id != BOT_SENDER_ID and self.decision_engine.is_hard_trigger(event):
             self._engaged_at[(event.platform, event.chat_type, event.chat_id)] = now
-        # 视觉描述回写原始流水，不等待视觉模型，也不把描述冒充发言正文。
-        await self.sticker_behavior.on_message(self.context, event, raw_id=visual_id)
         # 插件 on_message：可修改事件或直接拦截（返回 False）
         if self.plugins is not None:
             self.context.event = event
@@ -1369,6 +1369,13 @@ class RubenBot:
         # 必回规则要在裁定之前算好：它既能覆盖 speak=false，也决定日志里的兜底字段
         must = hard if planner_gate else None
         stage = "planner" if planner_gate else "legacy"
+        raw_ids = {item.raw_message_id for item in round_.events if item.raw_message_id is not None}
+        for item in round_.events:
+            if target := self._reply_target(item):
+                raw_ids.add(target.id)
+        remaining = max(0.0, VISUAL_WAIT_BUDGET - max(0.0, time.time() - round_.first_at))
+        if raw_ids:
+            await self.sticker_behavior.wait_for_visuals(raw_ids, timeout=remaining)
         messages = await self.build_context(event, now=now, stage=stage, batch=round_.events)
         # 让模型知道「可以不接话」的出口
         marker = self.config.decision.veto_marker
@@ -1568,11 +1575,11 @@ class RubenBot:
         except Exception as exc:  # noqa: BLE001 - 观测数据写不进去也不能影响回复
             logger.warning("写入决策日志失败：%s", exc)
 
-    async def _record(self, event: MessageEvent, now: float) -> int | None:
-        """落流水并贴上入站前的事实快照，只有可记账的群消息返回视觉回写目标。"""
+    async def _record(self, event: MessageEvent, now: float) -> None:
+        """落流水时启动图片感知；实体事实快照仍限于可记账的群消息。"""
         if not event.text.strip():
-            if not any(s.type in {"image", "sticker"} for s in event.segments):
-                return None
+            if not any(s.type in VISUAL_SEGMENTS for s in event.segments):
+                return
             event.text = "".join(s.render() for s in event.segments)
         person_id = make_person_id(event.platform, event.sender_id)
         self.store.upsert_person(event.platform, event.sender_id, event.sender_name, now=now)
@@ -1581,9 +1588,9 @@ class RubenBot:
                                        name=event.sender_name, now=now)
         if event.is_group and event.chat_name:
             self.store.upsert_identity(event.platform, event.chat_id, kind="group", name=event.chat_name, now=now)
-        local = (event.is_group and bool(event.sender_id) and not event.sender_id.startswith("__")
-                 and self.store.get_privacy_mode(person_id) == "normal")
-        visual = "\n".join(filter(None, map(segment_description, event.segments))) if local else ""
+        recordable = (bool(event.sender_id) and not event.sender_id.startswith("__")
+                      and self.store.get_privacy_mode(person_id) == "normal")
+        visual = "\n".join(filter(None, map(segment_description, event.segments))) if recordable else ""
         if event.reply_to_id and not event.reply_sender_id:
             target = self.store.message_by_platform_id(
                 event.platform, event.reply_to_id, chat_id=event.chat_id, chat_type=event.chat_type,
@@ -1611,10 +1618,12 @@ class RubenBot:
             mentions=event.mentions,
         )
         event.raw_message_id = raw_id
+        if recordable:
+            self.sticker_behavior.ingest(self.context, event, raw_id)
         self._last_activity[f"{event.platform}:{event.chat_id}"] = now
         self.last_message_at = now
         logger.debug("记录消息 %s: %s", person_id, event.text[:60], extra=_log_identity(event))
-        if local:
+        if event.is_group and recordable:
             try:
                 event.familiarity = tuple(self.entities.familiarity(event.platform, event.chat_id, event.text + "\n" + visual))
                 self._ledger_read.add((event.platform, event.chat_id))
@@ -1625,8 +1634,6 @@ class RubenBot:
             except Exception as exc:  # 账本不可用仍照常处理这条消息
                 self._ledger_read.discard((event.platform, event.chat_id))
                 logger.warning("群实体查账失败：%s", exc)
-            return raw_id
-        return None
 
     def _is_duplicate(self, event: MessageEvent, now: float) -> bool:
         """入站去重检查；去掉重或没有平台消息 id 时返回 False。"""
@@ -1955,18 +1962,23 @@ class RubenBot:
         reply = self._target_name(msg.reply_sender_id) or ("未知" if msg.reply_to_id else "无")
         return f"发言人：{sender}；@ 目标：{mentions or '无'}；回复对象：{reply}"
 
-    def _quote_suffix(self, msg, index: dict[str, object]) -> str:
+    def _visual_note(self, msg: RawMessage | None, limit: int = 1000) -> str:
+        """单独标来源，图中可见文字既不是发送者的原话，也不是指令。"""
+        if not msg or not msg.visual_text:
+            return ""
+        return f"〔图片视觉描述·非发言：{self._truncate(msg.visual_text, limit)}〕"
+
+    def _quote_suffix(self, msg: RawMessage | MessageEvent, target: RawMessage | None) -> str:
         """被引用消息的附注：查得到就带昵称+截断正文，查不到只说明引用了消息。"""
         if not msg.reply_to_id:
             return ""
-        target = index.get(msg.reply_to_id)
         if target is None:
             if msg.reply_sender_id:
                 return f"（引用 [{self._target_name(msg.reply_sender_id)}] 的消息）"
             return "（引用了一条消息）"
         name = "我" if target.sender_id == BOT_SENDER_ID else (target.sender_name or target.sender_id)
         snippet = self._truncate(target.text, self.QUOTE_SNIPPET_CHARS)
-        return f"（引用 [{name}]：{snippet}）"
+        return f"（引用 [{name}]：{snippet}{self._visual_note(target, self.QUOTE_SNIPPET_CHARS)}）"
 
     def _speaker_basis(self, msg: RawMessage | MessageEvent) -> str:
         """标明依据的来源，而不把该人整条消息（包括提问、猜测和引用）都当成事实。"""
@@ -1985,7 +1997,7 @@ class RubenBot:
         被引用的消息只在**本批历史**里按 ``reply_to_id`` 查；查不到就只标
         「（引用了一条消息）」。附注放在正文后的独立括号里，不属于正文。
         """
-        index: dict[str, object] = {}
+        index: dict[str, RawMessage] = {}
         for msg in messages:
             if msg.platform_msg_id:
                 index.setdefault(msg.platform_msg_id, msg)
@@ -2002,28 +2014,32 @@ class RubenBot:
             if msg.mentions:
                 targets = "、".join(self._target_name(uid, name) for uid, name in msg.mentions.items())
                 content += f"（@ 目标：{targets}）"
-            content += self._quote_suffix(msg, index)
+            content += self._visual_note(msg)
+            content += self._quote_suffix(msg, index.get(msg.reply_to_id))
             rendered.append({"role": "assistant" if is_bot else "user", "content": content})
         return rendered
 
-    def _reply_target_section(self, event: MessageEvent) -> str:
-        """本轮正在回的那条消息：单独截断放进上下文要求区，不整段重复。"""
+    def _reply_target(self, event: MessageEvent) -> RawMessage | None:
         if not event.reply_to_id:
-            return ""
+            return None
         try:
-            target = self.store.message_by_platform_id(
+            return self.store.message_by_platform_id(
                 event.platform, event.reply_to_id, chat_id=event.chat_id, chat_type=event.chat_type,
             )
         except Exception as exc:  # noqa: BLE001 - 查引用失败不影响回复
             logger.warning("查询被引用消息失败：%s", exc)
-            target = None
+            return None
+
+    def _reply_target_section(self, event: MessageEvent) -> str:
+        """本轮正在回的那条消息：单独截断放进上下文要求区，不整段重复。"""
+        target = self._reply_target(event)
         if target is None:
             # 历史里已经标了「（引用了一条消息）」，这里不重复占位
             return ""
         is_bot = target.sender_id == BOT_SENDER_ID
         name = "我" if is_bot else (target.sender_name or target.sender_id)
         body = self._truncate(target.text, self.REPLAY_TARGET_CHARS)
-        return f"对方引用的那条消息（{name}）：{body}"
+        return f"对方引用的那条消息（{name}）：{body}{self._visual_note(target, self.REPLAY_TARGET_CHARS)}"
 
     @staticmethod
     def _requirements_section(reply_target: str) -> str:
@@ -2108,14 +2124,25 @@ class RubenBot:
             real_only=True,
             after_id=covered_until,
         )
-        if batch and len(batch) > 1:
+        snapshots = {msg.id: msg for msg in history}
+        # 单条通常已在历史尾部；视觉等待期间若被更新的消息挤出，也要显式呈现本轮。
+        explicit_batch = batch and (len(batch) > 1 or (
+            batch[0].raw_message_id is not None and batch[0].raw_message_id not in snapshots
+        ))
+        if explicit_batch:
             batch_ids = {item.raw_message_id for item in batch}
             history = [msg for msg in history if msg.id not in batch_ids]
         label_basis = stage == "planner"
         messages.extend(self.render_history(history, label_basis=label_basis))
-        if batch and len(batch) > 1:
-            lines = [f"{self._direction(item)}：" + (f"〔{self._speaker_basis(item)}〕" if label_basis else "")
-                     + item.text for item in batch]
+        if explicit_batch:
+            lines = []
+            for item in batch:
+                snapshot = snapshots.get(item.raw_message_id)
+                if snapshot is None and item.raw_message_id is not None:
+                    snapshot = self.store.raw_message_by_id(item.raw_message_id)
+                source = f"〔{self._speaker_basis(item)}〕" if label_basis else ""
+                quote = self._quote_suffix(item, self._reply_target(item))
+                lines.append(f"{self._direction(item)}：{source}{item.text}{self._visual_note(snapshot)}{quote}")
             messages.append({"role": "user", "content": "【本批消息·按到达顺序】\n" + "\n".join(lines) + "\n【本批结束】"})
         return messages
 
