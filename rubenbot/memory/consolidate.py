@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Iterable
 
 from ..llm import LLMProtocol, parse_json_payload
+from .gate import OWNER_AUDIENCE
 from ..memory.store import Memory, MemoryStore
 
 logger = logging.getLogger(__name__)
@@ -247,7 +248,13 @@ class Consolidator:
                             "scope_type": sources[0].scope_type,
                             "scope_id": sources[0].scope_id,
                             "content": proposal.content,
-                            "category": proposal.category or sources[0].category,
+                            # 带来源的记忆按类目复用分寸裁定，模型不能替它换一个裁定键。
+                            "category": sources[0].category if sources[0].audience else proposal.category or sources[0].category,
+                            "origin_chat": sources[0].origin_chat,
+                            "audience": sources[0].audience,
+                            "sensitivity": sources[0].sensitivity,
+                            "stability": sources[0].stability,
+                            "expires_at": sources[0].expires_at,
                             "source": "extracted",
                             "source_ref": ",".join(str(m.id) for m in sources),
                         }
@@ -298,6 +305,13 @@ class Consolidator:
             # 合并会删除源记忆，因此 user 来源的记忆也不参与合并（保守处理）
             if any(m.source == "user" for m in sources):
                 return "user 来源的记忆不可合并删除"
+            if any(m.audience == OWNER_AUDIENCE for m in sources):
+                return "机主自述须保留逐条原话以便追封，不可合并"
+            # 合并不能洗掉来源、封存或有效期；边界不一致时宁可保留原记忆。
+            boundaries = {(m.audience, m.origin_chat, m.sensitivity, m.scope_type, m.scope_id,
+                           m.category if m.audience else None, m.stability, m.expires_at) for m in sources}
+            if len(boundaries) != 1:
+                return "来源、分寸裁定或有效期不同，不可合并"
             if not proposal.content.strip():
                 return "合并结果为空"
             new_tokens = find_new_tokens(proposal.content, sources)

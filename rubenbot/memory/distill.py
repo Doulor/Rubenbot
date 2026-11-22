@@ -25,6 +25,7 @@ import time
 from dataclasses import dataclass, field
 
 from ..llm import LLMProtocol, parse_json_payload
+from ..memory.gate import OWNER_AUDIENCE
 from ..memory.retrieve import jaccard
 from ..memory.store import Event, Memory, MemoryStore, Profile, ProfileLine
 
@@ -212,6 +213,9 @@ class ProfileDistiller:
             for mem in self.store.list_memories(person_id=person_id, limit=self.config.distill_max_facts)
             if mem.created_at > last_at
         ]
+        # 机主专属与封存项保留原始裁定键，不经通用画像再次抽象或派生钩子。
+        facts = [m for m in facts if m.audience != OWNER_AUDIENCE and m.sensitivity != "sealed"]
+        events = [e for e in events if e.audience != OWNER_AUDIENCE and e.sensitivity != "sealed"]
         old = self.store.get_profile(person_id)
         if not events and not facts:
             return ProfileUpdate(person_id=person_id)
@@ -226,6 +230,9 @@ class ProfileDistiller:
             json_mode=True,
         )
         stable, status, hooks = parse_profile(raw)
+        # 私聊画像行照常保留证据，钩子没有逐条证据，不能用私聊原料发布新钩子。
+        if any(item.audience == "private" for item in [*events, *facts]):
+            hooks = []
         if not stable and not status and not hooks:
             # 模型什么都没给（多半是坏输出）：保留旧画像，别把已有的画像清空
             logger.info("画像提炼没有产出有效内容（%s），保留旧画像", person_id, extra={"person_id": person_id})

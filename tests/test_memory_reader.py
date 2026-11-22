@@ -304,7 +304,7 @@ def test_budget_cuts_facts_then_timeline_keeps_profile(store):
     config = MemoryConfig(inject_budget_tokens=120)
     person_id = seed_person(store, "u1", "阿花", stable=["TA 是一名后端工程师"])
     for i in range(10):
-        store.add_memory(person_id, f"TA 喜欢喝美式咖啡，第 {i} 家店都去过", audience="private", now=NOW)
+        store.add_memory(person_id, f"TA 喜欢喝美式咖啡，第 {i} 家店都去过", audience="group:g1", now=NOW)
         store.add_event(
             person_id, f"TA 又去喝美式咖啡了，第 {i} 次", ts=NOW - i * 3600, audience="group:g1", now=NOW
         )
@@ -500,7 +500,7 @@ def test_self_events_take_precedence_in_budget(store):
     person_id = seed_person(store, "u1", "阿花")
     store.add_self_event("我说过今天要早点睡", source_chat="console:g1", ts=NOW - 60, now=NOW)
     for i in range(10):
-        store.add_memory(person_id, f"TA 喜欢喝美式咖啡，第 {i} 家店都去过", audience="private", now=NOW)
+        store.add_memory(person_id, f"TA 喜欢喝美式咖啡，第 {i} 家店都去过", audience="group:g1", now=NOW)
     block = asyncio.run(
         reader(store, config).assemble(
             text="美式咖啡", person_id=person_id, platform="console", chat_id="g1",
@@ -775,3 +775,30 @@ def test_estimate_tokens():
     assert estimate_tokens("") == 0
     assert estimate_tokens("abcdefgh") == 2
     assert estimate_tokens("你好世界") == 4
+
+
+def test_owner_memory_requires_actual_author_in_turn_not_mention_or_other_owner(store):
+    pid = seed_person(store, "o1", "甲机主")
+    store.add_memory(pid, "TA 喜欢荞麦面", audience="owner", stability="uncertain", now=NOW)
+    store.add_event(pid, "TA 在家做了荞麦面", audience="owner", source_chat="console:else", ts=NOW - 86400)
+    r = reader(store)
+    args = dict(text="甲机主，荞麦面呢", person_id="console:peer", platform="console", chat_type="group", chat_id="g", now=NOW)
+    for ids in [(), {"console:o2"}, {"other:o1"}]:
+        assert "荞麦面" not in asyncio.run(r.assemble(**args, owner_person_ids=ids)).render()
+    text = asyncio.run(r.assemble(**args, owner_person_ids={pid})).render()
+    assert "【机主自述记忆】" in text and "不太确定" in text and "昨天" in text
+    store.set_ruling(pid, "fact@group", "deny")
+    assert "喜欢荞麦面" not in asyncio.run(r.assemble(**args, owner_person_ids={pid})).render()
+
+
+def test_private_profile_hooks_do_not_follow_public_first_evidence(store):
+    pid = seed_person(store, "u1", "阿花")
+    group = store.add_memory(pid, "TA 喜欢喝咖啡", audience="group:g1")
+    private = store.add_memory(pid, "TA 喜欢水晶", audience="private")
+    store.save_profile(pid, stable_lines=[ProfileLine("喜欢咖啡", [f"memory:{group.id}"]),
+                                          ProfileLine("喜欢水晶", [f"memory:{private.id}"])],
+                       status_lines=[], hooks=["水晶"], now=NOW)
+    store.add_raw_message(platform="console", chat_id="g1", sender_id="u1", text="在呢", ts=NOW)
+    text = asyncio.run(reader(store).assemble(text="阿花喜欢什么", person_id="console:u2", platform="console",
+                                              chat_type="group", chat_id="g1", now=NOW)).render()
+    assert "咖啡" in text and "水晶" not in text

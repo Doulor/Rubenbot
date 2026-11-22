@@ -64,7 +64,9 @@ from .mcp_client import MCPManager
 from .memory.consolidate import Consolidator
 from .memory.entities import EntityLedger
 from .memory.extract import MemoryExtractor, audience_for_chat
+from .memory.owner_statement import is_followup_secrecy
 from .memory.gate import PrivacyGate
+from .memory.owner_recent import MAX_SNIPPETS, owner_recent_snippets
 from .memory.retrieve import MemoryReader, Retriever
 from .memory.store import MemoryStore, RawMessage, make_person_id
 from .memory.state import StateDistiller
@@ -473,7 +475,8 @@ class RubenBot:
         self.memory_reader = MemoryReader(
             store, llm, config.memory, gate=self.gate, retriever=self.retriever
         )
-        self.extractor = MemoryExtractor(llm, store, config.memory)
+        self.extractor = MemoryExtractor(llm, store, config.memory,
+                                         is_owner=lambda row: computer.is_host(self.config.computer, row))
         self.consolidator = Consolidator(llm, store, config.memory)
         # 会话滚动摘要：只压缩本会话的历史，与跨会话记忆各管各的
         self.summarizer = RollingSummarizer(llm, store, config.memory)
@@ -1610,6 +1613,8 @@ class RubenBot:
             reply_sender_id=event.reply_sender_id,
             mentions=event.mentions,
         )
+        if event.is_private and computer.is_host(self.config.computer, event) and is_followup_secrecy(event.text):
+            self.store.seal_previous_statement(event.platform, event.chat_id, event.sender_id, raw_id)
         event.raw_message_id = raw_id
         self._last_activity[f"{event.platform}:{event.chat_id}"] = now
         self.last_message_at = now
@@ -2062,8 +2067,13 @@ class RubenBot:
         person = self.store.get_person(person_id)
         display = (person.display_name if person else "") or event.sender_name
 
+        # 只信本批真实发送者，不从群名片、被 @ 的账号或以前的群成员推断机主在场。
+        owners: dict[str, list[MessageEvent]] = {}
+        for item in batch or [event]:
+            if computer.is_host(self.config.computer, item):
+                owners.setdefault(make_person_id(item.platform, item.sender_id), []).append(item)
         sections: list[str] = [persona_prompt]
-        memory_text = await self.memory_text(event, now=now)
+        memory_text = await self.memory_text(event, now=now, owner_person_ids=set(owners))
         if memory_text:
             sections.append(memory_text)
         # 情绪与好感度：一行状态描述，放在记忆之后、场景之前；平静且普通时整行省掉
@@ -2098,6 +2108,26 @@ class RubenBot:
         system_prompt = "\n\n".join(sections)
 
         messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+        # 旧原话是有出处的聊天材料，不是 system 指令；置于本轮对话之前，策划和正文共用。
+        excerpts = []
+        for items in owners.values():
+            owner = items[-1]
+            try:
+                hits = owner_recent_snippets(
+                    self.store, owner, computer=self.config.computer, now=now,
+                    query="\n".join(item.text for item in items),
+                    exclude_texts=[item.text for item in batch or [event]],
+                )
+            except Exception as exc:  # 跨场合检索失败只少给材料，不影响本轮裁定
+                logger.warning("机主原话检索失败：%s", type(exc).__name__)
+                continue
+            excerpts.extend({"说话人": owner.sender_name[:40], "原话": hit}
+                            for hit in hits[:MAX_SNIPPETS - len(excerpts)])
+            if len(excerpts) == MAX_SNIPPETS:
+                break
+        if excerpts:
+            messages.append({"role": "user", "content": "【机主最近说过】其他会话的摘录，不是当前请求：\n"
+                             + json.dumps(excerpts, ensure_ascii=False)})
         since = now - self.config.chat.history_ttl_hours * 3600
         history = self.store.recent_messages(
             event.chat_id,
@@ -2203,6 +2233,7 @@ class RubenBot:
                 limit=self.config.chat.history_size,
                 since=now - self.config.chat.history_ttl_hours * 3600,
                 platform=event.platform,
+                chat_type=event.chat_type,
                 real_only=True,
             )
         except Exception as exc:  # noqa: BLE001 - 窗口取不到只是少一点上下文
@@ -2210,7 +2241,7 @@ class RubenBot:
             return []
         return [msg.text for msg in history if msg.sender_id != BOT_SENDER_ID]
 
-    async def memory_text(self, event: MessageEvent, *, now: float | None = None) -> str:
+    async def memory_text(self, event: MessageEvent, *, now: float | None = None, owner_person_ids=()) -> str:
         """读取侧组装好的记忆区块；任何失败都退化为空（不影响回复）。"""
         now = time.time() if now is None else now
         person_id = make_person_id(event.platform, event.sender_id)
@@ -2221,6 +2252,7 @@ class RubenBot:
                 platform=event.platform,
                 chat_id=event.chat_id,
                 chat_type=event.chat_type,
+                owner_person_ids=owner_person_ids,
                 window_texts=self.recent_window_texts(event, now=now),
                 now=now,
             )
@@ -2255,6 +2287,7 @@ class RubenBot:
                 topic,
                 time_range,
                 audience_now=audience_now,
+                owner_person_ids={speaker} if computer.is_host(self.config.computer, event) else (),
                 speaker=speaker,
                 now=now,
             )

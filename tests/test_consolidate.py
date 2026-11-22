@@ -125,6 +125,30 @@ def test_merge_accepted_when_only_rearranging(store):
     assert logs[0].reason == "合并"
 
 
+def test_merge_cannot_broaden_audience_or_drop_seal(store):
+    fields = dict(origin_chat="console:u1", audience="private", sensitivity="sealed", category="health")
+    m1 = store.add_memory("console:u1", "TA 喜欢吃鸭腿", **fields)
+    m2 = store.add_memory("console:u1", "TA 喜欢吃鸡腿", **fields)
+    other = store.add_memory("console:u1", "TA 喜欢吃苹果", audience="group:g1")
+    consolidator, _ = make_consolidator(store, [
+        {"op": "merge", "ids": [m1.id, other.id], "content": "TA 喜欢吃苹果"},
+        {"op": "merge", "ids": [m1.id, m2.id], "content": "TA 喜欢吃鸭腿和鸡腿", "category": "hobby"},
+    ])
+    result = asyncio.run(consolidator.consolidate_person("console:u1"))
+    assert len(result.rejected) == 1 and result.merged == 1
+    merged, = [m for m in store.list_memories(person_id="console:u1") if m.id != other.id]
+    assert all(getattr(merged, name) == value for name, value in fields.items())
+
+
+def test_owner_merge_preserves_individual_source_refs(store):
+    memories = [store.add_memory("console:u1", f"我喜欢吃{food}", audience="owner", source_ref=f"console:p:{i}-{i}")
+                for i, food in enumerate(["鸭腿", "鸡腿"], 1)]
+    consolidator, _ = make_consolidator(store, [{"op": "merge", "ids": [m.id for m in memories],
+                                                "content": "我喜欢吃鸡腿和鸭腿"}])
+    assert asyncio.run(consolidator.consolidate_person("console:u1")).merged == 0
+    assert {m.source_ref for m in store.list_memories()} == {m.source_ref for m in memories}
+
+
 def test_merge_single_id_rejected(store):
     m1 = store.add_memory("console:u1", "TA 住在上海")
     consolidator, _ = make_consolidator(
