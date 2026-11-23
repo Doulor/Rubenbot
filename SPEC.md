@@ -265,7 +265,7 @@ SnowLuma 适配器（OneBot v11）：
 ## WebUI（当前已实现）
 
 - 技术：FastAPI + uvicorn；前端不用构建链，使用原生 HTML/CSS/JS 单页，静态文件由 FastAPI 直接托管。
-- 页面：概览、机器人/人设、模型、记忆、人物、群组与决策、插件市场、日志、设置和关于。模型页可管理提供商和各自的模型、选择与排序各角色的跨提供商候选，支持 `failover` / `round_robin` / `random` 策略编辑并热生效；人设页支持五文件编辑、热加载和预览；插件页支持索引发现、安装/更新/卸载/启停、已安装插件配置和逐项权限授权（`GET /api/plugins` 返回声明与授权对照，`PUT /api/plugins/{name}/permissions` 即时改授权）；情绪卡片与相关只读 API 已接入。
+- 页面：概览、机器人/人设、模型、记忆、人物、群组与决策、插件市场、日志、设置和关于。模型页可管理提供商和各自的模型、选择与排序各角色的跨提供商候选，支持 `failover` / `round_robin` / `random` 策略编辑并热生效；人设页支持五文件编辑、热加载和预览；插件页支持索引发现、安装/更新/卸载/启停、已安装插件配置、逐项权限授权（`GET /api/plugins` 返回声明与授权对照，`PUT /api/plugins/{name}/permissions` 即时改授权）与完整详情页（`#/plugins/detail/<id>`，`GET /api/plugins/{id}/detail`）；情绪卡片与相关只读 API 已接入。
 - 设置之后的「关于」页通过鉴权只读接口 `GET /api/about` 展示版本、项目仓库和提交链接、MIT 许可全文，以及当前模型与角色模型池、适配器状态和插件计数；不返回密钥。提交优先读取部署盖戳 `.deploy-commit`，其次读取项目的 Git HEAD，两者均不可用时显示未知和原因。仅点击「检查更新」时调用 `GET /api/about/update` 比对 GitHub `main` 的提交，超时 10 秒；失败只在按钮旁提示，不影响其余内容，也不执行升级。
 - 群组页查看会话决策日志、群定位与手写备注；群定位注入遵循手写优先、自归纳其次，两者都空或私聊时不注入。
 - 移动端使用导航抽屉；页面切换优先使用路由缓存并隔离迟到响应。登录签名密钥持久化在数据库目录，重启后有效会话可继续验证。
@@ -347,8 +347,14 @@ SnowLuma 适配器（OneBot v11）：
 - `id`（全局唯一，英文短横线）、`name`、`version`（semver）、`description`（一句话）、`author`
 - `min_core_version`：要求的框架最低版本，过低时禁止安装并在卡片上标明
 - `permissions`：能力声明数组，枚举固定：`read_messages`（读消息/历史）、`send_messages`（发消息）、`capabilities`（调用能力层，如贴表情）、`qzone_write`（空间写操作）、`scheduler`（定时任务）、`llm`（调用模型）、`network`（出网请求）
-- `config_schema`：配置项声明（key/类型/默认/说明），供设置界面自动渲染表单（二期落地，一期先解析存下）
+- `config_schema`：配置项声明数组（key / 类型 / 默认值 / 说明，可选 label / min / max / step / options / secret / min_length / max_length）。WebUI 按它自动生成表单并在保存时按同一份规则校验，`rubenbot/plugins/config_schema.py` 是唯一解读入口；没有 schema 的插件照常工作，只显示「无可配置项」。
+- `triggers`（可选）：面向详情页的人类可读触发方式说明（如「点歌 <歌名>」）。不是运行时配置，真正的触发词仍在 `config_schema` 的字段里。
+- `repository`（可选）：仓库 / 插件目录链接，详情页展示。
 - `hooks`：用到的钩子名列表（on_message / on_command / scheduled 等，与 loader 的 register(ctx) 对应）
+
+`config_schema` 字段类型固定为 `bool` / `int` / `number` / `string` / `text` / `list`（兼容 `boolean` / `integer` / `float` / `string_list` 等别名）；`options` 既接受裸值数组，也接受 `{value, label}` 对象数组。声明里不合法的条目会被跳过并记日志，不会让插件不可加载；默认值类型不对时退回类型默认值。已知字段名含 `key` / `token` / `secret` / `password` 或显式 `secret: true` 的按密钥处理：WebUI 不回显原值，留空表示保留原值。
+
+已知边界：`link_parse` 的 `delivery`（`direct` / `planner`）目前只用于验证 schema 能表达「枚举可选值 + 默认 direct」，第 25 项接入策划步投递前两种取值都按 `direct` 的既有行为处理。
 
 loader 加载时校验 manifest：缺失或字段不全的插件拒绝加载并在 WebUI 标「不合规」；现有 6 个官方插件（hello / qzone_post / music / image_gen / group_insights / link_parse）都声明了 manifest；表情包行为已于 2026-11-20 移入 core，emoji_react 已删除；新增插件（音乐 / 画图 / 群聊总结）沿用同一规范，默认不启用。画图走**自定义生图端点（OpenAI 兼容）**：`base_url` / `api_key` / `model` 三件套齐全才注册触发，硅基流动退为预设示例、不再写死。点歌默认发「歌名 — 歌手 + 链接」文字并附封面图；OneBot 音乐卡在新版 QQ 客户端只显示「发送者版本过低」，降为 `music_card: true` 的可选项。
 
@@ -365,7 +371,7 @@ loader 加载时校验 manifest：缺失或字段不全的插件拒绝加载并�
 - 布局：顶部搜索 + 分类标签（互动 / 空间 / 工具 / 系统），下面卡片网格。
 - 卡片元素：图标（manifest 可选 icon，无则用首字母块）、名字、一句话说明、版本号、权限徽标组、作者、状态按钮（安装 / 启用 / 停用 / 更新 / 卸载，随状态切换）。
 - 状态机：未安装 → 已安装（未启用）→ 已启用；另有「可更新」「不合规」「核心版本过低」标记态。
-- 详情抽屉：完整说明、版本与更新日志（如有）、权限清单、配置表单（二期）。
+- 插件详情页（`#/plugins/detail/<id>`，`GET /api/plugins/{id}/detail`）：介绍（插件目录 README 原文，最多 128 KiB，无 README 时用 manifest 一句话说明）、版本、作者、分类、启用 / 加载状态、权限清单（含授权状态与高危标记）、触发方式（manifest `triggers` / 运行时命令与钩子）、配置说明（每个字段的类型、默认值、范围、可选值）与 schema 驱动配置表单。只读信息与表单在同一页；单独成页便于从市场卡片直接打开，详情抽屉保留作快速预览。
 - 安装确认框：列全 permissions 逐项说明，含 qzone_write / scheduler 的插件额外标红提示；确认后才落盘。
 
 ### 安全原则（只有一条硬规矩）
@@ -389,7 +395,7 @@ loader 加载时校验 manifest：缺失或字段不全的插件拒绝加载并�
 ### 分期
 
 - 一期：manifest 规范 + loader 校验 + 4 插件迁移 + 索引拉取/回退 + 市场页（卡片/状态机/装卸启停/更新角标/安装确认）。
-- 二期：config_schema 自动配置表单、索引定时刷新与更新提醒。
+- 二期：config_schema 自动配置表单（已落地：schema 规范化 + 详情页 + 表单生成 / 保存回读 / 逐字段错误，音乐与链接解析全部可配项已迁入）、索引定时刷新与更新提醒。
 - 三期（有第三方插件再说）：投稿流程、权限分级放行、签名。
 
 ## 表情包设计（2026-11-20 多萝确认）

@@ -25,6 +25,7 @@
 - ``GET  /api/emotion``         当前心情 + 好感 Top5/Bottom3 + 最近变化流水（只读）
 - ``GET  /api/stickers``        表情库列表；``GET /api/stickers/{id}/image`` 取图片；``DELETE`` 删除
 - ``GET  /api/plugins``         插件列表（含目录里发现但未启用的）
+- ``GET  /api/plugins/{id}/detail`` 插件详情：介绍 / README、版本、作者、权限、触发方式、配置说明与启用状态
 - ``GET  /api/plugins/{id}/config`` 读取已安装插件配置
 - ``PUT  /api/plugins/{id}/config`` 保存插件配置；插件声明 ``on_config_change`` 时热生效，否则提示需重启
 - ``POST /api/plugins/{name}``  启用/禁用：热生效并写回 plugins.enabled
@@ -91,6 +92,7 @@ from .config_schema import (
 )
 from .logbuffer import records as log_records
 from .market import MarketError, MarketService
+from .plugin_detail import PluginDetailError, plugin_detail
 from .state import (
     WebState,
     describe_restart_fields,
@@ -1199,6 +1201,20 @@ def create_app(state: WebState):
     # 下载与解压更久，交给 FastAPI 的线程池跑，别把整个 WebUI 的事件循环卡住。
     market = MarketService(state)
 
+    @app.get("/api/plugins/{plugin_id}/detail")
+    def plugin_detail_view(plugin_id: str, request: Request):
+        """插件详情：介绍、版本、作者、权限清单、触发方式、配置说明与启用状态。
+
+        只读；已装插件额外附上当前配置值（密钥字段不回显）与授权状态。
+        市场索引故障不影响本地已装插件的详情。
+        """
+        require_session(request)
+        try:
+            payload = plugin_detail(state, market, plugin_id)
+        except PluginDetailError as exc:
+            raise ApiError(exc.status, exc.message) from exc
+        return {"ok": True, "plugin": payload}
+
     @app.get("/api/plugins/{plugin_id}/config")
     def plugin_config(plugin_id: str, request: Request):
         require_session(request)
@@ -1220,7 +1236,7 @@ def create_app(state: WebState):
         try:
             payload = market.save_plugin_config(plugin_id, body.get("values"))
         except MarketError as exc:
-            raise ApiError(exc.status, exc.message) from exc
+            raise ApiError(exc.status, exc.message, fields=exc.fields or None) from exc
         hot = bool(payload.pop("hot", False))
         message = payload.pop("message", "") or (
             "插件配置已保存并热生效，无需重启。" if hot else "插件配置已保存，重启 bot 后生效。"
