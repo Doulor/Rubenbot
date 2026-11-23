@@ -882,6 +882,17 @@ class StickerConfig:
     dir: str = "data/stickers"
     # 单张表情图片的收集上限（字节）；超过或格式识别不了就不收本体
     max_file_bytes: int = 8 * 1024 * 1024
+    # ---- 识图时序（入库描述与裁定等待；与表情开关无关，始终生效）----
+    # 触发消息本身含图时，裁定最多等这么久（每张图从自己入库时算起）等描述落库。
+    # 实测视觉描述 6.0–13.4 秒，默认留到 15 秒；等满仍无描述按缺失裁定。
+    vision_wait_seconds: float = 15.0
+    # 图片字节拉取失败后的重试次数与退避（QQ 媒体链接偶发拉不下来）。
+    vision_fetch_retries: int = 1
+    vision_fetch_backoff_seconds: float = 0.4
+    # 送视觉模型前按需下采样：长边上限（像素，0 表示不压缩）与 JPEG 质量。
+    # 可选依赖 Pillow 优先，没有时用系统 ffmpeg；都没有就按原图送。
+    vision_image_max_side: int = 1024
+    vision_image_quality: int = 80
     # 描述 embedding 检索（OpenAI 兼容 /embeddings）。base_url 与 model
     # 都填了才启用；没有时直接走 fast 角色文本选择。
     embedding_base_url: str = ""
@@ -907,6 +918,23 @@ class StickerConfig:
         if isinstance(self.max_file_bytes, bool) or not isinstance(self.max_file_bytes, (int, float)) or self.max_file_bytes <= 0:
             self.max_file_bytes = 8 * 1024 * 1024
         self.max_file_bytes = int(self.max_file_bytes)
+        if isinstance(self.vision_wait_seconds, bool) or not isinstance(self.vision_wait_seconds, (int, float)):
+            self.vision_wait_seconds = 15.0
+        self.vision_wait_seconds = max(0.0, float(self.vision_wait_seconds))
+        if isinstance(self.vision_fetch_retries, bool) or not isinstance(self.vision_fetch_retries, int):
+            self.vision_fetch_retries = 1
+        self.vision_fetch_retries = min(3, max(0, self.vision_fetch_retries))
+        if isinstance(self.vision_fetch_backoff_seconds, bool) or not isinstance(
+            self.vision_fetch_backoff_seconds, (int, float)
+        ):
+            self.vision_fetch_backoff_seconds = 0.4
+        self.vision_fetch_backoff_seconds = min(5.0, max(0.0, float(self.vision_fetch_backoff_seconds)))
+        if isinstance(self.vision_image_max_side, bool) or not isinstance(self.vision_image_max_side, (int, float)):
+            self.vision_image_max_side = 1024
+        self.vision_image_max_side = max(0, int(self.vision_image_max_side))
+        if isinstance(self.vision_image_quality, bool) or not isinstance(self.vision_image_quality, (int, float)):
+            self.vision_image_quality = 80
+        self.vision_image_quality = min(95, max(30, int(self.vision_image_quality)))
         self.embedding_base_url = str(self.embedding_base_url or "").strip()
         self.embedding_model = str(self.embedding_model or "").strip()
         self.embedding_api_key = str(self.embedding_api_key or "").strip()

@@ -38,6 +38,7 @@ from .http_body import CompressedBodyError, read_compressed_body
 from .llm import parse_json_payload
 from .memory.retrieve import tokenize
 from .stickers import KIND_PHOTO, KIND_STICKER, infer_ref_kind, sniff_image_suffix
+from .vision_image import Encoder as _ImageEncoder, prepare_image
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,20 @@ DESCRIBE_BACKFILL_BATCH = 10
 # 下载表情图片时的连接/读取上限（秒）
 DOWNLOAD_TIMEOUT = 10.0
 _DEFAULT_MAX_BYTES = 8 * 1024 * 1024
+# 识图时序默认值：与 StickerConfig 保持一致，供注入的简易配置（测试/插件）回退
+_DEFAULT_VISION_WAIT = 15.0
+_DEFAULT_FETCH_RETRIES = 1
+_DEFAULT_FETCH_BACKOFF = 0.4
+_DEFAULT_IMAGE_MAX_SIDE = 1024
+_DEFAULT_IMAGE_QUALITY = 80
+# 裁定日志里留多少条近期图片状态；超了从最旧的丢
+_VISUAL_STATUS_LIMIT = 512
+# 这些阶段说明字节没拿到或模型没给出描述，与「还在途」要分开记。
+_FETCH_FAILURE_STAGES = frozenset({
+    "image_bytes", "image_source", "invalid_image", "no_model",
+    "vision_model", "vision_model_timeout", "invalid_description",
+    "writeback", "writeback_skipped", "ingest", "fetch",
+})
 
 _MIME_BY_SUFFIX = {
     ".png": "image/png",
@@ -99,6 +114,7 @@ class StickerBehavior:
         clock: Callable[[], float] | None = None,
         downloader: Callable[[str, int], Awaitable[bytes | None]] | None = None,
         embed_fn: Callable[[list[str]], Awaitable[list[list[float]]]] | None = None,
+        image_encoder: _ImageEncoder | None = None,
     ) -> None:
         self.config = config
         self._store_getter = store_getter
@@ -109,10 +125,15 @@ class StickerBehavior:
         self._verified_adapter: dict[tuple[str, str], Any] = {}
         self._downloader = downloader
         self._embed_fn = embed_fn
+        # 视觉前压缩可注入（测试不依赖 Pillow/ffmpeg）
+        self._image_encoder = image_encoder
         self._embed_client: httpx.AsyncClient | None = None
         # 后台任务与缓存状态；都只在事件循环里访问
         self._bg_tasks: set[asyncio.Task] = set()
         self._visual_ready: dict[int, asyncio.Future[None]] = {}
+        # 每张图的描述状态：ready / timeout / 失败阶段；只供裁定日志区分用途。
+        self._visual_status: dict[int, str] = {}
+        self._visual_started: dict[int, float] = {}
         self._vision_slots = asyncio.Semaphore(VISION_CONCURRENCY)
         # 成功/失败按图片段；等待超时按本轮未就绪的流水计，不取消后台回写。
         self.visual_counts = dict(success=0, failed=0, timeout=0)
@@ -157,8 +178,11 @@ class StickerBehavior:
         ready = sum(bool(text) for text in descriptions)
         self.visual_counts["success"] += ready  # 适配器自带描述已经同步写入
         collect = event.is_group and self.enabled and self.config.collect
+        self._prune_visual_status()
         if ready == len(segments) and not collect:
+            self._visual_status[raw_id] = "ready"
             return
+        self._visual_started[raw_id] = self.clock()
         task = asyncio.create_task(self._ingest_images(
             runtime, raw_id, event.platform, event.chat_type, segments, descriptions,
             topic_tags(event.text) if collect else [], collect, self.clock(),
@@ -170,28 +194,129 @@ class StickerBehavior:
 
     def _release_visual(self, raw_id: int) -> None:
         ready = self._visual_ready.pop(raw_id, None)
+        # 放行的这一刻至少已有一段可见文字（适配器说明或刚落库的描述）；
+        # 已记下的失败阶段保留，不把它翻成成功。
+        if self._visual_status.get(raw_id, "") in ("", "timeout"):
+            self._visual_status[raw_id] = "ready"
         if ready is not None:
             ready.set_result(None)
 
+    def visual_pending(self, raw_id: int | None) -> bool:
+        """这张流水还有值得等的描述请求吗（已等满上限的不再重复等）。"""
+        return (raw_id is not None and raw_id in self._visual_ready
+                and self._visual_status.get(raw_id) != "timeout")
+
     def _finish_ingest(self, raw_id: int, task: asyncio.Task) -> None:
         self._bg_tasks.discard(task)
-        self._release_visual(raw_id)
         if not task.cancelled() and (exc := task.exception()) is not None:
             self._failure(raw_id, "ingest", exc)
+        self._release_visual(raw_id)
 
-    async def wait_for_visuals(self, raw_ids: Iterable[int], *, timeout: float) -> None:
-        tasks = {ready: rid for rid in raw_ids if (ready := self._visual_ready.get(rid)) is not None}
-        if not tasks:
-            return
-        _, pending = await asyncio.wait(tasks, timeout=max(0, timeout))
-        for task in pending:
-            self.visual_counts["timeout"] += 1
-            logger.warning("图片感知 raw_id=%s type=planner_timeout", tasks[task])
+    async def wait_for_visuals(self, raw_ids: Iterable[int], *, timeout: float) -> dict[str, Any]:
+        """等本批触发图落的描述；每个流水从**自己入库时**起算时限。
+
+        只应在触发消息本身含图时调用；历史/引用里的配图不在这里等。
+        ``timeout`` 是单张图从入库起最长等多久（配置 ``stickers.vision_wait_seconds``）。
+        返回可写进 ``decision_log`` 的等待报告：谁等到了、谁等满超时、
+        谁在字节或模型阶段失败、谁压根没有描述请求。
+
+        超时不取消后台任务：迟到的描述仍会回写流水，下一轮能看到。
+        """
+        ids = list(dict.fromkeys(rid for rid in raw_ids if rid is not None))
+        started = self.clock()
+        # 已经超时过的流水不再重复等：下一轮不该再被同一张图拖满一遍。
+        pending = {rid: self._visual_ready[rid] for rid in ids
+                   if rid in self._visual_ready and self._visual_status.get(rid) != "timeout"}
+        if pending:
+            now = self.clock()
+            # 每张图从入库起算自己的截止时间；本轮最多等到最晚的那张，
+            # 但整体不超过一个 `timeout`，排队很久的轮次不会又等满一轮。
+            remaining = max(
+                (self._visual_started.get(rid, started) + timeout - now for rid in pending),
+                default=0.0,
+            )
+            wait_for = min(timeout, max(0.0, remaining))
+            _, still_pending = await asyncio.wait(set(pending.values()), timeout=wait_for)
+            for rid, ready in pending.items():
+                if ready not in still_pending:
+                    continue
+                self.visual_counts["timeout"] += 1
+                logger.warning("图片感知 raw_id=%s type=planner_timeout", rid)
+                self._visual_status[rid] = "timeout"
+        report: dict[str, Any] = {
+            "waited_ms": int((self.clock() - started) * 1000),
+            # 调用时仍在途的条数；0 说明这些图本来就有描述，没真的等。
+            "pending": len(pending),
+            "ready": [], "timed_out": [], "failed": [], "no_request": [],
+        }
+        for rid in ids:
+            status = self._visual_status.get(rid, "")
+            if status == "ready":
+                report["ready"].append(rid)
+            elif status == "timeout":
+                report["timed_out"].append(rid)
+            elif status.startswith("failed") or status in _FETCH_FAILURE_STAGES:
+                report["failed"].append({"raw_id": rid, "stage": status.removeprefix("failed:")})
+            else:
+                report["no_request"].append(rid)
+        return report
 
     def _failure(self, raw_id: int, stage: str, exc: Exception | None = None) -> None:
         self.visual_counts["failed"] += 1
+        # 一段成功、另一段失败时仍以已有描述为准，不把成图报成失败。
+        if self._visual_status.get(raw_id) != "ready":
+            self._visual_status[raw_id] = stage
         logger.warning("图片感知失败 raw_id=%s type=%s error=%s", raw_id, stage,
                        type(exc).__name__ if exc is not None else "-")
+
+    def _prune_visual_status(self) -> None:
+        # 只为近期裁定留状态；超过上限先从最旧的丢，避免无限增长。
+        # 以入库时间为序清理，防止卡住的任务让 started 单独膨胀。
+        while len(self._visual_started) >= _VISUAL_STATUS_LIMIT:
+            oldest = next(iter(self._visual_started))
+            self._visual_started.pop(oldest, None)
+            self._visual_status.pop(oldest, None)
+        if len(self._visual_status) >= _VISUAL_STATUS_LIMIT:
+            for key in list(self._visual_status)[: len(self._visual_status) - _VISUAL_STATUS_LIMIT // 2]:
+                self._visual_status.pop(key, None)
+
+    async def _fetch_image_bytes(self, segment: Segment, resolve: Any, raw_id: int) -> tuple[bytes | None, str]:
+        """取图片字节（直接图源 → 平台补取），失败按配置有限次重试。
+
+        返回 ``(字节, 失败阶段)``：拿到有效图片时阶段为空；重试用尽仍失败时，
+        阶段是 ``image_bytes``（字节没拉到）或 ``image_source``（平台补取失败），
+        供裁定日志把「永远看不见」与「描述还在途」分开记。
+        """
+        attempts = self.fetch_retries + 1
+        stage = "image_bytes"
+        for attempt in range(1, attempts + 1):
+            raw: bytes | None = None
+            try:
+                raw = await self._image_bytes(segment.data)
+            except Exception as exc:  # noqa: BLE001 - 取源异常要重试，不打断后台任务
+                stage = "image_bytes"
+                logger.warning("图片取源失败 raw_id=%s type=%s error=%s attempt=%s", raw_id, stage,
+                               type(exc).__name__, attempt)
+            if sniff_image_suffix(raw):
+                return raw, ""
+            if resolve is not None:
+                try:
+                    source = await resolve(segment)
+                    fetched = await self._image_bytes(source) if source else None
+                    if sniff_image_suffix(fetched):
+                        return fetched, ""
+                    if raw and sniff_image_suffix(raw):
+                        return raw, ""
+                except Exception as exc:  # noqa: BLE001 - 平台补取失败同样重试
+                    stage = "image_source"
+                    logger.warning("图片补取失败 raw_id=%s type=%s error=%s attempt=%s", raw_id, stage,
+                                   type(exc).__name__, attempt)
+            elif raw:
+                # 不是可识别的图片也不是网络失败：直接按无效图处理，不重试。
+                return raw, ""
+            if attempt < attempts:
+                await asyncio.sleep(self.fetch_backoff_seconds)
+        return None, stage
 
     async def _ingest_images(self, runtime, raw_id, platform, chat_type, segments, descriptions,
                              tags, collect, started) -> None:
@@ -209,14 +334,10 @@ class StickerBehavior:
                 if descriptions[index] and ref is None:
                     continue
                 try:
-                    raw = await self._image_bytes(segment.data)
-                    if not sniff_image_suffix(raw) and resolve:
-                        source = await resolve(segment)
-                        if source:
-                            raw = await self._image_bytes(source)
-                except Exception as exc:
+                    raw, fetch_stage = await self._fetch_image_bytes(segment, resolve, raw_id)
+                except Exception as exc:  # noqa: BLE001 - 兜底：取源失败只记警告
                     logger.warning("图片取源失败 raw_id=%s type=image_source error=%s", raw_id, type(exc).__name__)
-                    raw = None
+                    raw, fetch_stage = None, "image_source"
                 sticker = None
                 if ref is not None:
                     try:
@@ -228,7 +349,7 @@ class StickerBehavior:
                         self._schedule_description(runtime, self.store, sticker)
                     continue
                 if not raw:
-                    self._failure(raw_id, "image_bytes")
+                    self._failure(raw_id, fetch_stage or "image_bytes")
                     continue
                 suffix = sniff_image_suffix(raw)
                 if not suffix or len(raw) > self.max_file_bytes:
@@ -238,7 +359,12 @@ class StickerBehavior:
                     self._failure(raw_id, "no_model")
                     continue
                 try:
-                    output = await vision_request(llm, raw, _MIME_BY_SUFFIX[suffix], IMAGE_PROMPT, 'image_description')
+                    payload_bytes, mime = await prepare_image(
+                        raw, suffix,
+                        max_side=self.image_max_side, quality=self.image_quality,
+                        encoder=self._image_encoder,
+                    )
+                    output = await vision_request(llm, payload_bytes, mime, IMAGE_PROMPT, 'image_description')
                     payload = parse_json_payload(output)
                 except Exception as exc:
                     self._failure(raw_id, "vision_model_timeout" if isinstance(exc, TimeoutError) else "vision_model", exc)
@@ -258,6 +384,8 @@ class StickerBehavior:
                     self._failure(raw_id, "writeback_skipped")
                     continue
                 self.visual_counts["success"] += 1
+                # 至少一段拿到描述就算「等到了」；别的段失败不能把它翻成失败。
+                self._visual_status[raw_id] = "ready"
                 logger.info("图片感知完成 raw_id=%s part=%s elapsed_ms=%d", raw_id, index + 1,
                             (self.clock() - started) * 1000)
                 if sticker and sticker.kind == KIND_STICKER and not sticker.description:
@@ -336,6 +464,26 @@ class StickerBehavior:
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
             return _DEFAULT_MAX_BYTES
         return int(value)
+
+    @property
+    def vision_wait_seconds(self) -> float:
+        return _float_setting(self.config, "vision_wait_seconds", _DEFAULT_VISION_WAIT)
+
+    @property
+    def fetch_retries(self) -> int:
+        return int(_float_setting(self.config, "vision_fetch_retries", _DEFAULT_FETCH_RETRIES))
+
+    @property
+    def fetch_backoff_seconds(self) -> float:
+        return _float_setting(self.config, "vision_fetch_backoff_seconds", _DEFAULT_FETCH_BACKOFF)
+
+    @property
+    def image_max_side(self) -> int:
+        return int(_float_setting(self.config, "vision_image_max_side", _DEFAULT_IMAGE_MAX_SIDE))
+
+    @property
+    def image_quality(self) -> int:
+        return int(_float_setting(self.config, "vision_image_quality", _DEFAULT_IMAGE_QUALITY))
 
     # ------------------------------------------------------------------
     # 描述生成（vision 角色走框架回退链，默认落到 chat 模型）

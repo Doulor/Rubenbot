@@ -52,7 +52,8 @@ def test_single_waits_before_planner_and_labels_history(bot, store, monkeypatch)
     wait, contents = judge(bot, [event], 0, complete, monkeypatch)
     wait.assert_awaited_once()
     assert set(wait.await_args.args[0]) == {event.raw_message_id}
-    assert wait.await_args.kwargs['timeout'] == 5.0
+    # 等待上限按实测 p95 拉长到 15 秒：触发图本身就是话头，值得等描述落库。
+    assert wait.await_args.kwargs['timeout'] == 15.0
     for text, visual in [('看这个 [图片]', '三只猫'), ('昨天的图 [图片]', '两棵树')]:
         row, = [part for part in contents if visual in part]
         assert text in row and '非发言' in row.split(text, 1)[1].split(visual, 1)[0]
@@ -97,8 +98,9 @@ def test_batch_waits_once_for_every_ref_and_attributes_visuals(bot, store, monke
 
     wait, contents = judge(bot, events, 2.5, complete, monkeypatch)
     wait.assert_awaited_once()
-    assert set(wait.await_args.args[0]) == {first_ref, second_ref, *(e.raw_message_id for e in events)}
-    assert wait.await_args.kwargs['timeout'] == 2.5
+    # 本批带图的流水；被回复的图已有描述且不在途，不再为它等。
+    assert set(wait.await_args.args[0]) == {events[0].raw_message_id, events[2].raw_message_id}
+    assert wait.await_args.kwargs['timeout'] == 15.0
     batch, = [part for part in contents if part.startswith('【本批消息')]
     peer, primary = batch.split('发言人：甲', 1)
     assert '发言人：乙' in peer and '绿色按钮' in peer and '挥手的小人' in peer and '非发言' in peer
@@ -108,7 +110,8 @@ def test_batch_waits_once_for_every_ref_and_attributes_visuals(bot, store, monke
 
 
 def test_real_timeout_leaves_recognition_running(bot, store, monkeypatch):
-    # 真正的识图任务在等模型，裁定只剩 10ms；放行后模型返回，仍能写回流水。
+    # 真正的识图任务在等模型；等满上限后按缺失裁定，放行后模型返回仍能写回流水。
+    bot.sticker_behavior.config = _with_wait(bot.config.stickers, 0.05)
     resume = asyncio.Event()
     started = asyncio.Event()
     complete = bot.llm.complete
@@ -125,16 +128,19 @@ def test_real_timeout_leaves_recognition_running(bot, store, monkeypatch):
     event = message('[图片]', segments=[Segment('image', {'base64': image})])
 
     async def run():
-        await bot._record(event, NOW - 4.99)
+        await bot._record(event, NOW)
         await asyncio.wait_for(started.wait(), timeout=1)
         try:
             await asyncio.wait_for(bot.process_round(MergedRound('recording', 'g', 'group', '甲', '甲',
-                                   [event], first_at=NOW - 4.99, hard=True)), timeout=1)
+                                   [event], first_at=NOW, hard=True)), timeout=2)
             call, = [call for call in bot.llm.calls if call['task'] == 'gen_stage1']
             assert any('[图片]〔视觉描述缺失〕' in part['content'] for part in call['messages'])
             audit, = store.list_decision_logs()
             assert audit['text'] == '[图片]〔视觉描述缺失〕'
             assert not store.raw_message_by_id(event.raw_message_id).visual_text
+            # 等满超时要在裁定日志里留痕，不能与「压根没描述请求」混在一起。
+            wait = audit['factors']['visual_wait']
+            assert wait['timed_out'] == [event.raw_message_id] and wait['waited_ms'] >= 40
         finally:
             resume.set()
             await asyncio.gather(*bot.sticker_behavior._bg_tasks)
@@ -144,17 +150,21 @@ def test_real_timeout_leaves_recognition_running(bot, store, monkeypatch):
     asyncio.run(run())
 
 
-@pytest.mark.parametrize('elapsed', [4.99, 8.0])
-def test_timeout_proceeds_with_placeholder(bot, monkeypatch, elapsed):
+def _with_wait(config, seconds):
+    from dataclasses import replace
+
+    return replace(config, vision_wait_seconds=seconds)
+
+
+def test_timeout_proceeds_with_placeholder(bot, monkeypatch):
     async def wait_until_deadline(ids, *, timeout):
-        # 模拟后台识图没有在剩余预算里产出：接口到期正常返回。
-        await asyncio.sleep(timeout)
+        # 模拟后台识图没有在上限内产出：接口到期正常返回。
+        assert timeout == 15.0
 
     event = message('[图片]')
-    wait, contents = judge(bot, [event], elapsed, wait_until_deadline, monkeypatch)
-    if elapsed < 5 or wait.await_count:
-        wait.assert_awaited_once()
-        assert wait.await_args.kwargs['timeout'] == pytest.approx(max(0, 5 - elapsed), abs=0.00001)
+    wait, contents = judge(bot, [event], 8.0, wait_until_deadline, monkeypatch)
+    wait.assert_awaited_once()
+    assert wait.await_args.kwargs['timeout'] == 15.0
     assert any(part.endswith('[图片]') for part in contents)
     assert not any('非发言' in part for part in contents)
 

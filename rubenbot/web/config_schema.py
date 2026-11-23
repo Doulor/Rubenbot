@@ -330,6 +330,12 @@ def structured_config(config: Config) -> dict[str, Any]:
             "embedding_api_key": "",
             "embedding_threshold": config.stickers.embedding_threshold,
             "embedding_refresh_seconds": config.stickers.embedding_refresh_seconds,
+            # 识图时序：触发图等描述的时限、字节重试与送视觉前的压缩
+            "vision_wait_seconds": config.stickers.vision_wait_seconds,
+            "vision_fetch_retries": config.stickers.vision_fetch_retries,
+            "vision_fetch_backoff_seconds": config.stickers.vision_fetch_backoff_seconds,
+            "vision_image_max_side": config.stickers.vision_image_max_side,
+            "vision_image_quality": config.stickers.vision_image_quality,
         },
         "plugins": {
             "dir": config.plugins.dir,
@@ -1165,6 +1171,20 @@ def _validate_stickers(section: dict[str, Any], v: _Validator) -> dict[str, Any]
         value = v.number(section["embedding_refresh_seconds"], "stickers.embedding_refresh_seconds", minimum=0)
         if value is not None:
             out["embedding_refresh_seconds"] = float(value)
+    # 识图时序：等待上限、拉取重试与压缩参数
+    for key, minimum, maximum in (("vision_wait_seconds", 0, 120),
+                                  ("vision_fetch_backoff_seconds", 0, 5)):
+        if key in section:
+            value = v.number(section[key], f"stickers.{key}", minimum=minimum, maximum=maximum)
+            if value is not None:
+                out[key] = float(value)
+    for key, minimum, maximum in (("vision_fetch_retries", 0, 3),
+                                  ("vision_image_max_side", 0, 4096),
+                                  ("vision_image_quality", 30, 95)):
+        if key in section:
+            value = v.number(section[key], f"stickers.{key}", integer=True, minimum=minimum, maximum=maximum)
+            if value is not None:
+                out[key] = int(value)
     return out
 
 

@@ -110,8 +110,6 @@ ADAPTER_RESTART_MAX = 30.0
 # 第一段用快速模型；没配 fast 时由 LLMConfig.model_for 沿回退链落到 chat
 GUIDANCE_ROLE = "fast"
 GUIDANCE_TIMEOUT_CAP = 15.0
-# 从批首入站计时，防抖、排队和视觉任务共享这段预算；复核不重置。
-VISUAL_WAIT_BUDGET = 5.0
 # 流水没有话题 ID；连续讨论中断十分钟就另起一段。仅用于展示计数。
 TOPIC_GAP_SECONDS = 10 * 60
 # 查询类电脑工具：只读结果本身就是答复；其余是产生副作用或交付物的动作。
@@ -252,6 +250,14 @@ def _visual_only(events: list[MessageEvent]) -> bool:
         and item.text.strip() in {render_segments(item.segments).strip(), ""}
         for item in events
     )
+
+
+_VISUAL_PLACEHOLDERS = ("[图片]", "[表情]", "[动画表情]")
+
+
+def _visual_placeholder(text: str) -> bool:
+    """正文里带视觉占位（``[图片]`` / ``[表情]``）的流水也值得看一眼描述。"""
+    return any(token in (text or "") for token in _VISUAL_PLACEHOLDERS)
 
 
 # 括号动作清理：只删「短、纯中文、命中动作/语气词」的括号内容。
@@ -1460,13 +1466,32 @@ class RubenBot:
             self._log_decision(event, decision, now)
             return
 
-        raw_ids = {item.raw_message_id for item in round_.events if item.raw_message_id is not None}
+        # 只有**触发消息本身**（本批消息及本轮正在回复、且描述仍在途的那条）
+        # 含图时才等描述。历史里已描述的配图不触发等待；被回复的图若已在途
+        # 也算本轮话头，不会让每轮都被历史配图拖慢。
+        trigger_visual_ids = {
+            item.raw_message_id for item in round_.events
+            if item.raw_message_id is not None
+            and (any(seg.type in VISUAL_SEGMENTS for seg in item.segments) or _visual_placeholder(item.text))
+        }
         for item in round_.events:
-            if target := self._reply_target(item):
-                raw_ids.add(target.id)
-        remaining = max(0.0, VISUAL_WAIT_BUDGET - max(0.0, time.time() - round_.first_at))
-        if raw_ids:
-            await self.sticker_behavior.wait_for_visuals(raw_ids, timeout=remaining)
+            target = self._reply_target(item)
+            if target is not None and self.sticker_behavior.visual_pending(target.id):
+                trigger_visual_ids.add(target.id)
+        visual_wait: dict[str, Any] | None = None
+        if trigger_visual_ids:
+            # 每张图从自己入库那时起算上限（实测描述 5.5–13.4 秒），
+            # 不把「等图」变成所有消息的全局硬延迟。
+            report = await self.sticker_behavior.wait_for_visuals(
+                trigger_visual_ids, timeout=self.sticker_behavior.vision_wait_seconds,
+            )
+            # 真的为在途描述等过，或出现超时/拉取失败/压根没请求时才留痕；
+            # 本来就有描述（适配器自带说明等）不写一条无信息量的等待记录。
+            if isinstance(report, dict) and (
+                report.get("pending") or report.get("timed_out")
+                or report.get("failed") or report.get("no_request")
+            ):
+                visual_wait = report
         visual_snapshots = self._visual_snapshots(round_.events)
         decision.visual_note = self._decision_visual_note(event, round_.events, visual_snapshots)
         messages = await self.build_context(event, now=now, stage="planner", batch=round_.events,
@@ -1495,14 +1520,14 @@ class RubenBot:
         visual_only = _visual_only(round_.events)
         if expression.speak is False and (retry or visual_only or not hard):
             decision.should_reply, decision.reason = False, "planner_silence"
-            self._log_decision(event, decision, now, expression)
+            self._log_decision(event, decision, now, expression, visual_wait=visual_wait)
             return
         # 明确裁定沉默而被必回覆盖时，原裁定照常审计；只替换给生成端的指导。
         override_silence = bool(hard and expression.speak is False)
         if expression.intent == "沉默" and not override_silence:
             decision.should_reply = False
             decision.reason = "expression_silence"
-            self._log_decision(event, decision, now, expression, must=hard)
+            self._log_decision(event, decision, now, expression, must=hard, visual_wait=visual_wait)
             return
 
         operation = expression.intent == COMPUTER_INTENT
@@ -1514,14 +1539,14 @@ class RubenBot:
         ):
             if proactive:
                 self.decision_engine.note_source_reply(event, round_.events, time.time())
-            self._log_decision(event, decision, now, expression, must=hard)
+            self._log_decision(event, decision, now, expression, must=hard, visual_wait=visual_wait)
             return
         if flight.updates:
             return
         if expression.intent == '表情回应':
             # 本来只想用表情回应；无图、未启用或发送失败都不换成硬挤一句话。
             decision.should_reply, decision.reason = False, 'sticker_unavailable'
-            self._log_decision(event, decision, now, expression, must=hard)
+            self._log_decision(event, decision, now, expression, must=hard, visual_wait=visual_wait)
             return
         # 生成步换成人格 + 回复风格；场景/记忆/工具说明原样保留。
         # 策划步的前缀按同一规则重新组装（确定性，正常必定一致）；万一
@@ -1602,7 +1627,7 @@ class RubenBot:
                 decision.should_reply = sent
                 if not sent:
                     decision.reason = "computer_task_send_failed"
-                self._log_decision(event, decision, now, expression, must=hard)
+                self._log_decision(event, decision, now, expression, must=hard, visual_wait=visual_wait)
                 self.opener_guard.clear_pending(round_.key)
                 return
             if flight.computer_failed or (operation and not raw):
@@ -1614,7 +1639,7 @@ class RubenBot:
                                              begin_send=flight.begin_send)
                 if sent and proactive:
                     self.decision_engine.note_source_reply(event, round_.events, time.time())
-                self._log_decision(event, decision, now, expression, must=hard)
+                self._log_decision(event, decision, now, expression, must=hard, visual_wait=visual_wait)
                 self.opener_guard.clear_pending(round_.key)
                 return
             body = clean_reply_patterns(strip_transcript_prefix(raw))
@@ -1674,7 +1699,8 @@ class RubenBot:
                 continue
             break
         if not decision.should_reply:
-            self._log_decision(event, decision, now, expression, must=hard, paraphrase=paraphrase_note)
+            self._log_decision(event, decision, now, expression, must=hard,
+                               paraphrase=paraphrase_note, visual_wait=visual_wait)
             # 没发出去：本轮纠偏没兑现，下轮可以继续提醒
             self.opener_guard.clear_pending(round_.key)
             return
@@ -1691,7 +1717,8 @@ class RubenBot:
             self.decision_engine.note_source_reply(event, round_.events, time.time())
         if flight.updates:
             return
-        self._log_decision(event, decision, now, expression, must=hard, paraphrase=paraphrase_note)
+        self._log_decision(event, decision, now, expression, must=hard,
+                           paraphrase=paraphrase_note, visual_wait=visual_wait)
         self.opener_guard.clear_pending(round_.key)
         if not visual_only:
             await self.sticker_behavior.on_after_reply(self.context, event, reply)
@@ -1736,11 +1763,16 @@ class RubenBot:
         *,
         must: str | None = None,
         paraphrase: dict[str, Any] | None = None,
+        visual_wait: dict[str, Any] | None = None,
     ) -> None:
         """把护栏与策划裁定写入同一条 decision_log。"""
         factor_data = {}
         if decision.effective_talk_value is not None:
             factor_data["effective_talk_value"] = decision.effective_talk_value
+        # 等图留痕：等到了多久、哪张等满超时、哪张压根没描述请求。只有真的
+        # 为触发图等过才写，普通文字轮次不受影响。
+        if visual_wait:
+            factor_data["visual_wait"] = visual_wait
         if expression is not None:
             factor_data["expression_decision"] = expression.to_dict()
             factor_data["planner"] = {
