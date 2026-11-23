@@ -22,9 +22,10 @@ from datetime import datetime, timedelta
 from ..llm import LLMProtocol, parse_json_payload
 from ..memory.retrieve import audience_for_chat, jaccard, normalize
 from ..privacy.gate import OWNER_AUDIENCE
-from ..privacy.sealing import batch_source_ref, register_extraction
+from ..privacy.sealing import batch_source_ref, merged_source_ref, register_extraction
 from ..memory.owner_statement import is_owner_self_statement
 from ..memory.entities import EntityCandidate, EntityLedger
+from ..memory.anchor import AnchorDecision, annotate, evaluate
 from ..memory.store import (
     VALID_SENSITIVITY,
     VALID_STABILITY,
@@ -62,6 +63,18 @@ EXTRACT_SYSTEM_PROMPT = """你是一个记忆整理员。你会看到某个会�
 - facts 的 stability：stable 长期有效；temporal 临时状态（如“明天出差”），
   同时给 expires_in_days（估计几天后失效，1~90 的整数）；uncertain 拿不准真假
 
+**指称完整性（每条 facts / events 都必须遵守）**：
+- 句子的主体必须是可识别的实体：写清专名（项目名、产品名、群名、人名，逐字沿用原话），
+  不要用「它」「这个东西」「那个平台」「一个『随手做的』东西」代替主语。
+- 评价、态度、看法必须连同被评价的对象一起写，例如「认为 Claude Code 推单向消息不错」，
+  不能只留「认为它用来推单向消息不错」；原话确实没点名时，宁可这条不写。
+- 如果原话里只有指代词，把指代对象从同一窗口其他消息中找出来并写进句子；
+  同时把这个名字填进 entity 字段。entity 必须能在 source_msg_id 那条原话里逐字找到，
+  代码会逐个核对，对不上就当没有。实在找不到就丢掉这条，不要猜。
+- 指向当前会话本身的「这个群 / 本群」不用专名，entity 留空即可。
+- events 贴近原话：普通叙事里的「它」可以保留；只有这句同时带评价/态度时，
+  才必须把评价对象写进 summary。
+
 不要记录：
 - 一次性的请求或问题、当天的天气、临时情绪、纯语气词
 - 对 bot 或他人的评价
@@ -78,9 +91,10 @@ scope 为 global（长期有效）或 group（只在当前会话有意义）。
 
 严格输出 JSON 对象：
 {"facts": [{"content": "...", "category": "identity", "scope": "global",
-            "stability": "stable", "expires_in_days": 0, "sensitivity": "normal", "source_msg_id": 123, "self_reported": true}],
- "events": [{"summary": "...", "time_hint": "", "salience": 0.4, "sensitivity": "normal", "source_msg_id": 123, "self_reported": true}],
+            "stability": "stable", "expires_in_days": 0, "sensitivity": "normal", "source_msg_id": 123, "self_reported": true, "entity": ""}],
+ "events": [{"summary": "...", "time_hint": "", "salience": 0.4, "sensitivity": "normal", "source_msg_id": 123, "self_reported": true, "entity": ""}],
  "entities": [{"name": "...", "gloss": "", "gloss_msg_id": "", "message_ids": [], "aliases": []}]}
+entity 填这句话所指的专名（必须与原话逐字一致），正文已自带主语时留空。
 没有内容就输出 {"facts": [], "events": [], "entities": []}。
 """
 
@@ -95,6 +109,7 @@ class ExtractedFact:
     sensitivity: str = "normal"
     source_msg_id: int | None = None
     self_reported: bool = False
+    entity: str = ""
 
 
 @dataclass
@@ -106,6 +121,7 @@ class ExtractedEvent:
     sensitivity: str = "normal"
     source_msg_id: int | None = None
     self_reported: bool = False
+    entity: str = ""
 
 
 @dataclass
@@ -122,6 +138,8 @@ class ExtractResult:
     skipped: int = 0
     added_events: list[str] = field(default_factory=list)
     skipped_events: int = 0
+    # 无实体锚点被拦下、只在 memory_log 留痕的条目（facts + events）
+    dropped: list[str] = field(default_factory=list)
     skipped_norecord: bool = False
     error: str | None = None
 
@@ -250,9 +268,18 @@ class MemoryExtractor:
         base_ts = messages[-1].ts
 
         existing = self.store.list_memories(person_id=person_id)
+        # 写前校验用：实体账里已登记的名字 + 本轮原文里的专名。
+        known_names = self._known_entities(messages)
         added: list[str] = []
         skipped = 0
+        dropped: list[str] = []
         for fact in extraction.facts:
+            # 指称校验必须在去重之前：重复的残缺条目也要能出现在丢弃记录里。
+            decision = self._check_anchor(fact, messages, known_names)
+            if not decision.ok:
+                dropped.append(fact.content)
+                self._record_dropped(person_id, "fact", fact.content, decision, sender, now, fact.source_msg_id)
+                continue
             duplicate = self._is_duplicate(fact.content, existing)
             if duplicate:
                 skipped += 1
@@ -260,19 +287,44 @@ class MemoryExtractor:
             target, sensitivity = route(fact, fact.content)
             ref = (f"{origin_chat}:{fact.source_msg_id}-{fact.source_msg_id}"
                    if fact.source_msg_id in by_id else source_ref)
+            expires_at = self._expiry_ts(fact, base_ts)
+            # 有实体锚点：能并进已有实体条目就并进去，否则独立成账并带上 entity。
+            merged = self._attach_to_entity(
+                person_id,
+                fact,
+                decision,
+                existing,
+                origin_chat=origin_chat,
+                audience=target,
+                sensitivity=sensitivity,
+                stability=fact.stability,
+                expires_at=expires_at,
+                scope_type=fact.scope_type,
+                scope_id=sender.chat_id if fact.scope_type == "group" else "",
+                ref=ref,
+                now=now,
+            )
+            if merged is not None:
+                existing[:] = [mem for mem in existing if mem.id != merged[1]]
+                existing.append(merged[0])
+                added.append(merged[0].content)
+                continue
+            # 有锚点而正文没写名字时补一个可回指的标注，保证这条记忆能按实体检索。
+            content = annotate(fact.content, decision.anchor)
             mem = self.store.add_memory(
                 person_id,
-                fact.content,
+                content,
                 scope_type=fact.scope_type,
                 scope_id=sender.chat_id if fact.scope_type == "group" else "",
                 category=fact.category,
+                entity=decision.anchor.name if decision.anchor else "",
                 source="extracted",
                 source_ref=ref,
                 origin_chat=origin_chat,
                 audience=target,
                 sensitivity=sensitivity,
                 stability=fact.stability,
-                expires_at=self._expiry_ts(fact, base_ts),
+                expires_at=expires_at,
                 now=now,
             )
             existing.append(mem)
@@ -282,6 +334,12 @@ class MemoryExtractor:
         skipped_events = 0
         for event in extraction.events:
             ts = resolve_event_ts(event.time_hint, base_ts) if event.ts is None else event.ts
+            # 事件贴近原文：只有「指代 + 评价」同时出现才拦，普通叙事不挡。
+            decision = self._check_anchor(event, messages, known_names, event=True)
+            if not decision.ok:
+                dropped.append(event.summary)
+                self._record_dropped(person_id, "event", event.summary, decision, sender, now, event.source_msg_id)
+                continue
             if self._event_exists(person_id, event.summary, ts):
                 skipped_events += 1
                 continue
@@ -317,6 +375,133 @@ class MemoryExtractor:
             skipped=skipped,
             added_events=added_events,
             skipped_events=skipped_events,
+            dropped=dropped,
+        )
+
+    def _known_entities(self, messages: list[RawMessage]) -> dict[str, str]:
+        """写前校验的实体来源：本群实体账里登记过的名字。"""
+        names: dict[str, str] = {}
+        for message in messages[:1]:
+            if message.chat_type != "group":
+                continue
+            for row in self.store.entity_rows(message.platform, message.chat_id, limit=500):
+                canonical = str(row.get("canonical_name") or "")
+                if canonical:
+                    names[canonical] = canonical
+                for alias in row.get("aliases") or ():
+                    if alias:
+                        names.setdefault(str(alias), canonical)
+        return names
+
+    def _check_anchor(
+        self,
+        item: ExtractedFact | ExtractedEvent,
+        messages: list[RawMessage],
+        known_names: dict[str, str],
+        *,
+        event: bool = False,
+    ) -> AnchorDecision:
+        """写前校验：指代/评价型断言必须有可回指的实体（见 memory/anchor.py）。"""
+        by_id = {m.id: m for m in messages}
+        source = by_id.get(item.source_msg_id)
+        text = item.content if isinstance(item, ExtractedFact) else item.summary
+        source_text = source.text if source is not None else " ".join(m.text for m in messages)
+        return evaluate(
+            text,
+            source_text=source_text,
+            known_names=known_names,
+            # 模型自报的实体必须能在出处原话里逐字对上；没给 source_msg_id 时
+            # 退而求其次核对整个窗口，但「窗口里只有一个名字就挂上去」仍不启用。
+            model_entity=item.entity,
+            event=event,
+            # 说不清是哪一条原话时，不按「窗口里只有一个名字」去猜。
+            allow_source_default=source is not None,
+        )
+
+    def _attach_to_entity(
+        self,
+        person_id: str,
+        fact: ExtractedFact,
+        decision: AnchorDecision,
+        existing: list,
+        *,
+        origin_chat: str,
+        audience: str,
+        sensitivity: str,
+        stability: str,
+        expires_at: float | None,
+        scope_type: str,
+        scope_id: str,
+        ref: str,
+        now: float,
+    ):
+        """把评价并进同一实体的已有条目；返回 (新记忆, 旧记忆 id)，没有可并的返回 None。
+
+        只处理「正文缺主语、靠出处原话补回实体」的断言（``decision.required``）；
+        自带主语的完整句子照旧独立成账，不并进别的条目。合并只在同一套分寸裁定
+        （受众、来源场合、敏感度、稳定性、scope）下进行，不把私聊/群聊、封存/普通
+        的内容搅在一起；机主自述（owner）保留逐条原话，不参与自动合并。合并写
+        ``memory_log`` 的 ``merge`` 记录，可撤销。
+        """
+        anchor = decision.anchor
+        if anchor is None or anchor.name == "" or not decision.required:
+            return None
+        category = fact.category
+        candidates = [
+            mem
+            for mem in existing
+            if mem.entity == anchor.name
+            and mem.source != "user"
+            and mem.audience != OWNER_AUDIENCE
+            and mem.audience == audience
+            and mem.origin_chat == origin_chat
+            and mem.sensitivity == sensitivity
+            and mem.stability == stability
+            and mem.scope_type == scope_type
+            and mem.scope_id == scope_id
+            and mem.category == category
+            and mem.expires_at == expires_at
+            and mem.id is not None
+        ]
+        # 只并进最近的同类条目，避免同一实体下的独立事实被糊成一条。
+        if not candidates:
+            return None
+        target = max(candidates, key=lambda mem: (mem.created_at, mem.id))
+        # 同一实体条目通常已经写了名字；只有原文没重复时才补可回指前缀。
+        merged_content = _join_entity_lines(target.content, fact.content, anchor=anchor)
+        if merged_content is None:
+            return None
+        merged = self.store.merge_memory_inplace(
+            target.id,
+            content=merged_content,
+            entity=anchor.name,
+            source_ref=merged_source_ref(target.origin_chat, (target.source_ref, ref)),
+            reason=f"评价并入实体条目「{anchor.name}」",
+            now=now,
+        )
+        if merged is None:
+            return None
+        return merged, target.id
+
+    def _record_dropped(
+        self,
+        person_id: str,
+        kind: str,
+        text: str,
+        decision: AnchorDecision,
+        sender: PendingSender,
+        now: float,
+        source_msg_id: int | None = None,
+    ) -> None:
+        """无锚点断言不落账，但必须在 memory_log 留一条可查的记录。"""
+        self.store.log_dropped_unanchored(
+            person_id=person_id,
+            origin_chat=f"{sender.platform}:{sender.chat_id}",
+            kind=kind,
+            content=text,
+            reason=decision.reason or "无实体锚点",
+            source_msg_id=source_msg_id,
+            now=now,
         )
 
     def _skip_norecord(self, person_id: str, messages: list[RawMessage]) -> bool:
@@ -391,6 +576,28 @@ class MemoryExtractor:
 VALID_CATEGORIES = {"identity", "preference", "habit", "relationship", "experience", "promise", "fact"}
 
 
+def _join_entity_lines(existing: str, addition: str, *, anchor=None) -> str | None:
+    """把同一实体的评价并进已有条目：句子间用「；」连接，不重写任何一边。
+
+    已有条目里的实体名就是这一整条的主语，新句子不必再加前缀；只有已有条目
+    也没写名字时才补「关于「名字」：」。
+    """
+    existing = (existing or "").strip()
+    addition = (addition or "").strip()
+    if not addition:
+        return None
+    if not existing:
+        return annotate(addition, anchor)
+    if normalize(addition) in normalize(existing):
+        return None  # 已经是同一句，交给去重逻辑处理
+    if anchor is not None and anchor.surface not in existing and anchor.name not in existing:
+        addition = f"关于「{anchor.surface}」：{addition}"
+    combined = f"{existing.rstrip('。；; ')}；{addition}"
+    if len(combined) > 400:
+        return None  # 过长就另起一条，别把实体条目堆成一段
+    return combined
+
+
 # ----------------------------------------------------------------------
 # 解析与时间推断
 # ----------------------------------------------------------------------
@@ -459,6 +666,7 @@ def _parse_facts(data: list) -> list[ExtractedFact]:
                 sensitivity=sensitivity,
                 self_reported=item.get("self_reported") is True and str(item.get("sensitivity", "normal")) in VALID_SENSITIVITY,
                 source_msg_id=item.get("source_msg_id") if type(item.get("source_msg_id")) is int else None,
+                entity=str(item.get("entity") or item.get("entity_name") or "").strip()[:120],
             )
         )
     return facts
@@ -489,6 +697,7 @@ def _parse_events(data: list) -> list[ExtractedEvent]:
                 sensitivity=sensitivity,
                 self_reported=item.get("self_reported") is True and str(item.get("sensitivity", "normal")) in VALID_SENSITIVITY,
                 source_msg_id=item.get("source_msg_id") if type(item.get("source_msg_id")) is int else None,
+                entity=str(item.get("entity") or item.get("entity_name") or "").strip()[:120],
             )
         )
     return events

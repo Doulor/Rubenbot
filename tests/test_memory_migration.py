@@ -61,6 +61,8 @@ def test_old_db_upgrades_without_data_loss(tmp_path):
             assert mem.sensitivity == "normal"
             assert mem.stability == "stable"
             assert mem.expires_at is None
+            # 指称完整性：旧行没有实体锚点，扫描工具会把它们当作候选
+            assert mem.entity == ""
         # 旧行为不变：日志/撤销仍可用的基本接口
         assert store.list_logs() == []
         # 新表就绪
@@ -84,6 +86,31 @@ def test_upgrade_is_idempotent(tmp_path):
         loaded = store.get_memory(mem.id)
         assert loaded.audience == "group:g1"
         assert loaded.sensitivity == "high"
+        assert loaded.entity == ""
+    finally:
+        store.close()
+
+
+def test_old_profile_evidence_gets_empty_entity_column(tmp_path):
+    """旧库的 profile_evidence 没有 entity 列；升级后补空值，画像行仍能读写。"""
+    from rubenbot.memory.store import ProfileLine
+
+    path = tmp_path / "old-profile.sqlite"
+    store = MemoryStore(path)
+    try:
+        store.save_profile(
+            "console:u1",
+            stable_lines=[ProfileLine("TA 住在杭州", ["event:1"])],
+            status_lines=[],
+        )
+    finally:
+        store.close()
+    with sqlite3.connect(path) as conn:
+        conn.execute("ALTER TABLE profile_evidence DROP COLUMN entity")
+    store = MemoryStore(path)
+    try:
+        assert store.get_profile_line_entities("console:u1") == {("stable", 0): ""}
+        assert store.get_profile_evidence("console:u1") == {("stable", 0): ["event:1"]}
     finally:
         store.close()
 

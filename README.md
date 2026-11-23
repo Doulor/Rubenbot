@@ -67,11 +67,14 @@ RubenBot 是一个以**记忆**为核心的拟人社交聊天 bot 框架。它�
 ### 记忆层数据流
 
 ```
-消息 ──▶ raw_messages ──(抽取)──▶ memories ──(检索)──▶ 注入系统提示词
-                                      ▲   │
-                                      │   └──(归纳：模型提议 / 代码裁决)──▶ memory_log
-                                      └──────────── restore 撤销 ◀──────────┘
+消息 ──▶ raw_messages ──(抽取 + 指称校验)──▶ memories ──(检索)──▶ 注入系统提示词
+                                                ▲   │
+                                                │   └──(归纳：模型提议 / 代码裁决)──▶ memory_log
+                                                └──────────── restore 撤销 ◀──────────┘
 ```
+
+**写入前先过指称校验**：只有评价、没有主语的断言（「认为它推单向消息不错」）不会独立成账，
+能回指到实体就并进该实体条目，回指不上就丢弃并在 `memory_log` 写一条 `dropped_unanchored`，见下文「指称完整性」。
 
 **检索**不依赖 embedding：中文按字 bigram、英文按整词切分，用 IDF 给稀有词更高权重，整句原文命中额外加分。注入顺序为「当前说话人的相关记忆 → 本群 scope 的相关记忆 → 最近记忆兜底」，总量不超过 `inject_limit`。embedding 融合接口已预留，v1 不启用。
 
@@ -81,7 +84,18 @@ RubenBot 是一个以**记忆**为核心的拟人社交聊天 bot 框架。它�
 2. `source = user` 的记忆不允许删除，也不参与合并（保守处理）；
 3. 一轮最多移除 20%，且至少允许 4 条，超出的留到下一轮；
 4. 按人分组，天然不会跨人合并；
-5. 每次变更写 `memory_log`（before/after 全文 + 理由），可撤销。
+5. 锚在不同实体上的记忆不许合并，合并结果沿用同一实体锚点；
+6. 每次变更写 `memory_log`（before/after 全文 + 理由），可撤销。
+
+**指称完整性**：每条人物记忆都得能回答「说的是什么」。正文用「它 / 这个东西 / 那个平台 /
+一个『随手做的』东西」指代句外对象、或写成「觉得不错 / 认为挺好用」把评价对象也省掉时，
+抽取与画像都必须在写账前找到实体锚点（正文或出处原话里的专名、模型给出且能在原话里逐字
+对上的 `entity`，或实体账登记名）；能挂到已有实体条目的并进去（写可撤销的 `merge`），
+挂不上的丢弃并在 `memory_log` 留一条 `dropped_unanchored`（正文、来源、原因可查，不能撤销
+成记忆）。「觉得压力很大」这种自带对象的写法不算缺主语，普通叙事不会因句子里有「它」被误伤；
+多实体对话里指称不明时宁可丢弃，也不猜。存量账本可用
+`python -m tools.scan_unanchored_memories --db data/rubenbot.db` 只读扫描，加 `--apply` 才
+补回或清掉。
 
 ### 记忆 v2：读取侧（渐进披露与分寸）
 
@@ -175,8 +189,10 @@ bot 对每个人的好感度、以及自己当下的心情，都由确定性规�
 | `rubenbot/memory/retrieve.py` | 分词、Jaccard、IDF 加权检索；读取侧（群成员索引 / 预拉取 / 跨会话 / recall） |
 | `rubenbot/memory/timeline.py` | 统一跨会话时间线、近期事件流与自动查账（固定最多 3 条、每条 160 字） |
 | `rubenbot/privacy/` | 核心隐私模块：审查跨场合记忆、登记封存、提供隐私命令；`privacy.enabled` 默认关闭 |
-| `rubenbot/memory/extract.py` | 批量抽取 + 去重 + 标记已处理 |
+| `rubenbot/memory/extract.py` | 批量抽取 + 去重 + 指称完整性校验 + 标记已处理 |
+| `rubenbot/memory/anchor.py` | 指称完整性：评价型断言必须有实体锚点（抽取 / 画像 / 归纳 / 存量扫描共用） |
 | `rubenbot/memory/consolidate.py` | 归纳提议的解析、校验与执行 |
+| `tools/scan_unanchored_memories.py` | 存量扫描：默认只读，列出只有评价没有主语的记忆，`--apply` 才补回/清掉 |
 | `rubenbot/memory/summary.py` | 会话滚动摘要：本会话早期对话压成五段式摘要，增量折叠、带水位与开关 |
 | `rubenbot/adapters/base.py` | `BaseAdapter`、`MessageEvent`、`Segment` |
 | `rubenbot/adapters/console.py` | stdin/stdout 调试适配器 |
@@ -320,6 +336,16 @@ stdout 记录前后 PID/commit。退出码 `0` 表示发布成功，`1` 表示�
 ```
 
 中转须提供 `workbuddy-deepseek-v4.1-flash`；脚本只取配置中的 LLM 连接信息，每个场景新建临时数据库和 Console，不接真实聊天平台。完整报告默认写入 `~/workspace/rubenbot-night/e2e-results.md`，只要一项 FAIL 就以状态码 1 退出。模型口头称已执行工具不算审计证据；本地页面被公网限制拦截时，报告会把抓取失败和缓存对照的隔离标注分开。其他凭据来源见 `--help`。
+
+**存量记忆扫描**（第 23 项：只有评价、没有主语的条目）默认只读，只打印报告；`--apply` 才改账本，改动都写 `memory_log`。跑之前先备份数据库：
+
+```bash
+.venv/bin/python -m tools.scan_unanchored_memories --db data/rubenbot.db            # 只读报告
+.venv/bin/python -m tools.scan_unanchored_memories --db data/rubenbot.db --format json
+.venv/bin/python -m tools.scan_unanchored_memories --db data/rubenbot.db --apply    # 补回 / 清掉
+```
+
+报告给出扫描总数、可补回数、需清掉数与逐条清单（原文、指称、出处原话）。补回口径：出处原话里能找到唯一可识别专名时，正文加「关于「名字」：」前缀并写入实体锚点；找不到或指称不明才清掉。
 
 四件回放使用仓库五文件人设、合成群历史与真实策划，报告列出实际出站原话和关键决策字段。`source=fallback` 的沉默不算通过，落库 `guess` 也不等于模型亲口报了 `guess`。2026-11-23 单次实测：Argon 旁听通过；panda 直接给了 `yt-dlp` 命令，但首跑采证误判 FAIL；星驰和破甲均因策划降级未验实。未重跑。
 
