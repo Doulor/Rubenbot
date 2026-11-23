@@ -68,6 +68,8 @@ SEARCH_POOL_FACTOR = 4
 SEARCH_POOL_MAX = 20
 # 探活并发度：探活是纯 IO，但别一次打 20 个 CDN；攒够结果就停，不再探后面的
 PROBE_CONCURRENCY = 6
+# 整批探活的总时限：慢 CDN 不能让人干等着，到点就用手上已有结果
+PROBE_BUDGET_SECONDS = 12.0
 
 # 平台命令别名 → (来源, 子平台, 显示名, 后面是否必须空白)。按长度从长到短
 # 匹配，避免「点歌」抢先吃掉「QQ点歌」。裸平台名（酷狗 / 网易云 等）后面要求
@@ -616,7 +618,9 @@ class MusicPlayer:
         """并发探活；明确不可播的丢掉，探不出结论的保留（交给发送链降级）。
 
         攒够 ``limit`` 条就停，不再探后面的：搜索池是结果的 4 倍，全探一遍
-        要多等好几秒，而多出来的条目本来也用不上。返回顺序保持搜索顺序。
+        要多等好几秒，而多出来的条目本来也用不上。整批探活另有总时限
+        :data:`PROBE_BUDGET_SECONDS`——CDN 慢的时候不能让人干等：到点就用手上
+        已经探完的结果（探不出结论的条目本来也会保留）。返回顺序保持搜索顺序。
         """
         if not songs:
             return []
@@ -624,27 +628,44 @@ class MusicPlayer:
         lock = asyncio.Lock()
         queue = list(enumerate(songs))
         kept: list[tuple[int, Song]] = []
+        dead = 0
 
         async def worker() -> None:
+            nonlocal dead
             while True:
                 async with lock:
                     if len(kept) >= target or not queue:
                         return
                     position, song = queue.pop(0)
                 if not song.audio_url:
+                    async with lock:
+                        dead += 1
                     continue
                 verdict = await probe_audio(client, song.audio_url)
-                if verdict is not False:
-                    async with lock:
+                async with lock:
+                    if verdict is False:
+                        dead += 1
+                    else:
                         kept.append((position, song))
 
-        await asyncio.gather(
-            *(worker() for _ in range(min(PROBE_CONCURRENCY, len(songs))))
-        )
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(worker() for _ in range(min(PROBE_CONCURRENCY, len(songs))))),
+                timeout=PROBE_BUDGET_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            async with lock:
+                pending = len(queue)
+            # 超时不算「放不了」：没探完的条目留到下次，这里只用已探完的结果
+            logger.info(
+                "music 探活超过 %.0f 秒，先用手上 %d 首（还有 %d 首没探完）",
+                PROBE_BUDGET_SECONDS,
+                len(kept),
+                pending,
+            )
         result = [song for _, song in sorted(kept, key=lambda item: item[0])]
-        dropped = len(songs) - len(result)
-        if dropped and len(result) < target:
-            logger.info("music 探活过滤掉 %d 首拿不到音频的结果（共 %d 首）", dropped, len(songs))
+        if dead:
+            logger.info("music 探活过滤掉 %d 首拿不到音频的结果（共 %d 首）", dead, len(songs))
         return result
 
     async def _send_song(self, adapter, event, song: Song) -> None:

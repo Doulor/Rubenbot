@@ -474,6 +474,57 @@ def test_netease_search_filters_unplayable_and_raises_when_all_dead():
         run(player.search("晴天"))
 
 
+def test_probe_budget_returns_partial_results(monkeypatch):
+    """慢 CDN 不能让人干等：探活超总时限就用手上已探完的结果。"""
+    monkeypatch.setattr(plugin, "PROBE_BUDGET_SECONDS", 0.05)
+
+    async def main():
+        async def slow_probe(client, url, *, timeout=8.0):
+            await asyncio.sleep(1.0)
+            return True
+
+        songs = [
+            sys.modules[f"{MODULE_NAME}.sources"].Song(
+                id=str(i), name=f"歌{i}", audio_url=f"http://e/{i}.mp3"
+            )
+            for i in range(4)
+        ]
+        client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200)))
+        player, _, _ = make_player(net=FakeNet())
+        monkeypatch.setattr(plugin, "probe_audio", slow_probe)
+        result = await player.filter_playable(client, songs)
+        await client.aclose()
+        return result
+
+    # 全部超时：拿到空列表（调用方按「一条都放不了」处理），但不会无限等待
+    assert run(main()) == []
+
+
+def test_probe_budget_keeps_finished_results(monkeypatch):
+    monkeypatch.setattr(plugin, "PROBE_BUDGET_SECONDS", 0.05)
+    sources = sys.modules[f"{MODULE_NAME}.sources"]
+
+    async def main():
+        async def probe(client, url, *, timeout=8.0):
+            if url.endswith("0.mp3"):
+                return True
+            await asyncio.sleep(1.0)
+            return True
+
+        songs = [
+            sources.Song(id=str(i), name=f"歌{i}", audio_url=f"http://e/{i}.mp3")
+            for i in range(3)
+        ]
+        client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200)))
+        player, _, _ = make_player(net=FakeNet())
+        monkeypatch.setattr(plugin, "probe_audio", probe)
+        result = await player.filter_playable(client, songs)
+        await client.aclose()
+        return [song.id for song in result]
+
+    assert run(main()) == ["0"]
+
+
 def test_txqq_non_netease_source_skips_probe():
     net = FakeNet(txqq=txqq_payload(("qq-1", "晴天", "周杰伦", "http://aqqmusic.tc.qq.com/C4001.m4a")))
     player, _, _ = make_player(net=net)
