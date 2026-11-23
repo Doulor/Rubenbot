@@ -555,7 +555,13 @@ class MarketService:
         return {"schema": schema, "values": values, "secrets": secrets}
 
     def save_plugin_config(self, plugin_id: str, values: Any) -> dict[str, Any]:
-        """按 manifest schema 校验并原子写入插件目录 config.yaml。"""
+        """按 manifest schema 校验并原子写入插件目录 config.yaml。
+
+        返回值在 :meth:`get_plugin_config` 的基础上多带 ``hot`` / ``message``：
+        运行中的插件管理器会拿写入前后的配置快照调插件声明的
+        ``on_config_change``，因此「是否热生效」由插件自己决定，WebUI 只如实
+        转述——没声明钩子的插件明确提示需要重启，不假装热更新。
+        """
         local = self._local_plugin(plugin_id)
         if local is None or not local.get("valid"):
             raise MarketError(f"插件不存在：{plugin_id}", status=404)
@@ -587,8 +593,57 @@ class MarketService:
                 updated[key] = parsed
         if errors:
             raise MarketError("插件配置校验失败：" + "；".join(item["field"] + " " + item["message"] for item in errors), status=422)
+        # 先算出「对插件而言真正生效的配置」的新旧值（schema 里声明到的键，
+        # 缺省用默认值），写盘后再交给插件决定能否热生效。
+        before = self._effective_config(schema, existing)
+        after = self._effective_config(schema, updated)
         self._write_plugin_yaml(directory, updated)
-        return self.get_plugin_config(plugin_id)
+        unchanged = before == after
+        if unchanged:
+            # 值没变：没有要热应用的东西，也不该借「已生效」的提示掩盖这一点
+            hot, message = True, "插件配置没有变化，无需重启。"
+        else:
+            hot, message = self._apply_config_change(local["name"], before, after)
+        logger.info(
+            "插件 %s 配置已保存（%s）",
+            local["name"],
+            "无需重启" if unchanged else ("已热生效" if hot else "需重启后生效"),
+        )
+        payload = self.get_plugin_config(plugin_id)
+        return {**payload, "hot": hot, "message": message}
+
+    @staticmethod
+    def _effective_config(schema: Any, raw: dict[str, Any]) -> dict[str, Any]:
+        """schema 声明的配置项按「缺省取默认值」展开，只比较真正影响插件的键。"""
+        values: dict[str, Any] = {}
+        for item in schema:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("key") or "").strip()
+            if not key:
+                continue
+            values[key] = raw[key] if key in raw else item.get("default")
+        return values
+
+    def _apply_config_change(
+        self,
+        name: str,
+        old: dict[str, Any],
+        new: dict[str, Any],
+    ) -> tuple[bool, str]:
+        """把配置变更交给插件热应用；没有运行中的管理器时如实返回需要重启。"""
+        manager = getattr(self.state, "plugins", None)
+        if manager is None:
+            # 独立 WebUI：配置已写盘，但没有运行中的插件实例能接收变更
+            return False, "插件配置已保存；当前 WebUI 没有运行中的 bot，重启后生效。"
+        try:
+            hot, reason = manager.apply_config_change(name, old, new)
+        except Exception as exc:  # noqa: BLE001 - 热应用失败不能吞掉已保存的配置
+            logger.warning("插件 %s 配置热应用失败：%s", name, exc)
+            return False, f"插件配置已保存，但热应用失败（{exc}），请重启 bot 后确认。"
+        if hot:
+            return True, "插件配置已保存并热生效，无需重启。"
+        return False, f"插件配置已保存，{reason}"
 
     def _schema_fields(self, schema: Any) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
@@ -784,8 +839,14 @@ class MarketService:
             if local.get("enabled"):
                 self._set_enabled(local["name"], False)
                 self._persist_enabled()
-            shutil.rmtree(path)
             manager = getattr(self.state, "plugins", None)
+            if manager is not None:
+                # 删目录前给插件 on_unload：清定时任务、后台线程与临时资源
+                try:
+                    manager.unload_plugin(local["name"])
+                except Exception as exc:  # noqa: BLE001 - 清理失败不挡卸载
+                    logger.warning("卸载前清理插件 %s 失败：%s", local["name"], exc)
+            shutil.rmtree(path)
             if manager is not None:
                 manager.plugins.pop(local["name"], None)
             self._forget_plugin(local["name"])

@@ -2761,7 +2761,9 @@ async function renderPluginConfigs(panel, selected) {
   editor.replaceChildren(skeleton(3));
   try {
     const data = await api.get(path);
-    editor.replaceChildren(pluginConfigForm(title, path, data, grantBlock));
+    editor.replaceChildren(
+      pluginConfigForm(title, path, data, grantBlock, { hot: Boolean(current.hot_config) })
+    );
   } catch (err) {
     if (!(err instanceof Unauthorized)) editor.replaceChildren(card(title, { body: [
       emptyState("warning", "读取配置失败", err.message),
@@ -2771,8 +2773,12 @@ async function renderPluginConfigs(panel, selected) {
   }
 }
 
-/** 表单与保存请求绑定在同一个插件上，后台响应只回写自己的表单。 */
-function pluginConfigForm(title, path, data, header = null) {
+/** 表单与保存请求绑定在同一个插件上，后台响应只回写自己的表单。
+ *  options.hot 来自插件的 hot_config（是否声明了 on_config_change）；
+ *  只有它能热生效时才提示「立即生效」，否则明说需要重启。
+ */
+function pluginConfigForm(title, path, data, header = null, options = {}) {
+  const hot = Boolean(options.hot);
   const draft = { ...data.values };
   const secretInputs = new Map();
   const fields = h("fieldset", { class: "plugin-config-fields", "aria-label": `${title}配置` });
@@ -2800,15 +2806,20 @@ function pluginConfigForm(title, path, data, header = null) {
     fields.append(h("div", { class: "field" }, h("span", { class: "field-label" }, label), control));
   }
   const save = h("button", { type: "submit", class: "btn btn-primary" }, icon("check"), "保存配置");
-  const resultBox = h("div", { role: "status", class: "field-hint" }, "保存后重启 bot 生效。");
-  const form = h("form", { class: "grid" }, header, fields, h("div", { class: "market-actions" }, save, resultBox));
+  // 插件声明 on_config_change 时能热生效；没声明就如实提示需要重启。
+  const resultBox = h(
+    "div",
+    { role: "status", class: "field-hint" },
+    hot ? "保存后立即生效，无需重启。" : "保存后重启 bot 生效。"
+  );
+  const form = h("form", { class: "grid" }, header || null, fields, h("div", { class: "market-actions" }, save, resultBox));
   form.addEventListener("submit", async event => {
     event.preventDefault();
     if (save.disabled) return;
     save.disabled = fields.disabled = true;
     try {
       const result = await api.put(path, { values: draft });
-      resultBox.textContent = result.message || "插件配置已保存，重启 bot 后生效。";
+      resultBox.textContent = result.message || "插件配置已保存。";
       // 服务端不会回显密钥；留在页面上时也不保留刚输入的密钥。
       for (const [key, input] of secretInputs) {
         input.value = draft[key] = "";
@@ -2913,6 +2924,23 @@ function marketActions(item, refresh) {
             ),
           },
           "启用"
+        )
+      );
+    }
+    // 已加载的插件可以原地热重载：停旧实例 → 重新加载新代码，授权记录与
+    // 插件配置都保留；没加载的插件没有可重载的实例，不给按钮。
+    if (item.loaded) {
+      buttons.push(
+        h(
+          "button",
+          {
+            class: "btn btn-sm",
+            type: "button",
+            title: "重新加载插件代码：先调 on_unload，再校验 manifest、重新 register 并调 on_load；授权与配置保留",
+            onclick: run(`/api/plugins/${encodeURIComponent(item.plugin_name)}/reload`, {}, "已重载"),
+          },
+          icon("refresh"),
+          "重载"
         )
       );
     }

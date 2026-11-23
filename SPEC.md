@@ -334,6 +334,18 @@ loader 加载时校验 manifest：缺失或字段不全的插件拒绝加载并�
 
 装后授权（Q6，2026-11-23）在此之上收口宿主公开给插件的入口：`rubenbot/plugins/permissions.py` 存每插件授权记录，loader 在 `call_capability` / `fetch` / `llm` / `store` 读取 / 适配器 `send` / 宿主代发命令回复 / 能力说明注入 / `on_start` 后台任务分发前逐项检查，默认拒绝；`extras["bot"]` 换成按授权检查的代理，`extras["plugins"]` 对插件不可见。它不隔离任意 Python 代码，不能替代沙箱。
 
+### 生命周期与热重载（Q7，2026-11-23）
+
+插件有三个可选生命周期钩子，签名固定：
+
+- `on_load(ctx, manifest)`：`register` 返回后调用一次（热重载成功后再调一次）
+- `on_unload(ctx)`：停用 / 卸载 / 热重载前调用，供插件清理定时任务、后台线程与临时资源；停用后重新启用会补一次 `on_load`，不重复 `register`
+- `on_config_change(ctx, old, new)`：WebUI 保存插件配置后调用；**声明了这个钩子才算配置能热生效**，没声明的插件如实提示需重启，不假装生效
+
+钩子可同步可异步，单个回调异常只记日志、不阻断加载 / 卸载流程；钩子分发沿用 Q6 的 `network` 准入（声明了 `network` 却未授权的插件三个回调都不发，跳过留审计）。加载 / 卸载 / 重载 / 配置热应用与钩子异常都记 `rubenbot.plugins.loader` 日志。
+
+热重载（`POST /api/plugins/{name}/reload`，市场卡片「重载」）：`on_stop` → `on_unload` → 清掉旧模块与注册 → 重新 `register` 新代码 → 校验 manifest → `on_load`。授权记录与插件 `config.yaml` 原样保留；任何一步失败（导入异常、manifest 不合规）都把插件对象恢复成重载前的快照并补一次 `on_load` 重新武装旧实例，以 409 把原因回给 WebUI，插件不从列表消失。市场卸载删目录前也先走 `on_unload`。
+
 ### 分期
 
 - 一期：manifest 规范 + loader 校验 + 4 插件迁移 + 索引拉取/回退 + 市场页（卡片/状态机/装卸启停/更新角标/安装确认）。

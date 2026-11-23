@@ -25,8 +25,10 @@
 - ``GET  /api/emotion``         当前心情 + 好感 Top5/Bottom3 + 最近变化流水（只读）
 - ``GET  /api/stickers``        表情库列表；``GET /api/stickers/{id}/image`` 取图片；``DELETE`` 删除
 - ``GET  /api/plugins``         插件列表（含目录里发现但未启用的）
-- ``GET/PUT /api/plugins/{id}/config`` 读写已安装插件配置
+- ``GET  /api/plugins/{id}/config`` 读取已安装插件配置
+- ``PUT  /api/plugins/{id}/config`` 保存插件配置；插件声明 ``on_config_change`` 时热生效，否则提示需重启
 - ``POST /api/plugins/{name}``  启用/禁用：热生效并写回 plugins.enabled
+- ``POST /api/plugins/{name}/reload`` 热重载单个插件（保留授权与配置，失败回滚）
 - ``GET  /api/market``          插件市场：数据来源 + 本地/索引合并后的卡片列表
 - ``POST /api/market/plugins/{id}/install``   从索引安装（默认不启用）
 - ``POST /api/market/plugins/{id}/update``    更新代码与 manifest（保留配置与启用状态）
@@ -73,6 +75,7 @@ from ..persona import (
     load_persona_parts,
     personafile_path,
 )
+from ..plugins.loader import PluginReloadError
 from ..plugins.manifest import PERMISSION_INFO
 from ..stickers import KIND_PHOTO, KIND_STICKER
 from .about import check_update, project_info, runtime_info
@@ -1122,18 +1125,19 @@ def create_app(state: WebState):
         manager = state.plugins
         if manager is None:
             raise ApiError(409, "当前 WebUI 没有运行中的 bot，无法修改插件授权")
-        if name not in manager.plugins:
+        plugin = manager.find_plugin(name)
+        if plugin is None:
             raise ApiError(404, f"插件不存在：{name}")
         try:
-            manager.set_permissions(name, values)
+            manager.set_permissions(plugin.name, values)
         except KeyError:
             raise ApiError(404, f"插件不存在：{name}") from None
         except ValueError as exc:
             raise ApiError(422, str(exc)) from exc
         item = next(
-            (row for row in manager.list_plugins() if row["name"] == name), None
+            (row for row in manager.list_plugins() if row["name"] == plugin.name), None
         )
-        logger.info("WebUI 更新插件授权 %s：%s", name, "、".join(sorted(set(values))) or "（全部撤回）")
+        logger.info("WebUI 更新插件授权 %s：%s", plugin.name, "、".join(sorted(set(values))) or "（全部撤回）")
         return {
             "ok": True,
             "item": item,
@@ -1154,12 +1158,14 @@ def create_app(state: WebState):
         enabled = bool(body.get("enabled"))
         if state.plugins is None:
             return _save_plugin_without_manager(state, name, enabled)
-        if not state.set_plugin_enabled(name, enabled):
+        target = state.plugins.find_plugin(name)
+        canonical = target.name if target is not None else name
+        if not state.set_plugin_enabled(canonical, enabled):
             # manifest 不合规（含核心版本过低）时把原因带回去，别只说「不存在」
-            plugin = state.plugins.plugins.get(name)
+            plugin = state.plugins.plugins.get(canonical)
             if plugin is not None and not plugin.valid:
                 raise ApiError(
-                    409, f"插件 {name} 的 manifest 不合规，不能启用：{plugin.invalid_reason}"
+                    409, f"插件 {canonical} 的 manifest 不合规，不能启用：{plugin.invalid_reason}"
                 )
             raise ApiError(404, f"插件不存在或启用失败：{name}")
         try:
@@ -1173,7 +1179,7 @@ def create_app(state: WebState):
                 "persisted": False,
                 "message": f"插件已{'启用' if enabled else '停用'}，但写回配置失败：{exc}",
             }
-        logger.info("WebUI %s 插件 %s（已写回 config.yaml）", "启用" if enabled else "禁用", name)
+        logger.info("WebUI %s 插件 %s（已写回 config.yaml）", "启用" if enabled else "禁用", canonical)
         return {
             "ok": True,
             "items": state.plugin_list(),
@@ -1203,13 +1209,55 @@ def create_app(state: WebState):
 
     @app.put("/api/plugins/{plugin_id}/config")
     async def put_plugin_config(plugin_id: str, request: Request):
+        """保存插件配置：写盘后交给插件 ``on_config_change`` 决定能否热生效。
+
+        能热生效的插件立即用新配置工作；没声明钩子的插件如实返回
+        ``restart_required: true``，前端不得显示「已生效」。
+        """
         require_session(request)
         body = await _json_body(request)
         try:
             payload = market.save_plugin_config(plugin_id, body.get("values"))
         except MarketError as exc:
             raise ApiError(exc.status, exc.message) from exc
-        return {"ok": True, **payload, "restart_required": True, "message": "插件配置已保存，重启 bot 后生效。"}
+        hot = bool(payload.pop("hot", False))
+        message = payload.pop("message", "") or (
+            "插件配置已保存并热生效，无需重启。" if hot else "插件配置已保存，重启 bot 后生效。"
+        )
+        logger.info("WebUI 保存插件配置 %s（%s）", plugin_id, "已热生效" if hot else "需重启")
+        return {"ok": True, **payload, "restart_required": not hot, "hot": hot, "message": message}
+
+    @app.post("/api/plugins/{name}/reload")
+    async def reload_plugin(name: str, request: Request):
+        """热重载单个插件：on_unload → 校验 manifest → register → on_load。
+
+        授权记录与插件配置都保留；失败时回滚到重载前的实例并在响应里说明
+        原因，插件不会从列表里消失。
+        """
+        require_session(request)
+        manager = state.plugins
+        if manager is None:
+            raise ApiError(409, "当前 WebUI 没有运行中的 bot，无法热重载插件")
+        try:
+            manager.reload_plugin(name)
+        except KeyError:
+            raise ApiError(404, f"插件不存在：{name}") from None
+        except PluginReloadError as exc:
+            raise ApiError(409, str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001 - 插件代码失败也要给前端一个明确结果
+            raise ApiError(500, f"插件 {name} 重载失败：{exc}") from exc
+        # 允许按 manifest id 重载：响应里的条目也要按 id 匹配，别把结果丢了
+        plugin = manager.find_plugin(name)
+        target = plugin.name if plugin is not None else name
+        item = next((row for row in manager.list_plugins() if row["name"] == target), None)
+        logger.info("WebUI 热重载插件 %s（授权与配置保留）", target)
+        return {
+            "ok": True,
+            "item": item,
+            "items": state.plugin_list(),
+            "restart_required": False,
+            "message": f"插件 {target} 已热重载，授权与配置保持不变。",
+        }
 
     @app.get("/api/market")
     def market_snapshot(request: Request):

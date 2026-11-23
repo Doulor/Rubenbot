@@ -306,6 +306,9 @@ plugins:
   # 装后授权：manifest 声明的权限要在 WebUI「插件 → 权限授权」页逐项批准才生效。
   # 授权记录不在本文件里，落在数据库同目录的 plugin_permissions.json，重启不丢；
   # 新装插件默认全部未授权，已装插件首次升级时按当时 manifest 全授（一次性迁移）。
+  # 生命周期：插件可声明 on_load / on_unload / on_config_change 三个可选钩子；
+  # 已加载插件可在 WebUI 插件页点「重载」热更新代码（保留授权与插件自己的 config.yaml，
+  # 失败回滚到旧实例）；声明了 on_config_change 的插件保存配置即热生效，否则需重启。
 
 stickers:
   # 核心表情包行为默认关闭；打开 enabled 后以下设置才生效。

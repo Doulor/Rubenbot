@@ -15,10 +15,12 @@ function setup() {
   const records = {
     '/api/market': {items: [
       {name: '远程插件', id: 'remote', state: 'not_installed', download_available: true},
-      {name: '本地插件', id: 'local-id', state: 'enabled', has_config: true},
+      {name: '本地插件', id: 'local-id', state: 'enabled', loaded: true, has_config: true,
+        plugin_name: 'local_dir', hot_config: true},
     ]},
     '/api/plugins': {hot_reload: true, items: [
-      {name: 'local_dir', valid: true, manifest: {id: 'local-id', name: '本地插件', config_schema: schema},
+      {name: 'local_dir', valid: true, loaded: true, hot_config: true,
+        manifest: {id: 'local-id', name: '本地插件', config_schema: schema},
         permissions: {declared: ['read_messages', 'scheduler'], granted: ['read_messages'], all_granted: false,
           permission_meta: [
             {id: 'read_messages', label: '读消息', description: '读取聊天消息', high_risk: false, declared: true, granted: true},
@@ -29,8 +31,13 @@ function setup() {
     ]},
     '/api/plugins/local-id/config': {schema, values: {model: '默认', ready: false, limit: 1, aliases: ['甲'], api_key: ''}, secrets: {api_key: true}},
   };
-  run(`const records = ${JSON.stringify(records)}; const calls = []; let fail = false;
+  run(`const records = ${JSON.stringify(records)}; const calls = []; let fail = false; let configHot = true;
+    window.toasts = [];
+    toast = (message, kind = 'ok') => { window.toasts.push([message, kind]); };
     api.get = async path => { calls.push(path); if (!records[path]) throw Error(path); return records[path]; };
+    api.post = async (path, body) => { calls.push([path, body]);
+      if (path.endsWith('/reload')) return {message: '插件 local_dir 已热重载，授权与配置保持不变。'};
+      return {message: '已启用'}; };
     api.put = async (path, body) => { calls.push([path, JSON.parse(JSON.stringify(body))]);
       if (path.endsWith('/permissions')) {
         const item = records['/api/plugins'].items.find(row => '/api/plugins/' + row.name + '/permissions' === path);
@@ -41,7 +48,9 @@ function setup() {
         return {item: {name: item.name, permissions: item.permissions},
           items: records['/api/plugins'].items, restart_required: false, message: '插件授权已更新，立即生效。'};
       }
-      if (fail) throw Error('校验失败'); return {message: '插件配置已保存，重启 bot 后生效。', secrets: {api_key: true}}; };`);
+      if (fail) throw Error('校验失败');
+      return {message: configHot ? '插件配置已保存并热生效，无需重启。' : '插件配置已保存，重启 bot 后生效。',
+        hot: configHot, restart_required: !configHot, secrets: {api_key: true}}; };`);
   const route = href => run(`location.hash = ${JSON.stringify(href)}; PAGES[currentRoute().page].render(root, currentRoute().param)`);
   function node(tag, match = () => true) {
     const found = root.walk().find(n => n.tagName === tag && match(n));
@@ -90,8 +99,33 @@ test('修改 schema 控件，保存失败保留草稿，重试提交至 manifest
   run('fail = false'); await node('FORM').fire('submit');
   assert.deepEqual(JSON.parse(run('JSON.stringify(calls.at(-1))')), ['/api/plugins/local-id/config',
     {values: {model: '新模型', ready: true, limit: 17, aliases: ['甲', '乙'], api_key: '新值'}}]);
-  assert.match(root.textContent, /已保存，重启 bot 后生效/);
+  // 插件声明了 on_config_change（hot_config=true）：如实提示已热生效
+  assert.match(root.textContent, /已保存并热生效，无需重启/);
   assert.equal(key.value, '');
+  // 没声明钩子的插件：保存后明说需要重启，不假装生效
+  run('configHot = false');
+  await node('FORM').fire('submit');
+  assert.match(root.textContent, /已保存，重启 bot 后生效/);
+});
+
+test('已加载插件的市场卡片可以先重载，提示回传后刷新列表', async () => {
+  const {root, run, route, node} = setup();
+  await route('#/plugins');
+  const reload = node('BUTTON', n => n.textContent === '重载');
+  assert.match(reload.getAttribute('title'), /on_unload/);
+  await reload.fire('click');
+  const calls = JSON.parse(run('JSON.stringify(calls)'));
+  const reloadCall = calls.find(call => Array.isArray(call) && call[0] === '/api/plugins/local_dir/reload');
+  assert.ok(reloadCall, `没有发出重载请求：${JSON.stringify(calls)}`);
+  assert.equal(JSON.stringify(reloadCall[1]), '{}');
+  // 重载成功后刷新市场列表
+  assert.ok(calls.slice(calls.indexOf(reloadCall) + 1).some(call => call === '/api/market'));
+  const toasts = JSON.parse(run('JSON.stringify(window.toasts)'));
+  assert.match(toasts.at(-1)[0], /已热重载/);
+  // 未加载的插件没有可重载的实例，不给按钮
+  run(`records['/api/market'].items.find(row => row.id === 'local-id').loaded = false`);
+  await route('#/plugins');
+  assert.ok(!root.walk().some(n => n.tagName === 'BUTTON' && n.textContent === '重载'));
 });
 
 test('没有本地插件、读取错误与迟到的响应都不破坏导航', async () => {

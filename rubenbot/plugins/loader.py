@@ -13,6 +13,12 @@ ctx 提供：
 - ``command(name, handler)``：注册命令，``handler(ctx, event, args)`` 返回字符串作为回复
 - ``on_start(handler)`` / ``on_stop(handler)``：插件启用 / 停用时的生命周期回调
   （后台任务据此启动与干净退出；可同步/异步，异常只记录）
+- ``on_load(handler)``：插件加载完成（``register`` 返回后）时调用，
+  ``handler(ctx, manifest)``
+- ``on_unload(handler)``：插件停用 / 卸载 / 热重载前调用，``handler(ctx)``，
+  供插件清理定时任务、后台线程与临时资源
+- ``on_config_change(handler)``：插件配置经 WebUI 变更后调用，
+  ``handler(ctx, old, new)``；实现了它才算「配置能热生效」
 
 除了 ``store`` / ``config``，插件还可以经 ``PluginContext`` 使用：
 
@@ -37,14 +43,24 @@ Python 插件本身仍是完全可信代码（市场页已说明），这里收�
 的入口，不构成沙盒。
 
 钩子与命令里的异常都会被捕获并记录，不会拖垮主循环。
+
+**热重载**（WebUI 插件页）：先调 ``on_unload`` / ``on_stop`` 让旧实例收尾，
+再清掉旧模块与本次注册，用磁盘上的新代码重新 ``register`` → 校验 manifest →
+调 ``on_load``。重载不重置授权记录、不删插件自己的 ``config.yaml``；任何一步
+失败都把插件恢复到重载前的旧实例（旧钩子、旧后台任务照常），失败原因回传给
+WebUI，插件不会从列表里消失。生命周期钩子本身也走授权准入：声明了
+``network`` 却没授权的插件同样收不到 ``on_load`` / ``on_unload`` /
+``on_config_change``。
 """
 
 from __future__ import annotations
 
 import asyncio
+import importlib
 import importlib.util
 import inspect
 import logging
+import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -69,6 +85,15 @@ CommandHandler = Callable[..., Any]
 
 # 各钩子返回值的语义标记：True 放行 / False 拦截
 HookResult = bool | None
+
+
+class PluginReloadError(RuntimeError):
+    """热重载失败且已回滚到重载前的实例。"""
+
+    def __init__(self, plugin: str, reason: str):
+        self.plugin = plugin
+        self.reason = reason
+        super().__init__(f"插件 {plugin} 重载失败，已回滚到重载前的实例：{reason}")
 
 
 @dataclass
@@ -101,6 +126,11 @@ class Plugin:
     stop_hooks: list[Callable[[], Any]] = field(default_factory=list)
     # 插件启用时的启动回调（拉起后台任务等）
     start_hooks: list[Callable[[], Any]] = field(default_factory=list)
+    # 加载完成 / 停用（卸载、热重载前）时的生命周期回调，签名见模块文档
+    load_hooks: list[Callable[..., Any]] = field(default_factory=list)
+    unload_hooks: list[Callable[..., Any]] = field(default_factory=list)
+    # 配置变更回调：handler(ctx, old, new)；空列表表示配置不能热生效
+    config_change_hooks: list[Callable[..., Any]] = field(default_factory=list)
     enabled: bool = False
     # 是否真的执行过 register；加载时被禁用的插件是 False
     loaded: bool = False
@@ -110,6 +140,8 @@ class Plugin:
     invalid_reason: str | None = None
     # 不合规是否因为框架版本低于 min_core_version
     core_too_old: bool = False
+    # on_load 是否已经跑过且尚未被 on_unload 收尾（用来避免重复回调）
+    lifecycle_active: bool = False
 
     @property
     def valid(self) -> bool:
@@ -630,6 +662,34 @@ class PluginContext:
         self.plugin.stop_hooks.append(handler)
         return handler
 
+    def on_load(self, handler: Callable[..., Any]) -> Callable[..., Any]:
+        """注册加载完成回调：``handler(ctx, manifest)``。
+
+        在 ``register`` 返回后调用一次（热重载成功时再调用一次）；可以同步
+        也可以返回 awaitable。异常只记录，不影响加载结果。
+        """
+        self.plugin.load_hooks.append(handler)
+        return handler
+
+    def on_unload(self, handler: Callable[..., Any]) -> Callable[..., Any]:
+        """注册卸载清理回调：``handler(ctx)``。
+
+        插件被禁用、卸载或热重载前调用，用来清理定时任务、后台线程与临时
+        资源；可以同步也可以返回 awaitable。异常只记录，不阻断停用/重载。
+        """
+        self.plugin.unload_hooks.append(handler)
+        return handler
+
+    def on_config_change(self, handler: Callable[..., Any]) -> Callable[..., Any]:
+        """注册配置变更回调：``handler(ctx, old, new)``。
+
+        插件声明这个钩子即表示配置可以热生效：WebUI 保存插件配置后，宿主会
+        把变更前后的值传进来；钩子异常只记录。没有声明时 WebUI 会如实提示
+        需要重启才生效，不假装热更新。
+        """
+        self.plugin.config_change_hooks.append(handler)
+        return handler
+
     def command(self, name: str, handler: CommandHandler | None = None):
         """注册命令。既可直接传 handler，也可作装饰器：``@ctx.command("hi")``。"""
         normalized = name.lstrip("/").lower()
@@ -649,6 +709,12 @@ async def _call(handler: Callable[..., Any], *args: Any) -> Any:
     if inspect.isawaitable(result):
         return await result
     return result
+
+
+def _diff_keys(old: Mapping[str, Any], new: Mapping[str, Any]) -> list[str]:
+    """两份插件配置里真正变了的键（值用相等比较，顺序不影响）。"""
+    keys = set(old) | set(new)
+    return sorted(key for key in keys if old.get(key) != new.get(key))
 
 
 def discover_plugin_dirs(directory: str | Path | None = None) -> list[tuple[str, Path]]:
@@ -843,9 +909,11 @@ class PluginManager:
                 continue
             if plugin.loaded:
                 # 重复调用 load_all 不重复 register（避免钩子翻倍），
-                # 但运行中被停用的要补一次 on_start
+                # 但运行中被停用的要补一次 on_start（此前停用时已跑过 on_unload）
                 if not plugin.enabled:
                     plugin.enabled = True
+                    if not plugin.lifecycle_active:
+                        self._run_load(plugin)
                     self._start_lifecycle(plugin)
                 loaded.append(plugin)
                 continue
@@ -910,6 +978,28 @@ class PluginManager:
         self.config.plugins.enabled = cleaned
         return failures
 
+    @staticmethod
+    def _module_name(plugin: Plugin) -> str:
+        """插件在主进程里的模块名（唯一，避免不同插件互相覆盖）。"""
+        return f"rubenbot_plugin_{plugin.name}"
+
+    def _purge_modules(self, plugin: Plugin) -> None:
+        """清掉上一版插件模块及其子模块，保证热重载真的读到磁盘上的新代码。
+
+        ``importlib`` 会把 ``rubenbot_plugin_<name>`` 及其 ``.fetch`` 等子模块
+        留在 ``sys.modules``；只重建 ``plugin.py`` 的话，插件目录里其它被改动的
+        文件仍是旧版。旧函数对象还持有旧模块的全局命名空间，回滚时继续可用。
+
+        同时清掉插件目录的 ``__pycache__``：``.pyc`` 头里只有秒级 mtime，
+        同一秒内、大小不变的改动会命中旧字节码，热重载就白做了。
+        """
+        prefix = self._module_name(plugin)
+        for name in list(sys.modules):
+            if name == prefix or name.startswith(prefix + "."):
+                sys.modules.pop(name, None)
+        shutil.rmtree(plugin.path / "__pycache__", ignore_errors=True)
+        importlib.invalidate_caches()
+
     def _load_plugin(self, plugin: Plugin) -> None:
         # 加载前再校验一次 manifest：目录可能在上一次扫描后被改过
         self._refresh_manifest(plugin)
@@ -918,7 +1008,7 @@ class PluginManager:
                 plugin.invalid_reason or "manifest 不合规",
                 core_too_old=plugin.core_too_old,
             )
-        module_name = f"rubenbot_plugin_{plugin.name}"
+        module_name = self._module_name(plugin)
         spec = importlib.util.spec_from_file_location(
             module_name,
             plugin.path / "plugin.py",
@@ -926,23 +1016,27 @@ class PluginManager:
         )
         if spec is None or spec.loader is None:
             raise ImportError(f"无法加载插件模块：{plugin.path}")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = module
-        spec.loader.exec_module(module)
-        register = getattr(module, "register", None)
-        if not callable(register):
-            raise AttributeError("plugin.py 缺少 register(ctx) 函数")
-        # 运行时重新启用会重新 register：先清掉上次注册的钩子，避免重复分发
-        plugin.message_hooks.clear()
-        plugin.before_reply_hooks.clear()
-        plugin.after_reply_hooks.clear()
-        plugin.commands.clear()
-        plugin.capability_notes.clear()
-        plugin.start_hooks.clear()
-        plugin.stop_hooks.clear()
-        register(PluginContext(plugin, self))
+        saved = self._snapshot(plugin)
+        self._clear_registrations(plugin)
+        self._purge_modules(plugin)
+        try:
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
+            spec.loader.exec_module(module)
+            register = getattr(module, "register", None)
+            if not callable(register):
+                raise AttributeError("plugin.py 缺少 register(ctx) 函数")
+            register(PluginContext(plugin, self))
+        except BaseException:
+            # 注册到一半失败：把上一次的钩子/命令放回去，插件不因一次坏加载而失能
+            self._restore(plugin, saved)
+            self._purge_modules(plugin)
+            raise
         plugin.loaded = True
+        # (重新)加载成功且当前启用：先跑 on_load，再按授权拉起后台任务。
+        # 已停用的插件只重建注册，不激活生命周期（热重载停用插件时同理）。
         if plugin.enabled:
+            self._run_load(plugin)
             self._start_lifecycle(plugin)
 
     # ------------------------------------------------------------------
@@ -1096,6 +1190,213 @@ class PluginManager:
             return
         self._run_lifecycle(plugin, plugin.start_hooks, "on_start")
 
+    def _run_load(self, plugin: Plugin) -> None:
+        """调 ``on_load(ctx, manifest)``：与钩子同一条准入，未授权不发。
+
+        声明了 ``network`` 却没授权的插件连加载回调也不给——它在回调里同样
+        可能直接出网。异常只记日志，不影响插件继续工作。
+        """
+        if not self._hooks_allowed(plugin):
+            self._audit_skip(plugin, "加载回调 on_load")
+            return
+        context = PluginContext(plugin, self)
+        manifest = plugin.manifest
+        self._run_lifecycle(plugin, plugin.load_hooks, "on_load", context, manifest)
+        # 先置标记再记日志：插件在 on_load 里同步查 list_plugins 也能看到已激活
+        plugin.lifecycle_active = True
+        logger.info(
+            "插件 %s 加载完成（on_load %s）",
+            plugin.name,
+            f"已执行 {len(plugin.load_hooks)} 个回调" if plugin.load_hooks else "未声明",
+        )
+
+    def _run_unload(self, plugin: Plugin, reason: str) -> None:
+        """调 ``on_unload(ctx)``：停用、卸载、热重载前各给一次清理机会。
+
+        ``reason`` 只进日志（停用 / 卸载 / 重载）；没有注册回调或没跑过
+        ``on_load`` 时不产生任何动作。异常只记日志，不阻断后续流程。
+        """
+        if not plugin.lifecycle_active:
+            return
+        if not self._hooks_allowed(plugin):
+            self._audit_skip(plugin, "卸载回调 on_unload")
+            plugin.lifecycle_active = False
+            return
+        context = PluginContext(plugin, self)
+        plugin.lifecycle_active = False
+        self._run_lifecycle(plugin, plugin.unload_hooks, "on_unload", context)
+        logger.info("插件 %s 已执行 on_unload（%s）", plugin.name, reason)
+
+    def _audit_skip(self, plugin: Plugin, action: str) -> None:
+        """未授权导致的钩子跳过留一条审计，和命令/钩子分发保持同一口径。"""
+        store = getattr(self, "permissions", None)
+        if store is not None:
+            store.audit_denial(plugin.name, "network", action)
+
+    def config_change_reason(self, name: str, old: Mapping[str, Any], new: Mapping[str, Any]) -> tuple[bool, bool, str]:
+        """预览一次配置变更的处理方式，返回 ``(能否热生效, 是否真的变了, 说明)``。
+
+        WebUI 先用它决定要不要调 ``on_config_change``，以及响应里怎么写：
+        声明了钩子的插件算能热生效；没声明的如实说需要重启，不假装更新。
+        """
+        plugin = self.find_plugin(name)
+        changed = _diff_keys(old, new)
+        if plugin is None:
+            return False, bool(changed), "插件未加载，配置保存后需重启生效"
+        if not changed:
+            # 值没变：不管插件声不声明钩子都不用重启
+            return True, False, "配置没有变化"
+        if not self._hooks_allowed(plugin):
+            return False, True, "插件未获网络授权，配置未热应用，请授权后重载或重启"
+        if not plugin.config_change_hooks:
+            return False, True, "该插件不支持热更新配置，已写入磁盘，重启 bot 后生效"
+        if not plugin.enabled or not plugin.loaded:
+            return False, True, "插件当前未启用，配置已保存，启用后生效"
+        return True, True, ""
+
+    def apply_config_change(
+        self, name: str, old: Mapping[str, Any], new: Mapping[str, Any]
+    ) -> tuple[bool, str]:
+        """把一次插件配置变更热应用给插件，返回 ``(是否热生效, 说明)``。
+
+        ``old`` / ``new`` 是插件 ``config.yaml`` 的键值快照；宿主只调插件
+        自己声明的 ``on_config_change(ctx, old, new)``，不替它猜哪些参数能
+        在线改。插件没声明钩子、没启用或未获授权时如实返回「需重启 / 未生效」。
+        """
+        hot, changed, reason = self.config_change_reason(name, old, new)
+        if not changed:
+            return True, reason or "配置没有变化"
+        if not hot:
+            plugin = self.find_plugin(name)
+            if plugin is not None and not self._hooks_allowed(plugin):
+                # 与钩子分发同一口径：未授权导致的跳过也留审计
+                self._audit_skip(plugin, "配置变更 on_config_change")
+            logger.info("插件 %s 配置变更未热应用：%s", name, reason)
+            return False, reason
+        plugin = self.find_plugin(name)
+        if plugin is None:  # 理论上不会发生：config_change_reason 已确认找到
+            return False, reason or "插件未加载"
+        context = PluginContext(plugin, self)
+        logger.info("插件 %s 配置变更，调用 on_config_change", name)
+        self._run_lifecycle(
+            plugin,
+            plugin.config_change_hooks,
+            "on_config_change",
+            context,
+            dict(old),
+            dict(new),
+        )
+        return True, "插件配置已热生效"
+
+    def find_plugin(self, name: str) -> Plugin | None:
+        """按目录名找插件；找不到再按 manifest id 找（WebUI 传哪个都能定位）。"""
+        plugin = self.plugins.get(name)
+        if plugin is not None:
+            return plugin
+        for candidate in self.plugins.values():
+            if candidate.manifest is not None and candidate.manifest.id == name:
+                return candidate
+        return None
+
+    def _snapshot(self, plugin: Plugin) -> dict[str, Any]:
+        """热重载前的注册现场：失败时原样放回去，旧实例继续跑。"""
+        return {
+            "path": plugin.path,
+            "manifest": plugin.manifest,
+            "invalid_reason": plugin.invalid_reason,
+            "core_too_old": plugin.core_too_old,
+            "loaded": plugin.loaded,
+            "lifecycle_active": plugin.lifecycle_active,
+            "message_hooks": list(plugin.message_hooks),
+            "before_reply_hooks": list(plugin.before_reply_hooks),
+            "after_reply_hooks": list(plugin.after_reply_hooks),
+            "commands": dict(plugin.commands),
+            "capability_notes": list(plugin.capability_notes),
+            "start_hooks": list(plugin.start_hooks),
+            "stop_hooks": list(plugin.stop_hooks),
+            "load_hooks": list(plugin.load_hooks),
+            "unload_hooks": list(plugin.unload_hooks),
+            "config_change_hooks": list(plugin.config_change_hooks),
+        }
+
+    @staticmethod
+    def _restore(plugin: Plugin, saved: Mapping[str, Any]) -> None:
+        """把 :meth:`_snapshot` 的现场写回去（热重载回滚用）。"""
+        for key, value in saved.items():
+            setattr(plugin, key, value)
+
+    @staticmethod
+    def _clear_registrations(plugin: Plugin) -> None:
+        """清空上一次 ``register`` 留下的注册，避免热重载后钩子翻倍。
+
+        生命周期回调也一并清空：``register`` 重新声明它们；如果新代码不再
+        声明某项（比如去掉了 ``on_config_change``），旧回调不能残留。
+        """
+        plugin.message_hooks.clear()
+        plugin.before_reply_hooks.clear()
+        plugin.after_reply_hooks.clear()
+        plugin.commands.clear()
+        plugin.capability_notes.clear()
+        plugin.start_hooks.clear()
+        plugin.stop_hooks.clear()
+        plugin.load_hooks.clear()
+        plugin.unload_hooks.clear()
+        plugin.config_change_hooks.clear()
+
+    def reload_plugin(self, name: str) -> dict[str, Any]:
+        """热重载一个插件：on_unload → 校验 manifest → 重新 register → on_load。
+
+        授权记录与插件自己的 ``config.yaml`` 都不动；任何一步失败都回滚到
+        重载前的实例（旧钩子、旧后台任务照常），抛 :class:`PluginReloadError`
+        让 WebUI 把原因带回去。``name`` 既可以是插件目录名，也可以是 manifest
+        里的 ``id``（WebUI 配置页按 id 定位插件）。未启用的插件只做
+        「重新发现 + 校验」，不跑钩子。
+        """
+        plugin = self.find_plugin(name)
+        if plugin is None:
+            raise KeyError(name)
+        name = plugin.name
+        was_enabled = plugin.enabled
+        was_loaded = plugin.loaded
+        saved = self._snapshot(plugin)
+        logger.info("热重载插件 %s 开始（启用=%s，已加载=%s）", name, was_enabled, was_loaded)
+        try:
+            if was_loaded:
+                # 先让旧实例收尾：后台任务停下、生命周期资源释放后再 import 新代码
+                if was_enabled:
+                    self._run_lifecycle(plugin, plugin.stop_hooks, "on_stop")
+                self._run_unload(plugin, "热重载")
+                self._refresh_manifest(plugin)
+                if not plugin.valid:
+                    raise ManifestError(
+                        plugin.invalid_reason or "manifest 不合规",
+                        core_too_old=plugin.core_too_old,
+                    )
+                self._load_plugin(plugin)
+            else:
+                # 未加载的插件只刷新发现结果与 manifest，不执行插件代码
+                self._refresh_manifest(plugin)
+                if not plugin.valid:
+                    raise ManifestError(
+                        plugin.invalid_reason or "manifest 不合规",
+                        core_too_old=plugin.core_too_old,
+                    )
+        except BaseException as exc:
+            self._restore(plugin, saved)
+            reason = getattr(exc, "reason", None) or str(exc) or exc.__class__.__name__
+            logger.error("热重载插件 %s 失败，已回滚到重载前的实例：%s", name, reason)
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            # 回滚后旧实例若本来就在跑：先补一次 on_load 重新武装它（卸载
+            # 回调可能已经释放了资源），再恢复后台任务。生命周期标记随快照还原。
+            if saved["loaded"] and was_enabled:
+                if saved["lifecycle_active"]:
+                    self._run_load(plugin)
+                self._start_lifecycle(plugin)
+            raise PluginReloadError(name, reason) from exc
+        logger.info("热重载插件 %s 成功", name)
+        return {"name": name, "enabled": plugin.enabled, "loaded": plugin.loaded}
+
     async def handle_commands(self, ctx, event: MessageEvent) -> bool:
         """识别 ``/命令 参数`` 并执行；返回是否命中。"""
         self._remember_runtime(ctx)
@@ -1158,7 +1459,15 @@ class PluginManager:
                     "on_message": len(p.message_hooks),
                     "on_before_reply": len(p.before_reply_hooks),
                     "on_after_reply": len(p.after_reply_hooks),
+                    "on_start": len(p.start_hooks),
+                    "on_stop": len(p.stop_hooks),
+                    "on_load": len(p.load_hooks),
+                    "on_unload": len(p.unload_hooks),
+                    "on_config_change": len(p.config_change_hooks),
                 },
+                "lifecycle": p.lifecycle_active,
+                # 插件是否声明了 on_config_change：WebUI 据此提示配置能否热生效
+                "hot_config": bool(p.config_change_hooks),
                 "path": str(p.path),
             }
             for p in sorted(self.plugins.values(), key=lambda item: item.name)
@@ -1170,7 +1479,9 @@ class PluginManager:
         只能授出 manifest 声明过的权限；未声明的一律拒绝。授权变化立即生效：
         撤掉 ``scheduler`` / ``network`` / ``llm`` 导致后台任务不再满足启动
         条件时会触发 ``on_stop``，让任务立即停下；重新满足条件时补一次
-        ``on_start``。其它权限在调用入口即时生效，已注册的钩子不用重载。
+        ``on_start``。撤掉 ``network`` 还会先给插件一次 ``on_unload``，恢复
+        时补 ``on_load``（与钩子分发同一口径，插件启用中才补）。其它权限在
+        调用入口即时生效，已注册的钩子不用重载。
         """
         plugin = self.plugins.get(name)
         if plugin is None:
@@ -1179,7 +1490,22 @@ class PluginManager:
             raise ValueError(plugin.invalid_reason or "manifest 不合规")
         declared = plugin.manifest.permissions
         had_start = self._scheduler_allowed(plugin)
+        had_hooks = self._hooks_allowed(plugin)
         grants = self.permissions.set_permissions(name, permissions, declared=declared)
+        has_hooks = self._hooks_allowed(plugin)
+        # 钩子准入随 network 授权变化：撤回后先跑卸载回调；恢复后补一次
+        # 加载回调，让插件重新拿到「已加载」状态（停用期间不重建资源，真正
+        # 启用时会补 on_load）。
+        if had_hooks and not has_hooks and plugin.loaded:
+            self._run_unload(plugin, "授权撤回")
+        elif (
+            not had_hooks
+            and has_hooks
+            and plugin.loaded
+            and plugin.enabled
+            and not plugin.lifecycle_active
+        ):
+            self._run_load(plugin)
         self._sync_background(plugin, had_start, self._scheduler_allowed(plugin))
         return grants
 
@@ -1192,13 +1518,44 @@ class PluginManager:
         elif plugin.enabled:
             self._start_lifecycle(plugin)
 
+    def shutdown(self) -> None:
+        """停机：给所有已加载插件一次 ``on_unload``（宿主进程退出前的收尾）。
+
+        只调卸载回调用不着停用插件：``on_stop`` 管的是后台任务，进程退出时
+        由事件循环统一取消。已经跑过 ``on_unload`` 的插件（比如运行中被停用）
+        不重复调用：``lifecycle_active`` 为假的插件本来就没有待清理的生命周期
+        资源。同步回调当场执行；异步回调交给事件循环，进程随后退出时可能被
+        取消，需要保证执行的清理请用同步回调。异常只记日志。
+        """
+        for plugin in list(self.plugins.values()):
+            if plugin.loaded and plugin.lifecycle_active:
+                self._run_lifecycle(plugin, plugin.stop_hooks, "on_stop")
+                self._run_unload(plugin, "停机")
+
+    def unload_plugin(self, name: str) -> bool:
+        """卸载前调用：给插件一次 ``on_unload`` 并停止后台任务，返回是否找到。
+
+        市场删目录前先走这里，插件才有机会关掉定时任务、后台线程与临时文件。
+        ``name`` 支持目录名或 manifest id；未加载的插件不产生动作。清理完顺手
+        清空注册，插件对象即使因为删目录失败而残留也不会继续被分发。
+        """
+        plugin = self.find_plugin(name)
+        if plugin is None:
+            return False
+        if plugin.loaded and plugin.enabled:
+            self._run_lifecycle(plugin, plugin.stop_hooks, "on_stop")
+        self._run_unload(plugin, "卸载")
+        self._clear_registrations(plugin)
+        plugin.loaded = False
+        return True
+
     def set_enabled(self, name: str, enabled: bool) -> bool:
         """运行时启用/禁用插件，返回是否找到该插件。
 
         禁用只是让分发时跳过它（已注册的钩子留着，再次启用立即生效）；
         启用一个加载时被跳过的插件时，会现场执行它的 ``register``。
-        禁用/启用时会同步调用插件的 ``on_stop`` / ``on_start`` 回调，
-        后台任务据此启动和干净退出。manifest 不合规的插件不能启用。
+        禁用/启用时会同步调用插件的 ``on_stop`` / ``on_unload`` 与
+        ``on_start``，后台任务据此启动和干净退出。manifest 不合规的插件不能启用。
 
         这个开关会同步更新内存里 ``config.plugins.enabled``；WebUI 调用它
         之后负责把列表写回 config.yaml。
@@ -1224,9 +1581,15 @@ class PluginManager:
         else:
             plugin.enabled = enabled
             if enabled and not was_enabled:
+                # 停用那一轮已经收过 on_unload；重新启用时补一次 on_load 让插件
+                # 重建生命周期资源（send/register 都没有再跑，钩子仍是旧的）
+                if plugin.loaded and not plugin.lifecycle_active:
+                    self._run_load(plugin)
                 self._start_lifecycle(plugin)
             elif not enabled and was_enabled:
+                # 停用：先收后台任务，再给插件 on_unload 清理生命周期资源
                 self._run_lifecycle(plugin, plugin.stop_hooks, "on_stop")
+                self._run_unload(plugin, "停用")
         self._sync_enabled_config(name, enabled)
         logger.info("插件 %s 已%s", name, "启用" if enabled else "禁用")
         return True
@@ -1245,13 +1608,23 @@ class PluginManager:
         self.config.plugins.enabled = names
 
     @staticmethod
-    def _run_lifecycle(plugin: Plugin, hooks: list[Callable[[], Any]], label: str) -> None:
-        """同步调用生命周期回调；协程回调有事件循环时调度，否则丢弃并记日志。"""
+    def _run_lifecycle(
+        plugin: Plugin,
+        hooks: list[Callable[..., Any]],
+        label: str,
+        *args: Any,
+    ) -> None:
+        """同步调用生命周期回调；协程回调有事件循环时调度，否则丢弃并记日志。
+
+        ``args`` 原样传给回调（``on_load(ctx, manifest)`` 等）；同步回调当场
+        执行，异步回调交给事件循环。单个回调失败只记日志、继续下一个，失败隔离。
+        """
         for handler in list(hooks):
             try:
-                result = handler()
+                result = handler(*args)
             except Exception as exc:  # noqa: BLE001 - 回调失败不能拖垮宿主
                 logger.warning("插件 %s 的 %s 回调异常：%s", plugin.name, label, exc)
+                logger.debug("插件 %s 的 %s 回调堆栈", plugin.name, label, exc_info=True)
                 continue
             if inspect.isawaitable(result):
                 try:

@@ -487,6 +487,17 @@ def register(ctx):
 - `on_before_reply(handler)`：`handler(ctx, event, messages)`，返回新的 messages 可改写上下文
 - `on_after_reply(handler)`：`handler(ctx, event, reply)`
 - `command(name, handler)`：`handler(ctx, event, args)`，返回字符串作为回复；可直接调用也可作装饰器
+- `on_start(handler)` / `on_stop(handler)`：启用 / 停用时的回调，后台任务据此启动与干净退出
+- `on_load(handler)`：加载完成（`register` 返回后）时调用，`handler(ctx, manifest)`；
+  热重载成功后会再调一次
+- `on_unload(handler)`：停用、卸载、热重载前调用，`handler(ctx)`，用来清理定时任务、
+  后台线程与临时资源；停用后再次启用会补一次 `on_load`
+- `on_config_change(handler)`：插件配置经 WebUI 保存后调用，`handler(ctx, old, new)`；
+  声明了它才算「配置能热生效」，没声明的插件保存后如实提示需要重启
+
+三个生命周期钩子都是可选的，不声明就什么都不做；同步 / 异步都支持，单个回调异常
+只记日志、不炸加载与卸载流程。它们和普通钩子走同一条授权准入：声明了 `network`
+却没授权的插件同样收不到这三个回调，跳过时记审计。
 
 钩子和命令都同时支持同步/异步函数，异常会被捕获并记录，不会拖垮主循环。`ctx` 上还能拿到 `store`、`config`、`call_capability`、`fetch`、`llm`、`bot`，钩子拿到的 `runtime` 里有 `persona`、`adapters`、`store`、`llm`、`extras`。这些入口都按装后授权检查：
 
@@ -503,7 +514,9 @@ def register(ctx):
 
 ### 插件市场
 
-WebUI 的「插件」分三页：「插件市场」在同一列表里发现、安装与启停插件；「插件配置」按 `config_schema` 编辑已安装插件的配置，保存后重启 bot 生效；「权限授权」逐项对照 manifest 声明并即时开关（高危项标红，声明了但未授权的项标「未授」，改动立即生效、不重启）。没有声明配置的插件会在配置页显示「无可配置项」。原来的 `#/plugins` 链接仍打开市场。
+WebUI 的「插件」分三页：「插件市场」在同一列表里发现、安装与启停插件；「插件配置」按 `config_schema` 编辑已安装插件的配置，插件声明了 `on_config_change` 时保存即热生效，没声明的如实提示需重启；「权限授权」逐项对照 manifest 声明并即时开关（高危项标红，声明了但未授权的项标「未授」，改动立即生效、不重启）。没有声明配置的插件会在配置页显示「无可配置项」。原来的 `#/plugins` 链接仍打开市场。
+
+已加载的插件在市场卡片上多一个「重载」按钮：先调 `on_unload`（及后台任务的 `on_stop`），清掉旧模块后按磁盘上的新代码重新 `register`、校验 manifest，再调 `on_load`——改插件代码不用重启 bot。授权记录与插件自己的 `config.yaml` 都保留；新代码导入失败或 manifest 不合规时整体回滚到重载前的实例（旧钩子照常分发），原因以 409 回给 WebUI，插件不会从列表里消失。加载、卸载、重载、配置热应用与钩子异常都记 `rubenbot.plugins.loader` 日志。
 
 - **数据来源**：配置 `market.index_url` 指向索引仓库的 `plugins.json`（raw 地址），条目字段为 `id / name / version / description / author / permissions / path`，可选 `download_url`（插件目录打包的 zip）与 `category` / `icon` / `min_core_version` / `hooks`。没配地址或 5 秒内拉不到，就回退到随框架发布的内置官方索引——页面顶部始终标注当前来源与失败原因，不会空白。
 - **状态机**：`未安装` → `已安装（未启用）` → `已启用`；附加「可更新」（索引版本更高）、「不合规」（manifest 有问题，详情里写原因）、「核心版本过低」、「仅展示」（索引没给 `download_url`）几个标记。

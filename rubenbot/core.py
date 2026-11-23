@@ -793,6 +793,11 @@ class RubenBot:
                 await self.voice.close()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("关闭语音客户端失败：%s", exc)
+        if self.plugins is not None:
+            try:
+                self.plugins.shutdown()
+            except Exception as exc:  # noqa: BLE001 - 插件收尾失败不能挡住停机
+                logger.warning("关闭插件失败：%s", exc)
         # 表情行为自建的 embedding 客户端；后台描述任务随事件循环结束
         try:
             await self.sticker_behavior.aclose()

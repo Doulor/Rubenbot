@@ -170,7 +170,18 @@ class WebState:
                     "manifest": manifest.as_dict() if manifest is not None else None,
                     "permissions": grants.summary(name, declared),
                     "commands": [],
-                    "hooks": {"on_message": 0, "on_before_reply": 0, "on_after_reply": 0},
+                    "hooks": {
+                        "on_message": 0,
+                        "on_before_reply": 0,
+                        "on_after_reply": 0,
+                        "on_start": 0,
+                        "on_stop": 0,
+                        "on_load": 0,
+                        "on_unload": 0,
+                        "on_config_change": 0,
+                    },
+                    "lifecycle": False,
+                    "hot_config": False,
                     "path": str(path),
                 }
             )
