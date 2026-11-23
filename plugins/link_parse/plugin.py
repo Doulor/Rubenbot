@@ -28,6 +28,10 @@ class Settings:
     max_bytes: int = 1024 * 1024
     timeout_seconds: float = 6
     sites: frozenset[str] = frozenset({"bilibili", "generic"})
+    # 解析结果的投递方式：direct 直接喂本轮回复，planner 交给策划步决定。
+    # 第 25 项接上策划步投递之前，两种取值都按 direct 的既有行为处理；
+    # 这里先让配置面能读写、不会因未知字段拒绝加载。
+    delivery: str = "direct"
 
     @classmethod
     def load(cls, directory: Path):
@@ -52,6 +56,9 @@ class Settings:
         mode = data.get("mode", defaults.mode)
         if mode not in {"on_mention", "auto"}:
             raise ValueError("未知链接解析模式")
+        delivery = data.get("delivery", defaults.delivery)
+        if delivery not in {"direct", "planner"}:
+            raise ValueError("未知投递方式")
         return cls(
             mode=mode,
             cooldown_seconds=number("cooldown_seconds", 0, 86400),
@@ -60,6 +67,7 @@ class Settings:
             max_bytes=number("max_bytes", 1, 4 * 1024 * 1024, integer=True),
             timeout_seconds=number("timeout_seconds", 0.1, 30),
             sites=frozenset(sites),
+            delivery=delivery,
         )
 
 

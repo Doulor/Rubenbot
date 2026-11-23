@@ -5,7 +5,9 @@ loader 加载前校验；市场页也用它区分「已安装 / 可更新 / 不�
 
 必填字段：``id`` / ``name`` / ``version`` / ``description`` / ``author`` /
 ``min_core_version`` / ``permissions``；``config_schema`` 与 ``hooks`` 可省略
-（省略时按空列表处理），``category`` / ``icon`` 为可选展示字段。
+（省略时按空列表处理），``category`` / ``icon`` / ``repository`` / ``triggers``
+为可选展示字段。``triggers`` 是给 WebUI 详情页看的人类可读触发方式说明，
+不是运行时配置；真正的触发词仍由各插件 ``config_schema`` 里的字段承担。
 """
 
 from __future__ import annotations
@@ -104,6 +106,8 @@ class Manifest:
     hooks: tuple[str, ...] = ()
     category: str = DEFAULT_CATEGORY
     icon: str = ""
+    repository: str = ""
+    triggers: tuple[str, ...] = ()
     raw: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
@@ -120,6 +124,8 @@ class Manifest:
             "hooks": list(self.hooks),
             "category": self.category,
             "icon": self.icon,
+            "repository": self.repository,
+            "triggers": list(self.triggers),
         }
 
     @property
@@ -222,6 +228,17 @@ def parse_manifest(data: Any, *, core_version: str = CORE_VERSION) -> Manifest:
         category = DEFAULT_CATEGORY
 
     icon = str(data.get("icon") or "").strip()[:4]
+    repository = str(data.get("repository") or "").strip()
+    # 纯展示字段写坏了不该让插件变得不合规：不是数组就按「没声明」处理
+    raw_triggers = data.get("triggers")
+    if raw_triggers is not None and not isinstance(raw_triggers, list):
+        logger.debug("插件 %s 的 triggers 不是数组，忽略", plugin_id)
+        raw_triggers = None
+    triggers = [
+        str(item).strip()
+        for item in (raw_triggers or [])
+        if str(item or "").strip()
+    ]
 
     if version_less(core_version, min_core_version):
         raise ManifestError(
@@ -241,6 +258,8 @@ def parse_manifest(data: Any, *, core_version: str = CORE_VERSION) -> Manifest:
         hooks=tuple(hooks),
         category=category,
         icon=icon,
+        repository=repository,
+        triggers=tuple(triggers),
         raw=dict(data),
     )
 

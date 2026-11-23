@@ -6,7 +6,7 @@
   <title>RubenBot 控制台</title>
   <link rel="icon" href="/bot-avatar">
   <link rel="stylesheet" href="/static/fonts.css?v=1120">
-  <link rel="stylesheet" href="/static/styles.css?v=1127">
+  <link rel="stylesheet" href="/static/styles.css?v=1128">
   <script data-cfasync="false">
     // 尽早定主题，避免首帧闪白/闪暗
     (function () {
@@ -162,6 +162,9 @@
   <dialog class="dialog" id="dialog"></dialog>
 
   <script data-cfasync="false" src="/static/motion.js?v=1121"></script>
-  <script data-cfasync="false" src="/static/app.js?v=1127"></script>
+  <!-- 详情页先于 app.js 加载：深链 #/plugins/detail/<id> 可能在 app.js 的启动
+       微任务里就渲染，那时详情函数必须已经存在。两者都只用函数声明，互不依赖加载顺序。 -->
+  <script data-cfasync="false" src="/static/plugin_detail.js?v=1128"></script>
+  <script data-cfasync="false" src="/static/app.js?v=1128"></script>
 </body>
 </html>

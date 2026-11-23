@@ -3092,3 +3092,80 @@ button {
   gap: 10px;
   flex: none;
 }
+
+/* ---------------- 插件详情 ---------------- */
+
+.plugin-detail-body {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+
+.plugin-detail-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  min-width: 0;
+}
+
+.plugin-detail-heading {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  flex: 1;
+}
+
+.plugin-detail-name {
+  margin: 0;
+  font-size: 20px;
+  line-height: 1.25;
+}
+
+.plugin-detail-head .btn {
+  flex: none;
+}
+
+.plugin-readme-wrap {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* README 是外部文本，原样展示：保留换行，长行折行，不解析 Markdown */
+.plugin-readme {
+  margin: 0;
+  max-height: 46vh;
+  overflow: auto;
+  padding: 12px 14px;
+  border-radius: var(--r-field);
+  background: var(--surface-sunk);
+  font: 12.5px/1.7 var(--font-sans);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.detail-triggers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.schema-docs li {
+  grid-template-columns: 120px minmax(0, 1fr);
+}
+
+.schema-docs li span .field-hint {
+  display: block;
+  margin-top: 2px;
+}
+
+.field-error {
+  color: var(--bad);
+  font-size: 12px;
+  line-height: 1.5;
+  min-height: 0;
+}
+
+.field-error:empty {
+  display: none;
+}

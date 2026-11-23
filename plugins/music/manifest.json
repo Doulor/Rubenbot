@@ -5,30 +5,41 @@
   "description": "「点歌 <歌名>」「我想听 <歌名>」搜网易云，默认发歌名 + 链接 + 封面图；可选 OneBot 音乐卡片",
   "author": "RubenBot",
   "min_core_version": "0.1.0",
+  "repository": "https://github.com/Doulor/Rubenbot/tree/main/plugins/music",
   "permissions": ["read_messages", "send_messages", "network"],
+  "triggers": ["「点歌 <歌名>」", "「我想听 <歌名>」"],
   "config_schema": [
     {
       "key": "triggers",
       "type": "list",
       "default": ["点歌", "我想听"],
-      "description": "点歌触发词，消息以其中之一开头即触发"
+      "label": "触发词",
+      "description": "点歌触发词，消息以其中之一开头即触发",
+      "placeholder": "添加触发词"
     },
     {
       "key": "cooldown_seconds",
       "type": "number",
       "default": 60,
-      "description": "单人两次点歌之间的冷却秒数"
+      "label": "单人冷却（秒）",
+      "description": "同一个人两次点歌之间的最小间隔",
+      "min": 0,
+      "max": 86400,
+      "step": 1
     },
     {
       "key": "source",
       "type": "string",
       "default": "netease",
-      "description": "默认音源（目前只支持 netease）"
+      "label": "音源",
+      "description": "目前只支持 netease（OneBot 音乐段的 type）",
+      "options": [{"value": "netease", "label": "网易云"}]
     },
     {
       "key": "music_card",
       "type": "boolean",
       "default": false,
+      "label": "先试音乐卡片",
       "description": "是否先尝试 OneBot 音乐卡片（默认关闭：新版 QQ 不渲染，只显示「发送者版本过低」）"
     }
   ],

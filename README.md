@@ -186,7 +186,9 @@ bot 对每个人的好感度、以及自己当下的心情，都由确定性规�
 | `rubenbot/plugins/loader.py` | 插件发现、钩子与命令分发；加载前校验 manifest；显式启用制与热启停；按授权收口插件入口 |
 | `rubenbot/plugins/manifest.py` | 插件 manifest 规范：字段 / 权限枚举 / 版本比较与校验 |
 | `rubenbot/plugins/permissions.py` | 装后授权：每插件授权记录（`data/plugin_permissions.json`）、首次迁移、授权审计 |
-| `rubenbot/web/market.py` | 插件市场：索引拉取与内置回退、本地插件合并、安装 / 更新 / 卸载（zip 安全解压） |
+| `rubenbot/plugins/config_schema.py` | 插件配置 schema：规范化声明、默认值、逐字段校验与表单描述（配置页与详情页共用） |
+| `rubenbot/web/market.py` | 插件市场：索引拉取与内置回退、本地插件合并、安装 / 更新 / 卸载（zip 安全解压）、按 schema 读写插件配置 |
+| `rubenbot/web/plugin_detail.py` | 插件详情：拼装 README、版本作者、权限与授权、触发方式、配置说明（`GET /api/plugins/{id}/detail`） |
 | `rubenbot/__main__.py` | 命令行入口 `rubenbot` / `python -m rubenbot` |
 | `plugins/hello/` | 示例插件：`/hello` 命令 + `on_message` 钩子（默认关闭，需显式启用） |
 | `plugins/qzone_post/` | 说说发布插件（命令 / 定时 / 概率触发）；自动互动开关默认关闭（默认不启用，需显式开启） |
@@ -284,7 +286,7 @@ ConsoleAdapter 的输入格式：
 
 普通群消息通过节奏护栏后，按 `attention.talk_value` 决定是否查看，再由策划步决定是否开口。当前默认 `attention.talk_value` 为 `0.75`，表示进入查看/策划步的概率，不是最终回复概率；私聊、@、点名、回复 bot 等硬触发不掷点，被点名后的 120 秒内有效查看概率为 1。插件默认全部关闭，想试 `/hello` 请在 WebUI 的「插件市场」页启用 `hello`，或在配置里写 `plugins.enabled: ["hello"]`。
 
-WebUI 当前包含概览、机器人/人设、模型、记忆、人物、群组与决策、插件市场、日志、设置和关于页面。模型页可增删改提供商及其模型，为各角色选择跨提供商候选、调整优先级及 `failover` / `round_robin` / `random` 策略；群组页可查看决策日志和群定位；插件页区分市场发现、安装更新卸载启停与已安装插件配置。群组定位为手写备注优先、自归纳其次，两者都空或当前是私聊时不注入。「记忆 → 画像与时间线」选定人物后，可查看画像和事件来源。移动端使用导航抽屉，页面切换优先使用路由缓存并隔离迟到响应；登录签名密钥落盘后，重启仍可维持有效会话。SnowLuma 的群名与成员名缓存在 SQLite，群名片按群区分；群卡和人物档案的「刷新名称」可重新取名，平台离线时保留旧资料。QQ 头像由浏览器直接请求 `qlogo.cn`（会向该域名发送对应的 QQ 号或群号），bot 不下载或存储图片。其他平台以及加载失败的头像使用名字首字色块。
+WebUI 当前包含概览、机器人/人设、模型、记忆、人物、群组与决策、插件市场、日志、设置和关于页面。模型页可增删改提供商及其模型，为各角色选择跨提供商候选、调整优先级及 `failover` / `round_robin` / `random` 策略；群组页可查看决策日志和群定位；插件页区分市场发现、安装更新卸载启停、已安装插件配置、权限授权与完整详情（介绍 / 版本作者 / 权限 / 触发方式 / 配置说明 / 启用状态）。群组定位为手写备注优先、自归纳其次，两者都空或当前是私聊时不注入。「记忆 → 画像与时间线」选定人物后，可查看画像和事件来源。移动端使用导航抽屉，页面切换优先使用路由缓存并隔离迟到响应；登录签名密钥落盘后，重启仍可维持有效会话。SnowLuma 的群名与成员名缓存在 SQLite，群名片按群区分；群卡和人物档案的「刷新名称」可重新取名，平台离线时保留旧资料。QQ 头像由浏览器直接请求 `qlogo.cn`（会向该域名发送对应的 QQ 号或群号），bot 不下载或存储图片。其他平台以及加载失败的头像使用名字首字色块。
 
 打开「关于」可核对运行版本、当前提交、各角色的首选模型与模型池策略，以及适配器状态和插件数。提交优先取部署盖戳 `.deploy-commit`，没有有效盖戳则读取本地 Git HEAD；都读不到时会说明原因。页面提供仓库、提交链接及可展开的 MIT 许可全文。点击「检查更新」才会由后端查询 GitHub `main`，只比较提交，不下载、不重启；超时或断网不影响查看本页。
 
@@ -447,6 +449,9 @@ plugins:
   "author": "RubenBot",
   "min_core_version": "0.1.0",
   "permissions": ["read_messages", "send_messages"],
+  "config_schema": [],
+  "triggers": ["「/hello」命令"],
+  "repository": "https://github.com/Doulor/Rubenbot/tree/main/plugins/hello",
   "hooks": ["command", "on_message"],
   "category": "互动",
   "icon": "👋"
@@ -460,8 +465,34 @@ plugins:
 | `version` | 是 | 形如 `1.0.0`；市场用它判断「可更新」 |
 | `min_core_version` | 是 | 要求的框架最低版本，高于当前版本时禁止安装 / 启用 |
 | `permissions` | 是 | 能力声明，只能取下列枚举值；市场安装前逐项展示中文说明 |
-| `config_schema` / `hooks` | 否 | 配置项声明（二期做自动表单）/ 用到的钩子名 |
+| `config_schema` | 否 | 配置项声明，WebUI 据此自动生成表单并校验（见下） |
+| `triggers` / `repository` | 否 | 详情页展示的触发方式说明 / 仓库链接（不影响运行） |
+| `hooks` | 否 | 用到的钩子名 |
 | `category` / `icon` | 否 | 市场分类（互动 / 空间 / 工具 / 系统，缺省「工具」）/ 卡片图标 |
+
+`config_schema` 的每个条目只要求 `key`，其余可选：
+
+```json
+"config_schema": [
+  {"key": "mode", "type": "string", "default": "on_mention", "label": "解析模式",
+   "description": "被点名或被问到才解析，还是收到链接就预取",
+   "options": [{"value": "on_mention", "label": "被点名/提问时解析"}, {"value": "auto", "label": "收到链接就预取"}]},
+  {"key": "cooldown_seconds", "type": "number", "default": 60, "label": "冷却（秒）", "min": 0, "max": 86400, "step": 1},
+  {"key": "sites", "type": "list", "default": ["bilibili", "generic"], "label": "允许的站点", "options": ["bilibili", "generic"]},
+  {"key": "api_key", "type": "string", "default": "", "label": "密钥", "secret": true}
+]
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `type` | `bool` / `int` / `number` / `string` / `text` / `list`（兼容 `boolean` / `integer` / `float` / `string_list`） |
+| `default` | 默认值；类型不对时退回该类型的空值并记日志 |
+| `label` / `description` | 表单标签与说明（没有 `label` 时用 `description`） |
+| `min` / `max` / `step` | 数字范围与步长；`list` / `string` 也可用 `min_length` / `max_length` |
+| `options` | 可选值数组，裸值或 `{value, label}` 均可；声明后保存时只接受列表内的值 |
+| `secret` | 密钥字段；不回显原值，留空表示保留原值（key 名含 `key` / `token` / `secret` / `password` 时自动按密钥处理） |
+
+没有 `config_schema` 的插件照常加载，WebUI 详情页与配置页显示「没有声明配置项」；schema 里写坏的条目会被跳过并记日志，不会让插件变得不合规。官方插件里 `music`（触发词 / 冷却 / 音源 / 音乐卡片）与 `link_parse`（模式 / 冷却 / 每日上限 / 缓存 / 字节与超时上限 / 站点 / 投递方式）的全部可配项都已进 schema，可作参考。`link_parse` 的 `delivery` 取 `direct`（默认）或 `planner`，用于验证枚举类配置项；策划步投递本身由后续项接入，目前两种取值都按 `direct` 处理。
 
 `permissions` 枚举固定为 7 项：
 
@@ -537,11 +568,11 @@ def register(ctx):
 
 ### 插件市场
 
-WebUI 的「插件」分三页：「插件市场」在同一列表里发现、安装与启停插件；「插件配置」按 `config_schema` 编辑已安装插件的配置，插件声明了 `on_config_change` 时保存即热生效，没声明的如实提示需重启；「权限授权」逐项对照 manifest 声明并即时开关（高危项标红，声明了但未授权的项标「未授」，改动立即生效、不重启）。没有声明配置的插件会在配置页显示「无可配置项」。原来的 `#/plugins` 链接仍打开市场。
+WebUI 的「插件」分四页：「插件市场」在同一列表里发现、安装与启停插件；「插件配置」按 `config_schema` 编辑已安装插件的配置；「权限授权」逐项对照 manifest 声明并即时开关（高危项标红，声明了但未授权的项标「未授」，改动立即生效、不重启）；「插件详情」展示任一插件的完整档案——介绍（插件目录 README 原文，最多 128 KiB）、版本、作者、权限清单与授权状态、触发方式（manifest `triggers` / 运行时命令与钩子）、配置说明与启用状态，并带同一份 schema 驱动表单。市场卡片的「详情」链接直接打开完整详情页，卡片上的箭头仍打开快速预览抽屉。配置表单由 schema 自动生成：`bool` 渲染成开关、`int` / `number` 是带范围与步长的数字框、`list` 是可增删的标签组、带 `options` 的字段是下拉、密钥字段是密码框（不回显，留空保留原值）；保存后端按同一份 schema 校验，错误逐字段显示在控件下方。插件声明了 `on_config_change` 时保存即热生效，没声明的如实提示需重启；没有声明配置的插件显示「没有声明配置项」。原来的 `#/plugins` 链接仍打开市场。
 
 已加载的插件在市场卡片上多一个「重载」按钮：先调 `on_unload`（及后台任务的 `on_stop`），清掉旧模块后按磁盘上的新代码重新 `register`、校验 manifest，再调 `on_load`——改插件代码不用重启 bot。授权记录与插件自己的 `config.yaml` 都保留；新代码导入失败或 manifest 不合规时整体回滚到重载前的实例（旧钩子照常分发），原因以 409 回给 WebUI，插件不会从列表里消失。加载、卸载、重载、配置热应用与钩子异常都记 `rubenbot.plugins.loader` 日志。
 
-- **数据来源**：配置 `market.index_url` 指向索引仓库的 `plugins.json`（raw 地址），条目字段为 `id / name / version / description / author / permissions / path`，可选 `download_url`（插件目录打包的 zip）与 `category` / `icon` / `min_core_version` / `hooks`。没配地址或 5 秒内拉不到，就回退到随框架发布的内置官方索引——页面顶部始终标注当前来源与失败原因，不会空白。
+- **数据来源**：配置 `market.index_url` 指向索引仓库的 `plugins.json`（raw 地址），条目字段为 `id / name / version / description / author / permissions / path`，可选 `download_url`（插件目录打包的 zip）与 `category` / `icon` / `min_core_version` / `hooks`，以及仅供详情页展示的 `triggers` / `repository` / `config_schema`（索引声明了 schema 时，未安装插件也能预览有哪些配置项，但不能保存）。没配地址或 5 秒内拉不到，就回退到随框架发布的内置官方索引——页面顶部始终标注当前来源与失败原因，不会空白。
 - **状态机**：`未安装` → `已安装（未启用）` → `已启用`；附加「可更新」（索引版本更高）、「不合规」（manifest 有问题，详情里写原因）、「核心版本过低」、「仅展示」（索引没给 `download_url`）几个标记。
 - **安装**：先弹确认框逐项列出权限（含 `qzone_write` / `scheduler` 时额外标红），确认后下载 zip、校验每个条目的解压路径都在目标目录内（防路径穿越，不合规整包拒绝）、校验 manifest 与 `min_core_version`，落盘到 `plugins/<id>`。**装好默认不启用、默认零授权**，仍走 `plugins.enabled`；启用前到「权限授权」页逐项打开。
 - **更新**：索引版本更高时卡片挂「可更新」，一键替换代码与 manifest，插件目录里的 `config.yaml`、启用状态与已有授权保持不变；新版本新增声明的权限默认未授权。

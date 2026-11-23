@@ -19,6 +19,8 @@
 
 ### Added
 
+- **插件详情页与 schema 驱动配置（第 27 项）**：manifest 新增两个可选展示字段——`triggers`（人类可读的触发方式说明）与 `repository`（仓库 / 插件目录链接），不影响运行，旧 manifest 照常加载。新增 `rubenbot/plugins/config_schema.py` 作为 `config_schema` 的唯一解读入口：类型别名归一（`boolean` / `integer` / `float` / `string_list` → `bool` / `int` / `number` / `list`）、默认值与范围修正、`min` / `max` / `step` / `min_length` / `max_length` / `options` / `secret` 逐字段校验；市场读写插件 `config.yaml` 与详情页都走这一份，前后端不再各写一套。WebUI 插件页新增「插件详情」（`#/plugins/detail/<id>`，`GET /api/plugins/{id}/detail`）：介绍（插件目录 README 原文，上限 128 KiB、拒绝符号链接与越界路径）、版本、作者、分类、启用 / 加载状态、权限清单（含逐项授权状态与高危标记）、触发方式（manifest `triggers` / 运行时命令与钩子）、配置说明（类型、默认值、范围、可选值）以及同一份 schema 自动生成的表单——`bool` 是开关、`int` / `number` 是带范围与步长的数字框、`list` 是可增删标签组、带 `options` 的字段是下拉、密钥字段是密码框（不回显，留空保留原值）；保存后以服务端回读值为准回填，校验错误按字段显示在控件下方。市场卡片新增「详情」入口，原详情抽屉保留作快速预览。旧插件没有 schema 照常工作（详情页与配置页显示「没有声明配置项」），schema 里写坏的条目跳过并记日志、不会让插件变得不合规。`music`（触发词 / 冷却 / 音源 / 音乐卡片）与 `link_parse`（模式 / 冷却 / 每日上限 / 缓存 / 字节与超时上限 / 站点 / 新增的投递方式 `delivery`）的全部可配项已迁入 schema；`delivery` 取 `direct`（默认）或 `planner`，用来验证枚举类配置项，策划步投递本身由第 25 项接入，目前两种取值都按 `direct` 处理。测试：详情渲染、schema 表单生成、保存回读往返、缺 schema 不崩、密钥不回显、越界 README 拒读。
+
 - **提供商 / 模型 / 角色池（Q21）**：各提供商独立配置端点、密钥和模型目录。`chat`、`vision` 等角色可跨提供商组池，沿用故障转移、轮询和随机策略。WebUI 可编辑三层配置并热生效。单端点旧配置仍按原规则读取，不会在启动时改写；迁移时保留已有环境变量密钥引用。
 
 - **Bing 搜索渠道（免 key 抓取型）**：搜索回退链新增第三个渠道 `bing`——GET `cn.bing.com/search` 并用标准库 `HTMLParser` 解析 SERP（`li.b_algo` → `h2 > a` 标题与直链、`b_caption > p` 摘要），请求带浏览器 UA 与 `Accept-Language`，超时/条数/注入字数沿用既有渠道契约。页面改版、验证页、空结果页或结构残缺一律按「本渠道没结果」处理，交给回退链顺延，不抛异常打断聊天；没有直链的条目直接丢弃（查证打不开原文）。`search.order` 可写 `bing`（免 key，无需配置字段），默认链仍是 `[tavily, deepseek]`，线上语义不变。配套 3 份真实 SERP 样本 fixture（正常 / 无结果 / 残缺）与回退链单测；同环境 5 题实测对比（延迟、前 3 条质量、整句问句的局限）见 `docs/bing-search-results.md`。
