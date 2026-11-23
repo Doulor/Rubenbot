@@ -773,7 +773,7 @@ def test_card_only_when_configured_and_only_for_snowluma():
     adapter = RecordingAdapter()
     player, _, _ = make_player(net=net, adapter=adapter, config={"send_modes": ["card", "text"]})
     run(player.on_message(runtime(adapter), event("点歌 晴天")))
-    assert adapter.sent[0][2][0] == {"type": "music", "data": {"type": "netease", "id": "1"}}
+    assert adapter.sent[0][2][0] == {"type": "music", "data": {"type": "163", "id": "1"}}
 
     net = FakeNet()
     adapter = RecordingAdapter(name="telegram")

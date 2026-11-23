@@ -265,10 +265,14 @@ def text_info(song: Song, *, note: str = "") -> str:
 
 
 def music_segment(song: Song) -> Segment:
-    """OneBot music 段：网易云 / QQ 用平台卡；其余平台用 custom 卡兜底。"""
+    """OneBot music 段：网易云 / QQ 用平台卡；其余平台用 custom 卡兜底。
+
+    平台卡的 ``type`` 按 OneBot v11 的取值写：网易云是 ``163``（不是
+    ``netease``），QQ 音乐是 ``qq``。
+    """
     platform = (song.platform_type or song.source or "").lower()
     if platform in ("netease", "163"):
-        return Segment("music", {"type": "netease", "id": song.id})
+        return Segment("music", {"type": "163", "id": song.id})
     if platform == "qq":
         return Segment("music", {"type": "qq", "id": song.id})
     data: dict[str, Any] = {
