@@ -75,10 +75,14 @@ def runtime_info(state: WebState) -> dict:
     llm = config.llm
     roles = {}
     models = set()
-    for role in dict.fromkeys((*MODEL_ROLES, *llm.models, *llm.model_strategies)):
-        pool = llm.models_for(role)
-        roles[role] = {"model": pool[0], "strategy": llm.strategy_for(role), "count": len(pool)}
-        models.update(pool)
+    layered = llm.providers is not None
+    configured = llm.role_pools if layered else llm.models
+    for role in dict.fromkeys((*MODEL_ROLES, *configured, *llm.model_strategies)):
+        pool = llm.targets_for(role)
+        first = pool[0]
+        roles[role] = {"model": f"{first.provider} / {first.model}" if layered else first.model,
+                       "strategy": llm.strategy_for(role), "count": len(pool)}
+        models.update((target.provider, target.model) for target in pool)
 
     adapters = getattr(state.bot, "adapters", {})
     snow = adapters.get("snowluma")
@@ -97,7 +101,7 @@ def runtime_info(state: WebState) -> dict:
         plugin_total, plugin_enabled = len(discover_plugin_dirs(config.plugins.dir)), 0
     return {
         "roles": roles,
-        "models": {f"{role}_model": getattr(llm, f"{role}_model") or None
+        "models": {f"{role}_model": roles[role]["model"] if layered else getattr(llm, f"{role}_model") or None
                    for role in ("chat", "extract", "consolidate", "gate")},
         "model_strategy": llm.model_strategy, "model_count": len(models),
         "adapters": sorted(adapters), "snowluma_status": snow_status,

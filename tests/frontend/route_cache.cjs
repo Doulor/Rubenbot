@@ -48,11 +48,11 @@ test('模型页首访显示两张卡的骨架，旧设置链接回切复用模�
   assert.ok(hasSkeleton(view));
   assert.equal(view.querySelector('.settings-menu'), null);
   run(`const config = {layout: {groups: [{id: 'models', title: '模型', pages: [{id: 'models'}]}],
-    rules: [{prefix: 'llm', page: 'models'}]}, structured: {llm: {chat_model: 'test-chat'}, mcp: {servers: []}, decision: {groups: {}}}};
+    rules: [{prefix: 'llm', page: 'models'}]}, structured: {llm: {providers: [{name: 'local', base_url: 'http://local/v1', models: ['test-chat']}], role_pools: {chat: [{provider: 'local', model: 'test-chat'}]}}, mcp: {servers: []}, decision: {groups: {}}}};
     pending['/api/config'].resolve(config);`);
   await first;
   assert.ok(view.querySelector('.settings-stack'), view.textContent);
-  assert.deepEqual(cards().map(n => n.querySelector('h2').textContent), ['模型与接口', '模型池与审查模型']);
+  assert.deepEqual(cards().map(n => n.querySelector('h2').textContent), ['模型配置', '调用参数']);
   assert.equal(run(`$('#page-title').textContent`), '模型');
   assert.equal(view.querySelector('.settings-menu'), null);
   const stack = view.querySelector('.settings-stack');

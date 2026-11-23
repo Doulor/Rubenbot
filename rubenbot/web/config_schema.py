@@ -26,7 +26,8 @@ from typing import Any
 from ..config import (
     COMPUTER_LIMITS, DEFAULT_MODEL_STRATEGY, MODEL_STRATEGIES, SEARCH_PROVIDERS,
     STT_PROVIDERS, TTS_MODES, TTS_PROVIDERS,
-    ComputerConfig, Config, MCPConfig, MCPServerConfig, PrivacyConfig, normalize_muted_senders,
+    ComputerConfig, Config, LLMConfig, MCPConfig, MCPServerConfig, PrivacyConfig,
+    _expand_env, normalize_muted_senders,
 )
 from ..decision import parse_quiet_hours
 
@@ -58,6 +59,7 @@ SECRET_PATHS = (
 # 从 YAML 里消失（空字典也替换），不能沿用旧值。
 _REPLACE_PATHS = {
     ("llm", "models"),
+    ("llm", "role_pools"),
     ("llm", "model_strategies"),
 }
 
@@ -240,6 +242,18 @@ def mcp_form(config: MCPConfig) -> dict[str, Any]:
     }
 
 
+# 新格式只有一份路由事实；不回显、不落盘给旧调用方用的投影。
+LEGACY_LLM_ROUTE_KEYS = ("base_url", "api_key", "chat_model", "extract_model", "consolidate_model", "gate_model", "models")
+
+
+def model_catalog_form(llm: LLMConfig) -> dict[str, Any]:
+    """目录视图永远不带密钥，旧端点在此显示为 default。"""
+    providers, pools = llm.catalog_view()
+    for row in providers:
+        row["has_api_key"] = bool(row.pop("api_key", ""))
+    return {"providers": providers, "role_pools": pools}
+
+
 def structured_config(config: Config) -> dict[str, Any]:
     """当前生效配置的表单视图：完整字段、密钥置空、附带 ``secrets`` 标记。"""
     enabled = set(config.enabled_adapters)
@@ -258,6 +272,13 @@ def structured_config(config: Config) -> dict[str, Any]:
     llm["models"] = dict(models) if isinstance(models, dict) else {}
     strategies = llm.get("model_strategies")
     llm["model_strategies"] = dict(strategies) if isinstance(strategies, dict) else {}
+    if config.llm.providers is None:
+        llm["api_key"] = ""
+    else:
+        for key in LEGACY_LLM_ROUTE_KEYS:
+            llm.pop(key, None)
+        api_key = ""
+    llm.update(model_catalog_form(config.llm))
     webui = asdict(config.webui)
     password = webui.pop("password", "")
     search = asdict(config.search)
@@ -274,7 +295,7 @@ def structured_config(config: Config) -> dict[str, Any]:
     access_token = snow.get("access_token", "")
 
     return {
-        "llm": {**llm, "api_key": ""},
+        "llm": llm,
         "persona": {"path": config.persona_path, **config.persona_example_options()},
         "database_path": config.database_path,
         "memory": asdict(config.memory),
@@ -537,6 +558,18 @@ def _validate_strategy(value: Any, v: _Validator, field: str) -> str | None:
 
 def _validate_llm(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
     out: dict[str, Any] = {}
+    if "providers" in section:
+        rows = section["providers"]
+        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+            v.fail("llm.providers", "应为提供商对象列表")
+        else:
+            # has_api_key 只是表单提示，不是磁盘字段。缺省 api_key 与显式清空不同。
+            out["providers"] = [{k: value for k, value in row.items() if k != "has_api_key"} for row in rows]
+    if "role_pools" in section:
+        if isinstance(section["role_pools"], dict):
+            out["role_pools"] = section["role_pools"]
+        else:
+            v.fail("llm.role_pools", "应为「角色 → 模型引用列表」的对象")
     if "base_url" in section:
         value = v.text(section["base_url"], "llm.base_url")
         if value is not None:
@@ -1412,6 +1445,49 @@ def validate_structured(payload: dict[str, Any]) -> dict[str, Any]:
 # ----------------------------------------------------------------------
 
 
+def _merge_llm_catalog(previous: dict, update: dict, merged: dict) -> None:
+    """迁移或替换目录。仅同一身份、同一端点可保留磁盘上的凭据原文。"""
+    new_format = "providers" in previous or "role_pools" in previous
+    if not ({"providers", "role_pools"} & update.keys()):
+        if new_format and any(key in update for key in LEGACY_LLM_ROUTE_KEYS):
+            raise ConfigValidationError([{"field": "llm", "message": "当前使用提供商与角色池，不能写入旧模型字段"}])
+        return
+
+    previous_llm = Config.from_raw({"llm": previous}).llm
+    previous_view = model_catalog_form(previous_llm)
+    if not new_format and "models" in update:
+        # 老式全量设置表单也可携带只读转换视图。仅改了旧字段或其它段时，
+        # 不让未触碰的目录覆盖那些编辑或悄悄迁移磁盘格式。
+        public_rows = [{k: v for k, v in row.items() if k != "has_api_key"} for row in previous_view["providers"]]
+        if update.get("providers") == public_rows and update.get("role_pools") == previous_view["role_pools"]:
+            merged.pop("providers", None)
+            merged.pop("role_pools", None)
+            return
+    if new_format:
+        old_rows = previous.get("providers", [])
+    else:
+        old_rows = [{"name": "default", "base_url": previous.get("base_url", LLMConfig.base_url), "api_key": previous.get("api_key", "")}]
+        merged.setdefault("providers", [{**previous_view["providers"][0], **old_rows[0]}])
+        merged.setdefault("role_pools", previous_view["role_pools"])
+
+    # 名称是去除两端空白的字面标识（绝不展开）；只有地址会展开环境变量。
+    by_name = {row["name"].strip(): row for row in old_rows}
+    for row in merged["providers"]:
+        # 格式错误由 Config.from_raw 统一报错；这里不处理畸形标识。
+        if not isinstance(row.get("name"), str) or not isinstance(row.get("base_url"), str):
+            continue
+        old = by_name.get(row["name"].strip())
+        # 地址引用本身变了也可能在未来指向别处；不向新变量继承旧凭据。
+        url = row["base_url"].strip()
+        if old and url in (old["base_url"].strip(), _expand_env(old["base_url"]).strip()):
+            row["base_url"] = old["base_url"]
+            if "api_key" in old:
+                row.setdefault("api_key", old["api_key"])
+        row.pop("has_api_key", None)
+    for key in LEGACY_LLM_ROUTE_KEYS:
+        merged.pop(key, None)
+
+
 def merge_config(raw: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
     """把规范字典合并进现有 YAML 数据，保留更新里没提到的键。"""
     base = copy.deepcopy(raw) if isinstance(raw, dict) else {}
@@ -1421,6 +1497,8 @@ def merge_config(raw: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
     # 数组按本次提交增删，只对同名且同传输的条目保留未回显的连接参数。
     # 从磁盘原文取值，绝不把展开的 ${ENV} 重新写成明文。
     _deep_merge(base, update, ())
+    if "llm" in update:
+        _merge_llm_catalog(raw.get("llm") or {}, update["llm"], base["llm"])
     if "servers" in update.get("mcp", {}):
         previous = raw.get("mcp")
         rows = previous.get("servers", []) if isinstance(previous, dict) else []

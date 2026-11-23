@@ -2290,6 +2290,23 @@ button {
   gap: 8px;
 }
 
+.model-layer-editor {
+  display: grid;
+  gap: 12px;
+}
+
+.model-layer-editor h3 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.model-layer-editor > button { justify-self: start; }
+.model-layer-editor > button + h3 { margin-top: 12px; }
+.model-layer-editor .model-pool-head > label { flex: 1; min-width: 0; }
+.model-layer-editor .model-pool-item > .select { max-width: 100%; }
+.model-layer-editor .model-pool-order { width: 1.3em; }
+
+.model-pool-row .select,
 .model-pool-row .input {
   flex: 1;
   min-width: 0;

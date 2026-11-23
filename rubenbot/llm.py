@@ -35,7 +35,7 @@ from typing import Any, Awaitable, Callable, Protocol
 
 import httpx
 
-from .config import LLMConfig
+from .config import LLMConfig, ModelTarget
 
 logger = logging.getLogger(__name__)
 
@@ -155,9 +155,10 @@ class LLMClient:
         self._usage_recorder = usage_recorder
         # 测试可注入零延迟；生产用模块默认的 1s / 3s
         self._retry_delays = RETRY_DELAYS if retry_delays is None else retry_delays
-        self._client: httpx.AsyncClient | None = None
-        # 探测到不支持工具后置 True，后续不再白试（省一次失败请求）
+        self._clients: dict[str, httpx.AsyncClient] = {}
+        # 旧配置保留整端点的探测语义；新配置只记住实际拒绝工具的提供商模型。
         self._tools_unsupported = False
+        self._no_tools: set[tuple[str, str]] = set()
         # 轮询策略的调用计数：只放内存，重启/重建客户端后从头开始（规格允许）
         self._round_robin: dict[str, int] = {}
 
@@ -165,22 +166,27 @@ class LLMClient:
     def supports_tools(self) -> bool:
         """当前是否还能尝试工具调用；模型/中转不支持时由 ``chat_with_tools``
         抛出 :class:`ToolUnsupported` 并置 False。"""
-        return not self._tools_unsupported
+        return not self._tools_unsupported and any(
+            (t.provider, t.model) not in self._no_tools for t in self.config.targets_for("chat")
+        )
 
-    async def _get_client(self) -> httpx.AsyncClient:
-        if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(
-                base_url=self.config.base_url.rstrip("/"),
+    async def _get_client(self, target: ModelTarget | None = None) -> httpx.AsyncClient:
+        # 按提供商隔离认证头、Cookie 和连接池；兼容回放工具预取聊天端点的钩子。
+        target = target or self.config.targets_for("chat")[0]
+        client = self._clients.get(target.provider)
+        if client is None or client.is_closed:
+            client = httpx.AsyncClient(
+                base_url=target.base_url.rstrip("/"),
+                headers={"Authorization": f"Bearer {target.api_key}"} if target.api_key else {},
                 timeout=self.config.timeout,
                 transport=self._transport,
-                headers={"Authorization": f"Bearer {self.config.api_key}"} if self.config.api_key else {},
             )
-        return self._client
+            self._clients[target.provider] = client
+        return client
 
     async def close(self) -> None:
-        if self._client is not None and not self._client.is_closed:
-            await self._client.aclose()
-        self._client = None
+        clients, self._clients = self._clients, {}
+        await asyncio.gather(*(c.aclose() for c in clients.values() if not c.is_closed))
 
     async def complete(
         self,
@@ -287,14 +293,17 @@ class LLMClient:
           400/401/403/404 这类换模型也救不了的错误直接抛（不重试、不降级）。
           全部失败时抛出最后一次的错误（包成 ``LLM 调用最终失败: ...``）。
         """
-        models = self.config.models_for(role)
+        targets = self.config.targets_for(role)
+        if allow_tool_unsupported:
+            targets = [t for t in targets if (t.provider, t.model) not in self._no_tools]
+            if not targets:
+                raise ToolUnsupported("已探测到该角色的模型池不支持工具调用")
         strategy = self.config.strategy_for(role)
-        order = self._model_order(role, models, strategy)
-        client = await self._get_client()
+        order = self._model_order(role, targets, strategy)
 
         if len(order) == 1:
             return await self._call_single(
-                client, order[0], task, payload, on_success=on_success,
+                order[0], task, payload, on_success=on_success,
                 allow_tool_unsupported=allow_tool_unsupported,
                 # 工具调用一直只做一次往返，不因 max_retries 变成多次
                 retries=0 if allow_tool_unsupported else None,
@@ -303,10 +312,10 @@ class LLMClient:
         # 按顺序尝试模型池，返回第一个成功的结果。可重试的失败切下一个；
         # 全部失败抛最后一次的错误（保留原异常类型，不吞上游信息）。
         last_error: Exception | None = None
-        for index, model in enumerate(order):
+        for index, target in enumerate(order):
             try:
                 return await self._call_single(
-                    client, model, task, payload, on_success=on_success,
+                    target, task, payload, on_success=on_success,
                     allow_tool_unsupported=allow_tool_unsupported, retries=0,
                 )
             except ToolUnsupported:
@@ -325,14 +334,15 @@ class LLMClient:
                 last_error = exc
             if last_error is not None and index + 1 < len(order):
                 logger.warning(
-                    "模型 %s 调用失败（%s），切换到下一个：%s", model, strategy, last_error
+                    "模型 %s / %s 调用失败（%s），切换到下一个：%s",
+                    target.provider, target.model, strategy, last_error,
                 )
         assert last_error is not None
         # 全部失败时沿用与单模型一致的错误形状（信息里带最后一次的模型/状态），
         # 网络错误和空响应都包成 LLMError，调用方统一按 LLM 失败处理。
         raise LLMError(f"LLM 调用最终失败: {last_error}") from last_error
 
-    def _model_order(self, role: str, models: list[str], strategy: str) -> list[str]:
+    def _model_order(self, role: str, models: list[ModelTarget], strategy: str) -> list[ModelTarget]:
         """按策略给出本次调用的尝试顺序。
 
         - ``failover``：原顺序，依次尝试；
@@ -351,8 +361,7 @@ class LLMClient:
 
     async def _call_single(
         self,
-        client: httpx.AsyncClient,
-        model: str,
+        target: ModelTarget,
         task: str,
         payload: dict[str, Any],
         *,
@@ -365,6 +374,8 @@ class LLMClient:
         ``allow_tool_unsupported`` 为 True 时把「不支持工具」的 4xx 转成
         :class:`ToolUnsupported` 并记住，后续不再白试。
         """
+        model = target.model
+        client = await self._get_client(target)
         body = {**payload, "model": model}
         retries = self.config.max_retries if retries is None else retries
         last_error: Exception | None = None
@@ -388,7 +399,10 @@ class LLMClient:
                     if allow_tool_unsupported and resp.status_code in (400, 404, 422, 501):
                         lowered = text.lower()
                         if "tool" in lowered or "function" in lowered or "unsupported" in lowered:
-                            self._tools_unsupported = True
+                            if self.config.providers is None:
+                                self._tools_unsupported = True
+                            else:
+                                self._no_tools.add((target.provider, model))
                             raise ToolUnsupported(f"模型不支持工具调用：{text}")
                     error: Exception = LLMResponseError(
                         f"LLM 返回 {resp.status_code}: {text}", status=resp.status_code

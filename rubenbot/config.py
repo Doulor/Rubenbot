@@ -10,6 +10,7 @@ import logging
 import math
 import os
 import re
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -72,11 +73,94 @@ MODEL_STRATEGIES: tuple[str, ...] = ("failover", "round_robin", "random")
 DEFAULT_MODEL_STRATEGY = "failover"
 
 
+@dataclass(frozen=True)
+class ModelTarget:
+    """一次尝试使用的完整目标；构造后不再从角色名反查提供商。"""
+
+    provider: str
+    model: str
+    base_url: str
+    api_key: str = field(repr=False)
+
+
+def _catalog_text(value: Any, path: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{path} 必须是非空字符串")
+    return value.strip()
+
+
+def _parse_catalog(providers: Any, pools: Any) -> tuple[list[dict], dict[str, list[dict]]]:
+    """校验整个引用图：只有目录里的（提供商、模型）组合才能进入角色池。"""
+    if not isinstance(providers, list) or not providers:
+        raise ValueError("llm.providers 必须是非空列表")
+    catalog = []
+    by_name: dict[str, set[str]] = {}
+    for index, entry in enumerate(providers):
+        path = f"llm.providers[{index}]"
+        if not isinstance(entry, dict) or entry.keys() - {"name", "base_url", "api_key", "models"}:
+            raise ValueError(f"{path} 应为包含提供商字段的对象")
+        name = _catalog_text(entry.get("name"), f"{path}.name")
+        if name in by_name:
+            raise ValueError(f"{path}.name 提供商名称重复")
+        url = _catalog_text(entry.get("base_url"), f"{path}.base_url")
+        try:
+            parsed = urlsplit(url)
+            valid = (
+                parsed.scheme in ("http", "https")
+                and parsed.hostname
+                and parsed.username is None
+                and not re.search(r"[?#\\\s\x00-\x1f\x7f]", url)
+            )
+            _ = parsed.port  # 非法端口不能留到运行时才报错
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ValueError(f"{path}.base_url 应为不含凭据、查询或片段的 HTTP(S) 地址")
+        key = entry.get("api_key", "")
+        if not isinstance(key, str):
+            raise ValueError(f"{path}.api_key 应为字符串")
+        models = entry.get("models")
+        if not isinstance(models, list):
+            raise ValueError(f"{path}.models 应为模型名列表")
+        names = [_catalog_text(m, f"{path}.models") for m in models]
+        if len(names) != len(set(names)):
+            raise ValueError(f"{path}.models 有重复模型名")
+        by_name[name] = set(names)
+        catalog.append({"name": name, "base_url": url, "api_key": key, "models": names})
+
+    if not isinstance(pools, dict):
+        raise ValueError("llm.role_pools 应为角色到引用列表的映射")
+    role_pools = {}
+    for role, refs in pools.items():
+        role = _catalog_text(role, "llm.role_pools 角色名")
+        path = f"llm.role_pools.{role}"
+        if role in role_pools or not isinstance(refs, list) or not refs:
+            raise ValueError(f"{path} 应为唯一角色的非空模型引用列表；跟随回退链请省略该角色")
+        seen = set()
+        clean = []
+        for ref in refs:
+            if not isinstance(ref, dict) or ref.keys() != {"provider", "model"}:
+                raise ValueError(f"{path} 每项必须含 provider 和 model")
+            provider = _catalog_text(ref["provider"], f"{path}.provider")
+            model = _catalog_text(ref["model"], f"{path}.model")
+            if model not in by_name.get(provider, set()):
+                raise ValueError(f"{path} 引用了未在提供商中定义的模型")
+            if (provider, model) in seen:
+                raise ValueError(f"{path} 含重复的提供商模型引用")
+            seen.add((provider, model))
+            clean.append({"provider": provider, "model": model})
+        role_pools[role] = clean
+    if "chat" not in role_pools:
+        raise ValueError("llm.role_pools.chat 必须配置至少一个模型")
+    return catalog, role_pools
+
+
 @dataclass
 class LLMConfig:
     """OpenAI 兼容接口配置。
 
-    角色表有两代写法，同时兼容：
+    三层写法：``providers`` 定义独立端点及其模型，``role_pools`` 的每项
+    ``{provider, model}`` 选择同一提供商里的上游模型。旧的角色表仍兼容：
 
     - ``models``：可扩展映射 ``{角色: 模型名}``，例如 ``fast: 小模型``；
       值也可以写成按优先级排的模型名列表（模型池），例如
@@ -92,7 +176,7 @@ class LLMConfig:
     """
 
     base_url: str = "https://api.openai.com/v1"
-    api_key: str = ""
+    api_key: str = field(default="", repr=False)
     chat_model: str = DEFAULT_CHAT_MODEL
     extract_model: str | None = None
     consolidate_model: str | None = None
@@ -111,6 +195,8 @@ class LLMConfig:
     # 全局默认策略；每角色可用 ``model_strategies`` 覆盖
     model_strategy: str = DEFAULT_MODEL_STRATEGY
     model_strategies: dict[str, str] = field(default_factory=dict)
+    providers: list[dict[str, Any]] | None = field(default=None, repr=False)
+    role_pools: dict[str, list[dict[str, str]]] | None = None
 
     def __post_init__(self) -> None:
         """归一化模型池与策略：模型名去空白、去重、空列表视为未配置。
@@ -156,6 +242,16 @@ class LLMConfig:
             strategies[role] = name
         self.model_strategies = strategies
 
+        if self.providers is not None or self.role_pools is not None:
+            self.providers, self.role_pools = _parse_catalog(self.providers, self.role_pools)
+            # 旧模块只读模型名（如视觉开关）；连接实际永远按完整引用选择。
+            self.models = {}
+            for role, refs in self.role_pools.items():
+                names = [ref["model"] for ref in refs]
+                self.models[role] = names[0] if len(names) == 1 else names
+            first = self.targets_for("chat")[0]
+            self.chat_model, self.base_url, self.api_key = first.model, first.base_url, first.api_key
+
     def _explicit_models(self, role: str) -> list[str] | None:
         """只看这个角色自己配没配，不沿着回退链走。"""
         mapped = self.models.get(role)
@@ -174,52 +270,42 @@ class LLMConfig:
             value = None
         return [value] if value else None
 
-    def _explicit_model(self, role: str) -> str | None:
-        """只看这个角色自己配没配，返回首选模型。"""
-        models = self._explicit_models(role)
-        return models[0] if models else None
+    def catalog_view(self) -> tuple[list[dict], dict[str, list[dict]]]:
+        """导出可独立编辑的三层结构（含凭据，不能直接发给前端）。旧配置只在内存迁移。"""
+        if self.providers is not None:
+            return deepcopy(self.providers), deepcopy(self.role_pools)
+        pools = {}
+        names = {}
+        for role in dict.fromkeys((*MODEL_ROLES, *self.models)):
+            models = self._explicit_models(role) or ([DEFAULT_CHAT_MODEL] if role == "chat" else [])
+            if models:
+                pools[role] = [{"provider": "default", "model": m} for m in models]
+                names.update(dict.fromkeys(models))
+        return [{"name": "default", "base_url": self.base_url, "api_key": self.api_key,
+                 "models": list(names)}], pools
 
-    def _resolve_model(self, role: str, seen: set[str]) -> str | None:
-        if role in seen:
-            return None
-        seen.add(role)
-        explicit = self._explicit_model(role)
-        if explicit:
-            return explicit
-        # 预置角色按表回退；未知角色一律回退 chat
-        for fallback in ROLE_FALLBACKS.get(role, ("chat",)):
-            resolved = self._resolve_model(fallback, seen)
-            if resolved:
-                return resolved
-        return None
-
-    def _resolve_models(self, role: str, seen: set[str]) -> list[str] | None:
-        """沿回退链取整个模型池；顺序与单个模型解析规则一致。"""
-        if role in seen:
-            return None
-        seen.add(role)
-        explicit = self._explicit_models(role)
-        if explicit:
-            return explicit
-        for fallback in ROLE_FALLBACKS.get(role, ("chat",)):
-            resolved = self._resolve_models(fallback, seen)
-            if resolved:
-                return resolved
-        return None
+    def targets_for(self, role: str = "chat") -> list[ModelTarget]:
+        """解析回退链上的第一个完整池；同名但属于不同端点的模型不合并。"""
+        name = _role_name(role)
+        roles = (name, *ROLE_FALLBACKS.get(name, ("chat",)))
+        if self.role_pools is not None:
+            providers = {p["name"]: p for p in self.providers}
+            refs = next(self.role_pools[r] for r in roles if r in self.role_pools)
+            return [ModelTarget(ref["provider"], ref["model"], providers[ref["provider"]]["base_url"],
+                                providers[ref["provider"]]["api_key"]) for ref in refs]
+        for r in roles:
+            explicit = self._explicit_models(r)
+            if explicit:
+                return [ModelTarget("default", model, self.base_url, self.api_key) for model in explicit]
+        return [ModelTarget("default", DEFAULT_CHAT_MODEL, self.base_url, self.api_key)]
 
     def model_for(self, role: str = "chat") -> str:
-        """按用途取首选模型：精确角色 → 回退链 → chat → 默认模型。
-
-        记忆 v2 的 ``gate`` 走 ``gate_model``；``distill`` 未配置时沿用
-        ``consolidate`` 的回退链（归纳模型 → chat）。
-        """
-        name = _role_name(role)
-        return self._resolve_model(name, set()) or self.chat_model or DEFAULT_CHAT_MODEL
+        """供旧调用方读取首选上游模型名。"""
+        return self.targets_for(role)[0].model
 
     def models_for(self, role: str = "chat") -> list[str]:
-        """按用途取按优先级排的模型池；未配置时回退到单个 ``model_for``。"""
-        name = _role_name(role)
-        return self._resolve_models(name, set()) or [self.model_for(name)]
+        """供旧调用方读取模型名；实际请求使用 targets_for 保留提供商。"""
+        return [target.model for target in self.targets_for(role)]
 
     def strategy_for(self, role: str = "chat") -> str:
         """这个角色该用哪种模型池策略：每角色覆盖优先，否则全局默认。"""
@@ -1266,12 +1352,29 @@ class Config:
         if not isinstance(data, dict):
             raise ValueError("配置的顶层必须是键值对（YAML mapping）")
         # 授权标识必须是字面值；不能把环境里的密钥展开到白名单并由设置页回显。
-        expanded = {key: value if key == "computer" else _expand_env(value) for key, value in data.items()}
+        # 模型目录中的名称会回显给 WebUI，只展开连接字段，池引用保持字面值。
+        expanded = {key: value if key in ("computer", "llm") else _expand_env(value) for key, value in data.items()}
+        llm = data.get("llm")
+        if isinstance(llm, dict):
+            section = {k: v if k in ("providers", "role_pools") else _expand_env(v) for k, v in llm.items()}
+            if isinstance(section.get("providers"), list):
+                section["providers"] = [
+                    {k: _expand_env(v) if k in ("api_key", "base_url") else v for k, v in p.items()}
+                    if isinstance(p, dict) else p for p in section["providers"]
+                ]
+            expanded["llm"] = section
         return cls.from_dict(expanded)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Config":
-        llm = LLMConfig(**{k: v for k, v in (data.get("llm") or {}).items() if _has(LLMConfig, k)})
+        section = data.get("llm") or {}
+        if not isinstance(section, dict):
+            raise ValueError("llm 应为配置对象")
+        if ("providers" in section or "role_pools" in section) and (
+            section.get("providers") is None or section.get("role_pools") is None
+        ):
+            raise ValueError("llm.providers 与 llm.role_pools 必须同时配置且不能为 null")
+        llm = LLMConfig(**{k: v for k, v in section.items() if _has(LLMConfig, k)})
         memory = _load_memory(data.get("memory") or {})
         search = _load_search(data.get("search") or {})
         voice = VoiceConfig(

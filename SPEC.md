@@ -159,7 +159,8 @@ SnowLuma 适配器（OneBot v11）：
 
 单个 YAML（`config.yaml`，仓库给 `config.example.yaml`）：
 
-- llm：base_url、api_key、chat_model、extract_model、consolidate_model（后两者缺省跟随 chat）；`models` 按角色配模型，值可以是单个模型名或按优先级排的模型名列表（模型池）；`model_strategy`（`failover` / `round_robin` / `random`）是全局默认策略，`model_strategies` 按角色覆盖。故障转移只在超时 / 连接错误 / 429 / 5xx 时切下一个，400/401/403/404 直接报；单模型时行为与旧版一致
+- llm 分三层：`providers` 列表中每个提供商有唯一 `name`、独立 `base_url` / `api_key` 和 `models` 上游模型名目录；`role_pools` 按角色列出有序 `{provider, model}` 引用，允许跨提供商和同名模型，不接受悬空引用。新格式必须指定非空 `chat` 池；其它角色沿原回退链取整个池（如 `distill → consolidate → chat`）。`model_strategy`（`failover` / `round_robin` / `random`）是默认策略，`model_strategies` 按调用角色覆盖。每次尝试使用该候选自己的端点、密钥及上游模型名。超时、连接错误、408 / 429 / 5xx 等可重试故障可切下一个，普通 400/401/403/404 直接报错；单候选保留旧重试语义。
+- 兼容：仍接受全局 `base_url` / `api_key`、`chat_model` / `extract_model` / `consolidate_model` / `gate_model` 以及 `models: {角色: 模型名或列表}`。旧格式在 WebUI 中映射到 `default` 提供商，不在启动时改写文件。保存模型目录和角色池时一并校验，密钥不回显；同名同地址且未提交密钥时保留磁盘原文，包括 `${ENV_VAR}`。
 - persona：人格文件路径（默认 `data/SOUL.md`，给一个默认 Ruben 人格示例）
 - memory：extract_every_n、inject_limit、consolidate_new_threshold、consolidate_interval_hours
 - chat：history_size、历史上下文参数；reply：多段回复的段数上限与段间打字延迟
@@ -205,7 +206,7 @@ SnowLuma 适配器（OneBot v11）：
 
 ### 入库图片与裁定时限
 
-- 个人隐私档位为 `normal` 的真实用户在群聊或私聊发图片、贴纸时，随原始流水入库即尝试记录画面；这里的“正常”不是全局 `privacy.enabled` 开关，也不依赖查看概率、表情收集开关或显式配置 `llm.models.vision`。适配器已有有效说明时直接使用；其余走 `vision` 角色（可回退到 `chat`），只记可见内容，不凭文件名或表情 ID 猜。`visual_text` 与发言正文分开，私聊不会写入群实体账；全局隐私开关只决定跨场合读取是否经过统一审查。
+- 个人隐私档位为 `normal` 的真实用户在群聊或私聊发图片、贴纸时，随原始流水入库即尝试记录画面；这里的“正常”不是全局 `privacy.enabled` 开关，也不依赖查看概率、表情收集开关或显式配置 `vision` 池。适配器已有有效说明时直接使用；其余走 `vision` 角色（可回退到 `chat`），只记可见内容，不凭文件名或表情 ID 猜。`visual_text` 与发言正文分开，私聊不会写入群实体账；全局隐私开关只决定跨场合读取是否经过统一审查。
 - 同一批次及其同会话引用的图共用从批首算起的 **5 秒**视觉预算，扣除已用防抖时间；不是每张再等 5 秒。超时按已经就绪的文字裁定，后台继续回写。历史缺失流水不补算，贴纸库原有回填独立保留。
 - `GET /api/health` 的 `vision.success` / `failed` 按图片段计，`timeout` 按一次裁定中未等到的流水数计；迟到的成功会同时反映在 `success` 和此前的 `timeout` 中。计数重启清零，独立 WebUI 未挂 bot 时 `vision` 为 `null`。失败 warning 含 `raw_id` 和失败阶段；模型描述回写成功的日志含从入库排队起算的 `elapsed_ms`。
 
@@ -228,7 +229,7 @@ SnowLuma 适配器（OneBot v11）：
 ## WebUI（当前已实现）
 
 - 技术：FastAPI + uvicorn；前端不用构建链，使用原生 HTML/CSS/JS 单页，静态文件由 FastAPI 直接托管。
-- 页面：概览、机器人/人设、模型、记忆、人物、群组与决策、插件市场、日志、设置和关于。模型页支持各角色模型池与 `failover` / `round_robin` / `random` 策略编辑并热生效；人设页支持五文件编辑、热加载和预览；插件页支持索引发现、安装/更新/卸载/启停、已安装插件配置和逐项权限授权（`GET /api/plugins` 返回声明与授权对照，`PUT /api/plugins/{name}/permissions` 即时改授权）；情绪卡片与相关只读 API 已接入。
+- 页面：概览、机器人/人设、模型、记忆、人物、群组与决策、插件市场、日志、设置和关于。模型页可管理提供商和各自的模型、选择与排序各角色的跨提供商候选，支持 `failover` / `round_robin` / `random` 策略编辑并热生效；人设页支持五文件编辑、热加载和预览；插件页支持索引发现、安装/更新/卸载/启停、已安装插件配置和逐项权限授权（`GET /api/plugins` 返回声明与授权对照，`PUT /api/plugins/{name}/permissions` 即时改授权）；情绪卡片与相关只读 API 已接入。
 - 设置之后的「关于」页通过鉴权只读接口 `GET /api/about` 展示版本、项目仓库和提交链接、MIT 许可全文，以及当前模型与角色模型池、适配器状态和插件计数；不返回密钥。提交优先读取部署盖戳 `.deploy-commit`，其次读取项目的 Git HEAD，两者均不可用时显示未知和原因。仅点击「检查更新」时调用 `GET /api/about/update` 比对 GitHub `main` 的提交，超时 10 秒；失败只在按钮旁提示，不影响其余内容，也不执行升级。
 - 群组页查看会话决策日志、群定位与手写备注；群定位注入遵循手写优先、自归纳其次，两者都空或私聊时不注入。
 - 移动端使用导航抽屉；页面切换优先使用路由缓存并隔离迟到响应。登录签名密钥持久化在数据库目录，重启后有效会话可继续验证。

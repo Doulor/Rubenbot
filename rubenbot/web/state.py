@@ -496,11 +496,17 @@ def save_config_text(path: str | Path, text: str, *, backup: bool = True) -> Pat
     try:
         data = yaml.safe_load(text)
     except yaml.YAMLError as exc:
-        raise ValueError(f"YAML 语法错误：{exc}") from exc
+        # 解析器的异常摘要带出错行原文，不能把凭据行送回浏览器。
+        mark = getattr(exc, "problem_mark", None)
+        location = f"（第 {mark.line + 1} 行，第 {mark.column + 1} 列）" if mark else ""
+        raise ValueError(f"YAML 语法错误{location}") from exc
     if data is not None and not isinstance(data, dict):
         raise ValueError("配置的顶层必须是键值对（YAML mapping）")
     if data and "computer" in data:
         ComputerConfig.parse(data["computer"])
+    llm = data.get("llm") if data else None
+    if isinstance(llm, dict) and ("providers" in llm or "role_pools" in llm):
+        Config.from_raw({"llm": llm})
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     backup_path: Path | None = None

@@ -3500,209 +3500,211 @@ const MODEL_POOL_STRATEGY_LABELS = {
   random: "随机",
 };
 
-/** 配置里的模型值可能是单个字符串（旧写法）或模型列表（模型池）。 */
-function modelPoolValue(value) {
-  if (Array.isArray(value)) return value.filter((item) => typeof item === "string");
-  if (typeof value === "string" && value.trim()) return [value];
-  return [];
-}
-
-/** 写回模型池：0 个删掉角色、单个非空模型写回字符串（保持旧格式）、其余写列表。
- * 单个空名也写成列表 ``[""]``，让后端按「模型名不能为空」报错，而不是被
- * 当成「这个角色没配」悄悄清掉。
- */
-function setModelPool(draft, role, list) {
-  draft.llm = draft.llm || {};
-  const models = draft.llm.models && typeof draft.llm.models === "object" ? { ...draft.llm.models } : {};
-  const cleaned = list.filter((item) => item !== undefined && item !== null);
-  if (cleaned.length === 0) delete models[role];
-  else if (cleaned.length === 1 && cleaned[0].trim()) models[role] = cleaned[0];
-  else models[role] = cleaned;
-  draft.llm.models = models;
-}
-
-/** 模型池编辑器：每角色一条模型列表（可增删、调顺序）与策略覆盖。 */
+/** 提供商名称与上游模型名共同标识一个池成员；不解析模型名中的斜线。 */
 function modelsEditor(draft) {
-  const ROLES = [
-    ["chat", "对话"],
-    ["fast", "快速档（小任务）"],
-    ["summary", "滚动摘要"],
-    ["vision", "看图"],
-    ["gate", "分寸审查"],
-    ["distill", "画像提炼"],
-  ];
-  draft.llm = draft.llm || {};
-  const models = () => (draft.llm.models && typeof draft.llm.models === "object" ? draft.llm.models : {});
-  const strategies = () =>
-    draft.llm.model_strategies && typeof draft.llm.model_strategies === "object"
-      ? draft.llm.model_strategies
-      : {};
-  const listFor = (role) => modelPoolValue(models()[role]);
+  const llm = draft.llm;
+  const providers = llm.providers;
+  const pools = Object.assign(Object.create(null), llm.role_pools);
+  const strategies = Object.assign(Object.create(null), llm.model_strategies);
+  llm.role_pools = pools;
+  llm.model_strategies = strategies;
+  const labels = new Map(Object.entries({
+    chat: "对话", vision: "看图", fast: "快速任务", summary: "滚动摘要",
+    extract: "记忆抽取", consolidate: "记忆归纳", gate: "分寸审查", distill: "画像提炼",
+  }));
+  const roles = new Set([...labels.keys(), ...Object.keys(pools), ...Object.keys(strategies)]);
+  const providerHost = h("div", { class: "model-pool-list" });
+  const roleHost = h("div", { class: "model-pool-list" });
+  const addButton = (label, fn) => h("button", {
+    class: "btn btn-sm btn-ghost", type: "button", onclick: fn,
+  }, icon("plus"), label);
+  const action = (label, glyph, fn, disabled = false) => h("button", {
+    class: `icon-btn-sm${glyph === "trash" ? " danger" : ""}`, type: "button",
+    "aria-label": label, title: label, disabled, onclick: fn,
+  }, icon(glyph === "up" || glyph === "down" ? "caret" : glyph, `icon ${glyph}`));
 
-  const body = h("div", { style: { display: "grid", gap: "14px" } });
+  function addText(label, placeholder, commit) {
+    const input = h("input", { class: "input mono", "aria-label": label, placeholder });
+    const add = () => { if (input.value.trim() && commit(input.value.trim())) input.value = ""; };
+    input.addEventListener("keydown", event => {
+      if (event.key === "Enter" && !event.isComposing) { event.preventDefault(); add(); }
+    });
+    return h("div", { class: "model-pool-add" }, input, addButton(label, add));
+  }
 
-  function roleRow(role, label) {
-    const list = listFor(role);
-    const strategy = strategies()[role] || "";
-    const rows = list.map((model, index) =>
-      h(
-        "div",
-        { class: "model-pool-row", dataset: { motionKey: `${role}-${index}`, role, index: String(index) } },
-        h("span", { class: "model-pool-order" }, String(index + 1)),
-        h("input", {
-          class: "input mono",
-          type: "text",
-          value: model,
-          "aria-label": `${label} 第 ${index + 1} 个模型`,
-          oninput: (event) => {
-            const next = listFor(role).slice();
-            next[index] = event.target.value;
-            setModelPool(draft, role, next);
+  function references(name, model) {
+    return Object.entries(pools).flatMap(([role, refs]) => refs
+      .filter(ref => ref.provider === name && (model === undefined || ref.model === model))
+      .map(ref => ({ role, ref })));
+  }
+  function canRemove(name, model) {
+    const used = references(name, model);
+    if (used.length) toast(`请先从角色池移除引用：${[...new Set(used.map(r => r.role))].join("、")}`, "error");
+    return !used.length;
+  }
+
+  function providerRow(provider) {
+    const originalName = provider.name;
+    const keyInput = h("input", { class: "input", type: "password", autocomplete: "new-password",
+      "aria-label": "API Key", value: provider.api_key || "",
+      placeholder: provider.has_api_key ? "已设置，留空保留" : "未设置，可留空",
+      oninput: event => {
+        if (event.target.value) provider.api_key = event.target.value;
+        else delete provider.api_key;
+        updateKeyAction();
+      },
+    });
+    const clearKey = h("button", { class: "btn btn-sm btn-ghost", type: "button", onclick: () => {
+      if (provider.api_key === "") delete provider.api_key;
+      else provider.api_key = "";
+      keyInput.value = "";
+      updateKeyAction();
+    } });
+    function updateKeyAction() {
+      clearKey.hidden = !provider.has_api_key;
+      clearKey.textContent = provider.api_key === "" ? "撤销清除" : "清除密钥";
+      keyInput.placeholder = provider.api_key === "" ? "保存后清除密钥" :
+        provider.has_api_key ? "已设置，留空保留" : "未设置，可留空";
+    }
+    updateKeyAction();
+    const deauthorize = () => {
+      provider.has_api_key = false;
+      updateKeyAction();
+      keyInput.placeholder = "名称或地址变更，请按需重新填写";
+    };
+    function rename(event) {
+      const name = event.target.value.trim();
+      if (!name || providers.some(other => other !== provider && other.name === name)) {
+        event.target.value = provider.name;
+        toast("提供商名称不能为空或重复", "error");
+        return;
+      }
+      event.target.value = name;
+      if (name === provider.name) return;
+      for (const { ref } of references(provider.name)) ref.provider = name;
+      provider.name = name;
+      deauthorize();
+      renderRoles();
+    }
+    const field = (label, control) => h("label", { class: "settings-field" },
+      h("span", { class: "field-label" }, label), control);
+    const modelRows = h("div", { class: "model-pool-list" });
+    function renderModels() {
+      modelRows.replaceChildren(...provider.models.map((model, index) => h("div", { class: "model-pool-row" },
+        h("input", { class: "input mono", value: model, "aria-label": "上游模型名",
+          onchange: event => {
+            const name = event.target.value.trim();
+            if (!name || provider.models.some((item, i) => i !== index && item === name)) {
+              event.target.value = provider.models[index]; toast("模型名不能为空或在同一提供商内重复", "error"); return;
+            }
+            event.target.value = name;
+            for (const { ref } of references(provider.name, provider.models[index])) ref.model = name;
+            provider.models[index] = name;
+            renderRoles();
           },
         }),
-        h(
-          "button",
-          {
-            class: "icon-btn-sm",
-            type: "button",
-            title: "上移",
-            "aria-label": `${label} 第 ${index + 1} 个模型上移`,
-            disabled: index === 0,
-            onclick: () => {
-              const next = listFor(role).slice();
-              [next[index - 1], next[index]] = [next[index], next[index - 1]];
-              setModelPool(draft, role, next);
-              render();
-            },
-          },
-          icon("caret", "icon up")
-        ),
-        h(
-          "button",
-          {
-            class: "icon-btn-sm",
-            type: "button",
-            title: "下移",
-            "aria-label": `${label} 第 ${index + 1} 个模型下移`,
-            disabled: index === list.length - 1,
-            onclick: () => {
-              const next = listFor(role).slice();
-              [next[index + 1], next[index]] = [next[index], next[index + 1]];
-              setModelPool(draft, role, next);
-              render();
-            },
-          },
-          icon("caret", "icon down")
-        ),
-        h(
-          "button",
-          {
-            class: "icon-btn-sm danger",
-            type: "button",
-            title: "删除",
-            "aria-label": `删除 ${label} 的第 ${index + 1} 个模型`,
-            onclick: () => {
-              const next = listFor(role).slice();
-              next.splice(index, 1);
-              setModelPool(draft, role, next);
-              render();
-            },
-          },
-          icon("trash")
-        )
-      )
-    );
-
-    const input = h("input", {
-      class: "input mono",
-      type: "text",
-      placeholder: list.length ? "再加一个备选模型" : "留空跟随回退链；填模型名启用模型池",
-      "aria-label": `${label} 新增模型`,
-    });
-    const add = () => {
-      const value = input.value.trim();
-      if (!value) {
-        toast("先填模型名再添加", "error");
-        return;
-      }
-      if (listFor(role).includes(value)) {
-        toast("这个模型已经在列表里了", "error");
-        return;
-      }
-      setModelPool(draft, role, listFor(role).concat(value));
-      render();
-    };
-    input.addEventListener("keydown", (event) => {
-      if (event.key === "Enter") {
-        event.preventDefault();
-        add();
-      }
-    });
-
-    return h(
-      "div",
-      { class: "model-pool-item", dataset: { role } },
-      h(
-        "div",
-        { class: "model-pool-head" },
-        h("span", { class: "field-label" }, `${label}（${role}）`),
-        selectField(
-          strategy,
-          [
-            { value: "", label: "跟随全局策略" },
-            ...MODEL_POOL_STRATEGIES.map((name) => ({
-              value: name,
-              label: `${name}（${MODEL_POOL_STRATEGY_LABELS[name]}）`,
-            })),
-          ],
-          (value) => {
-            draft.llm = draft.llm || {};
-            const next = { ...strategies() };
-            if (value) next[role] = value;
-            else delete next[role];
-            draft.llm.model_strategies = next;
-          }
-        )
-      ),
-      h(
-        "div",
-        { class: "model-pool-list" },
-        rows.length
-          ? rows
-          : [h("div", { class: "field-hint" }, "未配置：跟随回退链（未配置的角色回退到对话模型）。")]
-      ),
-      h(
-        "div",
-        { class: "model-pool-add" },
-        input,
-        h("button", { class: "btn btn-sm btn-ghost", type: "button", onclick: add }, icon("plus"), "添加")
-      )
-  );
-  }
-
-  function render() {
-    const extraRoles = Object.keys(models()).filter((role) => !ROLES.some(([name]) => name === role));
-    body.replaceChildren(
-      ...ROLES.map(([role, label]) => roleRow(role, label)),
-      ...extraRoles.map((role) => roleRow(role, role))
+        action("删除此上游模型", "trash", () => {
+          if (!canRemove(provider.name, provider.models[index])) return;
+          provider.models.splice(index, 1); renderModels(); renderRoles();
+        })
+      )));
+    }
+    renderModels();
+    return h("article", { class: "model-pool-item" },
+      h("div", { class: "model-pool-head" },
+        field("提供商名称", h("input", { class: "input", value: originalName, onchange: rename })),
+        action("删除此提供商", "trash", () => {
+          if (!canRemove(provider.name)) return;
+          providers.splice(providers.indexOf(provider), 1); renderProviders(); renderRoles();
+        })),
+      h("div", { class: "settings-fields" },
+        field("接口地址", h("input", { class: "input mono", type: "url", value: provider.base_url,
+          placeholder: "https://api.example.com/v1", oninput: event => {
+            if (event.target.value.trim() !== provider.base_url) deauthorize();
+            provider.base_url = event.target.value.trim();
+          } })), h("div", { class: "settings-field" }, field("API Key", keyInput), clearKey)),
+      h("span", { class: "field-label" }, "上游模型名"), modelRows,
+      addText("添加模型", "输入此接口接受的模型名", name => {
+        if (provider.models.includes(name)) { toast("此提供商已有这个模型", "error"); return false; }
+        provider.models.push(name); renderModels(); renderRoles(); return true;
+      })
     );
   }
+  function renderProviders() { providerHost.replaceChildren(...providers.map(providerRow)); }
 
-  render();
-  return h(
-    "div",
-    { style: { display: "grid", gap: "12px" } },
-    body,
-    h(
-      "span",
-      { class: "field-hint" },
-      "每个角色的模型按顺序排：故障转移遇超时/限流/5xx 自动试下一个；" +
-        "轮询每次按顺序换起点；随机每次均匀挑一个。只有一个模型时三种策略等价，" +
-        "配了模型池的角色优先于上面的旧模型字段；空模型名与空列表不允许保存。"
-    )
+  function renderRoles() {
+    const options = providers.flatMap(p => p.models.map(model => ({
+      provider: p.name, model, value: JSON.stringify([p.name, model]), label: `${p.name} · ${model}`,
+    })));
+    roleHost.replaceChildren(...[...roles].map(role => {
+      const refs = pools[role] || [];
+      const key = ref => JSON.stringify([ref.provider, ref.model]);
+      const available = options.filter(opt => !refs.some(ref => key(ref) === opt.value));
+      const picker = (value, choices, title, change) => {
+        const select = selectField(value, choices, change);
+        select.setAttribute("aria-label", title); return select;
+      };
+      const strategy = picker(strategies[role] || "", [
+        { value: "", label: "跟随默认策略" }, ...MODEL_POOL_STRATEGIES.map(name => ({
+          value: name, label: MODEL_POOL_STRATEGY_LABELS[name],
+        })),
+      ], `${role} 调用策略`, name => { if (name) strategies[role] = name; else delete strategies[role]; });
+      const move = (i, j) => { [refs[i], refs[j]] = [refs[j], refs[i]]; renderRoles(); };
+      const asRef = value => { const [provider, model] = JSON.parse(value); return { provider, model }; };
+      return h("article", { class: "model-pool-item", dataset: { role } },
+        h("div", { class: "model-pool-head" }, h("strong", { class: "field-label" },
+          labels.has(role) ? `${labels.get(role)}（${role}）` : role), strategy,
+          labels.has(role) ? null : action(`删除自定义角色 ${role}`, "trash", () => {
+            roles.delete(role); delete pools[role]; delete strategies[role]; renderRoles();
+          })),
+        refs.length ? refs.map((ref, i) => h("div", { class: "model-pool-row" },
+          h("span", { class: "model-pool-order" }, String(i + 1)),
+          picker(key(ref), options.filter(opt => opt.value === key(ref) || available.includes(opt)),
+            `${role} 第 ${i + 1} 个模型`, value => { refs[i] = asRef(value); renderRoles(); }),
+          action(`上移 ${role} 第 ${i + 1} 项`, "up", () => move(i, i - 1), i === 0),
+          action(`下移 ${role} 第 ${i + 1} 项`, "down", () => move(i, i + 1), i === refs.length - 1),
+          action(`删除 ${role} 第 ${i + 1} 项`, "trash", () => {
+            refs.splice(i, 1); if (!refs.length) delete pools[role]; renderRoles();
+          }, role === "chat" && refs.length === 1)
+        )) : h("span", { class: "field-hint" }, role === "chat" ? "请至少选择一个对话模型。" :
+          role === "distill" ? "跟随记忆归纳模型池，未配置时跟随对话。" : "未单独配置，跟随对话模型池。"),
+        available.length ? picker("", [{ value: "", label: "＋ 选择模型加入池" }, ...available], `${role} 新增模型`, value => {
+          if (value) { pools[role] = [...refs, asRef(value)]; renderRoles(); }
+        }) : h("span", { class: "field-hint" }, "暂无其他可选模型。")
+      );
+    }));
+  }
+  renderProviders(); renderRoles();
+  return h("div", { class: "model-layer-editor" },
+    h("h3", {}, "提供商与模型"),
+    h("span", { class: "field-hint" }, "每个提供商使用独立接口和密钥。改名或修改接口地址不会沿用已保存的密钥。"),
+    providerHost, addButton("添加提供商", () => {
+      let n = providers.length + 1;
+      while (providers.some(p => p.name === `provider-${n}`)) n++;
+      providers.push({ name: `provider-${n}`, base_url: "", models: [] }); renderProviders();
+    }),
+    h("h3", {}, "角色模型池"),
+    h("span", { class: "field-hint" }, "优先级由上到下；遇到超时、限流或服务端故障时尝试下一项。轮询和随机策略改变每次调用的起点。"),
+    roleHost, addText("添加自定义角色", "输入插件或模块的角色名", role => {
+      if (roles.has(role)) { toast("角色已存在", "error"); return false; }
+      roles.add(role); renderRoles(); return true;
+    })
   );
 }
 
+/** 不提交当前页之外的模型配置，避免保存其他设置时顺带迁移旧格式。 */
+function settingsPayload(draft, group) {
+  if (group !== "models") {
+    const { llm, ...other } = draft;
+    return other;
+  }
+  const { providers, role_pools, model_strategy, model_strategies, temperature, chat_temperature,
+    chat_frequency_penalty, timeout, max_retries } = draft.llm;
+  if (!role_pools.chat?.length) throw new Error("对话角色至少要选一个模型");
+  return { llm: { providers: providers.map(({ name, base_url, models, api_key }) => (
+    { name, base_url, models, ...(api_key !== undefined ? { api_key } : {}) }
+  )), role_pools, model_strategy, model_strategies, temperature, chat_temperature, chat_frequency_penalty, timeout, max_retries } };
+}
 
 /** 一个表单项：标签 + 控件 + 说明。 */
 function settingsField(def, draft) {
@@ -4172,22 +4174,21 @@ function settingsMenu(layout, group, page) {
 function settingsCardSpecs(draft, secrets, pluginsAvailable) {
   return [
     {
-      path: "llm.base_url",
-      node: card("模型与接口", {
-        hint: "OpenAI 兼容接口",
+      path: "llm.providers",
+      node: card("模型配置", {
+        hint: "从提供商目录组装跨接口的角色池",
+        body: modelsEditor(draft),
+      }),
+    },
+    {
+      path: "llm.temperature",
+      node: card("调用参数", {
+        hint: "默认策略与生成参数",
         body: fieldGrid(
           [
-            { path: "llm.base_url", label: "接口地址", hint: "例如 https://api.deepseek.com/v1", wide: true, mono: true },
-            {
-              path: "llm.api_key",
-              label: "API Key",
-              kind: "password",
-              hint: "留空表示保留原值；也可以写成 ${ENV_VAR} 从环境变量读取",
-              secretSet: Boolean(secrets["llm.api_key"]),
-            },
-            { path: "llm.chat_model", label: "对话模型", hint: "回复消息用的模型", mono: true },
-            { path: "llm.extract_model", label: "抽取模型", hint: "记忆抽取用；留空跟随对话模型", mono: true },
-            { path: "llm.consolidate_model", label: "归纳模型", hint: "记忆归纳用；留空跟随对话模型", mono: true },
+            { path: "llm.model_strategy", label: "默认调用策略", kind: "select",
+              options: MODEL_POOL_STRATEGIES.map(value => ({ value, label: MODEL_POOL_STRATEGY_LABELS[value] })),
+              hint: "角色未指定策略时使用" },
             { path: "llm.temperature", label: "默认温度", kind: "number", step: "0.05", min: 0, max: 2, hint: "非聊天角色的默认温度；0–2" },
             { path: "llm.chat_temperature", label: "聊天温度", kind: "number", step: "0.05", min: 0, max: 2, hint: "留空沿用默认温度；聊天角色单独生效" },
             { path: "llm.chat_frequency_penalty", label: "聊天重复惩罚", kind: "number", step: "0.05", min: -2, max: 2, hint: "聊天角色 frequency_penalty，默认 0.3" },
@@ -4195,33 +4196,6 @@ function settingsCardSpecs(draft, secrets, pluginsAvailable) {
             { path: "llm.max_retries", label: "重试次数", kind: "number", step: "1", min: 0, max: 10, hint: "失败后的重试次数" },
           ],
           draft
-        ),
-      }),
-    },
-    {
-      path: "llm.models",
-      node: card("模型池与审查模型", {
-        hint: "每个角色可以配多个模型，按策略调用；配了就用，没配回退对话模型",
-        body: h(
-          "div",
-          { style: { display: "grid", gap: "16px" } },
-          fieldGrid(
-            [
-              { path: "llm.gate_model", label: "分寸审查模型", hint: "记忆分寸审查用；留空跟随对话模型", mono: true },
-              {
-                path: "llm.model_strategy",
-                label: "默认调用策略",
-                kind: "select",
-                options: MODEL_POOL_STRATEGIES.map((name) => ({
-                  value: name,
-                  label: `${name}（${MODEL_POOL_STRATEGY_LABELS[name]}）`,
-                })),
-                hint: "模型池的默认策略；每个角色可以单独覆盖",
-              },
-            ],
-            draft
-          ),
-          modelsEditor(draft)
         ),
       }),
     },
@@ -4861,7 +4835,7 @@ function systemExtras(data) {
 
   // 整份文件可能在命令、URL、参数或任意请求头中含凭据，不能安全回显。
   if (data.raw_hidden) return [appearance, card("高级：原始 YAML", {
-    body: h("p", { class: "field-hint" }, "为避免暴露连接凭据，含 MCP 服务器或无法解析的配置不显示原文。请使用设置表单，或在本机直接编辑文件。"),
+    body: h("p", { class: "field-hint" }, "为避免暴露连接凭据，包含受保护的连接配置或无法解析的 YAML 时不显示原文。请使用设置表单，或在本机直接编辑文件。"),
   })];
   // 原始 YAML：折叠放在底部，保留旧编辑方式
   const textarea = h("textarea", {
@@ -5021,7 +4995,7 @@ async function renderSettingsGroup(view, groupId, sub, entry = {}) {
     errorBox.hidden = true;
     noticeBox.hidden = true;
     try {
-      const result = await api.put("/api/config", { config: draft });
+      const result = await api.put("/api/config", { config: settingsPayload(draft, group.id) });
       toast("配置已保存");
       if (result.relogin) {
         // 口令变了，当前会话立即作废；重新登录后再看结果

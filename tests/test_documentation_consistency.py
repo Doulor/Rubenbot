@@ -50,6 +50,10 @@ def test_shipped_config_example_loads_with_current_defaults():
     assert config.reply.segment_delay_min_ms == pytest.approx(1500)
     assert config.reply.segment_delay_max_ms == pytest.approx(4000)
     assert config.llm.model_strategy == "failover"
+    assert config.llm.providers is not None
+    chat = config.llm.targets_for("chat")
+    assert [(t.provider, t.model) for t in chat] == [("deepseek", "deepseek-chat")]
+    assert config.llm.targets_for("extract") == chat
     assert config.enabled_adapters == ["console", "snowluma"]
 
 

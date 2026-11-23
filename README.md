@@ -3,7 +3,7 @@
 RubenBot 是一个以**记忆**为核心的拟人社交聊天 bot 框架。它面向群聊/私聊场景，目标不是做一个随叫随到的问答助手，而是像一个住在群里的普通人：有自己的性格和节奏，会记得你说过的事，也会在合适的时候插一句嘴。
 
 - **记忆优先**：按人建档，消息先落流水，再由模型提炼耐久事实；检索时按稀有词加权，定期归纳去冗。
-- **模型池与故障转移**：每个角色可配多个模型，按角色选故障转移 / 轮询 / 随机；中转超时或限流自动切下一个，用量按实际出结果的模型记账。
+- **模型池与故障转移**：各提供商分别配置端点、密钥与模型；每个角色可跨提供商组池，按角色选故障转移 / 轮询 / 随机；中转超时或限流自动切下一个，用量按实际出结果的模型记账。
 - **跨会话时间线**：群聊和私聊共享统一时间线，近期事件流、带出处的自动查账和 `recall` 让 bot 能接上别处发生的事；隐私审查是 core 模块，默认关闭。
 - **有节奏的回复**：群聊按批合并、查看概率与依据门裁定，生成期间支持发送前复核；回复最多拆成 1～3 段并按字数模拟打字间隔。
 - **有心情、有远近**：每个人的好感度和 bot 当前情绪由代码按规则累积与衰减，变化可查；生成时只作一句背景提醒，不硬控说话内容。
@@ -218,7 +218,28 @@ cp config.example.yaml config.yaml
 export RUBENBOT_API_KEY="你的模型 API Key"
 ```
 
-`config.yaml` 里至少要配好 `llm.base_url` 和 `llm.chat_model`。配置支持 `${ENV_VAR}` 展开，建议把密钥放环境变量而不是文件里。
+在 `config.yaml` 的 `llm.providers` 里填端点、密钥和该提供商支持的模型名，再给 `llm.role_pools.chat` 选至少一个模型。只接一个提供商时，照示例保留一个即可。两个提供商、各有两个模型时，可以这样让对话和看图各走不同的主备顺序（地址和模型名换成实际值）：
+
+```yaml
+llm:
+  providers:
+    - name: primary
+      base_url: https://primary.example/v1
+      api_key: ${PRIMARY_API_KEY}
+      models: [chat-main, vision-main]
+    - name: backup
+      base_url: https://backup.example/v1
+      api_key: ${BACKUP_API_KEY}
+      models: [chat-alt, vision-alt]
+  role_pools:
+    chat: [{provider: primary, model: chat-main}, {provider: backup, model: chat-alt}]
+    vision: [{provider: backup, model: vision-alt}, {provider: primary, model: vision-main}]
+  model_strategy: failover
+```
+
+池中每项都指定提供商；即使两家的模型同名，也会请求各自的地址并使用各自的密钥。故障转移意味着**下一个提供商也会收到本次请求的内容**，包括消息或图片，只把可信端点放入池中。默认只在可重试的故障（例如连接失败、超时、429 或 5xx）时切换，401 等鉴权错误直接报错。
+
+旧 `llm.base_url`、`api_key`、`chat_model` 等字段及 `models: {角色: 名称或列表}` 无需手动修改；加载不会改写文件。WebUI 把旧端点展示为 `default`，保存三层配置时再写入新格式。提供商地址和密钥支持 `${ENV_VAR}`；目录名称、上游模型名和池引用按字面读取。同名同地址时，密钥框留空保留原值，点「清除密钥」才会清空；改名或换端点不会继承旧密钥。
 
 只想本地试玩时，把 `adapters.snowluma` 整段注释掉，只保留：
 
@@ -263,7 +284,7 @@ ConsoleAdapter 的输入格式：
 
 普通群消息通过节奏护栏后，按 `attention.talk_value` 决定是否查看，再由策划步决定是否开口。当前默认 `attention.talk_value` 为 `0.75`，表示进入查看/策划步的概率，不是最终回复概率；私聊、@、点名、回复 bot 等硬触发不掷点，被点名后的 120 秒内有效查看概率为 1。插件默认全部关闭，想试 `/hello` 请在 WebUI 的「插件市场」页启用 `hello`，或在配置里写 `plugins.enabled: ["hello"]`。
 
-WebUI 当前包含概览、机器人/人设、模型、记忆、人物、群组与决策、插件市场、日志、设置和关于页面。模型页可编辑各角色模型池及 `failover` / `round_robin` / `random` 策略；群组页可查看决策日志和群定位；插件页区分市场发现、安装更新卸载启停与已安装插件配置。群组定位为手写备注优先、自归纳其次，两者都空或当前是私聊时不注入。「记忆 → 画像与时间线」选定人物后，可查看画像和事件来源。移动端使用导航抽屉，页面切换优先使用路由缓存并隔离迟到响应；登录签名密钥落盘后，重启仍可维持有效会话。SnowLuma 的群名与成员名缓存在 SQLite，群名片按群区分；群卡和人物档案的「刷新名称」可重新取名，平台离线时保留旧资料。QQ 头像由浏览器直接请求 `qlogo.cn`（会向该域名发送对应的 QQ 号或群号），bot 不下载或存储图片。其他平台以及加载失败的头像使用名字首字色块。
+WebUI 当前包含概览、机器人/人设、模型、记忆、人物、群组与决策、插件市场、日志、设置和关于页面。模型页可增删改提供商及其模型，为各角色选择跨提供商候选、调整优先级及 `failover` / `round_robin` / `random` 策略；群组页可查看决策日志和群定位；插件页区分市场发现、安装更新卸载启停与已安装插件配置。群组定位为手写备注优先、自归纳其次，两者都空或当前是私聊时不注入。「记忆 → 画像与时间线」选定人物后，可查看画像和事件来源。移动端使用导航抽屉，页面切换优先使用路由缓存并隔离迟到响应；登录签名密钥落盘后，重启仍可维持有效会话。SnowLuma 的群名与成员名缓存在 SQLite，群名片按群区分；群卡和人物档案的「刷新名称」可重新取名，平台离线时保留旧资料。QQ 头像由浏览器直接请求 `qlogo.cn`（会向该域名发送对应的 QQ 号或群号），bot 不下载或存储图片。其他平台以及加载失败的头像使用名字首字色块。
 
 打开「关于」可核对运行版本、当前提交、各角色的首选模型与模型池策略，以及适配器状态和插件数。提交优先取部署盖戳 `.deploy-commit`，没有有效盖戳则读取本地 Git HEAD；都读不到时会说明原因。页面提供仓库、提交链接及可展开的 MIT 许可全文。点击「检查更新」才会由后端查询 GitHub `main`，只比较提交，不下载、不重启；超时或断网不影响查看本页。
 
@@ -321,7 +342,7 @@ stdout 记录前后 PID/commit。退出码 `0` 表示发布成功，`1` 表示�
 .venv/bin/python tools/e2e_live.py --config config.yaml --only 9 10 11 12 --results "$(mktemp /tmp/replay-XXXXXX.md)"
 ```
 
-中转须提供 `workbuddy-deepseek-v4.1-flash`；脚本只取配置中的 LLM 连接信息，每个场景新建临时数据库和 Console，不接真实聊天平台。完整报告默认写入 `~/workspace/rubenbot-night/e2e-results.md`，只要一项 FAIL 就以状态码 1 退出。模型口头称已执行工具不算审计证据；本地页面被公网限制拦截时，报告会把抓取失败和缓存对照的隔离标注分开。其他凭据来源见 `--help`。
+中转须提供 `workbuddy-deepseek-v4.1-flash`；脚本只取配置中的 LLM 连接信息（三层配置取 `chat` 首选提供商，不切换备用提供商），每个场景新建临时数据库和 Console，不接真实聊天平台。完整报告默认写入 `~/workspace/rubenbot-night/e2e-results.md`，只要一项 FAIL 就以状态码 1 退出。模型口头称已执行工具不算审计证据；本地页面被公网限制拦截时，报告会把抓取失败和缓存对照的隔离标注分开。其他凭据来源见 `--help`。
 
 四件回放使用仓库五文件人设、合成群历史与真实策划，报告列出实际出站原话和关键决策字段。`source=fallback` 的沉默不算通过，落库 `guess` 也不等于模型亲口报了 `guess`。2026-11-23 单次实测：Argon 旁听通过；panda 直接给了 `yt-dlp` 命令，但首跑采证误判 FAIL；星驰和破甲均因策划降级未验实。未重跑。
 
@@ -331,9 +352,9 @@ stdout 记录前后 PID/commit。退出码 `0` 表示发布成功，`1` 表示�
 
 | 配置段 | 关键项 | 说明 |
 | --- | --- | --- |
-| `llm` | `base_url` `api_key` `chat_model` | 任意 OpenAI 兼容接口 |
-| | `extract_model` `consolidate_model` | 留空则跟随 `chat_model` |
-| `models` | 可扩展的角色 → 模型映射，值为模型名或按优先级排的模型名列表（模型池，如 `chat: [主模型, 备模型]`；`fast` / `summary` / `vision` 未配的角色回退 `chat_model`），优先于上面两个旧字段 |
+| `llm` | `providers` | 提供商列表：各自配置唯一 `name`、`base_url`、`api_key` 与上游 `models` 名称列表 |
+| | `role_pools` | 角色 → 有序的 `{provider, model}` 引用列表；`chat` 必填，未配置的角色沿回退链取整个池，支持自定义角色 |
+| | 旧 `base_url`、`api_key`、`*_model`、`models` | 单端点旧格式仍可直接使用，原有优先级和回退规则不变 |
 | | `model_strategy` `model_strategies` | 模型池策略：`failover`（默认，按顺序故障转移）/ `round_robin`（轮询）/ `random`（随机）；每角色可在 `model_strategies` 覆盖。单模型时三种等价；多模型时最多按列表走一遍、不额外退避 |
 | `timeout` `max_retries` | 单次请求超时（秒）与失败重试次数（408/429/5xx，间隔 1s / 3s；仅单模型时生效） |
 | `persona` | `path` | 人格文件，默认 `data/SOUL.md` |

@@ -63,9 +63,14 @@ def relay_config(path: Path | None) -> LLMConfig:
             raise AssertionError('指定的中转配置文件不存在')
         raw = yaml.safe_load(path.read_text(encoding='utf-8')) or {}
         section = raw.get('llm', {})
-        if not section.get('base_url'):
-            raise AssertionError('配置缺少 llm.base_url')
-        llm = Config.from_raw({'llm': section}).llm
+        if not (section.get('providers') or section.get('base_url')):
+            raise AssertionError('配置缺少 LLM 提供商或旧版 llm.base_url')
+        source = Config.from_raw({'llm': section}).llm
+        # 三层配置只取 chat 首选的连接；回放禁止向池内其它提供商转发。
+        llm = LLMConfig(base_url=source.base_url, api_key=source.api_key,
+                        timeout=source.timeout, temperature=source.temperature,
+                        chat_temperature=source.chat_temperature,
+                        chat_frequency_penalty=source.chat_frequency_penalty)
     elif 'RUBENBOT_BASE_URL' in os.environ or 'RUBENBOT_API_KEY' in os.environ:
         llm = LLMConfig(base_url=os.getenv('RUBENBOT_BASE_URL', ''),
                         api_key=os.getenv('RUBENBOT_API_KEY', ''))

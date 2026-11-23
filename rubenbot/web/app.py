@@ -48,7 +48,6 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import asdict
-import json
 import logging
 import sqlite3
 import time
@@ -82,9 +81,11 @@ from .about import check_update, project_info, runtime_info
 from .auth import COOKIE_NAME, BindSecurityError, check_bind_security, mask_secret
 from .config_schema import (
     ConfigValidationError,
+    LEGACY_LLM_ROUTE_KEYS,
     config_layout,
     merge_config,
     mcp_form,
+    model_catalog_form,
     structured_config,
     validate_structured,
 )
@@ -1349,6 +1350,9 @@ def create_app(state: WebState):
             raw = yaml.safe_load(text)
             section = raw.get("mcp") if isinstance(raw, dict) else None
             raw_hidden = bool(section.get("servers")) if isinstance(section, dict) else bool(section)
+            llm = raw.get("llm") if isinstance(raw, dict) else None
+            if isinstance(llm, dict) and ("providers" in llm or llm.get("api_key")):
+                raw_hidden = True
         except yaml.YAMLError:
             raw_hidden = True
         return {
@@ -1393,8 +1397,12 @@ def create_app(state: WebState):
 
     def _pool_snapshot(config) -> dict[str, Any]:
         """当前模型池视图：角色顺序、模型列表与实际策略。"""
-        roles = list(MODEL_ROLES) + [role for role in config.llm.models if role not in MODEL_ROLES]
+        llm = config.llm
+        catalog = model_catalog_form(llm)
+        configured = catalog["role_pools"] if llm.providers is not None else llm.models
+        roles = dict.fromkeys((*MODEL_ROLES, *configured, *llm.model_strategies))
         return {
+            **catalog,
             "strategy": config.llm.model_strategy,
             "strategies": dict(config.llm.model_strategies),
             "roles": [
@@ -1402,38 +1410,13 @@ def create_app(state: WebState):
                     "role": role,
                     "label": MODEL_ROLE_LABELS.get(role, role),
                     "models": config.llm.models_for(role),
-                    "configured": role in config.llm.models,
+                    "configured": role in configured,
                     "strategy": config.llm.strategy_for(role),
                     "has_override": role in config.llm.model_strategies,
                 }
                 for role in roles
             ],
         }
-
-    def _write_pool_config(state, config):
-        """把模型池相关的三个字段写进 config.yaml 的 llm 段。
-
-        只动 ``models`` / ``model_strategy`` / ``model_strategies``，其余键
-        （含 ``${ENV}`` 形式的 api_key 原文）原样保留，绝不把展开后的密钥写盘。
-        """
-        import yaml
-
-        raw = _read_raw_config(state.config_path)
-        llm = raw.get("llm")
-        llm = dict(llm) if isinstance(llm, dict) else {}
-        llm["models"] = {
-            role: (list(models) if isinstance(models, list) else models)
-            for role, models in config.llm.models.items()
-        }
-        llm["model_strategy"] = config.llm.model_strategy
-        llm["model_strategies"] = dict(config.llm.model_strategies)
-        raw["llm"] = llm
-        path = state.config_path
-        try:
-            backup = save_config_text(path, yaml.safe_dump(raw, allow_unicode=True, sort_keys=False))
-        except ValueError as exc:
-            raise ApiError(422, f"配置校验失败：{exc}") from exc
-        return backup
 
     @app.get("/api/models/pool")
     async def get_model_pool(request: Request):
@@ -1444,57 +1427,26 @@ def create_app(state: WebState):
     async def put_model_pool(request: Request):
         require_session(request)
         body = await _json_body(request)
-        payload = {
-            "models": body.get("models") if "models" in body else None,
-            "model_strategy": body.get("strategy", body.get("model_strategy")),
-            "model_strategies": body.get("strategies", body.get("model_strategies")),
-        }
-        if "models" not in body and "strategy" not in body and "strategies" not in body:
-            raise ApiError(400, "至少要提交 models / strategy / strategies 之一")
-        try:
-            update = validate_structured(
-                {"llm": {key: value for key, value in payload.items() if value is not None}}
-            )
-            # 合并完整配置再校验一次：模型池里的模型名等约束以最终配置为准，
-            # 避免旧文件里别的段有问题时被这里悄悄带过去。
-            candidate = Config.from_raw(merge_config(_read_raw_config(state.config_path), update))
-        except ConfigValidationError as exc:
-            logger.warning("模型池保存被拒绝：%s", exc)
-            raise ApiError(422, f"模型池校验失败：{exc}", fields=exc.fields) from exc
-        except (TypeError, ValueError) as exc:
-            logger.warning("模型池保存被拒绝：%s", exc)
-            raise ApiError(
-                422, f"模型池校验失败：{exc}", fields=[{"field": "llm", "message": str(exc)}]
-            ) from exc
-
+        aliases = {"strategy": "model_strategy", "strategies": "model_strategies"}
+        fields = {"providers", "role_pools", "models", "model_strategy", "model_strategies"}
+        llm = {aliases.get(key, key): value for key, value in body.items() if aliases.get(key, key) in fields}
+        if not llm:
+            raise ApiError(400, "至少要提交一个模型目录、池或策略字段")
         before = _config_snapshot(state.config)
-        backup = _write_pool_config(state, candidate)
-        requires_restart = state.apply_config(candidate)
-        after = _config_snapshot(candidate)
+        saved = await _save_structured_config(state, {"llm": llm})
+        after = _config_snapshot(state.config)
         # 只有 llm 段会变：策略/列表都随 LLM 客户端重建热生效
         changed = [
             key
             for key in sorted(set(before) | set(after))
             if key.startswith("llm.") and before.get(key) != after.get(key)
         ]
-        logger.info(
-            "WebUI 保存模型池：%s（热生效：%s）",
-            json.dumps(
-                {role: value for role, value in candidate.llm.models.items()},
-                ensure_ascii=False,
-            ),
-            ", ".join(changed) or "无变化",
-        )
         return {
-            "ok": True,
-            # applied 用段名（与结构化保存一致，前端提示「模型与接口」已立即生效）；
-            # changed 给出具体改了哪些 llm 叶子字段，方便排查
+            **{key: saved[key] for key in ("ok", "requires_restart", "backup")},
             "applied": ["llm"] if changed else [],
             "changed": changed,
-            "requires_restart": requires_restart,
-            "message": _save_message(["llm"] if changed else [], requires_restart),
-            "backup": str(backup) if backup else None,
-            **_pool_snapshot(candidate),
+            "message": _save_message(["llm"] if changed else [], saved["requires_restart"]),
+            **_pool_snapshot(state.config),
         }
 
     @app.post("/api/restart")
@@ -1671,10 +1623,9 @@ async def _save_structured_config(state: WebState, payload: Any) -> dict[str, An
     try:
         update = validate_structured(payload)
         merged = merge_config(_read_raw_config(path), update)
+        new_config = Config.from_raw(merged)
     except ConfigValidationError as exc:
         raise ApiError(422, f"配置校验失败：{exc}", fields=exc.fields) from exc
-    try:
-        new_config = Config.from_raw(merged)
     except (TypeError, ValueError) as exc:
         raise ApiError(
             422, f"配置校验失败：{exc}", fields=[{"field": "config", "message": str(exc)}]
@@ -1759,6 +1710,9 @@ async def _save_structured_config(state: WebState, payload: Any) -> dict[str, An
 
 def _leaf_paths(prefix: str, value: Any) -> list[str]:
     """把嵌套字典展开成点分字段路径；列表/标量视为叶子。"""
+    # 角色池、角色策略都是整表替换；只比较提交的键会漏掉最后删掉的条目。
+    if prefix in ("llm.role_pools", "llm.model_strategies"):
+        return [prefix]
     if isinstance(value, dict) and value:
         paths: list[str] = []
         for key, item in value.items():
@@ -1843,7 +1797,10 @@ def _config_to_dict(config) -> dict[str, Any]:
 
     data = asdict(config)
     data["mcp"] = mcp_form(config.mcp)
-    data["llm"]["api_key"] = config.llm.api_key
+    if config.llm.providers is not None:
+        for key in LEGACY_LLM_ROUTE_KEYS:
+            data["llm"].pop(key, None)
+        data["llm"].update(model_catalog_form(config.llm))
     data["webui"]["password"] = ""
     return data
 
