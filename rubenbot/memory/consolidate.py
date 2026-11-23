@@ -22,6 +22,7 @@ from typing import Iterable
 from ..llm import LLMProtocol, parse_json_payload
 from ..privacy.gate import OWNER_AUDIENCE
 from ..privacy.sealing import merged_source_ref
+from ..memory.anchor import evaluate
 from ..memory.store import Memory, MemoryStore
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,11 @@ CONSOLIDATE_SYSTEM_PROMPT = """你是一个记忆整理员。你会看到关于�
 
 **极其重要**：合并后的新句子只能使用原记忆里已经出现过的字词，允许少量连接词。
 不得添加任何原记忆中没有的新词、新数字、新地名。宁可少合并，也不要编造。
+
+**指称完整性**：合并多条「对同一实体（项目/产品/平台）的评价」时，新句子必须带上
+那个实体的名字（原记忆里有就照抄，没有就不合并）；不能把主语并丢，只留
+「认为它……」「觉得不错」这类没有对象的评价。合并句的实体必须唯一，跨两个实体
+禁止合并。
 
 矛盾时保留新事实并注明变化（例如两条记忆分别说“住上海”和“住北京”，
 只能写“住北京（原住上海）”，不能用原记忆没有的字）。
@@ -254,6 +260,8 @@ class Consolidator:
                             "content": proposal.content,
                             # 带来源的记忆按类目复用分寸裁定，模型不能替它换一个裁定键。
                             "category": sources[0].category if sources[0].audience else proposal.category or sources[0].category,
+                            # 合并结果沿用同一实体的锚点；跨实体合并本来就被校验挡下。
+                            "entity": self._merged_entity(sources),
                             "origin_chat": sources[0].origin_chat,
                             "audience": sources[0].audience,
                             "sensitivity": sources[0].sensitivity,
@@ -283,8 +291,17 @@ class Consolidator:
         return result
 
     def _render_memories(self, memories: list[Memory]) -> str:
-        lines = [f"- id={m.id} [{m.category}] {m.content}" for m in memories]
+        lines = [
+            f"- id={m.id} [{m.category}]" + (f"（实体：{m.entity}）" if m.entity else "") + f" {m.content}"
+            for m in memories
+        ]
         return "关于这个人的记忆：\n" + "\n".join(lines)
+
+    @staticmethod
+    def _merged_entity(sources: list[Memory]) -> str:
+        """合并结果沿用的实体锚点：源记忆锚在同一个实体上才保留。"""
+        entities = {m.entity for m in sources if m.entity}
+        return entities.pop() if len(entities) == 1 else ""
 
     def _validate(
         self,
@@ -311,6 +328,10 @@ class Consolidator:
                 return "user 来源的记忆不可合并删除"
             if any(m.audience == OWNER_AUDIENCE for m in sources):
                 return "机主自述须保留逐条原话以便追封，不可合并"
+            # 合并不能把两个实体的评价糊成一条：锚点不同就拒绝。
+            entities = {m.entity for m in sources if m.entity}
+            if len(entities) > 1:
+                return "来源记忆锚在不同实体上，不可合并"
             # 合并不能洗掉来源、封存或有效期；边界不一致时宁可保留原记忆。
             boundaries = {(m.audience, m.origin_chat, m.sensitivity, m.scope_type, m.scope_id,
                            m.category if m.audience else None, m.stability, m.expires_at) for m in sources}
@@ -321,6 +342,11 @@ class Consolidator:
             new_tokens = find_new_tokens(proposal.content, sources)
             if new_tokens:
                 return f"合并句出现原文没有的词：{''.join(new_tokens)}"
+            # 合并句会删掉源记忆，必须自己就能回答「说的是什么」：拿合并句本身当出处
+            # 校验，正文只有指代/评价、没写名字的一律拒绝，不能靠源记忆的锚点兜底。
+            decision = evaluate(proposal.content, source_text=proposal.content)
+            if not decision.ok:
+                return "合并句没有可回指的实体（只有评价、没有主语）"
             return None
         return "未知操作"
 

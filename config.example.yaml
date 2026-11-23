@@ -28,6 +28,31 @@ llm:
   temperature: 0.8
   timeout: 60          # 单次请求超时（秒）
   max_retries: 2       # 失败重试次数：408/429/5xx 退避重试，间隔 1s / 3s（仅单模型时）
+  # 按任务类型的每日预算闸（Q11）：超限只停该类任务，别的任务和 bot 都不受影响。
+  # 统计口径与 llm_usage 一致：每次上游尝试算 1 次（含重试的失败尝试），token 只算
+  # 上游实际给出的值。台账落在数据库 meta 的 llm_budget:ledger，按本地自然日分桶，
+  # 跨日/重启都按当天累计；命中上限时日志打一条「LLM 预算熔断：…」。
+  budget:
+    enabled: true                   # 总开关；关掉后不再检查也不再记账
+    default_daily_calls: 500        # 未单列任务类型的每日调用上限；null 表示不限
+    default_daily_cost_usd: null    # 未单列任务类型的每日费用上限；null 表示不限
+    # 按任务类型覆盖（任务标签就是 llm_usage.task：chat / extract / gen_stage1 …）。
+    # 不写这一项时用内置默认：gen_stage1 1500、gen_stage2 1200、extract 600、
+    # image_description 400、sticker_* 300、conversation_state 300、chat 300、
+    # rolling_summary 200、group_profile 150、consolidate 150、distill 100、
+    # gate 100、event_judge 50；未列出的任务用 default_daily_calls。
+    # 单项写 null 表示该类不限，写 0 表示该类全部拦下。示例：
+    # tasks:
+    #   chat: {daily_calls: 300, daily_cost_usd: 1.0}
+    #   extract: {daily_calls: null}
+    #
+    # 单价（美元 / 百万 token），用于费用估算。**不配就照实按 0 计，费用上限不会触发**
+    # ——中转站没公布单价时不要拍脑袋填。键可写「提供商/模型」「模型」或「*」。
+    # 仓库没有 workbuddy 的公开单价：api.heevcmlz.cn 的 /api/pricing 对未登录请求返回
+    # 空列表，配好 key 后也拿不到该端点价格，所以示例里保持注释，费用档默认关闭。
+    # pricing:
+    #   deepseek/deepseek-chat: {input: 0.27, output: 1.10}
+    #   "*": {input: 0.5, output: 1.5}
 
 persona:
   path: "data/SOUL.md"
@@ -59,6 +84,10 @@ memory:
   distill_interval_hours: 24     # 或距上次提炼超过这么久
   distill_max_events: 120        # 一次提炼最多喂多少条新事件
   distill_max_facts: 80          # 一次提炼最多喂多少条新事实
+  # 指称完整性：评价型断言（「认为它……」「觉得不错」）必须能回指到实体，
+  # 挂不上的会被丢弃并写 memory_log 的 dropped_unanchored 记录；此行为无配置键，
+  # 不要用配置关掉。存量账本用 `python -m tools.scan_unanchored_memories --db data/rubenbot.db`
+  # 先只读扫描，确认报告后再加 --apply。
   status_expiry_min_days: 1      # 近况过期天数夹取下限
   status_expiry_max_days: 90     # 近况过期天数夹取上限
   timeline_compress_after_days: 7   # 7 天前的事件按周压成 digest
@@ -132,6 +161,8 @@ computer:
   # 白名单用户能以 bot 的系统账号操作真机，只填写可信账号，不要填密钥或环境变量。
   # whitelist: ["console:console:me"]
   # 群内明确委托按发送者独立执行，附件只回当前群；访客绝不使用真机上下文。
+  # 交付物送达或操作成功即静默结束（群里只出现文件本身），失败 / 部分完成只发一句人话说明；
+  # 这张表不控制汇报形态，成功时不会追加完成总结或「还需要什么」的邀约。
   max_task_rounds: 4           # 机主操作的工具轮数（1–16）；recall_tool_max_rounds 为 0 时仍关闭全部工具循环
   sandbox_quota_mb: 100        # 每位访客的沙盒容量（MiB），范围 1–10240
   command_timeout_seconds: 60  # 单次命令时限（秒），范围 1–600
@@ -308,6 +339,8 @@ plugins:
   dir: "plugins"
   # 插件默认全部关闭（显式启用制）：只有列在这里的插件才会加载，
   # 留空或不写 enabled 都表示一个插件都不启用。
+  # 没启用的插件不会以可用形态出现在策划的能力索引里：有人被点了它家的
+  # 指令（例如点歌），bot 会照实说还没开，而不是沉默。
   enabled: []
   # 例如只启用 hello 示例插件（也可以直接在 WebUI 设置页开关，保存后写回这里并热生效）：
   # enabled: ["hello"]

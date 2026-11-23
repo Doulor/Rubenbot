@@ -1,5 +1,6 @@
 """记忆层：存储、检索、抽取、归纳，以及记忆 v2 的画像提炼、时间线压缩与读取侧。"""
 
+from .anchor import Anchor, AnchorDecision, annotate, evaluate, needs_anchor, resolve_anchor
 from .consolidate import Consolidator, ConsolidateResult
 from .distill import ProfileDistiller, ProfileUpdate
 from .extract import (
@@ -50,6 +51,8 @@ from .timeline import (
 )
 
 __all__ = [
+    "Anchor",
+    "AnchorDecision",
     "CompressResult",
     "ConsolidateResult",
     "Consolidator",
@@ -88,12 +91,16 @@ __all__ = [
     "recent_timeline",
     "search_timeline",
     "audience_for_chat",
+    "annotate",
     "estimate_tokens",
+    "evaluate",
     "format_relative_time",
     "format_summary_block",
     "is_self_inquiry",
     "jaccard",
     "make_person_id",
+    "needs_anchor",
     "parse_extraction",
+    "resolve_anchor",
     "tokenize",
 ]

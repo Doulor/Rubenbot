@@ -79,6 +79,8 @@ function loadUI() {
   run(fs.readFileSync(path.join(__dirname, '../../rubenbot/web/static/motion.js'), 'utf8'));
   const file = path.join(__dirname, '../../rubenbot/web/static/app.js');
   run(fs.readFileSync(file, 'utf8').replace(/\bmain\(\);\s*$/, ''));
+  // 详情页在独立文件里，浏览器由 index.html 紧接着加载；测试宿主同样加载
+  run(fs.readFileSync(path.join(__dirname, '../../rubenbot/web/static/plugin_detail.js'), 'utf8'));
   return {root, document, run};
 }
 module.exports = {loadUI};

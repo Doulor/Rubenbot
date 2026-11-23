@@ -5,60 +5,89 @@
   "description": "按 hydrogen 点歌插件复刻：点歌 / 网易点歌 / QQ点歌 / 酷狗 等十几个平台命令，多结果发选歌列表（超时自动撤回），按 语音→文件→文字 逐档降级发送，可播音频先探活过滤，可选热评与歌词图",
   "author": "RubenBot",
   "min_core_version": "0.1.0",
+  "repository": "https://github.com/Doulor/Rubenbot/tree/main/plugins/music",
   "permissions": ["read_messages", "send_messages", "network", "capabilities"],
+  "triggers": [
+    "「点歌 <歌名> [序号]」「我想听 <歌名>」",
+    "「网易点歌 / QQ点歌 / 酷狗 / 酷我 / 百度 / 一听 / 咪咕 / 荔枝 / 蜻蜓 / 喜马拉雅 / 5sing原创 / 5sing翻唱 / 全民K歌 <歌名>」",
+    "「查歌词 <歌名>」，选歌列表出来后回复序号或「取消」"
+  ],
   "config_schema": [
     {
       "key": "song_limit",
       "type": "number",
       "default": 5,
-      "description": "选歌列表最多列几首（1-20）；select_mode 为 single 时固定取 1 首"
+      "label": "列表最多几首",
+      "description": "选歌列表最多列几首；select_mode 为 single 时固定取 1 首",
+      "min": 1,
+      "max": 20,
+      "step": 1
     },
     {
       "key": "select_mode",
       "type": "string",
       "default": "text",
-      "description": "选择模式：text（发编号列表选歌）或 single（直接发第一首）"
+      "label": "选择模式",
+      "description": "text 发编号列表选歌；single 直接发第一首",
+      "options": [
+        {"value": "text", "label": "编号列表选歌"},
+        {"value": "single", "label": "直接发第一首"}
+      ]
     },
     {
       "key": "timeout",
       "type": "number",
       "default": 30,
-      "description": "选歌列表的有效时间（5-600 秒），超时后撤回列表并提示已超时"
+      "label": "选歌超时（秒）",
+      "description": "选歌列表的有效时间，超时后撤回列表并提示已超时",
+      "min": 5,
+      "max": 600,
+      "step": 1
     },
     {
       "key": "send_modes",
       "type": "list",
       "default": ["record", "file", "text"],
-      "description": "发送模式优先级：record（语音条，可播放）/ file（音频文件）/ text（歌名+链接）/ card（OneBot 音乐卡，新版 QQ 不渲染，谨慎开启）"
+      "label": "发送方式优先级",
+      "description": "有序尝试：record 语音条（能直接播放）/ file 音频文件 / text 歌名+链接 / card OneBot 音乐卡（新版 QQ 不渲染，谨慎开启）",
+      "placeholder": "添加发送方式"
     },
     {
       "key": "enable_comments",
       "type": "boolean",
       "default": true,
+      "label": "附热评",
       "description": "发歌后附一句网易云热评"
     },
     {
       "key": "enable_lyrics",
       "type": "boolean",
       "default": false,
-      "description": "发歌后附歌词图（需要 Pillow 与系统 CJK 字体，否则自动跳过）"
+      "label": "附歌词图",
+      "description": "发歌后附歌词图（需要 Pillow 与系统 CJK 字体，缺了自动跳过）"
     },
     {
       "key": "timeout_recall",
       "type": "boolean",
       "default": true,
+      "label": "超时撤回列表",
       "description": "选歌列表超时后自动撤回（需要机主授予「平台能力」权限才能调 delete_msg）"
     },
     {
       "key": "cooldown_seconds",
       "type": "number",
       "default": 60,
-      "description": "单人两次点歌之间的冷却秒数"
+      "label": "单人冷却（秒）",
+      "description": "同一个人两次点歌之间的最小间隔",
+      "min": 0,
+      "max": 86400,
+      "step": 1
     },
     {
       "key": "default_player",
       "type": "string",
       "default": "网易点歌",
+      "label": "默认音源",
       "description": "不带平台名的「点歌」默认用哪个音源，如 网易点歌 / QQ点歌 / 酷狗点歌"
     }
   ],

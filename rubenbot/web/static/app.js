@@ -320,6 +320,7 @@ function pluginSkeleton(param) {
   if (param.split("/")[0] === "grants") {
     return skBox("grid", tabs, settingsSkeleton("plugins", "config"));
   }
+  if (param.split("/")[0] === "detail") return skBox("grid", tabs, settingsSkeleton("plugins", "config"));
   return skBox("grid", tabs, skBox("grid sk-market",
     skBox("notice", skeletonBar("70%", "40px")),
     skBox("market-toolbar", skeletonBar("min(100%, 420px)", "40px"),
@@ -3023,6 +3024,15 @@ function marketCard(item, refresh) {
           onclick: () => detailDrawer(item),
         },
         icon("caret")
+      ),
+      h(
+        "a",
+        {
+          class: "btn btn-sm btn-ghost",
+          href: `#/plugins/detail/${encodeURIComponent(item.id || item.plugin_name)}`,
+          title: "打开完整详情页：介绍、权限、触发方式与配置",
+        },
+        "详情"
       )
     ),
     h("p", { class: "market-desc" }, item.description || "这个插件没有写说明。"),
@@ -3038,12 +3048,14 @@ function marketCard(item, refresh) {
 
 async function renderPlugins(view, sub = "") {
   const [tab, selected] = sub.split("/");
+  const detail = tab === "detail";
   const grants = tab === "grants";
   const config = tab === "config";
   const modes = [
-    { href: "#/plugins", label: "插件市场", active: !config && !grants },
+    { href: "#/plugins", label: "插件市场", active: !config && !grants && !detail },
     { href: "#/plugins/config", label: "插件配置", active: config },
     { href: "#/plugins/grants", label: "权限授权", active: grants },
+    { href: "#/plugins/detail", label: "插件详情", active: detail },
   ];
   const tabs = h("nav", { class: "segmented plugin-tabs", "aria-label": "插件页面" },
     ...modes.map(({ href, label, active }) =>
@@ -3053,6 +3065,7 @@ async function renderPlugins(view, sub = "") {
   const panel = h("div", {}, skeleton(3));
   view.replaceChildren(h("div", { class: "grid" }, tabs, panel));
   try {
+    if (detail) return await renderPluginDetail(panel, selected);
     if (grants) return await renderPluginGrants(panel, selected);
     if (config) return await renderPluginConfigs(panel, selected);
     else await renderPluginMarket(panel);

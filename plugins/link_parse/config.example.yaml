@@ -8,3 +8,6 @@ timeout_seconds: 6
 sites:
   - bilibili
   - generic
+# 解析结果的投递方式：direct 直接喂本轮回复，planner 交给策划步决定。
+# 策划步投递（第 25 项）接入前，两种取值都按 direct 的既有行为处理。
+delivery: direct

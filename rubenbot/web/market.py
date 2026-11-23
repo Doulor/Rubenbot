@@ -24,7 +24,6 @@ import dataclasses
 import io
 import json
 import logging
-import math
 import shutil
 import stat
 import tempfile
@@ -36,6 +35,13 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 from .. import __version__ as CORE_VERSION
+from ..plugins.config_schema import (
+    ConfigValueError,
+    coerce_value,
+    effective_values,
+    normalize_schema,
+    validate_values,
+)
 from ..plugins.manifest import (
     CATEGORIES,
     DEFAULT_CATEGORY,
@@ -63,12 +69,18 @@ PRESERVED_FILES = ("config.yaml",)
 
 
 class MarketError(ValueError):
-    """市场操作失败；路由层转成 4xx/5xx 响应。"""
+    """市场操作失败；路由层转成 4xx/5xx 响应。
 
-    def __init__(self, message: str, *, status: int = 400):
+    ``fields`` 只在配置校验失败时出现，形如
+    ``[{"field": "cooldown_seconds", "message": "不能小于 0"}]``，供前端定位
+    出错控件；其它错误的 ``fields`` 为空列表。
+    """
+
+    def __init__(self, message: str, *, status: int = 400, fields: list[dict[str, Any]] | None = None):
         super().__init__(message)
         self.message = message
         self.status = status
+        self.fields = fields or []
 
 
 @dataclasses.dataclass(frozen=True)
@@ -87,6 +99,10 @@ class IndexEntry:
     icon: str = ""
     min_core_version: str = "0.0.0"
     hooks: tuple[str, ...] = ()
+    # 以下只在索引愿意声明时出现；缺省为空，详情页对未装插件只展示已有信息
+    repository: str = ""
+    triggers: tuple[str, ...] = ()
+    config_schema: tuple[dict[str, Any], ...] = ()
 
     @property
     def has_download(self) -> bool:
@@ -152,6 +168,18 @@ def _parse_entry(raw: Any) -> IndexEntry:
         category = DEFAULT_CATEGORY
     hooks = raw.get("hooks")
     hooks = tuple(str(item).strip() for item in hooks if str(item).strip()) if isinstance(hooks, list) else ()
+    triggers = raw.get("triggers")
+    triggers = (
+        tuple(str(item).strip() for item in triggers if str(item).strip())
+        if isinstance(triggers, list)
+        else ()
+    )
+    schema = raw.get("config_schema")
+    config_schema = (
+        tuple(dict(item) for item in schema if isinstance(item, dict))
+        if isinstance(schema, list)
+        else ()
+    )
     download_url = str(raw.get("download_url") or "").strip() or None
     return IndexEntry(
         id=plugin_id,
@@ -166,6 +194,9 @@ def _parse_entry(raw: Any) -> IndexEntry:
         icon=str(raw.get("icon") or "").strip()[:4],
         min_core_version=str(raw.get("min_core_version") or "0.0.0").strip(),
         hooks=hooks,
+        repository=str(raw.get("repository") or "").strip(),
+        triggers=triggers,
+        config_schema=config_schema,
     )
 
 
@@ -196,6 +227,9 @@ def builtin_index(official_dir: str | Path | None = None) -> list[IndexEntry]:
                 icon=manifest.icon,
                 min_core_version=manifest.min_core_version,
                 hooks=manifest.hooks,
+                repository=manifest.repository,
+                triggers=manifest.triggers,
+                config_schema=tuple(dict(item) for item in manifest.config_schema),
             )
         )
     return entries
@@ -482,6 +516,11 @@ class MarketService:
             "category": manifest.get("category")
             or (entry.category if entry else DEFAULT_CATEGORY),
             "icon": manifest.get("icon") or (entry.icon if entry else ""),
+            # 详情页展示用的可选元信息：本地 manifest 优先，缺失时用索引声明
+            "repository": manifest.get("repository") or (entry.repository if entry else ""),
+            "triggers": list(
+                manifest.get("triggers") or (entry.triggers if entry else [])
+            ),
             "installed": True,
             "enabled": enabled,
             "loaded": bool(item.get("loaded")),
@@ -511,6 +550,10 @@ class MarketService:
             "hooks": list(entry.hooks),
             "category": entry.category,
             "icon": entry.icon,
+            "repository": entry.repository,
+            "triggers": list(entry.triggers),
+            # 索引愿意声明 schema 时，未安装插件的详情页也能展示「有哪些配置项」
+            "config_schema": [dict(item) for item in entry.config_schema],
             "installed": False,
             "enabled": False,
             "loaded": False,
@@ -527,32 +570,41 @@ class MarketService:
         }
 
     def get_plugin_config(self, plugin_id: str) -> dict[str, Any]:
-        """读取已安装插件的 schema 与配置值；不回显疑似密钥。"""
+        """读取已安装插件的 schema 与配置值；不回显密钥字段的原值。
+
+        返回的 ``schema`` 是规范化后的视图（类型已归一、范围 / 可选值原样
+        保留），WebUI 直接按它生成表单；``secrets`` 标出哪些密钥字段已经
+        有值（前端用「已设置，留空保留」占位，不回显内容）。
+        """
         local = self._local_plugin(plugin_id)
         if local is None or not local.get("valid"):
             raise MarketError(f"插件不存在：{plugin_id}", status=404)
         manifest = local.get("manifest") or {}
-        schema = manifest.get("config_schema") or []
-        if not schema:
+        fields = normalize_schema(manifest.get("config_schema") or [])
+        if not fields:
             raise MarketError(f"插件 {plugin_id} 没有可配置项", status=409)
         directory = self._safe_local_dir(local)
         raw = self._read_plugin_yaml(directory)
         values: dict[str, Any] = {}
         secrets: dict[str, bool] = {}
-        schema_fields = self._schema_fields(schema)
-        if not schema_fields:
-            raise MarketError(f"插件 {plugin_id} 的配置 schema 不合规", status=409)
-        for field in schema_fields:
-            key = field["key"]
-            if key in raw:
-                value = raw[key]
+        for field in fields:
+            if field.key in raw:
+                # 配置值可能被手改成错误类型：回读时按 schema 归一，坏的退回默认值
+                try:
+                    value = coerce_value(field, raw[field.key])
+                except ConfigValueError:
+                    value = field.default
             else:
-                value = field.get("default")
-            if field["type"] in {"string", "text"} and self._is_secret(key):
-                secrets[key] = bool(value)
+                value = field.default
+            if field.secret:
+                secrets[field.key] = bool(value)
                 value = ""
-            values[key] = value
-        return {"schema": schema, "values": values, "secrets": secrets}
+            values[field.key] = value
+        return {
+            "schema": [field.as_dict() for field in fields],
+            "values": values,
+            "secrets": secrets,
+        }
 
     def save_plugin_config(self, plugin_id: str, values: Any) -> dict[str, Any]:
         """按 manifest schema 校验并原子写入插件目录 config.yaml。
@@ -561,42 +613,38 @@ class MarketService:
         运行中的插件管理器会拿写入前后的配置快照调插件声明的
         ``on_config_change``，因此「是否热生效」由插件自己决定，WebUI 只如实
         转述——没声明钩子的插件明确提示需要重启，不假装热更新。
+
+        校验失败时抛 422，``fields`` 逐项列出哪个字段、为什么（前端据此在
+        对应控件旁提示），不写盘。
         """
         local = self._local_plugin(plugin_id)
         if local is None or not local.get("valid"):
             raise MarketError(f"插件不存在：{plugin_id}", status=404)
         manifest = local.get("manifest") or {}
-        schema = manifest.get("config_schema") or []
-        if not schema:
+        fields = normalize_schema(manifest.get("config_schema") or [])
+        if not fields:
             raise MarketError(f"插件 {plugin_id} 没有可配置项", status=409)
         if not isinstance(values, dict):
             raise MarketError("values 必须是对象", status=422)
-        allowed = {field["key"] for field in self._schema_fields(schema)}
+        allowed = {field.key for field in fields}
         unknown = sorted(set(values) - allowed)
         if unknown:
             raise MarketError(f"包含未声明的配置项：{', '.join(unknown)}", status=422)
         directory = self._safe_local_dir(local)
         existing = self._read_plugin_yaml(directory)
-        errors: list[dict[str, str]] = []
-        updated = dict(existing)
-        for field in self._schema_fields(schema):
-            key, kind = field["key"], field["type"]
-            if key not in values:
-                continue
-            value = values[key]
-            if self._is_secret(key) and value in (None, ""):
-                continue
-            parsed, message = self._coerce_schema_value(value, kind)
-            if message:
-                errors.append({"field": key, "message": message})
-            else:
-                updated[key] = parsed
+        parsed, errors = validate_values(fields, values)
         if errors:
-            raise MarketError("插件配置校验失败：" + "；".join(item["field"] + " " + item["message"] for item in errors), status=422)
+            raise MarketError(
+                "插件配置校验失败：" + "；".join(item["field"] + " " + item["message"] for item in errors),
+                status=422,
+                fields=errors,
+            )
+        updated = dict(existing)
+        updated.update(parsed)
         # 先算出「对插件而言真正生效的配置」的新旧值（schema 里声明到的键，
         # 缺省用默认值），写盘后再交给插件决定能否热生效。
-        before = self._effective_config(schema, existing)
-        after = self._effective_config(schema, updated)
+        before = effective_values(fields, existing)
+        after = effective_values(fields, updated)
         self._write_plugin_yaml(directory, updated)
         unchanged = before == after
         if unchanged:
@@ -611,19 +659,6 @@ class MarketService:
         )
         payload = self.get_plugin_config(plugin_id)
         return {**payload, "hot": hot, "message": message}
-
-    @staticmethod
-    def _effective_config(schema: Any, raw: dict[str, Any]) -> dict[str, Any]:
-        """schema 声明的配置项按「缺省取默认值」展开，只比较真正影响插件的键。"""
-        values: dict[str, Any] = {}
-        for item in schema:
-            if not isinstance(item, dict):
-                continue
-            key = str(item.get("key") or "").strip()
-            if not key:
-                continue
-            values[key] = raw[key] if key in raw else item.get("default")
-        return values
 
     def _apply_config_change(
         self,
@@ -644,45 +679,6 @@ class MarketService:
         if hot:
             return True, "插件配置已保存并热生效，无需重启。"
         return False, f"插件配置已保存，{reason}"
-
-    def _schema_fields(self, schema: Any) -> list[dict[str, Any]]:
-        result: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        for item in schema:
-            if not isinstance(item, dict):
-                continue
-            key = str(item.get("key") or "").strip()
-            kind = str(item.get("type") or "string").strip().lower()
-            if not key or key in seen or kind not in {"bool", "boolean", "int", "integer", "float", "number", "string", "text", "list", "string_list"}:
-                continue
-            seen.add(key)
-            result.append({**item, "key": key, "type": kind})
-        return result
-
-    @staticmethod
-    def _is_secret(key: str) -> bool:
-        lower = key.lower()
-        return any(token in lower for token in ("key", "token", "secret", "password"))
-
-    @staticmethod
-    def _coerce_schema_value(value: Any, kind: str) -> tuple[Any, str | None]:
-        if kind in {"bool", "boolean"}:
-            return (value, None) if isinstance(value, bool) else (None, "必须是布尔值")
-        if kind in {"int", "integer"}:
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not float(value).is_integer():
-                return None, "必须是整数"
-            return int(value), None
-        if kind in {"float", "number"}:
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
-                return None, "必须是数字"
-            return float(value), None
-        if kind in {"list", "string_list"}:
-            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-                return None, "必须是字符串列表"
-            return [item.strip() for item in value if item.strip()], None
-        if not isinstance(value, str):
-            return None, "必须是字符串"
-        return value, None
 
     def _safe_local_dir(self, local: dict[str, Any]) -> Path:
         root = self._plugins_root().resolve()

@@ -102,6 +102,8 @@ GUIDANCE_TIMEOUT_CAP = 15.0
 VISUAL_WAIT_BUDGET = 5.0
 # 流水没有话题 ID；连续讨论中断十分钟就另起一段。仅用于展示计数。
 TOPIC_GAP_SECONDS = 10 * 60
+# 查询类电脑工具：只读结果本身就是答复；其余是产生副作用或交付物的动作。
+_QUERY_TOOLS = frozenset({"read_file", "list_dir", "fetch_url", "run_command"})
 GUIDANCE_TASK_PROMPT = (
     "先看这条消息里有没有值得回应的人和社交信号：谁在向谁求助、分享心情，或递来一个话头？"
     "你的注意力给人，机器自行流过的数据只是背景；有人拿它来说事，才去接那个人的话。"
@@ -1545,13 +1547,41 @@ class RubenBot:
         if operation:
             # 不把其他账号的历史、群内引文、策划生成的参数或记忆交给真机执行器。
             messages = [{"role": "system", "content": computer.TASK_GUIDANCE}, {"role": "user", "content": event.text}]
-        for attempt in range(2):
+        for attempt in range(1 if operation else 2):
             # 重写只改文字，不能再给工具，否则可能重复设提醒或执行平台动作。
             # 多人批次没有可代表全体的授权账号，不能以主要发言人的权限执行工具。
+            # 操作委托只执行一次：交付已送达就静默，没办成才有一句说明，均不重写。
             raw = await self.generate(messages, event=event if tools_allowed and not attempt else None,
                                       task="gen_agreement_retry" if attempt else "gen_stage2",
                                       computer_task=operation, deliver_file=expression.deliver_file)
             if flight.updates:
+                return
+            if operation and isinstance(raw, computer.TaskOutcome):
+                # 工具循环给出结束状态：已交付或没有动作 = 静默；失败 = 一句说明。
+                if raw.completed:
+                    # 交付完成即静默：群里只留交付物本身，不补任何文字。
+                    decision.should_reply, decision.reason = False, raw.reason
+                    break
+                decision.reason = raw.reason
+                if not raw:
+                    decision.should_reply = False
+                    break
+                # 说明只作为一条消息发出，不交给分段器拆条。
+                body = re.sub(r"[。！？!?]+", "。", clean_reply_patterns(strip_transcript_prefix(str(raw))))
+                if self.config.chat.strip_action_parens:
+                    body = strip_action_parens(body)
+                reply = computer.one_sentence(body) or computer.one_sentence(str(raw))
+                if not reply:
+                    decision.should_reply = False
+                    break
+                decision.should_reply = True
+                sent = await self.send_reply(event, [Segment.text(reply)], now=now, count_speech=False,
+                                             begin_send=flight.begin_send)
+                decision.should_reply = sent
+                if not sent:
+                    decision.reason = "computer_task_send_failed"
+                self._log_decision(event, decision, now, expression, must=hard)
+                self.opener_guard.clear_pending(round_.key)
                 return
             if flight.computer_failed or (operation and not raw):
                 decision.should_reply, decision.reason = False, 'computer_task_failed'
@@ -2627,12 +2657,30 @@ class RubenBot:
                 reply = None
             except Exception as exc:  # noqa: BLE001 - 工具循环失败不能拖死回复
                 logger.warning("工具循环失败，退化为单次生成：%s", exc)
-                reply = None
+                if computer_task and event is not None:
+                    # 异常逃出循环：无法确认做到哪步，只说明这次没办成。
+                    reply = await self._task_outcome(
+                        event, task=task, done=(), failed_tool="", error="执行中途出了岔子",
+                        file_sent=False, partial=False,
+                    )
+                else:
+                    reply = None
             if reply is not None:
-                return reply if isinstance(reply, WebReply) else reply.strip()
+                return reply if isinstance(reply, (WebReply, computer.TaskOutcome)) else reply.strip()
         if computer_task:
-            # 工具不可用或没有真实调用，不能换一次无工具生成来冒充操作回执。
-            return ''
+            # 工具不可用或没有真实调用，不能换一次无工具生成来冒充操作回执；
+            # 但仍欠对方一句说明，不能静默当办成了。
+            if event is not None:
+                return await self._task_outcome(
+                    event, task=task, done=(), failed_tool="", error="这边工具用不了",
+                    file_sent=False, partial=False,
+                )
+            return computer.TaskOutcome(
+                computer.one_sentence(computer.fallback_sentence(
+                    failed_tool="", error="这边工具用不了",
+                )),
+                reason="computer_task_failed",
+            )
         try:
             reply = await self.llm.complete(messages, role="chat", task=task)
         except Exception as exc:  # noqa: BLE001 - LLM 失败不能带死循环
@@ -2659,7 +2707,12 @@ class RubenBot:
         operation: bool = False,
         deliver_file: bool = False,
     ) -> str | None:
-        """有界工具循环；操作委托只接受真实执行结果，不走自由生成兜底。"""
+        """有界工具循环；操作委托只接受真实执行结果，不走自由生成兜底。
+
+        操作委托的结束形态只有两种：交付物送达或没有动作时静默返回空串，
+        失败 / 部分完成时返回一句说明（``computer.TaskOutcome``）。模型在
+        动作之后自行写下的总结、确认、邀约一律丢弃。
+        """
         if not getattr(self.llm, "supports_tools", True):
             raise ToolUnsupported("当前模型已确认不支持工具调用")
         chat_with_tools = getattr(self.llm, "chat_with_tools", None)
@@ -2669,15 +2722,31 @@ class RubenBot:
         if max_rounds == 0:
             raise ToolUnsupported("工具循环已关闭")
         file_sent = False
+        done: list[str] = []
         host = computer.is_host(self.config.computer, event)
         if operation and host:
             max_rounds = self.config.computer.max_task_rounds
         working: list[dict[str, Any]] = list(messages)
+
+        def silent(reason: str = "computer_task", *, completed: bool = True) -> computer.TaskOutcome:
+            # 交付完成即静默：不补总结、不确认、不邀约。
+            return computer.TaskOutcome("", reason=reason, delivered=file_sent, completed=completed)
+
+        def missing_deliverable() -> computer.TaskOutcome:
+            # 说明生成失败时给兜底句，绝不把未完成说成已交付；调用点负责 await。
+            return self._task_outcome(
+                event, task=task, done=tuple(done), failed_tool="send_file",
+                error="", file_sent=file_sent,
+                partial=bool(done or file_sent), state="文件还没发出去",
+            )
+
         for index in range(max_rounds):
             # 上一轮等待模型或执行工具期间 MCP 可能断线或重连，不能沿用旧清单。
             tools = self._generation_tools(event, operation)
             if not tools:
-                return '' if operation else await self.llm.complete(working, role="chat", task=task)
+                if operation:
+                    return silent("computer_task_failed", completed=False)
+                return await self.llm.complete(working, role="chat", task=task)
             required = operation and (index == 0 or (deliver_file and not file_sent))
             message = await self._call_with_tools(working, tools, role="chat", task=task,
                                                   tool_choice='required' if required else 'auto')
@@ -2685,21 +2754,33 @@ class RubenBot:
             if operation:
                 flight = self._flights.get((event.platform, event.chat_type, event.chat_id))
                 if flight and flight.updates:
-                    return ''  # 等待模型时机主补充了要求；执行前重裁，执行后不重放。
+                    return silent("computer_task_failed", completed=False)  # 等待模型时机主补充了要求；执行前重裁，执行后不重放。
                 if not self.config.computer.enabled or computer.is_host(self.config.computer, event) != host:
-                    return ''
+                    return silent("computer_task_failed", completed=False)
                 for call in tool_calls:
                     fn = call['function']
                     if fn['name'] not in computer.COMPUTER_TOOLS:
                         computer.audit_denial(self.config.computer, self.store, event, fn['name'],
                                               _parse_tool_arguments(fn.get('arguments')))
-                        return ''
+                        return silent("computer_task_failed", completed=False)
                 if required and not tool_calls:
-                    return ''
+                    # 有前置成果却始终没交出附件：算部分完成；一步都没做就保持沉默。
+                    return (await missing_deliverable()) if deliver_file and done else silent("computer_task_failed")
                 if tool_calls and flight:
                     flight.collecting = False  # 从实际分派起封口，新消息另起一轮。
             if not tool_calls:
                 content = (message.get("content") or "").strip()
+                if operation:
+                    if file_sent:
+                        return silent()  # 文件已送达：模型再写什么总结都不发。
+                    if deliver_file:
+                        return await missing_deliverable()
+                    if content and done and all(name in _QUERY_TOOLS for name in done):
+                        # 纯查询类委托：结果本身由模型作答，没有额外汇报。
+                        # 夹带过写文件 / 发文件等副作用的不算，成功即静默。
+                        return content
+                    # 只做了写文件之类的动作：成功即静默，不补确认。
+                    return silent()
                 if content:
                     # 模型没要工具、直接给了回复：这就是一次正常生成，不必再花一次请求
                     return content
@@ -2731,19 +2812,29 @@ class RubenBot:
                     fn = call['function']
                     computer.audit_denial(self.config.computer, self.store, event, fn['name'],
                                           _parse_tool_arguments(fn.get('arguments')))
-                    return ''
+                    return silent("computer_task_failed", completed=False)
                 result = await self._tool_result_message(call, event)
                 success = result.pop('computer_success', None)
                 if success is False:
-                    return ''  # 失败已审计；不让自由生成掩盖拒绝，也不执行同批余下动作。
+                    # 失败已审计；不让自由生成掩盖拒绝，也不执行同批余下动作。
+                    if not operation:
+                        return ''
+                    # 操作委托失败只发一句人话说明哪步没成、现在是什么状态。
+                    return await self._task_outcome(
+                        event, task=task, done=tuple(done), failed_tool=call['function']['name'],
+                        error=str(result.get('content') or ''), file_sent=file_sent,
+                        partial=bool(done or file_sent),
+                    )
+                if success:
+                    done.append(call['function']['name'])
                 if success and call['function']['name'] == 'send_file':
                     file_sent = True
                 working.append(result)
-        # 已耗尽预算，不再分派；只带实际工具结果收尾一次。
+        # 已耗尽预算，不再分派；成功即静默，不追加完成总结。
         if operation:
             if deliver_file and not file_sent:
-                return ''
-            return await self.llm.complete(working, role='chat', task=task)
+                return await missing_deliverable()
+            return silent()
         tools = self._generation_tools(event, operation)
         if not tools:
             return await self.llm.complete(working, role="chat", task=task)
@@ -2751,6 +2842,46 @@ class RubenBot:
             working, tools, role="chat", task=task, tool_choice="none"
         )
         return message.get("content") or ""
+
+    async def _task_outcome(
+        self,
+        event: MessageEvent,
+        *,
+        task: str,
+        done: tuple[str, ...],
+        failed_tool: str,
+        error: str,
+        file_sent: bool,
+        partial: bool,
+        state: str = "",
+    ) -> computer.TaskOutcome:
+        """失败 / 部分完成时让模型用自己的口吻说一句；模型不可用就给兜底句。
+
+        只给执行记录和本轮原话，不把群聊历史、记忆或工具输出正文交给这次生成。
+        """
+        record = computer.outcome_record(done=done, failed_tool=failed_tool, error=error,
+                                         file_sent=file_sent, state=state)
+        messages = [
+            {"role": "system", "content": self.persona_system_prompt(event, stage="generator")
+             + "\n\n" + computer.OUTCOME_GUIDANCE},
+            {"role": "user", "content": f"执行记录：{record}\n本轮原话：{event.text}"},
+        ]
+        text = ""
+        try:
+            kwargs: dict[str, Any] = {"role": "chat", "task": "gen_outcome"}
+            if self._accepts_kwarg(self.llm.complete, "max_tokens"):
+                kwargs["max_tokens"] = 120
+            text = await self.llm.complete(messages, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - 说明拿不到时用兜底句
+            logger.warning("电脑任务说明生成失败：%s", exc)
+        sentence = computer.one_sentence(text)
+        if not sentence:
+            sentence = computer.fallback_sentence(
+                failed_tool=failed_tool, error=error, done=done, file_sent=file_sent,
+                state=state or None,
+            )
+        reason = "computer_task_partial" if partial else "computer_task_failed"
+        return computer.TaskOutcome(sentence, reason=reason)
 
     @staticmethod
     def _accepts_kwarg(callable_: Any, name: str) -> bool:
@@ -2991,6 +3122,7 @@ class RubenBot:
         now: float | None = None,
         proactive: bool = False,
         begin_send: Callable[[], bool] | None = None,
+        count_speech: bool = True,
     ) -> bool:
         """拆条发送，并把 bot 自己的话写进流水（``processed=True``，不参与记忆抽取）。
 
@@ -2998,6 +3130,9 @@ class RubenBot:
         消息段：段列表原样交给适配器，整条消息只发一次，不做二次拆分。
         多条之间有按下一段字数估算的打字停顿（第一段立即发），可用
         ``reply.segment_delay_enabled`` 关闭。
+
+        ``count_speech=False`` 用于失败 / 部分完成说明：仍落流水与自我时间线，
+        但不计正常发言冷却与主动发言窗口（没办成不算接了一次话）。
 
         至少发出一条才返回 True 并记冷却，拆条连发只算一轮。
         """
@@ -3035,11 +3170,12 @@ class RubenBot:
             ok, sent_id = await self._send_voice(adapter, event, text, voice_audio, voice_mime)
             if ok:
                 self._record_bot_message(event, text, sent_id)
-                self.opener_guard.note_reply((event.platform, event.chat_type, event.chat_id), text)
-                self.decision_engine.note_bot_reply(
-                    self.decision_engine.chat_key(event), time.time() if now is None else now,
-                    proactive=proactive,
-                )
+                if count_speech:
+                    self.opener_guard.note_reply((event.platform, event.chat_type, event.chat_id), text)
+                    self.decision_engine.note_bot_reply(
+                        self.decision_engine.chat_key(event), time.time() if now is None else now,
+                        proactive=proactive,
+                    )
                 return True
         sent_any = False
         for index, segments in enumerate(parts):
@@ -3057,20 +3193,22 @@ class RubenBot:
             # 流水保留回执、发言计数和回复关系，但摘要、自我时间线与实体账都拿不到网页。
             self._record_bot_message(event, RECORD_PLACEHOLDER if isinstance(reply, WebReply) else text, message_id)
             # 以真正送达的文字条为准，不把网页引文、图片占位或失败的草稿当成自己的措辞。
-            if not isinstance(reply, WebReply):
+            if not isinstance(reply, WebReply) and count_speech:
                 spoken = "".join(s.render() for s in segments if s.type == "text")
                 self.opener_guard.note_reply((event.platform, event.chat_type, event.chat_id), spoken)
         if not sent_any:
             # 全部分条都发失败：当作没说过话——不进不应期、不记情绪
             logger.warning("发送全部失败（%s），不记本次发言", event.platform)
             return False
-        # 发言时间交给决策引擎：发言后冷却与主动发言窗口都依赖它（拆条只记一次）
-        self.decision_engine.note_bot_reply(
-            self.decision_engine.chat_key(event), time.time() if now is None else now,
-            proactive=proactive,
-        )
-        # 情绪侧：刚说过话 = 有人理；群里热闹就兴奋一下
-        self.note_emotion_after_reply(event, now=now)
+        # 发言时间交给决策引擎：发言后冷却与主动发言窗口都依赖它（拆条只记一次）。
+        # count_speech=False 是失败 / 部分完成的一句说明，不算社交发言。
+        if count_speech:
+            self.decision_engine.note_bot_reply(
+                self.decision_engine.chat_key(event), time.time() if now is None else now,
+                proactive=proactive,
+            )
+            # 情绪侧：刚说过话 = 有人理；群里热闹就兴奋一下
+            self.note_emotion_after_reply(event, now=now)
         return True
 
     def _record_bot_message(

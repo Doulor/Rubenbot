@@ -49,6 +49,8 @@ CREATE TABLE IF NOT EXISTS memories (
     scope_id    TEXT NOT NULL DEFAULT '',         -- group 时为群 id
     content     TEXT NOT NULL,
     category    TEXT NOT NULL DEFAULT 'fact',
+    -- 实体锚点：评价型断言所指的对象（空串表示正文自带主语，无需锚点）
+    entity      TEXT NOT NULL DEFAULT '',
     source      TEXT NOT NULL DEFAULT 'extracted', -- extracted / user / system
     source_ref  TEXT NOT NULL DEFAULT '',
     -- 记忆 v2：来源会话、原始受众、敏感度、事实稳定性与过期时间
@@ -86,6 +88,8 @@ CREATE TABLE IF NOT EXISTS profile_evidence (
     section       TEXT NOT NULL,                  -- stable / status
     line_no       INTEGER NOT NULL,               -- 该节第几行（0 起）
     evidence_refs TEXT NOT NULL DEFAULT '[]',     -- JSON 数组
+    -- 评价型行的实体锚点；自带主语的画像行留空
+    entity        TEXT NOT NULL DEFAULT '',
     UNIQUE(person_id, section, line_no)
 );
 CREATE INDEX IF NOT EXISTS idx_profile_evidence_person ON profile_evidence(person_id);
@@ -402,6 +406,8 @@ class Memory:
     scope_id: str = ""
     content: str = ""
     category: str = "fact"
+    # 实体锚点（评价型断言所指的专名）；正文自带主语时为空
+    entity: str = ""
     source: str = "extracted"
     source_ref: str = ""
     # 记忆 v2 元数据
@@ -478,6 +484,8 @@ class ProfileLine:
     line_no: int = 0
     # 近况类的估计有效天数（只用于计算 status_expires_at，不落库到证据表）
     expires_in_days: int | None = None
+    # 评价型断言所指的实体锚点（正文自带主语时为空）
+    entity: str = ""
 
 
 @dataclass
@@ -661,6 +669,9 @@ class MemoryStore:
                 # 旧 allow 不能证明本人在私聊明确答应过，不提升为授权。
                 self._conn.execute("ALTER TABLE rulings ADD COLUMN source TEXT NOT NULL DEFAULT 'unknown'")
             event_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(events)")}
+            profile_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(profile_evidence)")}
+            if "entity" not in profile_columns:
+                self._conn.execute("ALTER TABLE profile_evidence ADD COLUMN entity TEXT NOT NULL DEFAULT ''")
             if "source_ref" not in event_columns:
                 self._conn.execute("ALTER TABLE events ADD COLUMN source_ref TEXT NOT NULL DEFAULT ''")
             if "source_raw_id" not in event_columns:
@@ -903,6 +914,7 @@ class MemoryStore:
         scope_type: str = "global",
         scope_id: str = "",
         category: str = "fact",
+        entity: str = "",
         source: str = "extracted",
         source_ref: str = "",
         origin_chat: str = "",
@@ -921,9 +933,9 @@ class MemoryStore:
         with self._lock:
             cur = self._conn.execute(
                 """
-                INSERT INTO memories(person_id, scope_type, scope_id, content, category, source, source_ref,
+                INSERT INTO memories(person_id, scope_type, scope_id, content, category, entity, source, source_ref,
                                      origin_chat, audience, sensitivity, stability, expires_at, created_at, updated_at)
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     person_id,
@@ -931,6 +943,7 @@ class MemoryStore:
                     scope_id or "",
                     content.strip(),
                     category,
+                    entity.strip(),
                     source,
                     source_ref,
                     origin_chat,
@@ -1095,6 +1108,7 @@ class MemoryStore:
         *,
         content: str | None = None,
         category: str | None = None,
+        entity: str | None = None,
         now: float | None = None,
     ) -> Memory | None:
         mem = self.get_memory(memory_id)
@@ -1103,10 +1117,11 @@ class MemoryStore:
         now = time.time() if now is None else now
         new_content = mem.content if content is None else content.strip()
         new_category = mem.category if category is None else category
+        new_entity = mem.entity if entity is None else entity.strip()
         with self._lock:
             self._conn.execute(
-                "UPDATE memories SET content = ?, category = ?, updated_at = ? WHERE id = ?",
-                (new_content, new_category, now, memory_id),
+                "UPDATE memories SET content = ?, category = ?, entity = ?, updated_at = ? WHERE id = ?",
+                (new_content, new_category, new_entity, now, memory_id),
             )
             self._conn.commit()
         return self.get_memory(memory_id)
@@ -1116,6 +1131,41 @@ class MemoryStore:
             cur = self._conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
             self._conn.commit()
         return cur.rowcount > 0
+
+    def merge_memory_inplace(
+        self,
+        memory_id: int,
+        *,
+        content: str,
+        entity: str | None = None,
+        source_ref: str | None = None,
+        reason: str = "",
+        now: float | None = None,
+    ) -> Memory | None:
+        """原地补全一条已有记忆（如把评价并进实体条目），并写可撤销的 ``merge`` 日志。
+
+        不删旧行：既保住 id（画像证据链还指着它），也让 ``restore`` 能把正文改回去。
+        """
+        now = time.time() if now is None else now
+        with self._lock:
+            before = self.get_memory(memory_id)
+            if before is None:
+                return None
+            self._conn.execute(
+                "UPDATE memories SET content = ?, entity = ?, source_ref = ?, updated_at = ? WHERE id = ?",
+                (
+                    content.strip(),
+                    before.entity if entity is None else entity.strip(),
+                    before.source_ref if source_ref is None else source_ref,
+                    now,
+                    memory_id,
+                ),
+            )
+            after = self.get_memory(memory_id)
+            if after is not None:
+                self._insert_log("merge", before.person_id, [before], [after], reason, now)
+            self._conn.commit()
+        return after
 
     def count_memories(self, person_id: str | None = None, since: float | None = None) -> int:
         sql = "SELECT COUNT(*) AS c FROM memories WHERE 1=1"
@@ -1198,9 +1248,9 @@ class MemoryStore:
                 for spec in add_specs:
                     cur = self._conn.execute(
                         """
-                        INSERT INTO memories(person_id, scope_type, scope_id, content, category, source, source_ref,
+                        INSERT INTO memories(person_id, scope_type, scope_id, content, category, entity, source, source_ref,
                                              origin_chat, audience, sensitivity, stability, expires_at, created_at, updated_at)
-                        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             spec["person_id"],
@@ -1208,6 +1258,7 @@ class MemoryStore:
                             spec.get("scope_id", "") or "",
                             spec["content"].strip(),
                             spec.get("category", "fact"),
+                            spec.get("entity", ""),
                             spec.get("source", "extracted"),
                             spec.get("source_ref", ""),
                             spec.get("origin_chat", ""),
@@ -1278,6 +1329,35 @@ class MemoryStore:
             row = self._conn.execute("SELECT * FROM memory_log WHERE id = ?", (log_id,)).fetchone()
         return self._row_to_log(row) if row else None
 
+    def log_dropped_unanchored(
+        self,
+        *,
+        person_id: str,
+        origin_chat: str,
+        kind: str,
+        content: str,
+        reason: str,
+        source_msg_id: int | None = None,
+        now: float | None = None,
+    ) -> LogEntry:
+        """记一条「无实体锚点、未落账」的丢弃记录。
+
+        写进 ``memory_log``（``action='dropped_unanchored'``），正文与来源保留在
+        ``before_json`` 里供机主/前台查证；``after_json`` 为空，撤销无意义——
+        这条动作本身不可被 restore 回滚成一条记忆。
+        """
+        now = time.time() if now is None else now
+        before = [{
+            "content": content,
+            "kind": kind,
+            "origin_chat": origin_chat,
+            "source_msg_id": source_msg_id,
+        }]
+        with self._lock:
+            log = self._insert_log("dropped_unanchored", person_id, before, [], reason, now)
+            self._conn.commit()
+        return log
+
     def latest_log_id(self, person_id: str, *, action: str | None = None) -> int | None:
         """某人的最新一条日志 id（画像提炼写日志后取回用）。"""
         sql = "SELECT id FROM memory_log WHERE person_id = ?"
@@ -1307,13 +1387,17 @@ class MemoryStore:
         """撤销一条日志：把 before 快照写回，并生成一条可反撤销的 restore 日志。
 
         只有记忆变更日志能撤销；画像变更（``profile_update``）只作审计留痕，
-        本人要求清空（``purge``）是真删，绝不能从日志里撤销回来。
+        无锚点丢弃（``dropped_unanchored``）是「没有落账」的记录，撤销它等于
+        凭空造一条记忆，因此也拒绝；本人要求清空（``purge``）是真删，绝不能从
+        日志里撤销回来。
         """
         now = time.time()
         with self._lock:
             # 和清空共用同一把锁；不能在等待写锁时攥着一份已经删除的快照。
             log = self.get_log(log_id)
-            if log is None or log.reverted or log.action in ("profile_update", "purge"):
+            if log is None or log.reverted or log.action in (
+                "profile_update", "purge", "dropped_unanchored",
+            ):
                 return False
             before_ids = {int(m["id"]) for m in log.before}
             after_ids = {int(m["id"]) for m in log.after}
@@ -1323,11 +1407,26 @@ class MemoryStore:
                 restored: list[Memory] = []
                 for snapshot in log.before:
                     row = dict(snapshot)
+                    # 原地补全（merge 日志 before/after 是同一条）：改回原正文即可，
+                    # 不能 INSERT OR REPLACE 把画像证据链还指着的记忆换掉。
+                    if row["id"] in after_ids:
+                        self._conn.execute(
+                            "UPDATE memories SET content = ?, entity = ?, source_ref = ?, updated_at = ? WHERE id = ?",
+                            (
+                                row["content"],
+                                row.get("entity", ""),
+                                row.get("source_ref", ""),
+                                row.get("updated_at", now),
+                                row["id"],
+                            ),
+                        )
+                        continue
                     self._conn.execute(
                         """
-                        INSERT OR REPLACE INTO memories(id, person_id, scope_type, scope_id, content, category, source, source_ref,
-                                                        origin_chat, audience, sensitivity, stability, expires_at, created_at, updated_at)
-                        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        INSERT OR REPLACE INTO memories(id, person_id, scope_type, scope_id, content, category, entity,
+                                                        source, source_ref, origin_chat, audience, sensitivity, stability,
+                                                        expires_at, created_at, updated_at)
+                        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             row["id"],
@@ -1336,6 +1435,7 @@ class MemoryStore:
                             row.get("scope_id", "") or "",
                             row["content"],
                             row.get("category", "fact"),
+                            row.get("entity", ""),
                             row.get("source", "extracted"),
                             row.get("source_ref", ""),
                             row.get("origin_chat", ""),
@@ -1663,14 +1763,15 @@ class MemoryStore:
                             continue
                         self._conn.execute(
                             """
-                            INSERT INTO profile_evidence(person_id, section, line_no, evidence_refs)
-                            VALUES(?, ?, ?, ?)
+                            INSERT INTO profile_evidence(person_id, section, line_no, evidence_refs, entity)
+                            VALUES(?, ?, ?, ?, ?)
                             """,
                             (
                                 person_id,
                                 section,
                                 line_no,
                                 json.dumps(list(line.evidence_refs), ensure_ascii=False),
+                                (line.entity or "").strip(),
                             ),
                         )
                         line_no += 1
@@ -1722,6 +1823,15 @@ class MemoryStore:
                 refs = []
             result[(row["section"], int(row["line_no"]))] = [str(r) for r in refs]
         return result
+
+    def get_profile_line_entities(self, person_id: str) -> dict[tuple[str, int], str]:
+        """返回 {(section, line_no): entity}；自带主语的画像行值为空串。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT section, line_no, entity FROM profile_evidence WHERE person_id = ? ORDER BY section, line_no",
+                (person_id,),
+            ).fetchall()
+        return {(row["section"], int(row["line_no"])): str(row["entity"] or "") for row in rows}
 
     # ------------------------------------------------------------------
     # privacy_settings（按人三档隐私）
@@ -3502,6 +3612,8 @@ _MEMORIES_MIGRATIONS: dict[str, str] = {
     "sensitivity": "TEXT NOT NULL DEFAULT 'normal'",
     "stability": "TEXT NOT NULL DEFAULT 'stable'",
     "expires_at": "REAL",
+    # 指称完整性：评价型断言必须带可识别的实体锚点（见 memory/anchor.py）
+    "entity": "TEXT NOT NULL DEFAULT ''",
 }
 
 

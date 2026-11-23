@@ -1,24 +1,31 @@
-"""回复决策：合并窗口、硬触发、节奏护栏、主动冷场评分、生成否决。
+"""回复决策：合并窗口、硬触发、节奏护栏、指向折扣、改写复述核验、生成否决。
 
 所有时间都显式传入，随机源可注入，因此结果完全确定。
 """
 
 from __future__ import annotations
 
+import asyncio
 import random
 import time
 
 import pytest
 
+from conftest import ScriptedLLM
+from test_core import make_bot
+
 from rubenbot.adapters.base import MessageEvent
 from rubenbot.config import DecisionConfig, ProactiveConfig
 from rubenbot.decision import (
+    AddressingFactor,
     DecisionEngine,
     MessageMerger,
     in_quiet_hours,
     is_reply_to_bot,
+    paraphrase_verdict,
     parse_generation_output,
     parse_quiet_hours,
+    peer_ground,
 )
 
 
@@ -43,6 +50,8 @@ def group_event(
     mentions=False,
     reply_to=None,
     raw=None,
+    mention_map=None,
+    reply_sender=None,
 ) -> MessageEvent:
     return MessageEvent(
         platform="test",
@@ -53,6 +62,8 @@ def group_event(
         text=text,
         mentions_bot=mentions,
         reply_to_id=reply_to,
+        mentions=mention_map or {},
+        reply_sender_id=reply_sender or "",
         raw=raw or {},
     )
 
@@ -311,3 +322,217 @@ def test_generation_custom_marker():
     assert result.vetoed
     result = parse_generation_output("[不回复]", marker="<silent>")
     assert not result.vetoed
+
+
+# ----------------------------------------------------------------------
+# 增量核验：改写复述判定
+# ----------------------------------------------------------------------
+
+# 2026-11-23 10:17 主群 1125257581（decision 3135）：宇轩在答多萝，bot 插话
+# 把同一条消息换了个说法复述了一遍。问题不在字面重合（附和闸门拦不住改写），
+# 而在草稿没有带来任何新事实、新问题或新态度。
+_CASE_3135_SOURCE = "没想到是一天一个地区"
+_CASE_3135_REWRITES = (
+    "一天一个地区，天天有新地方可以开",
+    "原来是一天一个地区啊，那每天都能换个地方玩",
+    "一天一个地区啊，那天天都有新地方开",
+)
+
+
+@pytest.mark.parametrize("draft", _CASE_3135_REWRITES)
+def test_paraphrase_catches_case_3135_rewrites(draft):
+    verdict = paraphrase_verdict(_CASE_3135_SOURCE, draft)
+    assert verdict.repetitive, verdict.describe()
+
+
+@pytest.mark.parametrize(("source", "draft"), [
+    # 拆断句 + 加口头语，仍然是同一句话。
+    ("这个版本，明天才会开放下载", "嗯，确实，这个版本明天才会开放下载啊。"),
+    ("也就是说，今晚剧场开门的时间从原定的晚上七点推迟到了晚上八点。", "原定七点开门，现在推迟到八点了"),
+    ("剧场明晚开放线上售票，说起来，线下窗口也会同步开售", "剧场明晚开放线上售票，线下窗口也会同步开售"),
+    ("我已经把四个角都压紧了，书不会再翘了", "四个角都压紧了，书就不会翘了"),
+    ("今天轮到小陈去车站接小李", "今天是小陈去车站接小李啊"),
+])
+def test_paraphrase_catches_plain_rewrites(source, draft):
+    assert paraphrase_verdict(source, draft).repetitive
+
+
+@pytest.mark.parametrize(("source", "draft"), [
+    # 落回具体某一天/某个时间是新事实：「明天」不能当泛词剥掉。
+    ("今天食堂的糖醋排骨卖完了", "糖醋排骨卖完了，明天早点去"),
+    ("这个版本，明天才会开放下载", "明天才开放下载，今晚先用旧版"),
+    # 第一人称打算/邀约是原句没有的新内容。
+    ("今晚八点剧场开放线上售票", "八点开放线上售票，我去看看"),
+    ("今晚八点剧场开放线上售票", "八点开放线上售票，那我也要看看"),
+    # 换个措辞提问，是新的社交信号。
+    ("一号线今天停运", "那二号线今天正常吗"),
+])
+def test_paraphrase_keeps_new_facts_and_intent(source, draft):
+    verdict = paraphrase_verdict(source, draft)
+    assert not verdict.repetitive, verdict.describe()
+
+
+@pytest.mark.parametrize(("source", "draft"), [
+    # panda 案：知识型提问的直答，草稿与原句几乎没有字面重合。
+    ("下载 YouTube 视频用哪个工具？", "用 yt-dlp，后面接视频链接"),
+    # 附带新信息：限量、新时间、新数字、否定被去掉。
+    ("今晚八点剧场开放线上售票", "今晚八点剧场开放线上售票，限量"),
+    ("今晚8点剧场开放线上售票", "今晚9点剧场开放线上售票"),
+    ("不允许把这里的书和报纸带回家", "允许把这里的书和报纸带回家"),
+    # 换问法、加新态度、换主客体，都算有增量。
+    ("今晚八点剧场开放线上售票", "今晚八点剧场开放线上售票？"),
+    ("没想到是一天一个地区", "一天一个地区，这更新速度有点离谱"),
+    # 光秃秃的复述配一句评价（「更新挺快」「这也太慢了」）是新态度，不算纯复述。
+    ("没想到是一天一个地区", "一天一个地区，更新挺快"),
+    ("没想到是一天一个地区", "一天一个地区，这也太慢了"),
+    ("没想到是一天一个地区", "你那边现在开放到第几个地区了？"),
+    # 原句没提人，草稿突然对「你」说或是自己的打算：新的社交信号。
+    ("今晚八点剧场开放线上售票", "今晚八点剧场开放线上售票，你去不去"),
+    ("今晚八点剧场开放线上售票", "今晚八点剧场开放线上售票，那我提前守着"),
+    # 一字之差的新事实：「线上」换「线下」、补一句「量挺大」，都不是复述。
+    ("今晚八点剧场开放线上售票", "剧场八点开放线下售票"),
+    ("食堂今天有红烧肉", "今天食堂有红烧肉，量挺大"),
+    ("今天轮到小陈去车站接小李", "今天轮到小李去车站接小陈"),
+    ("我想下班之后去看音乐剧", "我中午就约了摄影师拍照"),
+    # 短接话不是「长复述」：交给附和闸门和策划。
+    ("今晚八点剧场开放线上售票", "收到，我去设个闹钟"),
+    ("今晚八点剧场开放线上售票", "好"),
+    # 空输入没有可判定的内容。
+    ("", "一天一个地区"),
+    ("没想到是一天一个地区", ""),
+])
+def test_paraphrase_lets_incremental_replies_through(source, draft):
+    verdict = paraphrase_verdict(source, draft)
+    assert not verdict.repetitive, verdict.describe()
+
+
+def test_paraphrase_is_pure_and_explains_itself():
+    first = paraphrase_verdict(_CASE_3135_SOURCE, _CASE_3135_REWRITES[0])
+    second = paraphrase_verdict(_CASE_3135_SOURCE, _CASE_3135_REWRITES[0])
+    assert first == second
+    assert first.reason == "restated_source" and first.skeleton
+    assert "复述" in first.describe()
+    assert "有增量" in paraphrase_verdict(_CASE_3135_SOURCE, "那这速度还挺快").describe()
+
+
+# ----------------------------------------------------------------------
+# 指向事实：别人互问时压低开口权重
+# ----------------------------------------------------------------------
+
+
+def _peer_event(text="没想到是一天一个地区", *, sender="宇轩", **kwargs) -> MessageEvent:
+    """2026-11-23 3135 现场事件：宇轩在答多萝，没有点 bot。"""
+    return group_event(text, sender=sender, **kwargs)
+
+
+def test_peer_ground_reads_platform_addressing():
+    replied = _peer_event(reply_to="m1", reply_sender="duoluo")
+    ground = peer_ground(replied)
+    assert ground.to_peer and ground.replied_peer and not ground.to_bot
+    assert ground.peers == ("duoluo",)
+
+    mentioned = group_event("你们觉得呢", mention_map={"B": "阿乙"})
+    assert peer_ground(mentioned).to_peer and not peer_ground(mentioned).replied_peer
+
+    # @所有人 不是指向某个人；点到 bot 也不算「指向别人」。
+    assert not peer_ground(group_event("大家好", mention_map={"all": ""})).to_peer
+    to_bot = group_event("在吗", mentions=True)
+    assert peer_ground(to_bot).to_bot and not peer_ground(to_bot).to_peer
+
+    # 引用自己刚说的话补充说明，仍是说给大家/bot 听，不算「指向别人」。
+    self_reply = _peer_event("补充一下", sender="宇轩", reply_to="m2", reply_sender="宇轩")
+    assert not peer_ground(self_reply).replied_peer
+    assert not peer_ground(self_reply).to_peer
+
+
+def test_addressing_factor_only_penalizes_peer_to_peer():
+    penalty = AddressingFactor(replied_peer=True, to_peer=True, penalty=1.0)
+    assert penalty.penalized and penalty.score == -1.0
+    # 只 @ 了别人、没回复谁：记录事实，但折扣为 0（可能是在问 bot）。
+    mentioned_only = AddressingFactor(replied_peer=False, to_peer=True, penalty=1.0)
+    assert not mentioned_only.penalized and mentioned_only.score == 0.0
+    # 点到 bot 就不打折，哪怕同时回复了别人。
+    to_bot = AddressingFactor(to_bot=True, to_peer=True, replied_peer=True, penalty=1.0)
+    assert not to_bot.penalized and to_bot.score == 0.0
+
+
+def test_engine_addressing_uses_aliases_before_penalizing():
+    engine = make_engine()
+    # 「Argon 和 Ruben 哪个好用」@ 了阿乙，但正文点了 bot 的名字：不折扣。
+    called = group_event("Argon 和 Ruben 哪个更好用？", mention_map={"B": ""})
+    assert not engine.addressing(called).penalized
+    # 3135 这轮回复的是多萝，正文没有叫 bot：折扣。
+    assert engine.addressing(_peer_event(reply_to="m1", reply_sender="duoluo")).penalized
+
+
+def test_case_3135_silenced_at_decision_layer():
+    """回放 3135：别人互答、没点 bot 的普通群消息，在裁定层直接沉默。"""
+    engine = make_engine()
+    event = _peer_event(reply_to="m1", reply_sender="duoluo")
+
+    guard = engine.guard(event, now=100.0, proactive=True)
+    assert guard is not None and not guard.should_reply
+    assert guard.reason == "addressing_elsewhere"
+    assert guard.addressing is not None and guard.addressing.penalized
+    assert guard.factors is not None and guard.factors.addressing == -1.0
+    assert "指向-1.00" in guard.factors.describe()
+    assert "指向别人" in guard.addressing.describe()
+
+
+def test_panda_and_direct_address_still_pass():
+    """panda 案（知识型提问直答）与明确递到 bot 面前的接话不受指向因子影响。"""
+    engine = make_engine()
+    panda = group_event("下载 YouTube 视频用哪个工具？", mentions=True)
+    assert engine.guard(panda, now=100.0, proactive=True) is None
+    replied_to_bot = group_event("那用哪个参数？", reply_to="m9", reply_sender="__bot__")
+    assert engine.guard(replied_to_bot, now=100.0, proactive=True) is None
+    # 普通无指向的群消息照旧放行，交给策划。
+    assert engine.guard(group_event("今天的天气不错"), now=100.0, proactive=True) is None
+    # 私聊没有「别人」，永不折扣。
+    assert engine.guard(private_event(), now=100.0, proactive=True) is None
+    # 指向折扣只作用于普通主动开口路径；显式非主动调用不拦。
+    peer = _peer_event(reply_to="m1", reply_sender="duoluo")
+    assert engine.guard(peer, now=100.0) is None
+
+
+def test_mention_peer_without_reply_is_audited_but_not_silenced():
+    """@ 了别人但没回复谁：记录事实，交给策划——这类话也可能在问 bot。"""
+    engine = make_engine()
+    event = group_event("你们觉得哪个好用", mention_map={"B": "阿乙"})
+    factor = engine.addressing(event)
+    assert factor.to_peer and not factor.penalized
+    assert factor.to_dict() == {"to_bot": False, "to_peer": True, "replied_peer": False,
+                                "peers": ["B"], "penalized": False}
+    assert engine.guard(event, now=100.0, proactive=True) is None
+
+
+def test_addressing_factor_is_plain_data_for_wiring():
+    """接线时可直接调用：结果可序列化，describe 为空话不产生占位文字。"""
+    engine = make_engine()
+    plain = engine.addressing(group_event("今天的天气不错"))
+    assert plain.to_dict() == {"to_bot": False, "to_peer": False, "replied_peer": False,
+                               "peers": [], "penalized": False}
+    assert plain.describe() == "" and not plain.penalized
+    # 主群案例：引用多萝、正文没叫 bot —— 事实与折扣都能直接交给日志。
+    case = engine.addressing(_peer_event(reply_to="m1", reply_sender="duoluo"))
+    assert case.to_dict() == {"to_bot": False, "to_peer": True, "replied_peer": True,
+                              "peers": ["duoluo"], "penalized": True}
+    assert case.describe() == "指向别人"
+
+
+def test_case_3135_silenced_through_core_without_planner(config, store):
+    """端到端回放：合并窗口 0 时，3135 这类消息走 core 也在策划前沉默。
+
+    本 brief 不接线 core 的改写复述复核，这里只验证指向因子在真实调用链上
+    生效：不产生任何模型调用，decision_log 记下 `addressing_elsewhere`。
+    """
+    llm = ScriptedLLM({"fast": ['{"speak":true,"intent":"顺着接一句"}'], "chat": ["一天一个地区，天天有新地方可以开"]})
+    bot, adapter = make_bot(config, store, llm)
+    event = group_event("没想到是一天一个地区", sender="A", reply_to="m1", reply_sender="C")
+
+    asyncio.run(bot.handle_event(event))
+
+    assert adapter.texts == []
+    assert llm.calls == []
+    log, = store.list_decision_logs()
+    assert log["reason"] == "addressing_elsewhere" and log["should_reply"] is False
