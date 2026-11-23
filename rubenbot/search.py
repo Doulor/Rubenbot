@@ -1,4 +1,4 @@
-"""联网搜索后端：Tavily / DeepSeek 两家可插拔，按配置顺序组成回退链。
+"""联网搜索后端：Tavily / DeepSeek / Bing 可插拔，按配置顺序组成回退链。
 
 这一层只负责「拿 query 去搜、把结果压成一段紧凑文本」；工具注册、冷却提示
 与系统提示里的使用指引在 :mod:`rubenbot.core`。结果来自外部网页，注入时
@@ -6,8 +6,12 @@
 
 一次 ``search`` 调用先过冷却闸（整条链只过一次），再按 ``search.order``
 依次尝试：没配 key 的渠道跳过；抛错/超时/空结果顺延下一个；第一个有结果的
-渠道胜出。整条链一个 key 都没有时 :func:`build_searcher` 返回 ``None``
+渠道胜出。整条链一个可用渠道都没有时 :func:`build_searcher` 返回 ``None``
 （工具不注册）；全部失败只返回提示句，不向前抛。
+
+``bing`` 是免 key 的抓取型渠道：GET ``cn.bing.com/search`` 并解析 SERP
+HTML。页面改版、验证页或任何解析不出的情况都按空结果处理，交给回退链，
+不把异常抛给聊天。
 """
 
 from __future__ import annotations
@@ -17,16 +21,30 @@ import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from urllib.parse import urlsplit
 
 import httpx
 
-from .config import SearchConfig
+from .config import KEYLESS_SEARCH_PROVIDERS, SearchConfig
 
 logger = logging.getLogger(__name__)
 
 TAVILY_URL = "https://api.tavily.com/search"
 DEEPSEEK_URL = "https://api.deepseek.com/v1/tools/search"
+# 国内索引；免 key，靠抓取 SERP HTML。页面改版时解析结果为空，回退链继续。
+BING_URL = "https://cn.bing.com/search"
+# 浏览器形态的请求头；缺 UA 时 cn.bing 常直接跳首页或验证页
+BING_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+}
+# Bing 对超长 query 会截断或报错；本地先截，和 DeepSeek 渠道同一个思路
+BING_QUERY_MAX = 200
 
 # 单次结果条数：默认 5，最多 8（DeepSeek 接口本身允许 1–50，这里跟其他渠道对齐）
 DEFAULT_COUNT = 5
@@ -93,6 +111,148 @@ def _clean(text: object) -> str:
     return " ".join(str(text or "").split())
 
 
+@dataclass
+class _BingBlock:
+    """解析中攒的一条 Bing 结果；字段在 ``</li>`` 时统一清洗。"""
+
+    title: list[str]
+    snippet: list[str]
+    url: str = ""
+    # 标题锚点是否已经出现：h2 里可能先有站点图标等锚点，标题只认第一个
+    title_started: bool = False
+
+
+class _BingSerpParser(HTMLParser):
+    """从 Bing SERP HTML 里抠出 ``li.b_algo`` 的标题、链接与摘要。
+
+    只认线上观察到的结构（``ol#b_results > li.b_algo``，标题在 ``h2 > a``，
+    摘要在 ``div.b_caption > p``）；其余标签一律跳过。结构对不上时产出空列表，
+    由调用方按「本渠道没结果」处理，绝不抛异常。
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.results: list[dict[str, str]] = []
+        self._block: _BingBlock | None = None
+        # 当前 b_algo 的 li 嵌套深度：块内偶尔还套着别的 list，最外层关门才收尾
+        self._li_depth = 0
+        # h2 嵌套深度
+        self._h2_depth = 0
+        # 是否已选中标题锚点、正在采集它的文字
+        self._title_active = False
+        # 摘要段落：p 嵌套深度、是否已收完第一个 p
+        self._p_depth = 0
+        self._p_done = False
+        # 摘要里「阅读更多」等锚点的嵌套深度，这些文字不收
+        self._caption_anchor_depth = 0
+
+    def _reset_block_states(self) -> None:
+        self._h2_depth = 0
+        self._title_active = False
+        self._p_depth = 0
+        self._p_done = False
+        self._caption_anchor_depth = 0
+
+    @staticmethod
+    def _classes(attrs: list[tuple[str, str | None]]) -> set[str]:
+        for key, value in attrs:
+            if key == "class" and value:
+                return set(value.split())
+        return set()
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "li":
+            is_result = "b_algo" in self._classes(attrs)
+            if self._block is not None:
+                if is_result:
+                    # 上一块忘了关门：收下已经采到的字段，从新块重新开始
+                    self._finish_block()
+                else:
+                    # 块里套着别的 list（问答、相关搜索等），整段跳过
+                    self._li_depth += 1
+                    return
+            if is_result:
+                self._block = _BingBlock(title=[], snippet=[])
+                self._reset_block_states()
+                self._li_depth = 1
+            return
+        if self._block is None:
+            return
+        if tag == "h2":
+            self._h2_depth += 1
+        elif tag == "p":
+            if not self._p_done:
+                self._p_depth += 1
+        elif tag == "a":
+            if self._title_active:
+                return
+            href = next((value or "" for key, value in attrs if key == "href"), "")
+            if self._h2_depth and not self._block.title_started:
+                # h2 里第一个锚点就是结果标题；链接只收绝对的 http(s)，
+                # 站内跳转（/search?q=…）不当作结果地址
+                self._title_active = True
+                self._block.title_started = True
+                if href.startswith(("http://", "https://")):
+                    self._block.url = href
+            elif self._p_depth:
+                self._caption_anchor_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if self._block is None:
+            return
+        if tag == "li":
+            self._li_depth -= 1
+            if self._li_depth <= 0:
+                self._finish_block()
+            return
+        if tag == "h2":
+            self._h2_depth = max(0, self._h2_depth - 1)
+        elif tag == "p":
+            if self._p_depth:
+                self._p_depth -= 1
+                if self._p_depth == 0:
+                    self._p_done = True
+        elif tag == "a":
+            self._title_active = False
+            self._caption_anchor_depth = max(0, self._caption_anchor_depth - 1)
+
+    def handle_data(self, data: str) -> None:
+        if self._block is None:
+            return
+        if self._title_active:
+            self._block.title.append(data)
+        elif self._p_depth and not self._caption_anchor_depth:
+            self._block.snippet.append(data)
+
+    def _finish_block(self) -> None:
+        block, self._block = self._block, None
+        self._reset_block_states()
+        if block is None:
+            return
+        title = _clean("".join(block.title))
+        snippet = _clean("".join(block.snippet))
+        if title or snippet:
+            self.results.append({"title": title, "snippet": snippet, "url": block.url})
+
+
+def parse_bing_html(html: str) -> list[SearchResult]:
+    """解析 Bing SERP；页面改版或结构残缺时返回空列表，不抛异常。"""
+    parser = _BingSerpParser()
+    try:
+        parser.feed(str(html or ""))
+        parser.close()
+        if parser._block is not None:
+            # 页面被截断、最后一个 li 没关门：已采到的字段照样收下
+            parser._finish_block()
+    except Exception as exc:  # HTMLParser 对畸形输入偶有意外；解析失败等同无结果
+        logger.warning("Bing 结果页解析失败，按无结果处理：%s", exc)
+        return []
+    return [
+        SearchResult(title=row["title"], snippet=row["snippet"], url=row["url"])
+        for row in parser.results
+    ]
+
+
 def _truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
@@ -152,11 +312,11 @@ class WebSearcher:
         return self.enabled and self._remaining(chat_key, self.now_fn()) == 0
 
     def _channels(self) -> list[str]:
-        """链上真正会尝试的渠道：按顺序、跳过没配 key 的。"""
+        """链上真正会尝试的渠道：按顺序、跳过没配 key 的（免 key 渠道恒可用）。"""
         return [
             name
             for name in self.config.order
-            if self.config.channel(name).configured
+            if name in KEYLESS_SEARCH_PROVIDERS or self.config.channel(name).configured
         ]
 
     async def _get_client(self) -> httpx.AsyncClient:
@@ -218,7 +378,29 @@ class WebSearcher:
             return await self._fetch_deepseek(client, query, count)
         if name == "tavily":
             return await self._fetch_tavily(client, query, count)
+        if name == "bing":
+            return await self._fetch_bing(client, query, count)
         raise ValueError(f"未知搜索渠道：{name}")
+
+    async def _fetch_bing(
+        self, client: httpx.AsyncClient, query: str, count: int
+    ) -> list[SearchResult]:
+        """Bing：免 key，抓 cn.bing 的结果页再解析 HTML。
+
+        ``count`` 只是提示：Bing 网页端没有可靠条数参数，先取整页结果再截断。
+        解析不出（改版、验证页、跳首页）就是空列表，由回退链顺延。
+        没有链接的条目对查证没用（打不开原文），这里一并丢掉；全都没有时
+        同样按空结果处理。
+        """
+        response = await client.get(
+            BING_URL,
+            params={"q": query[:BING_QUERY_MAX], "count": count},
+            headers=BING_HEADERS,
+            follow_redirects=True,
+        )
+        response.raise_for_status()
+        results = [item for item in parse_bing_html(response.text) if item.url]
+        return results[:count]
 
     async def _fetch_tavily(
         self, client: httpx.AsyncClient, query: str, count: int
@@ -283,6 +465,9 @@ class WebSearcher:
 
 
 __all__ = [
+    "BING_HEADERS",
+    "BING_QUERY_MAX",
+    "BING_URL",
     "COOLDOWN_TEXT",
     "DEFAULT_COUNT",
     "DEEPSEEK_QUERY_MAX",
@@ -299,4 +484,5 @@ __all__ = [
     "build_searcher",
     "clamp_count",
     "format_results",
+    "parse_bing_html",
 ]
