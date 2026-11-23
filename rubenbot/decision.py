@@ -6,6 +6,7 @@
   纯逻辑、时钟外部传入，测试可以完全确定。
 - :class:`DecisionEngine`：硬触发直通（私聊、@、回复 bot、叫名字），普通群消息
   经过节奏护栏后交给策划。冷场主动开口另行评分。
+- :func:`paraphrase_verdict`：拿草稿与触发消息做改写复述判定，供发送前复核压稿。
 - :func:`parse_generation_output`：解析模型输出里的「不回复」标记。
 
 设计上刻意保持轻量：所有状态都在内存里，进程重启后从零开始；没有额外的表。
@@ -17,6 +18,7 @@ import logging
 import random
 import re
 import time
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Iterable
@@ -55,6 +57,203 @@ def _similar_template(a: str, b: str) -> bool:
     left = {a[i:i+3] for i in range(len(a) - 2)}
     right = {b[i:i+3] for i in range(len(b) - 2)}
     return len(left & right) >= 0.85 * len(left | right)
+
+
+# ----------------------------------------------------------------------
+# 增量核验：改写复述判定
+# ----------------------------------------------------------------------
+#
+# 附和闸门（:mod:`rubenbot.agreement`）只认字面高重合的长复述，对方换几个
+# 词、拆一下断句就能溜过去。这里补的是「改写复述」：草稿的意思基本被触发
+# 消息包含、又没有带来新东西时判为复述。做法是纯结构化、可解释的：
+#
+# 1. 去掉标点与口头填充词（「也就是说」「确实」「啊」等），留下骨架；
+# 2. 只看骨架里的实词字（泛词「的了」「天天」「可以」不算信息）：草稿的实词
+#    必须都出现在原句里，且实词二元组的顺序基本没变；顺序大乱就是调换了
+#    主客体（「小陈接小李」→「小李接小陈」），同样放行；
+# 3. 草稿带上新事实（数字、具体某一天）、新态度、第一人称打算、新问法或
+#    否定的增减，一律放行。
+#
+# 不判断「同义换词」（如「推迟一小时」→「晚点一小时」），那是 embedding 的
+# 活；这里不引重依赖，宁可漏判也不误杀有信息的接话。
+
+# 泛词：这些字不算信息量，草稿里出现不构成新内容，也不参与顺序判断。
+_GENERIC_CHARS = frozenset(
+    "的了是我你他她它们咱您这那哪谁啥什么么呢吧啊呀哦喔噢嗯哈嘿哟啦咯喽嘛着得地之与及或而"
+    "并且但却还也就都又再才只光仅总一直从来很太真挺蛮好更最特非常比较可以能会该应需要打算准备"
+    "不没别未勿被把让给向从对关于因为如果虽然然后但是而且于是就是只是还是还有没有一下子"
+    "些个种位块条件次回遍趟点儿样种事情东西地方方式方面问题情况时候时间大家自己别人人家"
+    "上下左右前后里外中内间旁边附近周围里面外面上面下面前面后面现在目前刚才马上"
+    # 具体某一天/某一年是新事实，不算泛词；「每天」「天天」这类频率才是泛词。
+    "早上午中午下午晚上夜里凌晨平日每天一天天天"
+    "大小多高低长短快慢新旧老轻重"
+    "说看想开玩弄搞做用帮找换带买拿做弄挺好行成变干来去起住存放"
+)
+# 数字是事实，不进泛词表。「下」也不进：「线上」与「线下」只差一个字，
+# 却是完全不同的渠道；「上」保留为泛词，因为「晚上」「上午」里太常见。
+_GENERIC_CHARS -= frozenset("一二三四五六七八九十百千万亿两0123456789下")
+
+_PUNCT_RE = re.compile(r"[\s，。！？、；：,.!?;:~～…—―·「」『』“”‘’\"'（）()【】\[\]<>《》]+")
+_NUMBER_RE = re.compile(r"\d+")
+_NUMERALS = frozenset("零一二三四五六七八九十百千万亿两0123456789")
+_NEGATIONS = frozenset("不没别未勿")
+_QUESTION_WORDS = ("吗", "什么", "怎么", "为什么", "为啥", "哪", "几", "多少", "如何",
+                   "是不是", "有没有", "要不要", "能不能", "何时", "几点")
+# 明确的态度/评价词：原句没有、草稿加了，就算带来了新立场。
+# 含「快/慢/新鲜」这类单字评价：光秃秃的复述加一句「更新挺快」「那也挺好」
+# 也是表态。太常用的泛字（如单字「好」）不单列，改用下面这些带语境的评价说法。
+_ATTITUDE_WORDS = ("我觉得", "我感觉", "我认为", "希望", "期待", "担心", "可惜", "开心", "难过",
+                   "喜欢", "讨厌", "烦", "厉害", "离谱", "奇怪", "居然", "竟然", "太棒", "完了",
+                   "糟糕", "不错", "心疼", "羡慕", "服了", "绝了", "悲哀", "可怜",
+                   "快", "慢", "新鲜", "刺激", "无聊", "有意思", "没意思", "划算", "贵", "便宜",
+                   "好吃", "难吃", "好看", "难看", "辛苦",
+                   "挺好", "还行", "也不错", "太好了", "真棒", "好棒", "赞", "很难受")
+# 第一人称的打算/动作：草稿自己要做点什么，是原句没有的新内容。
+# 「我也」单独列出：去掉「也」是泛词后仍要看得出这是接话人自己的打算。
+_VOLITION_WORDS = ("我去", "我来", "我想", "我要", "我陪", "我帮", "我看", "我试试", "我请", "我带",
+                   "我也", "咱们", "我们", "一起")
+# 草稿突然改用第一/第二人称称呼（原句里没有），通常是接话人自己的打算或
+# 直接对某人说话，都算新增的社交信号；宁可漏判也不压掉。
+_PERSON_WORDS = ("我", "咱", "俺", "你", "您")
+# 口头填充：出现在句首/句尾时可以剥掉，不改变句子的信息量。
+_LEAD_FILLERS = ("也就是说", "换句话说", "说白了", "说到底", "总的来说", "总之", "反正",
+                 "没想到", "没成想", "原以为", "还以为", "原来如此", "原来", "其实", "就是说",
+                 "说实话", "说真的", "老实说", "讲真", "看来", "所以", "因此", "不过", "可是",
+                 "但是", "然后", "而且", "确实如此", "确实是这样", "确实", "的确", "没错",
+                 "你说得对", "说得也是", "我也这么觉得", "我也觉得", "我同意", "对对对", "对啊",
+                 "对呀", "是啊", "是呀", "是的", "那就是", "可不是嘛", "相当于", "这不就是",
+                 "嗯", "哦", "噢", "啊", "唉", "诶", "欸")
+_TAIL_FILLERS = ("没错", "对吧", "是吧", "啊", "呀", "呢", "吧", "嘛", "啦", "哦", "哈", "嗯",
+                 "噢", "诶", "欸", "咯", "喽", "喔", "哈哈")
+
+# 草稿太短时根本不构成「长复述」，交给原来的附和闸门和策划判断。
+_MIN_DRAFT_CHARS = 10
+# 原句太短（单字、两个词）时任何改写都可能只是正常接话，不判复述。
+_MIN_SOURCE_CHARS = 6
+# 草稿剥掉泛词后至少要有这么多实词，才谈得上「复述了原句的内容」。
+_MIN_CONTENT_CHARS = 3
+# 草稿实词里至少这么多比例仍按原句顺序出现，才算「复述」而不是调换主客体。
+_ORDER_KEEP_RATIO = 0.6
+# 只比较前这么多字符：问答草稿和触发消息都远短于此，也避免长批次拖慢剥词。
+_MAX_SCAN_CHARS = 512
+
+
+def _compact(text: str) -> str:
+    """去掉标点与空白，全角归一，只留比较用的骨架。"""
+    normalized = unicodedata.normalize("NFKC", text or "")[:_MAX_SCAN_CHARS]
+    return _PUNCT_RE.sub("", normalized).casefold()
+
+
+def _strip_fillers(text: str) -> str:
+    """反复剥掉句首/句尾的口头填充词，剥到不能再剥为止。"""
+    changed = True
+    while changed and text:
+        changed = False
+        for filler in _LEAD_FILLERS:
+            if text.startswith(filler) and len(text) - len(filler) >= 2:
+                text, changed = text[len(filler):], True
+                break
+        for filler in _TAIL_FILLERS:
+            if text.endswith(filler) and len(text) - len(filler) >= 2:
+                text, changed = text[: -len(filler)], True
+                break
+    return text
+
+
+def _numbers(text: str) -> frozenset[str]:
+    """阿拉伯数字整段 + 中文数字单个字符都能构成新时间/数量。"""
+    found = set(_NUMBER_RE.findall(text))
+    found.update(ch for ch in text if ch in _NUMERALS)
+    return frozenset(found)
+
+
+def _bigrams(text: str) -> list[str]:
+    """相邻两字的二元组；顺序判断用，单字文本返回空列表。"""
+    return [text[i:i + 2] for i in range(len(text) - 1)]
+
+
+@dataclass(frozen=True)
+class ParaphraseVerdict:
+    """一次「草稿是否只是复述触发消息」的判定结果。"""
+
+    repetitive: bool
+    reason: str
+    # 草稿骨架里剥掉口头填充后剩下的部分，便于日志复盘。
+    skeleton: str = ""
+
+    def describe(self) -> str:
+        return f"{'复述' if self.repetitive else '有增量'}（{self.reason}）"
+
+
+def _content_chars(text: str) -> str:
+    """只留实词字（去掉泛词与标点），用来判断「草稿说了哪些原句没有的话」。
+
+    泛词（「的了」「天天」「可以」等）不承载信息，先全部剥掉；剩下的实词
+    序列才是比对依据。这样「一天一个地区，天天有新地方可以开」的实词只剩
+    「一一区」，不会被「天天」「可以」「新地方」这类填充词撑大。
+    """
+    return "".join(char for char in text if char not in _GENERIC_CHARS)
+
+
+def paraphrase_verdict(source: str, draft: str) -> ParaphraseVerdict:
+    """判断 ``draft`` 是否只是 ``source`` 的改写复述、没有新东西。
+
+    纯函数：同样的输入永远给同样的结论，不碰配置、不调模型、不发消息。
+    ``repetitive=True`` 表示草稿的实词基本逐字来自触发消息、顺序也没变，
+    没有带来新事实、新问题、新态度；调用方可以在发送前据此压掉这条草稿。
+
+    判定顺序（先放行后拦截，宁可漏判也不误杀）：
+
+    1. 草稿太短、原句太短 → 放行（短接话不是「长复述」）；
+    2. 草稿引入原句没有的数字 / 态度词 / 第一人称打算 / 问法 / 否定增减 → 放行；
+    3. 剥掉泛词只剩实词；草稿实词太少 → 放行（没有可比的内容）；
+    4. 草稿实词必须都来自原句，实词二元组顺序也基本不变 → 判为复述；
+       有实词找不到（新人物、新地点、新动作）或顺序大乱（调换主客体）→ 放行。
+    """
+    raw_draft = unicodedata.normalize("NFKC", draft or "")
+    src = _strip_fillers(_compact(source))
+    drf = _strip_fillers(_compact(draft))
+    if len(drf) < _MIN_DRAFT_CHARS:
+        return ParaphraseVerdict(False, "draft_too_short", drf)
+    if len(src) < _MIN_SOURCE_CHARS:
+        return ParaphraseVerdict(False, "source_too_short", drf)
+
+    # 先看草稿有没有带来新的东西；新增的数字/态度/问法/否定都算增量。
+    if _numbers(drf) - _numbers(src):
+        return ParaphraseVerdict(False, "new_numbers", drf)
+    if any(word in drf and word not in src for word in _ATTITUDE_WORDS):
+        return ParaphraseVerdict(False, "new_attitude", drf)
+    if any(word in drf and word not in src for word in _VOLITION_WORDS):
+        return ParaphraseVerdict(False, "new_stance", drf)
+    # 原句没提到任何人，草稿却突然说「我」「你」：是接话人自己的打算或直接
+    # 对某人说话，算新的社交信号（「……，你去」这类邀约不算纯复述）。
+    if any(word in drf and word not in src for word in _PERSON_WORDS):
+        return ParaphraseVerdict(False, "new_person", drf)
+    # 否定增减都会改变判断（「不开放」→「开放」同样是新内容），按集合差异放行。
+    if {ch for ch in _NEGATIONS if ch in drf} != {ch for ch in _NEGATIONS if ch in src}:
+        return ParaphraseVerdict(False, "changed_negation", drf)
+    if re.search(r"[？?]", raw_draft) and not re.search(r"[？?]", source or ""):
+        return ParaphraseVerdict(False, "new_question", drf)
+    if any(word in drf and word not in src for word in _QUESTION_WORDS):
+        return ParaphraseVerdict(False, "new_question", drf)
+
+    # 实词比对：草稿实词全部来自原句，且实词二元组的顺序基本没变，才算
+    # 「没有新内容」。拆句、换语序会让少量二元组断开，但调换主客体
+    # （「小陈接小李」→「小李接小陈」）会让大部分二元组断开，二者可区分。
+    draft_content = _content_chars(drf)
+    if len(draft_content) < _MIN_CONTENT_CHARS:
+        return ParaphraseVerdict(False, "too_little_content", drf)
+    source_content = _content_chars(src)
+    for char in draft_content:
+        if char not in source_content:
+            return ParaphraseVerdict(False, f"new_content:{char}", drf)
+    source_pairs = set(_bigrams(source_content))
+    draft_pairs = _bigrams(draft_content)
+    if draft_pairs:
+        kept = sum(1 for pair in draft_pairs if pair in source_pairs) / len(draft_pairs)
+        if kept < _ORDER_KEEP_RATIO:
+            return ParaphraseVerdict(False, "reordered", drf)
+    return ParaphraseVerdict(True, "restated_source", drf)
 
 
 _QUIET_RE = re.compile(r"\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*")
@@ -255,14 +454,24 @@ class MessageMerger:
 
 @dataclass
 class OpenerFactors:
-    """主动冷场开口的独立评分明细。"""
+    """开口评分的明细：冷场基础分、话题相关性、指向折扣与随机扰动。
+
+    ``addressing`` 是「这轮对话到底是不是指向 bot」的折扣：消息明确 @ 别人
+    或回复别人、又没有点到 bot 时，把它算成负数，压低开口权重。冷场开口
+    没有具体事件，这一项恒为 0。
+    """
 
     base: float
     relevance: float
     noise: float = 0.0
+    addressing: float = 0.0
 
     def describe(self) -> str:
-        return f"基础{self.base:.2f} 相关+{self.relevance:.2f} 随机{self.noise:+.2f}"
+        parts = [f"基础{self.base:.2f}", f"相关+{self.relevance:.2f}"]
+        if self.addressing:
+            parts.append(f"指向{self.addressing:+.2f}")
+        parts.append(f"随机{self.noise:+.2f}")
+        return " ".join(parts)
 
 
 @dataclass
@@ -276,6 +485,8 @@ class ReplyDecision:
     hard_trigger: str | None = None
     factors: OpenerFactors | None = None
     effective_talk_value: float | None = None
+    # 「这轮指向谁」的结构化事实（别人互问、点名别人等）；接线时原样记入决策日志。
+    addressing: AddressingFactor | None = None
     # 裁定当时该发送者的画面快照；不读回稍后才完成的视觉结果冒充当时所见。
     visual_note: str = ""
 
@@ -311,6 +522,100 @@ def is_reply_to_bot(event: MessageEvent) -> bool:
     if bot_ids:
         return any(str(event.reply_to_id) == str(item) for item in bot_ids)
     return bool(raw.get("reply_to_bot"))
+
+
+# ----------------------------------------------------------------------
+# 指向事实：这条消息在问谁
+# ----------------------------------------------------------------------
+#
+# 「一天一个地区」那轮里，宇轩在答多萝，bot 插进去复述了一句。策划看到
+# 的对话历史里其实有 @ 目标和被回复人，只是裁定权重没有用上。这里把
+# 「消息有没有点到 bot、是不是别人在问别人」做成结构化事实与折扣分，
+# 让接管线的裁定层能直接压低开口权重。
+#
+# 只认平台明确给出的指向（``mentions`` / ``reply_sender_id``），不从正文
+# 里的名字猜；猜错别人在叫谁，比漏判更糟。
+
+# 平台用 ``all`` 表示「@所有人」，那不是指向某个人。
+_BROADCAST_MENTION = "all"
+# 指向折扣：别人问别人时把这一轮的开口权重扣干净（1.0 = 不再查看）。
+_ADDRESSING_PENALTY = 1.0
+
+
+@dataclass
+class AddressingFactor:
+    """一条消息的指向事实与它对开口权重的折扣。
+
+    - ``to_bot``：平台明确 @ 了 bot 或回复了 bot；
+    - ``to_peer``：@ 了某个具体的人或回复了某个具体的人（不含 bot、不含 @所有人）；
+    - ``replied_peer``：被回复的那条消息是别人发的——对话发生在别人之间，
+      这是比单纯 @ 更强的指向信号；
+    - ``penalty``：扣掉的开口权重（0~1）。``score`` 是可直接加到开口权重
+      上的折扣分（``-penalty`` 或 0），``penalized`` 表示是否打折。
+
+    ``@`` 了别人但正文没回复任何人时只记录事实（``to_peer`` 为真、``score``
+    为 0），交给策划判断——「Argon 和 Ruben 哪个好用」这类话仍可能是问
+    bot 的。回复别人的消息则是明确的「别人问别人」，默认在裁定层沉默。
+    """
+
+    to_bot: bool = False
+    to_peer: bool = False
+    replied_peer: bool = False
+    # 被指向的具体账号（不含 bot 与 @所有人），只作审计展示用。
+    peers: tuple[str, ...] = ()
+    penalty: float = 0.0
+
+    def to_dict(self) -> dict:
+        """接线写 decision_log 用的结构化事实；不给内部折扣幅度。"""
+        return {
+            "to_bot": self.to_bot,
+            "to_peer": self.to_peer,
+            "replied_peer": self.replied_peer,
+            "peers": list(self.peers),
+            "penalized": self.penalized,
+        }
+
+    @property
+    def penalized(self) -> bool:
+        return self.score < 0
+
+    @property
+    def score(self) -> float:
+        """折扣分：别人问别人、又没点到 bot 时压低开口权重。"""
+        if self.to_bot or not self.replied_peer:
+            return 0.0
+        return -min(1.0, max(0.0, float(self.penalty or 0.0)))
+
+    def describe(self) -> str:
+        if self.to_bot:
+            return "指向我"
+        if self.penalized:
+            return "指向别人"
+        if self.to_peer:
+            return "也提到别人"
+        return ""
+
+
+def peer_ground(event: MessageEvent) -> AddressingFactor:
+    """读出这条消息的指向事实：是不是别人在问别人、有没有点到 bot。
+
+    纯函数，只读 ``mentions`` / ``reply_sender_id`` / ``mentions_bot``；
+    只报事实，不带折扣幅度（折扣由 :meth:`DecisionEngine.addressing` 加）：
+
+    - 点到 bot（@ 或回复）→ ``to_bot=True``；
+    - 只 @ 了别人 / 只回复了别人 → ``to_peer=True``；
+    - 回复的是别人的消息 → ``replied_peer=True``；引用自己的话补充说明不算；
+    - ``@所有人`` 不算指向任何人；没有明确指向时各项都是 False。
+    """
+    to_bot = bool(event.mentions_bot) or is_reply_to_bot(event)
+    peers = tuple(
+        sorted(str(uid) for uid in event.mentions if uid not in {BOT_SENDER_ID, _BROADCAST_MENTION})
+    )
+    replied = str(event.reply_sender_id or "")
+    replied_peer = bool(replied) and replied not in {BOT_SENDER_ID, str(event.sender_id)}
+    if replied_peer and replied not in peers:
+        peers = (*peers, replied)
+    return AddressingFactor(to_bot=to_bot, to_peer=bool(peers), replied_peer=replied_peer, peers=peers)
 
 
 def _compile_alias(alias: str) -> re.Pattern[str]:
@@ -523,6 +828,20 @@ class DecisionEngine:
         """
         return self.is_hard_trigger(event)
 
+    def addressing(self, event: MessageEvent) -> AddressingFactor:
+        """这条消息的指向事实（别人互问 / 点到 bot），供裁定层与日志直接使用。
+
+        平台明确 @ 了别人 / 回复了别人、正文里也没有叫到 bot 名字时，返回
+        带折扣的 :class:`AddressingFactor`（``penalized`` 为真）；正文里叫了
+        bot 名字（例如「Argon 和 Ruben 哪个好用」）或点到 bot 本身时不打折，
+        交给策划判断。私聊不适用（没有「别人」）。
+        """
+        ground = peer_ground(event)
+        if event.is_private or ground.to_bot or not ground.to_peer or self.match_alias(event.text):
+            return ground
+        return AddressingFactor(to_bot=False, to_peer=True, replied_peer=ground.replied_peer,
+                                peers=ground.peers, penalty=_ADDRESSING_PENALTY)
+
     def guard(
         self,
         event: MessageEvent,
@@ -537,7 +856,10 @@ class DecisionEngine:
         - **最小发言间隔**：这个会话刚说过话，间隔内普通消息不开口
           （``min_reply_interval_seconds``，0 表示关闭；放在不应期之后，
           两者同时命中时以更贴切的不应期为准）；
-        - **主动发言上限**：滚动窗口内主动发言到顶后拦下（防刷屏）。
+        - **主动发言上限**：滚动窗口内主动发言到顶后拦下（防刷屏）；
+        - **指向别人**：平台明确回复了别人的消息、又没点到 bot 的普通群
+          消息，记 ``addressing_elsewhere`` 并压掉开口权重（与其它护栏
+          并列，返回的裁定带指向折扣明细）。只 @ 了别人的只记事实。
 
         这些都在 stage1 之前做，省下模型调用；不改变已记录的发言状态。
         """
@@ -557,6 +879,15 @@ class DecisionEngine:
         if proactive and cfg.proactive_window_enabled and cfg.proactive_window_limit >= 0:
             if self.active_reply_count(chat_key, now) >= cfg.proactive_window_limit:
                 return ReplyDecision(False, "proactive_window", 0.0, 0.0)
+        if proactive and event.is_group:
+            # 别人互问时 bot 没有接口：压低开口权重直接沉默，不再花一次策划调用。
+            addressing = self.addressing(event)
+            if addressing.penalized:
+                return ReplyDecision(
+                    False, "addressing_elsewhere", addressing.score, 0.0,
+                    factors=OpenerFactors(base=0.0, relevance=0.0, addressing=addressing.score),
+                    addressing=addressing,
+                )
         return None
 
     # ---- 评分 ----

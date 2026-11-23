@@ -7,6 +7,8 @@
 
 ### Fixed
 
+- **无意义附和（decision 3135）**：群里别人互答时，bot 把触发消息换个说法复述一遍就开口。`rubenbot/decision.py` 补两件事，都在裁定层、不花模型调用：(1) 指向事实进裁定权重——平台明确回复了别人的消息、正文又没叫到 bot 名字时，普通群聊护栏记 `addressing_elsewhere` 并直接沉默；只 @ 了别人、没回复谁的只记事实交给策划，点到 bot 和私聊永不打折。判定只看平台给的 `mentions` / `reply_sender_id`；除识别 bot 自己的名字外，不解析正文里的人名，也不新增配置项。(2) 新增纯函数 `paraphrase_verdict(source, draft)`：剥掉标点和「也就是说」「确实」这类口头填充与泛词后按实词比对，草稿实词全部来自原句、顺序没被调换，且没带来新数字/新问法/新态度（含「更新挺快」这类光秃评价）/第一人称打算/原句没有的「我」「你」称呼/否定增减时判为改写复述，供发送前复核压掉草稿。改写在字面证据不足或同义换词时宁可漏判。迁移：指向因子已经通过 `DecisionEngine.guard()` 在现有 core 决策链上生效（新增 `DecisionEngine.addressing()` / `ReplyDecision.addressing`）；`paraphrase_verdict` 接进 speak 前复核、以及把指向事实原样记进 `decision_log`，另开跟进。
+
 - **聊天撤回不再误进电脑任务**：群里 @ bot 说「撤回这条」时优先撤回所引用的消息；无法从当前会话台账确定目标时，就请对方引用。撤回 bot 自发消息、作者本人要求撤自己的消息、机主下令撤回当前会话的消息，都无需开启 `gateway.allow_sensitive`；普通成员撤第三方消息仍受敏感开关限制。成功、拒绝和目标不明的澄清都写入 `gateway_audit`。
 
 - **部署预检兼容缺少 `pytest-timeout` 的环境**：插件不可用时告警并继续运行全量 pytest 和 ruff，不再因 pytest 无法识别超时参数而中止。`--dry-run` 同时说明有无插件时的预检命令。
