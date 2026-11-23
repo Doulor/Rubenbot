@@ -958,6 +958,22 @@ def test_lyrics_falls_back_to_text_when_renderer_unavailable():
     assert "第一句" in adapter.texts[-1] and "第二句" in adapter.texts[-1]
 
 
+def test_lyrics_works_for_unplayable_vip_song():
+    """VIP 曲目点不了歌，但歌词查得到：查歌词不该被探活过滤挡住。"""
+    net = FakeNet(netease=netease_payload((1, "晴天", "周杰伦")), unplayable_ids={"1"})
+    player, adapter, _ = make_player(net=net)
+
+    def handler(request):
+        url = str(request.url)
+        if "lyric" in url:
+            return httpx.Response(200, json={"lrc": {"lyric": "[00:01.00]第一句"}})
+        return net(request)
+
+    player._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    run(player.on_message(runtime(adapter), event("查歌词 晴天")))
+    assert "第一句" in adapter.texts[-1]
+
+
 class StubCtx:
     def __init__(self, path: Path):
         self.extras = {}

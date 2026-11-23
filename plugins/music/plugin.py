@@ -674,10 +674,10 @@ class MusicPlayer:
         if not name:
             await self._reply_text(adapter, event, "请输入歌曲名称\n用法：查歌词 <歌名>")
             return
+        # 查歌词不涉及播放，不探活：VIP 曲目拿不到音频但歌词照样查得到
+        limit = self.config.real_song_limit
         try:
-            songs = await self.search(name, source="netease", platform_type="netease")
-        except SongsUnplayable:
-            songs = []
+            songs = await NETEASE_SOURCE.search(await self._get_client(), name, limit)
         except Exception as exc:  # noqa: BLE001 - 网络失败降级
             logger.warning("music 查歌词搜索「%s」失败：%s", name, exc)
             songs = []
