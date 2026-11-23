@@ -159,7 +159,8 @@ bot 对每个人的好感度、以及自己当下的心情，都由确定性规�
 | --- | --- |
 | `rubenbot/config.py` | 读取 YAML 配置，展开 `${ENV_VAR}`，未知键忽略，缺文件走默认值 |
 | `rubenbot/persona.py` | 加载人格：五文件目录（`data/persona/`）优先，缺目录时回退单文件 SOUL.md |
-| `rubenbot/llm.py` | OpenAI 兼容客户端；按角色（`chat` / `extract` / `consolidate` / `fast` / `summary` / `vision` 及自定义）选模型，支持模型池（故障转移 / 轮询 / 随机）；408/429/5xx 指数退避重试；每次调用写用量表（按实际出结果的模型记） |
+| `rubenbot/llm.py` | OpenAI 兼容客户端；按角色（`chat` / `extract` / `consolidate` / `fast` / `summary` / `vision` 及自定义）选模型，支持模型池（故障转移 / 轮询 / 随机）；408/429/5xx 指数退避重试；每次调用写用量表（按实际出结果的模型记）；发请求前查每日预算闸 |
+| `rubenbot/llm_budget.py` | 按任务类型的每日预算闸：调用次数与费用估算两档，超限只停该类任务并记「LLM 预算熔断」日志；台账存 `meta`、按自然日分桶，跨重启保留、跨日清零 |
 | `rubenbot/core.py` | 消息主循环、合并窗口调度、决策、上下文拼装、拆条发送、后台维护 |
 | `rubenbot/search.py` | Tavily / DeepSeek / Bing 渠道回退、Bing SERP 解析、结果链接归一、按会话冷却 |
 | `rubenbot/verification.py` | 限时读取结果页，用隔离的阅读步骤选原句与出处；无法核对就不作答 |
@@ -238,6 +239,24 @@ llm:
 ```
 
 池中每项都指定提供商；即使两家的模型同名，也会请求各自的地址并使用各自的密钥。故障转移意味着**下一个提供商也会收到本次请求的内容**，包括消息或图片，只把可信端点放入池中。默认只在可重试的故障（例如连接失败、超时、429 或 5xx）时切换，401 等鉴权错误直接报错。
+
+预算闸默认开启，按任务类型（`chat`、`extract`、`gen_stage1`、`image_description` 等）统计当日调用次数与估算费用，某一类超限就只停那一类，其余任务和 bot 本身不受影响：
+
+```yaml
+llm:
+  budget:
+    enabled: true
+    default_daily_calls: 500          # 未单列任务类型的兜底；null 不限
+    # default_daily_cost_usd: 2.0     # 费用档；不配 pricing 时不会触发
+    tasks:
+      chat: {daily_calls: 300}
+      extract: {daily_calls: 600}     # 显式写 null 表示该类不限
+    # pricing 是美元 / 百万 token；键可写 提供商/模型、模型 或 *
+    # pricing:
+    #   deepseek/deepseek-chat: {input: 0.27, output: 1.10}
+```
+
+台账落在数据库 `meta` 的 `llm_budget:ledger`，按本地自然日分桶，重启从库恢复、跨日清零；触发时日志里会有一条 `LLM 预算熔断：任务 chat 今日调用 300 次已达上限 300`，连续命中只打一次。次数口径与 `llm_usage` 一致（每次上游尝试算 1 次，含重试的失败尝试），token 只算上游实际提供的值；没有配置单价时费用恒为 0，不猜单价。默认阈值取自家里云 2026-11-20～23 的单任务日峰值并留 3–5 倍余量（`gen_stage1` 峰值 365 → 1500 等，明细见 `rubenbot/llm_budget.py` 顶部与 SPEC）。这是护栏而非计费闸：并发下允许少量超额。
 
 旧 `llm.base_url`、`api_key`、`chat_model` 等字段及 `models: {角色: 名称或列表}` 无需手动修改；加载不会改写文件。WebUI 把旧端点展示为 `default`，保存三层配置时再写入新格式。提供商地址和密钥支持 `${ENV_VAR}`；目录名称、上游模型名和池引用按字面读取。同名同地址时，密钥框留空保留原值，点「清除密钥」才会清空；改名或换端点不会继承旧密钥。
 
@@ -358,6 +377,7 @@ stdout 记录前后 PID/commit。退出码 `0` 表示发布成功，`1` 表示�
 | | `role_pools` | 角色 → 有序的 `{provider, model}` 引用列表；`chat` 必填，未配置的角色沿回退链取整个池，支持自定义角色 |
 | | 旧 `base_url`、`api_key`、`*_model`、`models` | 单端点旧格式仍可直接使用，原有优先级和回退规则不变 |
 | | `model_strategy` `model_strategies` | 模型池策略：`failover`（默认，按顺序故障转移）/ `round_robin`（轮询）/ `random`（随机）；每角色可在 `model_strategies` 覆盖。单模型时三种等价；多模型时最多按列表走一遍、不额外退避 |
+| | `budget` | 按任务类型的每日预算闸：`default_daily_calls`（默认 500）、`default_daily_cost_usd`（默认关）、按任务类型 `tasks: {任务: {daily_calls, daily_cost_usd}}` 覆盖、`pricing` 单价（美元 / 百万 token，可写 `提供商/模型` / `模型` / `*`）。未写 `tasks` 时用内置峰值默认；`null` 不限、`0` 全拦。超限只停该类任务，日志打「LLM 预算熔断」；不配 `pricing` 时费用恒为 0、费用档不生效 |
 | `timeout` `max_retries` | 单次请求超时（秒）与失败重试次数（408/429/5xx，间隔 1s / 3s；仅单模型时生效） |
 | `persona` | `path` | 人格文件，默认 `data/SOUL.md` |
 | | `dir` | 五文件人设目录，默认取 `path` 同级的 `persona/`；目录里有 `persona.md` 就按五文件加载 |
@@ -673,6 +693,9 @@ WebUI 的「插件」分三页：「插件市场」在同一列表里发现、�
 
 31. **点歌默认发文字 + 封面，音乐卡只做配置可选项**
     协议端对新版 QQ 不渲染 OneBot `music` 段（`type=netease` + 歌曲 id）这件事毫无感知：回执照样 200，接收方客户端却只显示「发送者版本过低，无法展示内容」，所以「发送抛异常才降级」这条兜底永远等不到触发。默认形态因此改成「歌名 — 歌手 + 链接」文字并附封面图，三要素在手机上都能直接看到；`music_card: true` 才在 SnowLuma 上先试卡片，发不出去照常降级。封面图单独发不出去时只发文字，不把歌名和链接一起赔进去。验证口径是接收端肉眼可见，不是协议回执。
+
+32. **预算闸按任务类型熔断，缺数据就不编**
+    上限按线上 `llm_usage` 的单任务日峰值留 3～5 倍余量（口径见 `docs/llm-budget-results.md`），默认只开次数档。费用档必须显式配 `pricing` 单价才生效——中转站查不到 workbuddy 公开价格时，宁可费用恒为 0、费用档不触发，也不拿 token 乘一个编出来的单价。熔断是「停掉这一类任务」，不是让 bot 崩：各调用方本来就按 LLM 异常降级（策划失败走短呼应、抽取/摘要失败下轮再试），`LLMBudgetExceeded` 不随 `max_retries` 重试，也不切模型池下一候选。台账放 `meta` 而非新表，按自然日整体替换，省掉流水聚合与清理成本；进程内计数允许并发少量超额。
 
 ---
 

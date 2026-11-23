@@ -15,6 +15,13 @@
 时 token 记 ``None``（落库为 NULL），不猜不编。记录失败只记 debug，不影响主流程。
 测试里可以用任意实现了 ``complete`` 的假对象替换。
 
+预算闸（Q11）：``usage_recorder`` 若由 :func:`make_usage_recorder` 创建，会带上
+``store`` 属性，客户端据此按 ``llm.budget`` 配置建一个
+:class:`~rubenbot.llm_budget.LLMBudgetGate`。每次上游尝试前按任务类型检查当日
+累计，超限抛 :class:`LLMBudgetExceeded`（``LLMError`` 的子类），不发起请求，
+只影响该类任务；每次尝试后把次数与 token/费用记进台账。台账在数据库 ``meta``
+里按本地自然日分桶，跨日自动清零。没有 store（如测试里的假回调）时闸门关闭。
+
 另外负责把上游偶发吐在 ``content`` 里的 DSML 文本工具调用（形如
 ``<...DSML... calls>`` 的标签块，竖线可能是全角）解析回与结构化调用相同
 的内部表示；解析失败只剥除文本并记 warning，绝不抛异常打断正常聊天。
@@ -36,6 +43,7 @@ from typing import Any, Awaitable, Callable, Protocol
 import httpx
 
 from .config import LLMConfig, ModelTarget
+from .llm_budget import BudgetDenial, LLMBudgetGate
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +108,22 @@ class LLMResponseError(LLMError):
         self.status = status
 
 
+class LLMBudgetExceeded(LLMError):
+    """任务类型当日预算已熔断，本次调用没有发往上游。
+
+    ``task`` / ``kind`` / ``limit`` / ``current`` 供调用方与日志核对。它仍是
+    ``LLMError`` 的子类，所以现有的「LLM 失败即降级」路径天然适用；单独成类
+    只是让需要区分「预算停了」和「请求失败」的地方可以按需捕获。
+    """
+
+    def __init__(self, denial: BudgetDenial):
+        super().__init__(f"LLM 预算熔断：{denial.message()}")
+        self.task = denial.task
+        self.kind = denial.kind
+        self.limit = denial.limit
+        self.current = denial.current
+
+
 def is_retryable_status(status: int) -> bool:
     """408 / 429 / 5xx 值得退避重试；401、404 这类配置错误不重试。"""
     return status in RETRYABLE_STATUS or 500 <= status < 600
@@ -149,10 +173,14 @@ class LLMClient:
         transport: httpx.AsyncBaseTransport | None = None,
         usage_recorder: UsageRecorder | None = None,
         retry_delays: tuple[float, ...] | None = None,
+        budget_gate: LLMBudgetGate | None = None,
     ):
         self.config = config
         self._transport = transport
         self._usage_recorder = usage_recorder
+        # 预算闸：显式注入优先；否则从用量回调带出的 store 建一个（没有库就不拦）
+        store = getattr(usage_recorder, "store", None)
+        self.budget = budget_gate if budget_gate is not None else LLMBudgetGate(config.budget, store)
         # 测试可注入零延迟；生产用模块默认的 1s / 3s
         self._retry_delays = RETRY_DELAYS if retry_delays is None else retry_delays
         self._clients: dict[str, httpx.AsyncClient] = {}
@@ -320,6 +348,9 @@ class LLMClient:
                 )
             except ToolUnsupported:
                 raise
+            except LLMBudgetExceeded:
+                # 预算熔断与具体模型无关：换下一个模型也还是同一类任务，直接停
+                raise
             except LLMResponseError as exc:
                 if not is_retryable_status(exc.status):
                     # 401/403/404/400：换模型也救不了，直接报，不做无谓切换
@@ -380,12 +411,18 @@ class LLMClient:
         retries = self.config.max_retries if retries is None else retries
         last_error: Exception | None = None
         for attempt in range(retries + 1):
+            denial = self.budget.denial(task)
+            if denial is not None:
+                # 已熔断：不再发起新请求，也不按 max_retries 继续烧
+                raise LLMBudgetExceeded(denial)
             started = time.perf_counter()
             try:
                 resp = await client.post("/chat/completions", json=body)
             except httpx.HTTPError as exc:
                 # 网络/超时层失败：这次尝试没有响应，token 记 NULL
-                await self._record_usage(task, model, None, started, ok=False)
+                await self._record_usage(
+                    task, model, None, started, ok=False, provider=target.provider
+                )
                 last_error = exc
             else:
                 try:
@@ -394,7 +431,9 @@ class LLMClient:
                     data = None
                 if resp.status_code >= 400:
                     # 429/5xx 也可能带 usage 计费信息，能读到就记上
-                    await self._record_usage(task, model, data, started, ok=False)
+                    await self._record_usage(
+                        task, model, data, started, ok=False, provider=target.provider
+                    )
                     text = resp.text[:300]
                     if allow_tool_unsupported and resp.status_code in (400, 404, 422, 501):
                         lowered = text.lower()
@@ -414,11 +453,15 @@ class LLMClient:
                 else:
                     choices = (data.get("choices") if isinstance(data, dict) else None) or []
                     if not choices:
-                        await self._record_usage(task, model, data, started, ok=False)
+                        await self._record_usage(
+                            task, model, data, started, ok=False, provider=target.provider
+                        )
                         last_error = LLMError(f"LLM 响应缺少 choices: {str(data)[:300]}")
                     else:
                         result = on_success(data)
-                        await self._record_usage(task, model, data, started, ok=True)
+                        await self._record_usage(
+                            task, model, data, started, ok=True, provider=target.provider
+                        )
                         return result
             if attempt >= retries:
                 break
@@ -437,12 +480,23 @@ class LLMClient:
         started: float,
         *,
         ok: bool,
+        provider: str = "",
     ) -> None:
-        """写一条用量；没配回调或写失败都只记 debug，绝不影响调用结果。"""
+        """写一条用量；没配回调或写失败都只记 debug，绝不影响调用结果。
+
+        同时把这次尝试记进预算台账（成功失败都算一次）。
+        """
+        prompt, completion, total = usage_from_response(data)
+        self.budget.record(
+            task,
+            provider=provider,
+            model=model,
+            prompt_tokens=prompt,
+            completion_tokens=completion,
+        )
         recorder = self._usage_recorder
         if recorder is None:
             return
-        prompt, completion, total = usage_from_response(data)
         usage = LLMUsage(
             ts=time.time(),
             task=task,
@@ -462,7 +516,10 @@ class LLMClient:
 
 
 def make_usage_recorder(store: Any) -> UsageRecorder | None:
-    """把 store 包成用量回调；``store`` 没有用量表（或测试用的假 store）时返回 None。"""
+    """把 store 包成用量回调；``store`` 没有用量表（或测试用的假 store）时返回 None。
+
+    回调对象带 ``store`` 属性，:class:`LLMClient` 据此建立同库的预算台账。
+    """
     add = getattr(store, "add_llm_usage", None)
     if not callable(add):
         return None
@@ -478,6 +535,7 @@ def make_usage_recorder(store: Any) -> UsageRecorder | None:
             ts=usage.ts,
         )
 
+    record.store = store  # type: ignore[attr-defined] - 预算闸从这里取库
     return record
 
 

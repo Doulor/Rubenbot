@@ -21,6 +21,8 @@
 
 ### Added
 
+- **按任务类型的 LLM 每日预算闸（Q11）**：沿用 `llm_usage` 的任务标签，在每次上游尝试前累计当日调用次数与估算费用，任一项达到上限就只停该类任务——不再发起新请求，日志打一条 `LLM 预算熔断：任务 X 今日调用 N 次已达上限 N`（连续命中只打一次），bot 与其它任务类型不受影响；熔断不按 `max_retries` 重试、也不切模型池的下一候选。台账按「任务类型」和「提供商/模型」两个维度落数据库 `meta` 的 `llm_budget:ledger`，重启从库恢复、本地自然日跨日清零。配置写进 `llm.budget`：`enabled`、`default_daily_calls`（默认 500）、`default_daily_cost_usd`（默认关）、`tasks` 按任务覆盖（`null` 不限、`0` 全拦）、`pricing` 单价。默认阈值取家里云 2026-11-20～23 的 `llm_usage` 单任务日峰值并留 3～5 倍余量（`gen_stage1` 1500、`gen_stage2` 1200、`extract` 600、`image_description` 400 等），明细与取样 SQL 见 `docs/llm-budget-results.md`。workbuddy 在 `api.heevcmlz.cn` 查不到公开单价（`/api/pricing` 返回空表、`/api/ratio_config` 返回 403），所以 `pricing` 默认留空、费用档默认关闭，**不凭 token 编造费用**；配了费用上限却没配单价时只记一条 warning。检查与记账在进程内完成，并发下允许少量超额，是护栏不是计费闸。WebUI 本次不展示台账，阈值只走 `config.yaml`。
+
 - **提供商 / 模型 / 角色池（Q21）**：各提供商独立配置端点、密钥和模型目录。`chat`、`vision` 等角色可跨提供商组池，沿用故障转移、轮询和随机策略。WebUI 可编辑三层配置并热生效。单端点旧配置仍按原规则读取，不会在启动时改写；迁移时保留已有环境变量密钥引用。
 
 - **Bing 搜索渠道（免 key 抓取型）**：搜索回退链新增第三个渠道 `bing`——GET `cn.bing.com/search` 并用标准库 `HTMLParser` 解析 SERP（`li.b_algo` → `h2 > a` 标题与直链、`b_caption > p` 摘要），请求带浏览器 UA 与 `Accept-Language`，超时/条数/注入字数沿用既有渠道契约。页面改版、验证页、空结果页或结构残缺一律按「本渠道没结果」处理，交给回退链顺延，不抛异常打断聊天；没有直链的条目直接丢弃（查证打不开原文）。`search.order` 可写 `bing`（免 key，无需配置字段），默认链仍是 `[tavily, deepseek]`，线上语义不变。配套 3 份真实 SERP 样本 fixture（正常 / 无结果 / 残缺）与回退链单测；同环境 5 题实测对比（延迟、前 3 条质量、整句问句的局限）见 `docs/bing-search-results.md`。
