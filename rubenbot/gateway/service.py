@@ -23,6 +23,7 @@ from typing import Any
 
 from ..adapters.base import ActionNotSupported, BaseAdapter
 from ..config import Config
+from ..expression import CapabilityNote
 from .catalog import RISK_DENIED, RISK_SENSITIVE, ActionCatalog, ActionEntry, catalog_for
 from .gatekeeper import CREDENTIAL_ACTIONS, GateDecision, Gatekeeper, object_id_from_params
 
@@ -168,6 +169,13 @@ class GatewayService:
             return []
         return [ADAPTER_ACTIONS_TOOL, ADAPTER_CALL_TOOL]
 
+    def capability_notes(self, adapter: BaseAdapter, *, chat_id: str, chat_type: str) -> list[CapabilityNote]:
+        """从本会话开放目录生成聊天能力说明；说明不授予原始工具权限。"""
+        if not self.available(adapter, chat_id=chat_id, chat_type=chat_type):
+            return []
+        catalog = self.catalog_for(adapter)
+        return [entry.capability_note for entry in catalog.visible() if entry.capability_note]
+
     def guide(self, adapter: BaseAdapter | None, *, chat_id: str = "", chat_type: str = "group") -> str:
         """系统提示里的一行指针；工具不可用时为空。"""
         if not self.available(adapter, chat_id=chat_id, chat_type=chat_type):
@@ -223,20 +231,30 @@ class GatewayService:
         """闸门 → 执行 → 审计；永远返回给模型看的文本，不抛异常。"""
         action = str(action or "").strip()
         credential_action = action in CREDENTIAL_ACTIONS
+        chat_recall = source == "chat" and action == "delete_msg"
+        chat_failure = "没能撤回这条消息，平台没有确认成功。"
         chat_key = self._chat_key(adapter, chat_id)
         params = params if isinstance(params, dict) else {}
+
+        def unavailable(reason: str) -> str:
+            # 撤回请求即便被总开关或会话白名单拦下，也留一笔；此时不查台账。
+            if action == "delete_msg":
+                self.gatekeeper.audit(action=action, source=source, chat_key=chat_key, chat_type=chat_type,
+                                      params=params, reject_reason=reason, sensitive=True, now=now)
+            return reason
+
         if adapter is None:
-            return "当前没有可用的适配器。"
+            return unavailable("当前没有可用的适配器。")
         if not self.config.gateway.enabled:
-            return "平台接口网关未开启。"
+            return unavailable("平台接口网关未开启。")
         # 没有动作通道的适配器（Telegram / QQ 官方）：明确说不支持，不静默
         if not adapter.supports_actions():
-            return f"当前适配器不支持动作调用（{action or '未知动作'}）。"
+            return unavailable(f"当前适配器不支持动作调用（{action or '未知动作'}）。")
         catalog = self.catalog_for(adapter)
         if catalog is None:
-            return "当前适配器没有接口目录。"
+            return unavailable("当前适配器没有接口目录。")
         if not self.conversation_allowed(adapter, chat_id=chat_id, chat_type=chat_type):
-            return "这个会话不在网关允许范围内。"
+            return unavailable("这个会话不在网关允许范围内。")
         entry = catalog.get(action)
         if entry is None:
             # 不存在与 denied 对模型是同一个答案：不泄露被禁动作
@@ -284,6 +302,8 @@ class GatewayService:
         decision: GateDecision = self.gatekeeper.check(
             entry,
             chat_key=chat_key,
+            chat_type=chat_type,
+            params=params,
             object_id=object_id_from_params(params),
             now=now,
         )
@@ -296,7 +316,7 @@ class GatewayService:
                 params=params,
                 ok=False,
                 reject_reason=decision.reason,
-                sensitive=entry.risk == RISK_SENSITIVE,
+                sensitive=decision.sensitive,
                 now=now,
             )
             return decision.reason
@@ -312,10 +332,10 @@ class GatewayService:
                 params=params,
                 ok=False,
                 reject_reason="不支持此动作" if credential_action else str(exc),
-                sensitive=entry.risk == RISK_SENSITIVE,
+                sensitive=decision.sensitive,
                 now=now,
             )
-            return f"当前适配器不支持动作 {action}。"
+            return chat_failure if chat_recall else f"当前适配器不支持动作 {action}。"
         except Exception as exc:  # noqa: BLE001 - 失败原因回给模型供其重试
             summary = (
                 "凭据接口错误详情已省略" if credential_action
@@ -330,13 +350,13 @@ class GatewayService:
                 params=params,
                 ok=False,
                 result=summary,
-                sensitive=entry.risk == RISK_SENSITIVE,
+                sensitive=decision.sensitive,
                 now=now,
             )
             logger.warning("网关动作 %s 失败：%s", action, summary)
-            return f"{action} 调用失败：{summary}"
+            return chat_failure if chat_recall else f"{action} 调用失败：{summary}"
 
-        self.gatekeeper.note_success(entry, chat_key=chat_key, object_id=object_id_from_params(params), now=now)
+        self.gatekeeper.note_success(entry, chat_key=chat_key, object_id=decision.object_id, now=now)
         # 事件调用方只把返回文本写日志，不消费凭据；模型工具仍拿原有结果摘要。
         summary = "" if credential_action and source == "event" else _summarize_result(result)
         self.gatekeeper.audit(
@@ -347,11 +367,13 @@ class GatewayService:
             params=params,
             ok=True,
             result=summary,
-            sensitive=entry.risk == RISK_SENSITIVE,
+            sensitive=decision.sensitive,
             now=now,
         )
         logger.info("网关动作 %s 成功（%s）", action, chat_key,
                     extra={"platform": adapter.name, "chat_type": chat_type, "chat_id": chat_id})
+        if chat_recall:
+            return "已撤回。"
         return f"{action} 调用成功：{summary}" if summary else f"{action} 调用成功。"
 
     # ------------------------------------------------------------------

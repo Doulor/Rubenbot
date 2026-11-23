@@ -419,6 +419,7 @@ loader 加载时校验 manifest：缺失或字段不全的插件拒绝加载并�
 
 - **三层漏斗**：L0 全量记录事件；L1 规则门（类型/会话/安静时段过滤）；L2 由 fast 角色判定（ignore / react / message / gateway / notify_owner）。request 类事件在一期永不自动执行加好友/加群审批。
 - **闸门**：动作按风险分级——denied（硬禁名单）、sensitive（需 `gateway.allow_sensitive=true`，默认关）、safe；四维冷却：单动作×会话、人均 ≤3 次/小时、单会话每日预算（默认 20）、全局每日上限（默认 200），失败退避。
+- **聊天撤回**：明确对 bot 的撤回委托走固定网关动作 `delete_msg`，不进 `computer_task`。引用优先，按平台、会话类型、会话号和平台消息 ID 查 `raw_messages`；没有引用时，机主或明确指向 bot 上一条发言的请求可取本会话最近一条自发消息。指向不明、无回执或引用不在本会话台账，向请求者询问，不猜 ID。网关按台账发送者核定实际风险：bot 自发为 safe，他人为 sensitive，两路均记 `gateway_audit`；总开关、会话准入与原有冷却、额度不变。
 - **作用域**：总开关 `gateway.enabled` 默认关；群聊必须显式写进 `gateway.enabled_conversations` 才放行，私聊主人会话恒可；安静时段（默认 00:00–08:00）不执行动作。
 - **硬禁动作**：`delete_friend`、`set_group_dismiss`、`set_restart`、`clean_cache`、`set_online_status` 不可通过网关调用；即使打开敏感动作也须拒绝并记审计，不向协议端发送请求。
 - **审计**：每次判定与执行写入 `gateway_audit` 表，WebUI 有只读审计卡可查。`get_cookies`、`get_csrf_token` 保留动作、会话、来源与成败，不保存参数、返回凭据或上游错误正文。

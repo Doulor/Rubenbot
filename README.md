@@ -303,6 +303,8 @@ stdout 记录前后 PID/commit。退出码 `0` 表示发布成功，`1` 表示�
 
 **群聊电脑任务回放**：`python -m pytest tests/test_chat_computer_routing.py` 会从 Console 入站，核对 `list_dir → write_file → send_file` 的三条审计、落盘字节和原群收到的附件，而不是只看聊天回复。开启 `computer.enabled`、配置真实平台账号白名单、使用支持工具调用的模型，并保持 `memory.recall_tool_max_rounds > 0`。机主可直接委托或 @ bot；授予机主权限不等于每句话都要接。机主操作默认最多 4 轮（`computer.max_task_rounds`）；访客只能用自己的沙盒，不能借同群机主调用真机、MCP 或平台原始接口。
 
+**聊天撤回**：先启用 `gateway.enabled`，并把要使用的群加入 `gateway.enabled_conversations`。回复目标消息并 @ bot 说「撤回这条」，即可向网关请求撤回，不走电脑工具。没有引用时，机主可请 bot 撤回本会话最近一条自发消息；其他人可明确说「撤回你刚发的那条」，或紧接 bot 的发言说「撤回这条」。指向不清、找不到引用或没有平台回执时，bot 会请你引用，不猜消息 ID。撤 bot 自己的消息不需要敏感开关；撤其他人的消息仍需 `gateway.allow_sensitive: true`，能否成功也取决于平台权限和撤回时限。
+
 **SnowLuma 网关真机验收**：[44 项逐动作回执与审计](docs/gateway-e2e-results.md) · [静态接口对照](docs/snowluma-contract.md)。`2.1.1-node` 上已核实空间说说发布、独立读回与清理；私聊贴表情不支持，好友/入群审批等机主配合真实申请。`delete_friend`、`set_group_dismiss`、`set_restart`、`clean_cache`、`set_online_status` 五项永久拒绝，即使开启敏感动作也不会发往协议端。
 
 **Q2 其余真机实测（2026-11-23）**：出站语音、表情图片段、附件按内联字节发送已在自聊实发、读回后撤回；`web_search` 的搜索→抓页→摘录→出站整链在修复正文截断后走通（Tavily 5 条命中、凤凰网原文摘录带出处）；提醒在隔离库 + 真实适配器上到点触发并投递自聊，落库 `done`。两处如实记录的上限：QQ 原生转写 `fetch_ptt_text` 只部分语音可用（自聊语音 `error=9`、部分群语音 20 秒超时，旧群语音可转），群内贴表情仍需机主提供非主群的专用测试群与一条真实群消息。证据与未验条件见 `docs/q2-rest-results.md`。

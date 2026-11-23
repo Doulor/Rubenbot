@@ -20,11 +20,13 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Any
 
 from ..config import Config
+from ..memory.store import BOT_SENDER_ID, SYSTEM_SENDER_PREFIX
 from .catalog import RISK_DENIED, RISK_SENSITIVE, ActionEntry
 
 logger = logging.getLogger(__name__)
@@ -57,6 +59,8 @@ class GateDecision:
     allowed: bool
     reason: str = ""
     retry_after: float | None = None
+    sensitive: bool = False
+    object_id: str = ""
 
     @classmethod
     def allow(cls) -> "GateDecision":
@@ -105,17 +109,49 @@ class Gatekeeper:
         *,
         chat_key: str,
         object_id: str = "",
+        chat_type: str = "",
+        params: dict[str, Any] | None = None,
         now: float | None = None,
     ) -> GateDecision:
-        """顺序检查风险、退避、冷却、对象上限与预算；拒绝原因带剩余秒数。"""
+        """顺序检查风险、退避、冷却、对象上限与预算；审计沿用本次实际分档。"""
         now = time.time() if now is None else now
         if entry.risk == RISK_DENIED:
-            return GateDecision.refuse("这个接口被禁止调用（账号破坏性操作）。")
-        if entry.risk == RISK_SENSITIVE and not self.settings.allow_sensitive:
-            return GateDecision.refuse(
-                "这是敏感操作（踢人/禁言/撤回/处理申请等），当前没有开启 allow_sensitive。"
-            )
+            return GateDecision(False, "这个接口被禁止调用（账号破坏性操作）。", sensitive=True)
+        sensitive = entry.risk == RISK_SENSITIVE
+        if entry.name == "delete_msg":
+            sender = self._recall_sender(chat_key, chat_type, params or {})
+            if not sender:
+                return GateDecision(False, "无法从当前会话的消息记录确认撤回目标。", sensitive=True)
+            sensitive = sender != BOT_SENDER_ID
+            object_id = sender
+        if sensitive and not self.settings.allow_sensitive:
+            return GateDecision(False, "这是敏感操作，当前没有开启 allow_sensitive。", sensitive=True)
+        decision = self._check_limits(entry, chat_key, object_id, now)
+        decision.sensitive = sensitive
+        decision.object_id = object_id
+        return decision
 
+    def _recall_sender(self, chat_key: str, chat_type: str, params: dict[str, Any]) -> str:
+        """只认当前会话的平台消息号，不把本地行号、引用作者或调用者自述当证据。"""
+        platform, chat_id = _split_chat_key(chat_key)
+        if not platform or not chat_id or chat_type not in {"group", "private"} or params.keys() != {"message_id"}:
+            return ""
+        value = params["message_id"]
+        # 协议端用 JS 整数解析；拒绝有歧义的拼法与会被舍入的整数，保证查、撤同号。
+        if type(value) not in (int, str) or not re.fullmatch(r"-?[1-9][0-9]{0,15}", str(value)):
+            return ""
+        if abs(int(value)) > 2**53 - 1:
+            return ""
+        try:
+            row = self.store.message_by_platform_id(platform, str(value), chat_id=chat_id, chat_type=chat_type)
+        except Exception as exc:  # 查账失败不能退化为只检查敏感开关
+            logger.warning("撤回目标查账失败：%s", type(exc).__name__)
+            return ""
+        if row and (row.sender_id == BOT_SENDER_ID or not row.sender_id.startswith(SYSTEM_SENDER_PREFIX)):
+            return row.sender_id
+        return ""
+
+    def _check_limits(self, entry: ActionEntry, chat_key: str, object_id: str, now: float) -> GateDecision:
         backoff = self._backoff(entry.name, now)
         if backoff is not None:
             return GateDecision.refuse(

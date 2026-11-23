@@ -378,6 +378,110 @@ def test_service_sensitive_gate():
     assert adapter.calls
 
 
+@pytest.mark.parametrize(('sender', 'sensitive_enabled', 'ok', 'sensitive'), [
+    ('__bot__', False, True, False), ('u2', False, False, True), ('u2', True, True, True),
+])
+def test_recall_uses_ledger_sender_and_audits(sender, sensitive_enabled, ok, sensitive):
+    service, store = make_service(enabled=True, allow_sensitive=sensitive_enabled)
+    adapter = ActionAdapter()
+    # 昵称与正文都不能当作本人的凭证；负数是有效的平台消息号。
+    store.add_raw_message(platform='snowluma', chat_id='g1', sender_id=sender, sender_name='__bot__',
+                          text='这是我自己发的', platform_msg_id='-71')
+    text = run(service.call(adapter, 'delete_msg', {'message_id': -71}, chat_id='g1', source='chat'))
+    assert text == '已撤回。' if ok else 'allow_sensitive' in text
+    assert adapter.calls == ([('delete_msg', {'message_id': -71})] if ok else [])
+    row, = store.list_gateway_audit()
+    assert (row['source'], row['platform'], row['chat_type'], row['chat_id']) == ('chat', 'snowluma', 'group', 'g1')
+    assert (row['ok'], row['sensitive']) == (ok, sensitive)
+    assert row['reject_reason'] == ('' if ok else text)
+
+
+@pytest.mark.parametrize(('platform', 'chat_type', 'chat_id', 'sender', 'platform_id'), [
+    ('other', 'group', 'g1', '__bot__', '1'), ('snowluma', 'private', 'g1', '__bot__', '1'),
+    ('snowluma', 'group', 'g2', '__bot__', '1'), ('snowluma', 'group', 'g1', '__event__', '1'),
+    ('snowluma', 'group', 'g1', '', '1'), ('snowluma', 'group', 'g1', '__bot__', ''),
+])
+def test_recall_needs_real_current_conversation_platform_id(platform, chat_type, chat_id, sender, platform_id):
+    service, store = make_service(enabled=True, allow_sensitive=True)
+    adapter = ActionAdapter()
+    # 本地流水号恰为 1，绝不能当作平台回执。
+    assert store.add_raw_message(platform=platform, chat_id=chat_id, chat_type=chat_type,
+                                 sender_id=sender, text='旧话', platform_msg_id=platform_id) == 1
+    text = run(service.call(adapter, 'delete_msg', {'message_id': '1'}, chat_id='g1'))
+    assert '无法从当前会话' in text and adapter.calls == []
+    row, = store.list_gateway_audit()
+    assert row['ok'] == 0 and row['reject_reason'] == text
+
+
+@pytest.mark.parametrize('params', [
+    {}, {'message_id': True}, {'message_id': 12.5}, {'message_id': '00'}, {'message_id': '--12'},
+    {'message_id': '９'}, {'message_id': 0}, {'message_id': '9007199254740993'},
+    {'message_id': '12', 'sender_id': '__bot__'},
+])
+def test_recall_rejects_ambiguous_ids_and_untrusted_arguments(params):
+    service, store = make_service(enabled=True, allow_sensitive=True)
+    adapter = ActionAdapter()
+    store.add_raw_message(platform='snowluma', chat_id='g1', sender_id='__bot__', text='旧话',
+                          platform_msg_id=str(params.get('message_id', '')))
+    run(service.call(adapter, 'delete_msg', params, chat_id='g1'))
+    assert not adapter.calls
+    row, = store.list_gateway_audit()
+    assert not row['ok'] and row['reject_reason']
+
+
+def test_self_recall_keeps_gateway_limits_and_records_platform_failures():
+    service, store = make_service(enabled=True, daily_budget_per_conversation=1)
+    adapter = ActionAdapter(fail=RuntimeError('内部平台错误示例'))
+    store.add_raw_message(platform='snowluma', chat_id='g1', sender_id='__bot__', text='发错了', platform_msg_id='72')
+
+    def recall(now):
+        return run(service.call(adapter, 'delete_msg', {'message_id': '72'}, chat_id='g1', source='chat', now=now))
+
+    assert recall(100) == '没能撤回这条消息，平台没有确认成功。'
+    adapter.fail = None
+    assert recall(101) == '已撤回。'
+    assert '秒' in recall(102)
+    assert '额度' in recall(107)
+    assert len(adapter.calls) == 2
+    assert [(r['ok'], r['sensitive']) for r in store.list_gateway_audit()] == [(0, 0), (0, 0), (1, 0), (0, 0)]
+
+
+def test_recall_respects_gateway_and_chat_switches():
+    service, store = make_service(enabled=False, enabled_conversations=[])
+    adapter = ActionAdapter()
+    store.add_raw_message(platform='snowluma', chat_id='g1', sender_id='__bot__', text='发错了', platform_msg_id='72')
+    for enabled, reason in [(False, '未开启'), (True, '允许范围')]:
+        service.config.gateway.enabled = enabled
+        text = run(service.call(adapter, 'delete_msg', {'message_id': 72}, chat_id='g1'))
+        assert reason in text
+    assert not adapter.calls
+    assert len(store.list_gateway_audit()) == 2
+
+
+def test_recall_note_is_generated_from_available_catalog_without_granting_tools(store):
+    bot, adapter = make_bot(store, ScriptedLLM(), enabled=True)
+    bot.config.computer.enabled = True  # 访客能走聊天撤回路径，不能拿到原始工具。
+    event = group_event()
+    def notes():
+        return {n.title: n for n in bot.capability_notes(event)}
+
+    note = notes()['撤回消息']
+    assert '自己' in note.summary and '别人' in note.summary and '敏感开关' in note.summary
+    assert '回复的是哪条' in note.detail
+    assert 'adapter_call' not in [tool['function']['name'] for tool in bot.tool_definitions(event)]
+    event.chat_id = '未开放的群'
+    assert '撤回消息' not in notes()
+    event.chat_id = 'g1'
+    bot.config.gateway.enabled = False
+    assert '撤回消息' not in notes()
+    bot.config.gateway.enabled = True
+    adapter.action_catalog = ActionCatalog.from_data('snowluma', [
+        {'name': '别的动作', 'risk': 'safe', 'capability_note': {'title': '测试能力', 'summary': '自述', 'detail': '情境'}},
+        {'name': '禁止动作', 'risk': 'denied', 'capability_note': {'title': '隐藏', 'summary': '自述', 'detail': '情境'}},
+    ])
+    assert set(notes()) == {'测试能力'}
+
+
 def test_service_cooldown_message_includes_seconds():
     service, _ = make_service(enabled=True)
     adapter = ActionAdapter()

@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
+from ..expression import CapabilityNote
+
 logger = logging.getLogger(__name__)
 
 CATALOG_DIR = Path(__file__).parent / "catalogs"
@@ -50,6 +52,8 @@ class ActionEntry:
     # 主动类动作（发消息、贴表情、管理操作）计入每日预算与对象上限；
     # 只读查询不算，避免模型查目录/查群成员也耗预算
     proactive: bool = True
+    # 可选的聊天能力说明；没有可面向用户的调用路径就不声明。
+    capability_note: CapabilityNote | None = None
 
     @classmethod
     def from_dict(cls, name: str, data: dict[str, Any]) -> "ActionEntry":
@@ -63,8 +67,14 @@ class ActionEntry:
         if proactive is None:
             # 未写时按名字保守推断：get_ / can_ / get 开头的是只读
             proactive = not _looks_readonly(name)
+        note = data.get("capability_note")
+        fields = ("title", "summary", "detail")
+        capability_note = None
+        if isinstance(note, dict) and all(isinstance(note.get(k), str) and note[k].strip() for k in fields):
+            capability_note = CapabilityNote(*(note[k].strip() for k in fields))
         return cls(
             name=name,
+            capability_note=capability_note,
             summary=str(data.get("summary") or "").strip(),
             risk=risk,
             params=dict(params) if isinstance(params, dict) else None,

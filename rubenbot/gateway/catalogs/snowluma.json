@@ -41,8 +41,13 @@
     },
     {
       "name": "delete_msg",
-      "summary": "撤回一条消息",
+      "summary": "撤回消息：撤回自己发的不用开敏感操作，撤回别人发的需要开启敏感操作",
       "risk": "sensitive",
+      "capability_note": {
+        "title": "撤回消息",
+        "summary": "我能撤回自己发的消息，不用开敏感操作；撤回别人发的消息要先打开敏感开关。",
+        "detail": "有人说发错了、让我撤回刚才那条时，先看他回复的是哪条；不清楚要撤哪条就问一句，不猜。"
+      },
       "cooldown_seconds": 5,
       "params": {
         "message_id": {"type": "integer", "description": "要撤回的消息 id"}
