@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 
 from ..llm import LLMProtocol, parse_json_payload
 from ..privacy.gate import OWNER_AUDIENCE
+from ..memory.anchor import annotate, evaluate
 from ..memory.retrieve import jaccard
 from ..memory.store import Event, Memory, MemoryStore, Profile, ProfileLine
 
@@ -47,6 +48,14 @@ DISTILL_SYSTEM_PROMPT = """你是一个人物画像整理员。你会看到关�
 ["event:12", "memory:34"]。只能引用输入里真实存在的 id；没有证据的支持
 宁可不要写这一行。**不许编造输入里没有的事实。**
 
+**每一行也必须写清所指的实体**：职业、住址这类自带主语的句子不用另填；
+「对某个东西/平台/项目的评价」必须把名字写进正文（如「认为 Claude Code 推单向
+消息不错」），并在 entity 填同一个专名。名字只能来自这条行的 evidence 原文里
+逐字出现过的专名，不能用「它」「这个东西」「那个平台」代替主语，也不要凭常识补全
+（输入没点名就不写这一行，代码会按指称不完整丢掉并记一条丢弃记录）。
+现有画像里仍然有效的评价行，正文已经带「关于「名字」：」前缀的，照原样保留，
+entity 也照抄。
+
 与现有画像矛盾时（比如现画像说在杭州、新事件说搬到北京），
 用新结论替换旧结论，不要两句都写。现有画像里**仍然有效的行要原样保留**，
 并把原来的 evidence 一并带上；只有确实过时或矛盾的行才删掉。
@@ -54,8 +63,8 @@ DISTILL_SYSTEM_PROMPT = """你是一个人物画像整理员。你会看到关�
 再给出 3~8 个话题关键词 hooks：从画像内容里提炼，用于群聊索引与记忆触发。
 
 严格输出 JSON 对象：
-{"stable": [{"text": "...", "evidence": ["event:12"]}],
- "status": [{"text": "...", "expires_in_days": 7, "evidence": ["event:15"]}],
+{"stable": [{"text": "...", "evidence": ["event:12"], "entity": ""}],
+ "status": [{"text": "...", "expires_in_days": 7, "evidence": ["event:15"], "entity": ""}],
  "hooks": ["爬山", "猫"]}
 """
 
@@ -77,6 +86,7 @@ class _CandidateLine:
     text: str
     refs: list[str]
     expires_in_days: int | None = None
+    entity: str = ""
 
 
 def parse_profile(raw: str) -> tuple[list[_CandidateLine], list[_CandidateLine], list[str]]:
@@ -123,7 +133,8 @@ def _parse_lines(items, *, with_expiry: bool) -> list[_CandidateLine]:
                 expires = int(float(item.get("expires_in_days")))
             except (TypeError, ValueError):
                 expires = None
-        lines.append(_CandidateLine(text=text, refs=refs, expires_in_days=expires))
+        entity = str(item.get("entity") or item.get("entity_name") or "").strip()[:120]
+        lines.append(_CandidateLine(text=text, refs=refs, expires_in_days=expires, entity=entity))
     return lines
 
 
@@ -242,9 +253,10 @@ class ProfileDistiller:
         # 旧画像的既有证据也算有效证据：模型顺带保留仍有效的旧行时，可直接沿用原证据
         for refs in self.store.get_profile_evidence(person_id).values():
             allowed.update(refs)
+        sources = self._source_texts(events, facts, allowed)
 
-        stable_lines, dropped_stable = self._validate(stable, allowed)
-        status_lines, dropped_status = self._validate(status, allowed)
+        stable_lines, dropped_stable = self._validate(stable, allowed, sources, person_id, now=now)
+        status_lines, dropped_status = self._validate(status, allowed, sources, person_id, now=now)
         dropped = dropped_stable + dropped_status
         if old is not None and not stable_lines and not status_lines and dropped:
             # 模型给的行全被证据校验挡下（或漏写旧行）：宁可保留旧画像，
@@ -296,8 +308,16 @@ class ProfileDistiller:
         self,
         lines: list[_CandidateLine],
         allowed: set[str],
+        sources: dict[str, str],
+        person_id: str,
+        *,
+        now: float,
     ) -> tuple[list[ProfileLine], int]:
-        """只保留证据链指向输入（或旧画像已有证据）的行；同节近重复也丢掉。"""
+        """只保留证据链指向输入（或旧画像已有证据）的行；同节近重复也丢掉。
+
+        画像行同样过指称完整性：只有评价、没有主语的句子不许独立成行，
+        找不到可回指的实体就丢弃并在 ``memory_log`` 留痕。
+        """
         kept: list[ProfileLine] = []
         dropped = 0
         for line in lines:
@@ -305,18 +325,84 @@ class ProfileDistiller:
             if not refs:
                 dropped += 1
                 continue
+            decision = evaluate(
+                line.text,
+                source_text="\n".join(sources.get(ref, "") for ref in refs),
+                # 证据记忆自己已经锚在实体上时，直接沿用，别让画像行再猜一次。
+                entity=self._anchored_entity(refs),
+                model_entity=line.entity,
+            )
+            if not decision.ok:
+                dropped += 1
+                self.store.log_dropped_unanchored(
+                    person_id=person_id,
+                    origin_chat=self._origin_hint(refs),
+                    kind="profile",
+                    content=line.text,
+                    reason=decision.reason or "无实体锚点",
+                    now=now,
+                )
+                continue
             if any(jaccard(line.text, existing.text) >= 0.9 for existing in kept):
                 dropped += 1
                 continue
             kept.append(
                 ProfileLine(
-                    text=line.text,
+                    text=annotate(line.text, decision.anchor),
                     evidence_refs=refs,
                     line_no=len(kept),
                     expires_in_days=line.expires_in_days,
+                    entity=decision.anchor.name if decision.anchor else "",
                 )
             )
         return kept, dropped
+
+    def _source_texts(
+        self, events: list[Event], facts: list[Memory], allowed: set[str]
+    ) -> dict[str, str]:
+        """证据引用 → 原文（event 摘要 / memory 正文）；旧证据从库里补读。"""
+        sources: dict[str, str] = {}
+        for event in events:
+            sources[f"event:{event.id}"] = event.summary
+        for mem in facts:
+            sources[f"memory:{mem.id}"] = mem.content
+        for ref in allowed:
+            if ref in sources:
+                continue
+            kind, _, value = ref.partition(":")
+            try:
+                ident = int(value)
+            except ValueError:
+                continue
+            if kind == "event":
+                event = self.store.get_event(ident)
+                if event is not None:
+                    sources[ref] = event.summary
+            elif kind == "memory":
+                mem = self.store.get_memory(ident)
+                if mem is not None:
+                    sources[ref] = mem.content
+        return sources
+
+    def _anchored_entity(self, refs: list[str]) -> str:
+        """证据引用里唯一已核实的实体锚点；多条证据指向不同实体时不猜。"""
+        entities: set[str] = set()
+        for ref in refs:
+            kind, _, value = ref.partition(":")
+            if kind != "memory":
+                continue
+            try:
+                mem = self.store.get_memory(int(value))
+            except ValueError:
+                continue
+            if mem is not None and mem.entity:
+                entities.add(mem.entity)
+        return entities.pop() if len(entities) == 1 else ""
+
+    @staticmethod
+    def _origin_hint(refs: list[str]) -> str:
+        """丢弃记录里的来源提示：列出证据引用（event/memory id），方便回查原话。"""
+        return ",".join(refs[:3])
 
     def _render_input(self, old: Profile | None, events: list[Event], facts: list[Memory]) -> str:
         from ..memory.extract import format_ts
