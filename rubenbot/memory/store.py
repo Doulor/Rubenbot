@@ -2121,13 +2121,18 @@ class MemoryStore:
     def timeline_rows(
         self, *, since: float | None, until: float, person_id: str | None = None,
         exclude_chat: tuple[str, str, str] | None = None, raw_only: bool = False,
-        prefer_events: bool = False, latest_raw: bool = False, terms: Sequence[tuple[str, int]] = (),
-        mentioned: Sequence[str] = (), limit: int = 256, offset: int = 0,
+        include_self: bool = False, prefer_events: bool = False, latest_raw: bool = False,
+        terms: Sequence[tuple[str, int]] = (), mentioned: Sequence[str] = (),
+        limit: int = 256, offset: int = 0,
     ) -> list[sqlite3.Row]:
         """统一流水与事件的出处。先按人/时段选记录，排名、分页都在 SQLite 内完成。
 
         不按受众或封存标记筛选；两者原样返回供可选的隐私审查使用。
         旧事件可能只有受众没有出处；不猜未知场合，也不在「别处近况」中展示。
+
+        默认只取「别人做了什么」：bot 自己的 self 事件不进通用时间线，
+        避免自己的话被当成旁证。``include_self=True`` 只给私聊里的
+        「我最近在别处做过什么」这一层用，调用方负责场合与隐私口径。
         """
         args = dict(since=since, until=until, person=person_id, limit=limit, offset=offset)
         def window(alias: str) -> str:
@@ -2148,16 +2153,18 @@ class MemoryStore:
             AND substr(r.sender_id,1,2)<>'__' AND r.text<>'' {raw_filter}"""
         queries = [raw_sql]
         if not raw_only:
+            self_filter = '' if include_self else " AND e.person_id<>'self'"
             queries.append(f"""SELECT 'event', e.id,
                 CASE WHEN instr(e.source_chat,':')>0 THEN substr(e.source_chat,1,instr(e.source_chat,':')-1) ELSE '' END,
                 COALESCE(NULLIF(e.source_chat_type,''), r.chat_type, CASE WHEN e.audience LIKE 'group:%' THEN 'group'
                                           WHEN e.audience='private' THEN 'private' ELSE 'unknown' END),
                 substr(e.source_chat,instr(e.source_chat,':')+1), e.person_id,
-                COALESCE(NULLIF(r.sender_name,''), NULLIF(p.display_name,''), e.person_id),
+                CASE WHEN e.person_id='self' THEN '我'
+                     ELSE COALESCE(NULLIF(r.sender_name,''), NULLIF(p.display_name,''), e.person_id) END,
                 e.summary, e.ts, e.audience, e.sensitivity, e.source_raw_id, COALESCE(r.entity_blocked,0)
                 FROM events e LEFT JOIN people p ON p.person_id=e.person_id
                 LEFT JOIN raw_messages r ON r.id=e.source_raw_id AND r.platform||':'||r.chat_id=e.source_chat
-                WHERE {window('e')} AND e.compressed=0 AND e.person_id<>'self'
+                WHERE {window('e')} AND e.compressed=0{self_filter}
                 AND e.summary<>'' {event_filter}""")
         sql = 'WITH entries AS (' + ' UNION ALL '.join(queries) + ')'
         source = 'entries'
