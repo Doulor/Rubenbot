@@ -179,9 +179,11 @@ class StickerBehavior:
         self.visual_counts["success"] += ready  # 适配器自带描述已经同步写入
         collect = event.is_group and self.enabled and self.config.collect
         self._prune_visual_status()
-        if ready == len(segments) and not collect:
+        if ready == len(segments):
+            # 适配器自带说明：不需要等模型，别在裁定日志里记成「没请求过」。
             self._visual_status[raw_id] = "ready"
-            return
+            if not collect:
+                return
         self._visual_started[raw_id] = self.clock()
         task = asyncio.create_task(self._ingest_images(
             runtime, raw_id, event.platform, event.chat_type, segments, descriptions,
