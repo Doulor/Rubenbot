@@ -561,14 +561,16 @@ class PlannerConfig:
 
 
 # 联网搜索支持的渠道；顺序只影响默认尝试顺序，不代表优先级
-SEARCH_PROVIDERS: tuple[str, ...] = ("tavily", "deepseek")
-# 用户拍板：Tavily 当主力、DeepSeek 当备胎
+SEARCH_PROVIDERS: tuple[str, ...] = ("tavily", "deepseek", "bing")
+# 免密钥的抓取型渠道：排在 order 里即可用，不需要 api_key
+KEYLESS_SEARCH_PROVIDERS: frozenset[str] = frozenset({"bing"})
+# 用户拍板：Tavily 当主力、DeepSeek 当备胎；bing 不排进默认链，按需自行加
 DEFAULT_SEARCH_ORDER: tuple[str, ...] = ("tavily", "deepseek")
 
 
 @dataclass
 class SearchChannelConfig:
-    """单个搜索渠道的配置；目前只有密钥。"""
+    """单个搜索渠道的配置；目前只有密钥（免 key 渠道不用填）。"""
 
     api_key: str = ""
 
@@ -611,14 +613,16 @@ class SearchConfig:
 
     搜索渠道改成**有序回退链**：``order`` 里的渠道按顺序尝试，没配 key 的
     自动跳过，抛错/超时/空结果就顺延下一个，第一个有结果的胜出。渠道目前
-    有 ``tavily`` 与 ``deepseek``，各自在 ``tavily.api_key`` /
-    ``deepseek.api_key`` 配密钥；支持 ``${ENV_VAR}``（加载时已统一展开）。
-    整条链一个 key 都没有时工具不注册，模型看不见它。
+    有 ``tavily`` 、``deepseek`` 与免 key 的抓取型 ``bing``，前两家各自在
+    ``tavily.api_key`` / ``deepseek.api_key`` 配密钥；支持 ``${ENV_VAR}``
+    （加载时已统一展开）。整条链一个可用渠道都没有时工具不注册，模型看不见它。
     """
 
     order: list[str] = field(default_factory=lambda: list(DEFAULT_SEARCH_ORDER))
     tavily: SearchChannelConfig = field(default_factory=SearchChannelConfig)
     deepseek: SearchChannelConfig = field(default_factory=SearchChannelConfig)
+    # 免 key 渠道当前用不到密钥；保留字段只为让配置结构统一
+    bing: SearchChannelConfig = field(default_factory=SearchChannelConfig)
     timeout_seconds: float = 10.0
     # 每个会话两次真实搜索之间的冷却；整条链共用，冷却内不发任何请求
     cooldown_seconds: float = 30.0
@@ -642,8 +646,11 @@ class SearchConfig:
 
     @property
     def configured(self) -> bool:
-        """链上至少有一个渠道配了 key 才算可用。"""
-        return any(self.channel(name).configured for name in self.order)
+        """链上至少有一个可用渠道：配了 key，或本身免 key（bing）。"""
+        return any(
+            name in KEYLESS_SEARCH_PROVIDERS or self.channel(name).configured
+            for name in self.order
+        )
 
 
 # 语音转写（STT）与语音合成（TTS）的可选后端

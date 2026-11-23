@@ -101,17 +101,24 @@ memory:
 
 # 联网查证：搜索定位结果页，再匿名只读打开公网原文；未读到原文不引用摘要。
 # 渠道按 order 依次尝试：没配 key 的自动跳过，抛错/超时/空结果就换下一个，
-# 第一个有结果的胜出。整条链一个 key 都没有时工具不注册，模型看不见它；
+# 第一个有结果的胜出。整条链一个可用渠道都没有时工具不注册，模型看不见它；
 # 日志会打一行「联网搜索未配置，已跳过」。
 # 旧写法（provider + api_key 平铺）仍可加载，会自动映射成 order: [provider]；
 # 已下线的旧渠道在配置里出现时会被忽略并打一行日志。
 search:
-  order: [tavily, deepseek]  # 尝试顺序；可选 tavily / deepseek，未知名字忽略并打日志
+  # 尝试顺序；可选 tavily / deepseek / bing，未知名字忽略并打日志。
+  # bing 免 key、抓取型：直接 GET cn.bing.com/search 解析结果页 HTML，不需要 api_key；
+  # cn.bing 是国内索引（中文站点覆盖好），页面改版或跳验证页时解析为空，回退链自动顺延。
+  # 想试免 key 搜索就把它排进链里，例如 [tavily, bing]；默认链不含它，线上语义不变。
+  order: [tavily, deepseek]
   tavily:
     api_key: "${RUBENBOT_TAVILY_KEY}"
   deepseek:
     # 与 DeepSeek 模型同一把 key；按成功请求计费 $0.75/千次（失败/空结果不计费）
     api_key: "${RUBENBOT_DEEPSEEK_KEY}"
+  # bing 是免 key 的抓取渠道，没有需要填的字段；保留这一段只为说明，删掉也不影响。
+  # 注意：它是网页抓取，Bing 改版后可能失效；实测记录见 docs/bing-search-results.md。
+  # bing: {}
   timeout_seconds: 10      # 单次搜索请求超时（秒），整条链共用
   cooldown_seconds: 30     # 每会话两次真实搜索之间的冷却，整条链只过一次闸；冷却内只返回提示
 

@@ -166,6 +166,7 @@ SnowLuma 适配器（OneBot v11）：
 - decision：合并窗口、硬触发别名、发言间隔、不应期、滚动窗口上限与否决标记
 - emotion：情绪与好感度的开关、各档增减幅度、每日上限、衰减比例（见「情绪与好感度」）
 - plugins：插件目录、`enabled` 显式启用列表（留空即全部关闭）、命令前缀；逐项授权不在 config.yaml 里，落在数据库同目录的 `plugin_permissions.json`
+- search：`order` 是渠道回退链（可选 `tavily` / `deepseek` / `bing`），`tavily.api_key` / `deepseek.api_key` 各自配 key；`bing` 免 key，写进 `order` 即可用，不需要任何字段
 - adapters：启用的适配器及各自参数（snowluma 的 ws_url、http_url、access_token）
 
 ## 第一阶段交付标准（本次任务）
@@ -221,6 +222,8 @@ SnowLuma 适配器（OneBot v11）：
 策划步的一行一项能力自述来自当前会话实际可用的工具、适配器或已加载插件，而不是写进人设。只列已配置、有依据说自己做得到的能力，不用注册表代替权限校验。常驻索引只说能做什么；选中某项才展开适用情境。
 
 知道答案就直接帮忙；拿不准的公开事实可以搜索，再匿名只读打开少量结果页。标题和搜索摘要不是原文。读页沿用公网地址校验和限额，网页只交给无工具权限的阅读步骤；答复要能在读到的正文里逐字核对，并标出实际出处。超时、无正文或证据不足就说没查实，不拿模型常识填补。网页原文不进入记忆、会话摘要或群内实体说明。本阶段不使用浏览器，不登录、不提交表单。
+
+搜索渠道是可插拔的有序回退链（`search.order`）：`tavily`、`deepseek` 需在各自段里配 key，`bing` 免 key、抓取型（GET `cn.bing.com/search`，解析结果页 HTML，只收有直链的条目）。页面改版、验证页、空结果页或结构残缺都按「本渠道没结果」顺延下一家，不抛异常。默认链保持 `[tavily, deepseek]`；国内索引与整句问句的局限、5 题实测数据见 `docs/bing-search-results.md`。
 
 ## WebUI（当前已实现）
 

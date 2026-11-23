@@ -864,7 +864,7 @@ def test_put_structured_search_section(client, config_path, state):
 
 def test_validate_search_rejects_unknown_channel():
     with pytest.raises(ConfigValidationError) as info:
-        validate_structured({"search": {"order": ["tavily", "bing"]}})
+        validate_structured({"search": {"order": ["tavily", "google"]}})
     assert any(item["field"] == "search.order" for item in info.value.fields)
     with pytest.raises(ConfigValidationError) as info:
         validate_structured({"search": {"order": []}})

@@ -1,4 +1,4 @@
-"""联网搜索：配置解析、渠道回退链、两家后端解析、注入格式与截断、冷却、工具注册。"""
+"""联网搜索：配置解析、渠道回退链、三家后端解析、注入格式与截断、冷却、工具注册。"""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -19,6 +20,8 @@ from rubenbot.memory.store import MemoryStore
 from rubenbot.persona import Persona
 from rubenbot.plugins.loader import PluginManager
 from rubenbot.search import (
+    BING_QUERY_MAX,
+    BING_URL,
     DEEPSEEK_QUERY_MAX,
     DEEPSEEK_URL,
     NO_RESULT_TEXT,
@@ -33,6 +36,7 @@ from rubenbot.search import (
     build_searcher,
     clamp_count,
     format_results,
+    parse_bing_html,
 )
 
 from rubenbot.verification import MAX_PAGES, NO_EVIDENCE, RECORD_PLACEHOLDER
@@ -118,14 +122,34 @@ def deepseek_handler(seen=None, body=None, status=200):
     return handler
 
 
+BING_FIXTURES = Path(__file__).parent / "fixtures"
+# 真实 SERP 抓样（2026-11-23 从 cn.bing.com 取回）截出的前 4 条结果
+BING_NORMAL_HTML = (BING_FIXTURES / "bing_serp_normal.html").read_text(encoding="utf-8")
+# 真实「没有与此相关的结果」页
+BING_EMPTY_HTML = (BING_FIXTURES / "bing_serp_empty.html").read_text(encoding="utf-8")
+# 手工构造的结构残缺样本：未关门的 p/li、站内跳转链接、无标题条目、答案卡
+BING_BROKEN_HTML = (BING_FIXTURES / "bing_serp_broken.html").read_text(encoding="utf-8")
+
+
+def bing_handler(seen=None, html=None, status=200, text=None):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if seen is not None:
+            seen.append(request)
+        if text is not None:
+            return httpx.Response(status, text=text)
+        return httpx.Response(status, html=html if html is not None else BING_NORMAL_HTML)
+
+    return handler
+
+
 def routing_handler(routes):
-    """按 URL 路由到不同 handler；记录调用顺序。"""
+    """按 URL 前缀路由到不同 handler；记录调用顺序（Bing 的结果页带查询参数）。"""
     calls: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         for prefix, route in routes.items():
-            if url == prefix:
+            if url.startswith(prefix):
                 calls.append(prefix)
                 return route(request)
         raise AssertionError(f"未预期的请求：{url}")
@@ -155,13 +179,26 @@ def test_search_config_defaults():
 
 def test_search_config_order_ignores_unknown_channel(caplog):
     with caplog.at_level(logging.WARNING, logger="rubenbot.config"):
-        config = SearchConfig(order=["tavily", "bing", "deepseek", "tavily"])
+        config = SearchConfig(order=["tavily", "google", "deepseek", "tavily"])
     assert config.order == ["tavily", "deepseek"]
-    assert any("bing" in record.message for record in caplog.records)
+    assert any("google" in record.message for record in caplog.records)
     # 全是未知渠道时回落到默认顺序，不崩
-    assert SearchConfig(order=["bing"]).order == ["tavily", "deepseek"]
+    assert SearchConfig(order=["google"]).order == ["tavily", "deepseek"]
     # 逗号分隔字符串也认
     assert SearchConfig(order="deepseek, tavily").order == ["deepseek", "tavily"]
+
+
+def test_bing_is_keyless_and_can_join_chain():
+    # bing 是抓取型免 key 渠道：排进 order 就能用，默认顺序仍不含它
+    config = SearchConfig(order=["bing"])
+    assert config.order == ["bing"]
+    assert config.bing.api_key == ""
+    assert config.configured is True
+    # 默认链保持线上语义：tavily 在前，bing 不被悄悄加进来
+    assert SearchConfig().order == ["tavily", "deepseek"]
+    assert SearchConfig().configured is False
+    # 与有 key 的渠道混排时按写法保留顺序
+    assert SearchConfig(order=["tavily", "bing"]).order == ["tavily", "bing"]
 
 
 def test_config_loads_new_search_section_and_env(tmp_path, monkeypatch):
@@ -336,6 +373,160 @@ def test_deepseek_long_query_is_truncated():
     searcher, _ = make_searcher(deepseek_handler(seen), order=["deepseek"])
     asyncio.run(searcher.search("长" * 300, 2, chat_key="c1"))
     assert len(seen[0][1]["query"]) == DEEPSEEK_QUERY_MAX
+
+
+def test_bing_parses_normal_fixture():
+    results = parse_bing_html(BING_NORMAL_HTML)
+    assert len(results) == 4
+    assert results[0].title == "Welcome to Python.org"
+    assert results[0].url == "https://www.python.org/"
+    assert "Python Software Foundation" in results[0].snippet
+    # 摘要里的「阅读更多」锚点文字不算摘要
+    assert "阅读更多" not in results[0].snippet
+    # 第 4 条是中文摘要，标题里的 <strong> 标签不影响文字拼接
+    assert results[3].title == "Python 3.15.2 documentation"
+    assert results[3].domain == "docs.python.org"
+
+
+def test_bing_empty_fixture_yields_no_results():
+    # 「没有与此相关的结果」页：只有 b_no 块，没有任何 b_algo
+    assert parse_bing_html(BING_EMPTY_HTML) == []
+
+
+def test_bing_broken_fixture_is_tolerant():
+    # 结构残缺：p 未关门、li 缺结束标签、站内跳转链接、无标题条目、答案卡
+    results = parse_bing_html(BING_BROKEN_HTML)
+    assert len(results) == 3
+    assert results[0].title == "What's New In Python 3.13"
+    assert results[0].url == "https://docs.python.org/3/whatsnew/3.13.html"
+    # 标题锚点只有站内相对链接：保留标题，不把 /search?q=… 当结果地址
+    assert results[1].title == "只有站内链接的条目"
+    assert results[1].url == ""
+    # 只有摘要的条目也收；b_ans 答案卡被跳过
+    assert results[2].title == ""
+    assert "只有一小段摘要文字" in results[2].snippet
+    assert all("答案卡" not in r.snippet for r in results)
+
+
+@pytest.mark.parametrize(
+    "html",
+    [
+        "",
+        "not html at all",
+        "<li class=\"b_algo\"><h2><a href=\"https://x.test\">半截",
+        "<ol id=\"b_results\"><li class=\"b_algo\"></li></ol>",
+        "<html><body><div class='b_algo'><h2>缺 ul 包裹</h2></div></body></html>",
+    ],
+)
+def test_bing_parser_never_raises(html):
+    assert isinstance(parse_bing_html(html), list)
+
+
+def test_bing_request_shape_and_headers():
+    seen = []
+    searcher, _ = make_searcher(bing_handler(seen), order=["bing"])
+    text = asyncio.run(searcher.search("python 教程", 3, chat_key="c1"))
+
+    request = seen[0]
+    assert str(request.url).startswith(BING_URL + "?")
+    assert request.url.params["q"] == "python 教程"
+    assert request.url.params["count"] == "3"
+    header = request.headers.get("user-agent", "")
+    assert "Mozilla/5.0" in header and "Chrome/" in header
+    assert "zh-CN" in request.headers.get("accept-language", "")
+    assert "text/html" in request.headers.get("accept", "")
+    lines = text.splitlines()
+    assert lines[0] == RESULT_HEADER
+    assert "Welcome to Python.org" in lines[1]
+    assert "来源：python.org" in lines[1]
+    assert searcher.last_provider == "bing"
+
+
+def test_bing_long_query_is_truncated():
+    seen = []
+    searcher, _ = make_searcher(bing_handler(seen), order=["bing"])
+    asyncio.run(searcher.search("长" * 300, 2, chat_key="c1"))
+    assert len(seen[0].url.params["q"]) == BING_QUERY_MAX
+
+
+def test_bing_results_are_capped_by_count():
+    searcher, _ = make_searcher(bing_handler(), order=["bing"])
+    results = asyncio.run(searcher.lookup("q", 2, chat_key="c1"))
+    assert isinstance(results, list)
+    assert len(results) == 2
+
+
+def test_bing_results_without_url_are_dropped():
+    # 查证必须能打开原文：没有链接的条目（站内跳转、纯摘要）不进结果
+    searcher, _ = make_searcher(bing_handler(html=BING_BROKEN_HTML), order=["bing"])
+    results = asyncio.run(searcher.lookup("q", 5, chat_key="c1"))
+    assert isinstance(results, list)
+    assert [item.url for item in results] == [
+        "https://docs.python.org/3/whatsnew/3.13.html"
+    ]
+
+
+def test_bing_empty_page_falls_back_to_next_channel():
+    # 「没有相关结果」页解析为空：不算失败，回退链顺延
+    handler, calls = routing_handler(
+        {
+            BING_URL: bing_handler(html=BING_EMPTY_HTML),
+            TAVILY_URL: lambda request: httpx.Response(200, json=TAVILY_BODY),
+        }
+    )
+    searcher, _ = make_searcher(handler, order=["bing", "tavily"])
+    text = asyncio.run(searcher.search("q", 3, chat_key="c1"))
+    assert calls == [BING_URL, TAVILY_URL]
+    assert "Python 3.13 发布" in text
+    assert searcher.last_provider == "tavily"
+
+
+def test_bing_http_error_falls_back_to_next_channel():
+    handler, calls = routing_handler(
+        {
+            BING_URL: lambda request: httpx.Response(503, text="busy"),
+            DEEPSEEK_URL: lambda request: httpx.Response(200, json=DEEPSEEK_BODY),
+        }
+    )
+    searcher, _ = make_searcher(handler, order=["bing", "deepseek"])
+    text = asyncio.run(searcher.search("q", 3, chat_key="c1"))
+    assert calls == [BING_URL, DEEPSEEK_URL]
+    assert "DeepSeek 搜索结果" in text
+
+
+def test_bing_network_error_falls_back_to_next_channel():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).startswith(BING_URL):
+            raise httpx.ConnectError("no route", request=request)
+        return httpx.Response(200, json=TAVILY_BODY)
+
+    searcher, _ = make_searcher(handler, order=["bing", "tavily"])
+    text = asyncio.run(searcher.search("q", 3, chat_key="c1"))
+    assert "Python 3.13 发布" in text
+    assert searcher.last_provider == "tavily"
+
+
+def test_bing_success_stops_the_chain():
+    handler, calls = routing_handler(
+        {
+            BING_URL: bing_handler(),
+            TAVILY_URL: lambda request: httpx.Response(200, json=TAVILY_BODY),
+        }
+    )
+    searcher, _ = make_searcher(handler, order=["bing", "tavily"])
+    text = asyncio.run(searcher.search("q", 3, chat_key="c1"))
+    # 首个渠道有结果：不再打 Tavily
+    assert calls == [BING_URL]
+    assert "Welcome to Python.org" in text
+    assert searcher.last_provider == "bing"
+
+
+def test_bing_only_chain_failure_returns_unavailable():
+    # 免 key 渠道也失败时，没有别的可用渠道：返回提示，不抛异常
+    searcher, _ = make_searcher(
+        bing_handler(status=500), order=["bing"], tavily_key="", deepseek_key=""
+    )
+    assert asyncio.run(searcher.search("q", 3, chat_key="c1")) == UNAVAILABLE_TEXT
 
 
 def test_count_is_clamped_to_max():
