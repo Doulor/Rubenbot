@@ -17,13 +17,15 @@ logger = logging.getLogger(__name__)
 
 # LRC 时间戳：[00:12.34] / [00:12.345] / [00:12]
 _TIMESTAMP = re.compile(r"\[\d{1,2}:\d{2}(?:\.\d{1,3})?\]")
-# 系统里常见的中文字体；仓库不带字体文件（避免第三方字体授权问题）
+# 系统里常见的中文字体；仓库不带字体文件（避免第三方字体授权问题）。
+# 只列带 CJK 字形的字体：DejaVu 之类没有汉字，拿它渲染只会出一片方框，
+# 宁可判定「渲染不可用」退回文本歌词。
 _FONT_CANDIDATES = (
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc",
     "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
     "/System/Library/Fonts/PingFang.ttc",
     "C:/Windows/Fonts/msyh.ttc",
 )

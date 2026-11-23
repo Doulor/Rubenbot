@@ -1035,3 +1035,32 @@ def test_aclose_is_registered_on_stop():
         assert pending.task.done()
 
     run(main())
+
+
+# ----------------------------------------------------------------------
+# 歌词渲染
+# ----------------------------------------------------------------------
+
+
+def test_clean_lyrics_strips_timestamps_and_keeps_gaps():
+    renderer = sys.modules[f"{MODULE_NAME}.renderer"]
+    lines = renderer.clean_lyrics("[00:01.00]第一句\n\n[00:05.12]第二句\n[00:09]第三句\n")
+    assert lines == ["第一句", "", "第二句", "第三句"]
+
+
+def test_renderer_unavailable_without_font_or_pillow(tmp_path):
+    renderer_mod = sys.modules[f"{MODULE_NAME}.renderer"]
+    instance = renderer_mod.LyricsRenderer(font_path=str(tmp_path / "missing.ttf"))
+    assert instance.available is False
+    assert instance.render("[00:01.00]第一句") is None
+
+
+def test_renderer_draws_png_when_environment_allows(tmp_path):
+    pytest.importorskip("PIL")
+    renderer_mod = sys.modules[f"{MODULE_NAME}.renderer"]
+    font = renderer_mod.find_font()
+    if not font:
+        pytest.skip("环境里没有 CJK 字体")
+    instance = renderer_mod.LyricsRenderer(font_path=font)
+    image = instance.render("[00:01.00]第一句\n[00:02.00]第二句")
+    assert image and image.startswith(b"\x89PNG")
