@@ -1,17 +1,53 @@
 {
   "id": "music",
   "name": "点歌",
-  "version": "1.1.0",
-  "description": "「点歌 <歌名>」「我想听 <歌名>」搜网易云，默认发歌名 + 链接 + 封面图；可选 OneBot 音乐卡片",
+  "version": "3.0.0",
+  "description": "按 hydrogen 点歌插件复刻：点歌 / 网易点歌 / QQ点歌 / 酷狗 等十几个平台命令，多结果发选歌列表（超时自动撤回），按 语音→文件→文字 逐档降级发送，可播音频先探活过滤，可选热评与歌词图",
   "author": "RubenBot",
   "min_core_version": "0.1.0",
-  "permissions": ["read_messages", "send_messages", "network"],
+  "permissions": ["read_messages", "send_messages", "network", "capabilities"],
   "config_schema": [
     {
-      "key": "triggers",
+      "key": "song_limit",
+      "type": "number",
+      "default": 5,
+      "description": "选歌列表最多列几首（1-20）；select_mode 为 single 时固定取 1 首"
+    },
+    {
+      "key": "select_mode",
+      "type": "string",
+      "default": "text",
+      "description": "选择模式：text（发编号列表选歌）或 single（直接发第一首）"
+    },
+    {
+      "key": "timeout",
+      "type": "number",
+      "default": 30,
+      "description": "选歌列表的有效时间（5-600 秒），超时后撤回列表并提示已超时"
+    },
+    {
+      "key": "send_modes",
       "type": "list",
-      "default": ["点歌", "我想听"],
-      "description": "点歌触发词，消息以其中之一开头即触发"
+      "default": ["record", "file", "text"],
+      "description": "发送模式优先级：record（语音条，可播放）/ file（音频文件）/ text（歌名+链接）/ card（OneBot 音乐卡，新版 QQ 不渲染，谨慎开启）"
+    },
+    {
+      "key": "enable_comments",
+      "type": "boolean",
+      "default": true,
+      "description": "发歌后附一句网易云热评"
+    },
+    {
+      "key": "enable_lyrics",
+      "type": "boolean",
+      "default": false,
+      "description": "发歌后附歌词图（需要 Pillow 与系统 CJK 字体，否则自动跳过）"
+    },
+    {
+      "key": "timeout_recall",
+      "type": "boolean",
+      "default": true,
+      "description": "选歌列表超时后自动撤回（需要机主授予「平台能力」权限才能调 delete_msg）"
     },
     {
       "key": "cooldown_seconds",
@@ -20,16 +56,10 @@
       "description": "单人两次点歌之间的冷却秒数"
     },
     {
-      "key": "source",
+      "key": "default_player",
       "type": "string",
-      "default": "netease",
-      "description": "默认音源（目前只支持 netease）"
-    },
-    {
-      "key": "music_card",
-      "type": "boolean",
-      "default": false,
-      "description": "是否先尝试 OneBot 音乐卡片（默认关闭：新版 QQ 不渲染，只显示「发送者版本过低」）"
+      "default": "网易点歌",
+      "description": "不带平台名的「点歌」默认用哪个音源，如 网易点歌 / QQ点歌 / 酷狗点歌"
     }
   ],
   "hooks": ["on_message", "on_stop"],

@@ -314,7 +314,7 @@ SnowLuma 适配器（OneBot v11）：
 - `config_schema`：配置项声明（key/类型/默认/说明），供设置界面自动渲染表单（二期落地，一期先解析存下）
 - `hooks`：用到的钩子名列表（on_message / on_command / scheduled 等，与 loader 的 register(ctx) 对应）
 
-loader 加载时校验 manifest：缺失或字段不全的插件拒绝加载并在 WebUI 标「不合规」；现有 6 个官方插件（hello / qzone_post / music / image_gen / group_insights / link_parse）都声明了 manifest；表情包行为已于 2026-11-20 移入 core，emoji_react 已删除；新增插件（音乐 / 画图 / 群聊总结）沿用同一规范，默认不启用。画图走**自定义生图端点（OpenAI 兼容）**：`base_url` / `api_key` / `model` 三件套齐全才注册触发，硅基流动退为预设示例、不再写死。点歌默认发「歌名 — 歌手 + 链接」文字并附封面图；OneBot 音乐卡在新版 QQ 客户端只显示「发送者版本过低」，降为 `music_card: true` 的可选项。
+loader 加载时校验 manifest：缺失或字段不全的插件拒绝加载并在 WebUI 标「不合规」；现有 6 个官方插件（hello / qzone_post / music / image_gen / group_insights / link_parse）都声明了 manifest；表情包行为已于 2026-11-20 移入 core，emoji_react 已删除；新增插件（音乐 / 画图 / 群聊总结）沿用同一规范，默认不启用。画图走**自定义生图端点（OpenAI 兼容）**：`base_url` / `api_key` / `model` 三件套齐全才注册触发，硅基流动退为预设示例、不再写死。点歌按 hydrogen 点歌插件复刻：多平台命令（点歌 / 网易点歌 / QQ点歌 / 酷狗 等十余个），多结果发选歌列表、选中 / 取消 / 超时都撤回（超时撤回走适配器 `delete_msg`，需 `capabilities` 授权），`send_modes` 默认 `record → file → text`——语音条能直接播放，OneBot 音乐卡在新版 QQ 客户端只显示「发送者版本过低」，只作为配置可选项；搜索结果先探活过滤（网易云 VIP 曲目拿到的是 404 页面），聚合子平台空结果时退回网易云。
 
 ### 分发：GitHub 索引仓库
 
