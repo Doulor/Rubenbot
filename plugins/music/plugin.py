@@ -234,7 +234,7 @@ def parse_request(
     触发词按长度从长到短匹配。裸平台名（酷狗 / 网易云 等）后面必须跟空白，
     「点歌」类命令则允许直接跟歌名（「点歌晴天」）。
     """
-    value = (text or "").strip()
+    value = _strip_leading_mentions(text)
     if not value:
         return None
     aliases = sorted(
@@ -281,9 +281,21 @@ def _default_target(default_player: str) -> tuple[str, str, str]:
     return "netease", "netease", DISPLAY_NAME["netease"]
 
 
+def _strip_leading_mentions(text: str) -> str:
+    """去掉正文开头的 ``@某人`` 占位，让「@bot 点歌 晴天」也能命中。
+
+    统一事件里 @ 段渲染成 ``@昵称 ``；其他人在开头 @ 别人时同样剥掉，
+    后面紧跟「点歌」才触发，不改变「正文里提到 @ 字样不算寻址」的约定。
+    """
+    value = (text or "").strip()
+    # 统一事件把 @ 段渲染成「@账号id 」（见 Segment.render），整段剥掉即可
+    stripped = re.sub(r"^(?:@\S+\s+)+", "", value)
+    return stripped.strip()
+
+
 def parse_lyrics_request(text: str) -> str | None:
     """``查歌词 <歌名>`` / ``歌词 <歌名>``；不命中返回 None（空歌名返回空串）。"""
-    match = _LYRICS_PATTERN.match((text or "").strip())
+    match = _LYRICS_PATTERN.match(_strip_leading_mentions(text))
     if not match:
         return None
     return (match.group("song") or "").strip().strip(_TRIM_CHARS).strip()
@@ -369,7 +381,7 @@ class MusicPlayer:
 
     async def _handle(self, runtime, event):
         adapter = _adapter_for(runtime, event)
-        text = (getattr(event, "text", "") or "").strip()
+        text = _strip_leading_mentions(getattr(event, "text", "") or "")
         sender_id = str(getattr(event, "sender_id", "") or "")
 
         pending = self._pending.get(self._pending_key(event))

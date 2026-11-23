@@ -298,6 +298,15 @@ def test_parse_longest_alias_wins():
     assert plugin.parse_request("喜马拉雅点歌 三国").platform_type == "ximalaya"
 
 
+def test_parse_ignores_leading_mentions():
+    # 群里 @bot 点歌：事件正文开头是「@账号id 」（@ 段渲染成这个形状），剥掉后照样命中
+    assert plugin.parse_request("@Ruben 点歌 晴天").song == "晴天"
+    assert plugin.parse_request("@小明 @Ruben QQ点歌 稻香").platform_type == "qq"
+    assert plugin.parse_lyrics_request("@Ruben 查歌词 晴天") == "晴天"
+    # 只有 @ 没有点歌内容不算点歌
+    assert plugin.parse_request("@Ruben 今天好热") is None
+
+
 def test_parse_uses_default_player():
     request = plugin.parse_request("点歌 晴天", default_player="QQ点歌")
     assert (request.source, request.platform_type) == ("txqq", "qq")
