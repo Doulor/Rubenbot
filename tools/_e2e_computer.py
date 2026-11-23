@@ -7,6 +7,7 @@ from pathlib import Path
 from secrets import token_hex
 from unittest.mock import patch
 
+from rubenbot.computer import one_sentence
 from rubenbot.core import _parse_tool_arguments
 
 
@@ -17,6 +18,11 @@ _METRICS = ("/usr/bin/stat -f -c 'disk_available_blocks=%a' / && "
             "/usr/bin/awk '/^MemAvailable:/ {print \"memory_available_KiB=\" $2}' /proc/meminfo")
 _NUMBERS = re.compile(r'disk_available_blocks=([0-9]+)\nmemory_available_KiB=([0-9]+)\n?')
 _DENIED = '操作失败：访客只允许工作区内的相对路径'
+
+
+def _one_sentence(text: str) -> bool:
+    """失败说明必须恰好一句：无列表、无换行、无邀约尾巴。"""
+    return bool(text) and one_sentence(text) == text and text.count("。") == 1
 
 
 class _Failure(AssertionError):
@@ -76,10 +82,10 @@ async def _turn(ctx, *, sender, chat, prompt, tool, accepts, verifies, success=T
         raise failure
     if not seen:
         raise _Failure(f'本轮未观察到真实的 {tool} 调用；口头答复不算证据')
-    if not success and reply:
-        raise _Failure('拒绝操作后仍有出站消息')
-    if success and not reply and tool != 'send_file':
-        raise _Failure('工具调用成功，但本轮没有出站文本')
+    if not success and reply and not _one_sentence(reply):
+        raise _Failure('失败说明不是恰好一句人话（含列表、换行或邀约尾巴）')
+    if success and tool == 'send_file' and reply:
+        raise _Failure('附件已送达却仍补发了汇报文字')
 
 
 async def sandbox(ctx) -> str:

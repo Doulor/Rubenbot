@@ -30,8 +30,13 @@ class Model:
         self.deliver = deliver
         self.requests = []
         self.plans = []
+        self.outcome_prompts = []
 
     async def complete(self, messages, **kwargs):
+        if kwargs['task'] == 'gen_outcome':
+            # 失败说明只给执行记录和本轮原话，模型仍可能顺手带上邀约尾巴。
+            self.outcome_prompts.append(messages)
+            return '那步没走通。\n如果你需要，我可以再试。'
         assert kwargs['task'] == 'gen_stage1', '不能退化为无工具生成'
         prompt = messages[-1]['content']
         self.plans.append(prompt)
@@ -89,18 +94,28 @@ def test_owner_task_between_guests_executes_in_own_group_turn(instance, store, t
             if s.type == 'file'] == [('room', 'group', path.read_bytes())]
     assert [(a['tool'], a['context'], a['success']) for a in reversed(store.recent_computer_actions())] == [
         (tool, 'host', True) for tool in ('list_dir', 'write_file', 'send_file')]
-    assert any(r['reason'] == 'computer_task' and r['should_reply'] for r in store.list_decision_logs())
+    log = next(r for r in store.list_decision_logs() if r['reason'] == 'computer_task')
+    assert not log['should_reply']  # 交付完成即静默：决策日志记不发言，群里只有附件
+    assert 'console:room' not in bot.decision_engine._last_reply_at
     assert bot.decision_engine.active_reply_count('console:room', 0) == 0
 
 
 @pytest.mark.parametrize('steps,deliver', [([{'content': '已经看过了'}], False),
                                           ([call('list_dir'), {'content': '附件已发送'}], True)])
 def test_ungrounded_completion_not_sent(instance, store, steps, deliver):
-    bot, console, _ = instance(steps, deliver)
+    bot, console, llm = instance(steps, deliver)
     asyncio.run(console.dispatch(event('请查看目录并按要求操作')))
-    assert not console.sent
+    # 没交付成功就不再冒充完成；失败说明最多一句，绝不带列表和邀约尾巴。
+    assert len(console.sent) <= 1
+    if console.sent:
+        text = "".join(s.render() for s in console.sent[0][2])
+        assert text.count("。") == 1 and "\n" not in text and "- " not in text
+        assert "如果" not in text and "需要" not in text
+    else:
+        # 一步都没做、也没可说的进展：保持沉默，不硬凑一句。
+        assert not llm.outcome_prompts
     log, = store.list_decision_logs()
-    assert log['reason'] == 'computer_task_failed' and not log['should_reply']
+    assert log['reason'] in ('computer_task_failed', 'computer_task_partial')
     assert 'console:room' not in bot.decision_engine._last_reply_at
 
 
@@ -112,8 +127,14 @@ def test_guest_denial_no_host_no_outbound(instance, store, name, args):
     asyncio.run(console.dispatch(event('请测试这个操作的权限', 'visitor', mentions_bot=True)))
     _, tools, _ = llm.requests[0]
     assert all('访客沙盒' in t['function']['description'] for t in tools)
-    assert not console.sent and not store.recent_messages('room', sender_id=BOT_SENDER_ID)
+    # 拒绝不许伪装成功；最多一句人话说明，且不进入正常发言节奏。
+    assert len(console.sent) <= 1
+    if console.sent:
+        text = "".join(s.render() for s in console.sent[0][2])
+        assert text.count("。") == 1 and "\n" not in text
     assert 'console:room' not in bot.decision_engine._last_reply_at
+    bot_lines = [m.text for m in store.recent_messages('room', sender_id=BOT_SENDER_ID)]
+    assert len(bot_lines) <= 1 and all(len(line.split("。")) <= 2 for line in bot_lines)
     row, = store.recent_computer_actions()
     assert (row['who'], row['context'], row['success']) == ('console:visitor', 'sandbox', False)
     assert row['tool'] == ('mcp' if name.startswith('mcp__') else name)
