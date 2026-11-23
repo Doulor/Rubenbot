@@ -2,7 +2,7 @@
 
 现场：机主在群里点歌，music 插件没在 ``plugins.enabled`` 里，指令掉进普通
 聊天被策划沉默，无从分辨是没开还是坏了。这里回放两遍：关着时被 @ 要歌必须
-明说「还没开」，开着时照常由插件出歌卡。
+明说「还没开」，开着时照常由插件出歌（第 26 项后默认发文字 + 封面，不再默认发音乐卡）。
 """
 
 from __future__ import annotations
@@ -261,11 +261,11 @@ def test_group_song_request_with_disabled_music_answers_honestly(tmp_path):
 
 
 # ----------------------------------------------------------------------
-# 回放二：music 启用，群里点歌 → 照常由插件出歌卡
+# 回放二：music 启用，群里点歌 → 照常由插件出歌（默认文字 + 封面）
 # ----------------------------------------------------------------------
 
 
-def test_group_song_request_with_enabled_music_plays_card(tmp_path):
+def test_group_song_request_with_enabled_music_sends_text_and_cover(tmp_path):
     plan = json.dumps({"basis": "settled", "speak": True, "intent": "短附和", "increment": "不用答"},
                       ensure_ascii=False)
     bot, manager, llm, adapter, _ = make_bot(tmp_path, enabled=["music"], fast=plan, chat="不该出现")
@@ -277,7 +277,10 @@ def test_group_song_request_with_enabled_music_plays_card(tmp_path):
         asyncio.run(client.aclose())
 
     assert adapter.sent == [
-        ("1125257581", "group", [{"type": "music", "data": {"type": "netease", "id": "186016"}}])
+        ("1125257581", "group", [
+            {"type": "text", "data": {"text": "晴天 — 周杰伦\nhttps://music.163.com/#/song?id=186016"}},
+            {"type": "image", "data": {"url": "https://p1.music.126.net/cover.jpg"}},
+        ])
     ]
     # 插件拦下了消息，策划一次都没跑；启用状态下也不会把它报成没开
     assert llm.calls == []
