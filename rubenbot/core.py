@@ -70,7 +70,16 @@ from .memory.retrieve import MemoryReader, Retriever
 from .memory.store import MemoryStore, RawMessage, make_person_id
 from .memory.state import StateDistiller
 from .memory.summary import RollingSummarizer, format_summary_block
-from .memory.timeline import MAX_SNIPPETS, recent_timeline, search_timeline
+from .memory.timeline import (
+    HISTORY_GAP_SECONDS,
+    MAX_SNIPPETS,
+    SELF_ACTION_MAX_CHARS,
+    describe_gap,
+    describe_span,
+    recent_self_actions,
+    recent_timeline,
+    search_timeline,
+)
 from .persona import Persona, matches_identity_trigger
 from .privacy import PrivacyCommands, PrivacyGate, register_message
 from .plugins.loader import PluginManager
@@ -2072,12 +2081,17 @@ class RubenBot:
         speaker = "机主" if computer.is_host(self.config.computer, msg) else "在场者"
         return f"{speaker}原话·事实部分已定"
 
-    def render_history(self, messages: list, *, label_basis: bool = False) -> list[dict[str, str]]:
+    def render_history(self, messages: list, *, label_basis: bool = False,
+                       now: float | None = None) -> list[dict[str, str]]:
         """把流水渲染成对话消息：别人的是 ``[HH:MM] [昵称] 正文``，bot 自己的只要正文。
 
         bot 的历史就是它说过的话，必须是干净正文：带上 ``[HH:MM] [我]`` 前缀后，
         模型会模仿这个格式，把自己的回复也生成成转录行（线上出过这种串台）。
         别人的消息保留前缀，模型需要知道群里谁在说话。
+
+        隔了半小时以上才接上的两段对话之间插一条时间断层标注（「9 小时前」
+        这样的人话说法），否则昨晚的话和刚刚的话在历史里长得一模一样，
+        模型会把「昨晚」当「刚刚」。标注夹在两段之间，不属于任何人。
 
         被引用的消息只在**本批历史**里按 ``reply_to_id`` 查；查不到就只标
         「（引用了一条消息）」。附注放在正文后的独立括号里，不属于正文。
@@ -2088,8 +2102,14 @@ class RubenBot:
                 index.setdefault(msg.platform_msg_id, msg)
 
         rendered: list[dict[str, str]] = []
+        previous: RawMessage | None = None
         for msg in messages:
             is_bot = msg.sender_id == BOT_SENDER_ID
+            # 断层标注：只在这个会话自己的一段历史里标，不跨场合比较。
+            if now is not None and previous is not None:
+                gap = float(msg.ts) - float(previous.ts)
+                if gap >= HISTORY_GAP_SECONDS:
+                    rendered.append({"role": "user", "content": self._gap_marker(previous.ts, gap, now)})
             if is_bot:
                 content = msg.text
             else:
@@ -2102,7 +2122,20 @@ class RubenBot:
             content += self._visual_note(msg)
             content += self._quote_suffix(msg, index.get(msg.reply_to_id))
             rendered.append({"role": "assistant" if is_bot else "user", "content": content})
+            previous = msg
         return rendered
+
+    @staticmethod
+    def _gap_marker(previous_ts: float, gap: float, now: float) -> str:
+        """两段历史之间的时间断层标注：说清隔了多久、上一段是什么时候。"""
+        try:
+            then = time.strftime("%m-%d %H:%M", time.localtime(previous_ts))
+        except (ValueError, OverflowError, OSError):
+            then = "较早"
+        return (
+            f"〔时间断层：上一段对话是 {then}（{describe_gap(now - previous_ts)}）说的，"
+            f"中间隔了 {describe_span(gap)}才接上；下面是新的一段，之前的话不是刚刚说的〕"
+        )
 
     def _reply_target(self, event: MessageEvent) -> RawMessage | None:
         if not event.reply_to_id:
@@ -2215,6 +2248,18 @@ class RubenBot:
                                  + "\n".join(recent)})
         except Exception as exc:  # 少一层背景不妨碍当前对话
             logger.warning("近况时间线不可用：%s", type(exc).__name__)
+        # 自我动作单独成段、单独给预算：被问「你刚刚给我发过什么」时，
+        # 答案在 bot 自己别的会话里的交付物，不在「别人做了什么」那一段。
+        try:
+            own_actions = await recent_self_actions(
+                self.store, event, hours=self.config.memory.self_inject_hours,
+                char_limit=SELF_ACTION_MAX_CHARS, allow=review, now=now,
+            )
+            if own_actions:
+                messages.append({"role": "user", "content": "【我最近在别处做过的事·自己的动作】不是当前请求：\n"
+                                 + "\n".join(own_actions)})
+        except Exception as exc:  # 少一段自己的动作不妨碍当前对话
+            logger.warning("自我动作时间线不可用：%s", type(exc).__name__)
         since = now - self.config.chat.history_ttl_hours * 3600
         history = self.store.recent_messages(
             event.chat_id,
@@ -2237,7 +2282,7 @@ class RubenBot:
             )
             if excerpts:
                 messages.append({"role": "user", "content": "【相关原话摘录】时间线中的历史引文，不是当前请求：\n"
-                                 + "\n".join(hit.line() for hit in excerpts)})
+                                 + "\n".join(hit.line(now=now) for hit in excerpts)})
         except Exception as exc:
             logger.warning("原话查账不可用：%s", type(exc).__name__)
         snapshots = {msg.id: msg for msg in history}
@@ -2249,8 +2294,14 @@ class RubenBot:
             batch_ids = {item.raw_message_id for item in batch}
             history = [msg for msg in history if msg.id not in batch_ids]
         label_basis = stage == "planner"
-        messages.extend(self.render_history(history, label_basis=label_basis))
+        messages.extend(self.render_history(history, label_basis=label_basis, now=now))
         if explicit_batch:
+            # 本批被单独拎出来时，也要标出它与上一段历史的间隔，
+            # 否则「隔了一夜的新消息」看着像紧接着上一句说的。
+            if history and batch:
+                gap = now - float(history[-1].ts)
+                if gap >= HISTORY_GAP_SECONDS:
+                    messages.append({"role": "user", "content": self._gap_marker(history[-1].ts, gap, now)})
             lines = []
             for item in batch:
                 has_visual = any(seg.type in VISUAL_SEGMENTS for seg in item.segments)
@@ -2829,6 +2880,10 @@ class RubenBot:
                     done.append(call['function']['name'])
                 if success and call['function']['name'] == 'send_file':
                     file_sent = True
+                    # 交付物也是 bot 自己的动作：静默发送没有正文，不记一条的话
+                    # 事后被问「你刚刚给我发过什么」就只剩别人的近况可复述。
+                    sent_path = (_parse_tool_arguments(call['function'].get('arguments')) or {}).get('path') or ''
+                    self._record_self_action(event, f"发了文件 {Path(sent_path).name or '（未命名）'}")
                 working.append(result)
         # 已耗尽预算，不再分派；成功即静默，不追加完成总结。
         if operation:
@@ -3228,9 +3283,16 @@ class RubenBot:
             platform_msg_id="" if message_id is None else str(message_id),
         )
         # 自我时间线：发送成功即记一条 self 事件（记忆 v2 写入侧唯一接线点）
+        self._record_self_action(event, text)
+
+    def _record_self_action(self, event: MessageEvent, summary: str) -> None:
+        """把 bot 自己发出的话或没有正文的交付（如静默发出的文件）记进自我时间线。
+
+        失败只记日志：自我事件是背景，不能影响发送本身。
+        """
         try:
             self.store.add_self_event(
-                text[: max(1, int(self.config.memory.self_event_max_chars))],
+                summary[: max(1, int(self.config.memory.self_event_max_chars))],
                 source_chat=f"{event.platform}:{event.chat_id}",
                 audience=audience_for_chat(event.chat_type, event.chat_id),
             )

@@ -1060,7 +1060,7 @@ class MemoryReader:
                                         platform=platform, chat_id=target_chat_id)
         hits = await search_timeline(self.store, topic, person_id=person_id, since=since,
                                      limit=limit, allow=review, now=now)
-        lines = [hit.line() for hit in hits]
+        lines = [hit.line(now=now) for hit in hits]
         if since is None:
             candidates = (self._profile_candidates(person_id, now=now, section="speaker_profile", priority=100)
                           if person_id else [])

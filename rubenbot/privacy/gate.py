@@ -177,9 +177,15 @@ class PrivacyGate:
                     source = OWNER_AUDIENCE
                 if not same_site and e.chat_type == 'private' and e.person_id == 'self':
                     continue  # bot 自己的私聊记录也可能含对方的原话
+                # bot 自己在群里做过的事（说话、发文件）当着整个群发生过；
+                # 私聊里回看它，与原受众一致、不涉及别人的私密转述，沿用
+                # 「自己的动作」类目（``local_self``）直接放行。高敏感仍走
+                # 常规跨场合判定（默认扣下），封存与不记模式在上面已拦。
+                owned_action = (e.person_id == 'self' and e.chat_type == 'group'
+                                and audience_now == 'private' and sensitivity == 'normal')
                 item = ReviewItem(person_id=e.person_id, text=e.text, audience=source,
                                   origin=f'{e.platform}:{e.chat_id}', sensitivity=sensitivity,
-                                  subject=f'{e.kind}:{e.id}',
+                                  subject='self' if owned_action else f'{e.kind}:{e.id}',
                                   ref=f'{e.kind}:{e.id}', kind=e.kind,
                                   askable=not is_raw)
                 pairs.append((e, item))
@@ -309,7 +315,7 @@ class PrivacyGate:
                 # 群→私的无缝接续是本人的群记录，不是把甲的敏感事项给乙。
                 if item.sensitivity == "high" and not own_private and item.audience in ("", "public"):
                     same = False
-                if audience_now == "private" and item.audience.startswith("group:") and not own_private:
+                if audience_now == "private" and item.audience.startswith("group:") and not (own_private or local_self):
                     same = False
             if not private_outside and same:
                 allowed.append(item)

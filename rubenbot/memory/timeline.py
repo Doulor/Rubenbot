@@ -24,12 +24,17 @@ from datetime import datetime
 
 from ..adapters.base import MessageEvent
 from ..privacy.gate import OWNER_AUDIENCE
-from .store import Event, MemoryStore
+from .store import SELF_PERSON_ID, Event, MemoryStore
 
 logger = logging.getLogger(__name__)
 
 MAX_SNIPPETS = 3
 MAX_SNIPPET_CHARS = 160
+# 自我动作段单独成块、单独给预算：交付物（发文件）不能被「别处近况」挤掉。
+SELF_ACTION_MAX_CHARS = 600
+SELF_ACTION_MAX_LINES = 6
+# 历史渲染的时间断层门槛：短于这个间隔的连续对话不打断。
+HISTORY_GAP_SECONDS = 30 * 60
 _PAGE = 128
 _FILLER = re.compile(r'你(?:还)?(?:知道|记得)(?:吗|么)?|你能告诉我|请问')
 
@@ -40,6 +45,37 @@ def _clip(text: str, length: int) -> str:
 
 def _one_line(text: str) -> str:
     return ' '.join(text.split())
+
+
+def describe_gap(seconds: float) -> str:
+    """把一段已经过去的时间说成人话：刚刚 / 18 分钟前 / 9 小时前 / 昨天。"""
+    seconds = max(0.0, float(seconds))
+    if seconds < 90:
+        return '刚刚'
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return f'{minutes} 分钟前'
+    hours = minutes // 60
+    if hours < 24:
+        return f'{hours} 小时前'
+    days = hours // 24
+    if days == 1:
+        return '昨天'
+    return f'{days} 天前'
+
+
+def describe_span(seconds: float) -> str:
+    """把一段时间长度说成人话（不带「前／后」）：18 分钟 / 9 小时 / 2 天。"""
+    seconds = max(0.0, float(seconds))
+    if seconds < 90:
+        return '一会儿'
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return f'{minutes} 分钟'
+    hours = minutes // 60
+    if hours < 24:
+        return f'{hours} 小时'
+    return f'{hours // 24} 天'
 
 
 @dataclass(frozen=True)
@@ -64,18 +100,21 @@ class TimelineEntry:
     def excerpt(self, max_chars: int = MAX_SNIPPET_CHARS) -> str:
         return _clip(self.text, max_chars)
 
-    def label(self) -> str:
+    def label(self, *, now: float | None = None) -> str:
         try:
             when = datetime.fromtimestamp(self.ts).strftime('%Y-%m-%d %H:%M')
         except (ValueError, OverflowError, OSError):
             when = '时间不详'
+        if now is not None:
+            # 绝对时间之外再给一个人话间隔：模型才不会把昨晚的话当成「刚刚」。
+            when = f'{when}，{describe_gap(now - self.ts)}'
         kind = {'group': '群聊', 'private': '私聊'}.get(self.chat_type, '场合')
         ref = f'{self.platform}:{self.chat_id}' if self.platform and self.chat_id else self.audience or '出处不详'
         place = f'{self.chat_name}（{ref}）' if self.chat_name else ref
         return f'[{when}｜{kind} {_clip(_one_line(place), 80)}｜{_clip(_one_line(self.speaker), 40)}]'
 
-    def line(self, max_chars: int = MAX_SNIPPET_CHARS) -> str:
-        return f'{self.label()} {self.excerpt(max_chars)}'
+    def line(self, max_chars: int = MAX_SNIPPET_CHARS, *, now: float | None = None) -> str:
+        return f'{self.label(now=now)} {self.excerpt(max_chars)}'
 
 
 AllowBatch = Callable[[list[TimelineEntry]], Awaitable[list[TimelineEntry]]]
@@ -84,7 +123,7 @@ _ENTRY_FIELDS = tuple(f.name for f in fields(TimelineEntry))
 
 def read_timeline(store: MemoryStore, *, since: float | None = None, now: float | None = None,
                   person_id: str | None = None, exclude_chat: MessageEvent | None = None,
-                  raw_only: bool = False, limit: int = 256, offset: int = 0,
+                  raw_only: bool = False, include_self: bool = False, limit: int = 256, offset: int = 0,
                   prefer_events: bool = False, latest_raw: bool = False,
                   terms: tuple[tuple[str, int], ...] = (), mentioned: Iterable[str] = ()) -> list[TimelineEntry]:
     """读取统一时间线的一页；默认最新在先，有检索词时先比相关性再比时间。"""
@@ -93,7 +132,8 @@ def read_timeline(store: MemoryStore, *, since: float | None = None, now: float 
     place = (exclude_chat.platform, exclude_chat.chat_type, str(exclude_chat.chat_id)) if exclude_chat else None
     rows = store.timeline_rows(since=since, until=time.time() if now is None else now,
                                person_id=person_id, exclude_chat=place, raw_only=raw_only,
-                               prefer_events=prefer_events, latest_raw=latest_raw, terms=terms, mentioned=tuple(mentioned),
+                               include_self=include_self, prefer_events=prefer_events,
+                               latest_raw=latest_raw, terms=terms, mentioned=tuple(mentioned),
                                limit=limit, offset=offset)
     return [TimelineEntry(**{key: row[key] for key in _ENTRY_FIELDS}) for row in rows]
 
@@ -119,7 +159,7 @@ async def recent_timeline(store: MemoryStore, event: MessageEvent, *, hours: flo
             if row.kind == 'raw' and place in raw_places:
                 continue
             raw_places.add(place)
-            prefix = row.label() + ' '
+            prefix = row.label(now=now) + ' '
             line = prefix + _clip(_one_line(row.text), 100 if row.kind == 'raw' else MAX_SNIPPET_CHARS)
             remaining = char_limit - bool(lines)
             if len(line) > remaining:
@@ -132,6 +172,48 @@ async def recent_timeline(store: MemoryStore, event: MessageEvent, *, hours: flo
         if len(page) < _PAGE or not char_limit:
             return lines
         offset += len(page)
+
+
+async def recent_self_actions(store: MemoryStore, event: MessageEvent, *, hours: float = 24,
+                              char_limit: int = SELF_ACTION_MAX_CHARS, allow: AllowBatch | None = None,
+                              limit: int = SELF_ACTION_MAX_LINES,
+                              now: float | None = None) -> list[str]:
+    """私聊里回看 bot 自己近期在其他会话的动作（说过的话、发过的文件）。
+
+    「别处近况」只讲别人做了什么，回答不了「你刚刚给我发过什么」：那问的
+    是 bot 自己的动作。这里单独取自我时间线（``person_id='self'``）并单独
+    占一段预算，交付物不会被别处近况挤掉。
+
+    只在私聊里给：群里说自己的私聊交付会泄漏给其他人。只取群聊来源的
+    自我事件——bot 和别人私聊里的话属于那个人的私聊，不能换个会话就摊开；
+    群里的动作本就是公开场合发生的，私聊里回看它不越过原受众。
+    """
+    if hours <= 0 or char_limit <= 0 or limit <= 0 or not event.is_private:
+        return []
+    now = time.time() if now is None else now
+    offset = 0
+    lines: list[str] = []
+    while len(lines) < limit:
+        page = read_timeline(store, since=now - hours * 3600, now=now, person_id=SELF_PERSON_ID,
+                             exclude_chat=event, include_self=True, limit=_PAGE, offset=offset)
+        rows = [row for row in page if row.kind != 'raw' and row.chat_type == 'group']
+        allowed = (await allow(rows) if allow else rows) if rows else []
+        for row in allowed:
+            prefix = row.label(now=now) + ' '
+            line = prefix + _clip(_one_line(row.text), MAX_SNIPPET_CHARS)
+            remaining = char_limit - bool(lines)
+            if len(line) > remaining:
+                if remaining > len(prefix) + 1:
+                    lines.append(line[:remaining - 1] + '…')
+                return lines
+            lines.append(line)
+            char_limit = remaining - len(line)
+            if len(lines) >= limit or not char_limit:
+                return lines
+        if len(page) < _PAGE:
+            return lines
+        offset += len(page)
+    return lines
 
 
 def _query_terms(query: str) -> tuple[tuple[str, int], ...]:

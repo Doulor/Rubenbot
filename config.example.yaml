@@ -108,8 +108,8 @@ memory:
   # 自动查账固定每轮最多 3 条原话、每条正文最多 160 字，带出处与时间；
   # 不按询问句式筛选，也不重复本轮或已经展示的流水，此行为没有单独配置键。
   cross_session_hours: 24        # 私聊跨会话摘要回看的小时数
-  self_inject_hours: 24          # 自我注入回看本会话的小时数
-  self_inject_limit: 3           # 自我注入最多几条
+  self_inject_hours: 24          # 自我注入：本会话自我回看与私聊「我最近在别处做过的事」共用的小时数
+  self_inject_limit: 3           # 本会话自我注入最多几条（别处动作段固定最多 6 条/600 字）
   gate_confidence_threshold: 0.6 # 分寸审查模型判定的置信度下限
   gate_ask_high_sensitivity: true # 高敏感跨场合项是否进待问队列
   recall_tool_enabled: true      # 模型支持工具调用时开放 recall 工具
