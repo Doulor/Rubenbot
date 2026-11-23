@@ -37,11 +37,14 @@ from . import computer
 from .config import Config
 from .decision import (
     BOT_SENDER_ID,
+    AddressingFactor,
     DecisionEngine,
     MessageMerger,
     MergedRound,
     ReplyDecision,
+    paraphrase_verdict,
     parse_generation_output,
+    peer_ground,
 )
 from .expression import (
     COMPUTER_INTENT, CapabilityNote, ExpressionDecision, capability_index, choose_length_band, is_question,
@@ -97,7 +100,7 @@ logger = logging.getLogger(__name__)
 
 # 护栏拦截原因（写进 decision_log 的 factors.guard，便于统计）
 _GUARD_REASONS = frozenset({"min_interval", "refractory", "proactive_window", "muted_sender",
-                            "fatigue_triggered", "fatigue_cooldown"})
+                            "fatigue_triggered", "fatigue_cooldown", "addressing_elsewhere"})
 
 # 适配器异常后的重启退避（秒）
 ADAPTER_RESTART_MIN = 1.0
@@ -1556,6 +1559,16 @@ class RubenBot:
         if operation:
             # 不把其他账号的历史、群内引文、策划生成的参数或记忆交给真机执行器。
             messages = [{"role": "system", "content": computer.TASK_GUIDANCE}, {"role": "user", "content": event.text}]
+        # 普通群聊发言才做发送前的改写复述复核：被 @ / 被回复 / 私聊 /
+        # 机主开口 / 操作委托 / 本轮用过工具（交付、提醒等）都不压。
+        echo_applies = (event.is_group and decision.hard_trigger is None
+                        and not round_.hard and not operation)
+        # 触发消息的平台 id（拿不到时用本地流水主键），压稿时写进 decision_log。
+        trigger_ids = [item.platform_msg_id or str(item.raw_message_id or "")
+                       for item in round_.events if item.sender_id == event.sender_id]
+        trigger_ids = [item for item in trigger_ids if item]
+        # 复核留下可查记录；本轮草稿被判复述过、最终没发出去时才有值。
+        paraphrase_note: dict[str, Any] | None = None
         for attempt in range(1 if operation else 2):
             # 重写只改文字，不能再给工具，否则可能重复设提醒或执行平台动作。
             # 多人批次没有可代表全体的授权账号，不能以主要发言人的权限执行工具。
@@ -1615,6 +1628,39 @@ class RubenBot:
             if visual_snapshots and _IMAGE_SCOLD_RE.search(parsed.text):
                 decision.should_reply, decision.reason = False, "image_behavior_veto"
                 break
+            if echo_applies and not flight.used_action:
+                # 草稿只是把触发消息换个说法复述一遍：优先沉默，不记发言动量；
+                # 还有一次重写预算就先重写，重写后仍判复述才沉默。复核本身
+                # 出问题时按放行处理，宁可漏判也不能把回复吞掉。
+                try:
+                    verdict = paraphrase_verdict(event.text, parsed.text)
+                except Exception as exc:  # noqa: BLE001 - 复核失败不能影响回复
+                    logger.warning("改写复述复核失败，按放行处理：%s", exc)
+                    verdict = None
+                if verdict is not None and verdict.repetitive:
+                    logger.info(
+                        "改写复述复核命中：%s/%s 触发 %s，%s", event.platform, event.chat_id,
+                        event.platform_msg_id or event.raw_message_id or "",
+                        "重写仍是复述，本轮沉默" if attempt else "尝试一次重写",
+                        extra=_log_identity(event),
+                    )
+                    if attempt:
+                        # 压下时留可查记录：触发消息 id、判定理由与草稿骨架。
+                        paraphrase_note = {
+                            "trigger_msg_ids": trigger_ids,
+                            "verdict": "repetitive",
+                            "reason": verdict.reason,
+                            "skeleton": verdict.skeleton,
+                            "attempts": attempt + 1,
+                        }
+                        decision.should_reply, decision.reason = False, "paraphrase_veto"
+                        break
+                    messages = [*messages, {"role": "assistant", "content": parsed.text}, {
+                        "role": "system",
+                        "content": "刚才的草稿只是把对方的话换个说法复述了一遍。换一个新角度，"
+                                   "补上原句没有的东西，或者回三个字以内。",
+                    }]
+                    continue
             if operation or not is_repetitive_agreement(event.text, parsed.text):
                 break
             logger.info("附和闸门命中：%s/%s，%s", event.platform, event.chat_id,
@@ -1625,8 +1671,10 @@ class RubenBot:
                 messages = [*messages, {"role": "assistant", "content": parsed.text}, {
                     "role": "system", "content": "刚才的草稿复述了对方。换一个新角度，或只回三个字以内。",
                 }]
+                continue
+            break
         if not decision.should_reply:
-            self._log_decision(event, decision, now, expression, must=hard)
+            self._log_decision(event, decision, now, expression, must=hard, paraphrase=paraphrase_note)
             # 没发出去：本轮纠偏没兑现，下轮可以继续提醒
             self.opener_guard.clear_pending(round_.key)
             return
@@ -1643,7 +1691,7 @@ class RubenBot:
             self.decision_engine.note_source_reply(event, round_.events, time.time())
         if flight.updates:
             return
-        self._log_decision(event, decision, now, expression, must=hard)
+        self._log_decision(event, decision, now, expression, must=hard, paraphrase=paraphrase_note)
         self.opener_guard.clear_pending(round_.key)
         if not visual_only:
             await self.sticker_behavior.on_after_reply(self.context, event, reply)
@@ -1654,6 +1702,31 @@ class RubenBot:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("插件 on_after_reply 异常：%s", exc)
 
+    def _decision_addressing(
+        self, event: MessageEvent, decision: ReplyDecision,
+    ) -> AddressingFactor | None:
+        """这条裁定的指向事实：护栏算过折扣的直接沿用，否则只记平台给出的事实。
+
+        纯读 ``mentions`` / ``reply_sender_id`` 与自己名字，不改裁定、不决定
+        发不发。折扣只在裁定层真的压过权重时才有（``decision.addressing``）；
+        其余情况记 ``peer_ground`` 的事实，折扣为 0——回复了别人也可能照常
+        开口（机主、点名等），日志不能把没生效的折扣写成生效。没有任何指向
+        （私聊、普通无指向发言）时返回 None，不写空壳字段。
+        """
+        factor = decision.addressing
+        if factor is None:
+            # 私聊没有「别人」，指向事实不适用（与 DecisionEngine.addressing 一致）。
+            if event.is_private:
+                return None
+            try:
+                factor = peer_ground(event)
+            except Exception as exc:  # noqa: BLE001 - 观测失败不能影响回复
+                logger.debug("指向事实计算失败：%s", exc)
+                return None
+        if not (factor.to_bot or factor.to_peer or factor.penalized):
+            return None
+        return factor
+
     def _log_decision(
         self,
         event: MessageEvent,
@@ -1662,6 +1735,7 @@ class RubenBot:
         expression: ExpressionDecision | None = None,
         *,
         must: str | None = None,
+        paraphrase: dict[str, Any] | None = None,
     ) -> None:
         """把护栏与策划裁定写入同一条 decision_log。"""
         factor_data = {}
@@ -1678,6 +1752,13 @@ class RubenBot:
         # 护栏命中：reason 是护栏名时补一个字段，方便统计拦截率
         if decision.reason in _GUARD_REASONS:
             factor_data["guard"] = decision.reason
+        # 指向事实（别人互问 / 点到 bot）原样入档：只作核对，不参与是否发送。
+        addressing = self._decision_addressing(event, decision)
+        if addressing is not None:
+            factor_data["addressing"] = {**addressing.to_dict(), "discount": round(addressing.score, 3)}
+        # 改写复述复核：被压下的那一轮留下触发消息 id 与判定结果，不无痕丢弃。
+        if paraphrase:
+            factor_data["paraphrase"] = paraphrase
         try:
             self.store.add_decision_log(
                 platform=event.platform,

@@ -523,8 +523,9 @@ def test_addressing_factor_is_plain_data_for_wiring():
 def test_case_3135_silenced_through_core_without_planner(config, store):
     """端到端回放：合并窗口 0 时，3135 这类消息走 core 也在策划前沉默。
 
-    本 brief 不接线 core 的改写复述复核，这里只验证指向因子在真实调用链上
-    生效：不产生任何模型调用，decision_log 记下 `addressing_elsewhere`。
+    判定本身不在这里验证（发送前复核的接线见 ``tests/test_echo_wiring.py``）：
+    指向因子在真实调用链上生效，不产生任何模型调用，decision_log 记下
+    `addressing_elsewhere` 与指向折扣明细。
     """
     llm = ScriptedLLM({"fast": ['{"speak":true,"intent":"顺着接一句"}'], "chat": ["一天一个地区，天天有新地方可以开"]})
     bot, adapter = make_bot(config, store, llm)
@@ -536,3 +537,4 @@ def test_case_3135_silenced_through_core_without_planner(config, store):
     assert llm.calls == []
     log, = store.list_decision_logs()
     assert log["reason"] == "addressing_elsewhere" and log["should_reply"] is False
+    assert log["factors"]["addressing"]["penalized"] is True
