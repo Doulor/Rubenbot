@@ -17,18 +17,51 @@ MAX_REASON = 60
 
 @dataclass(frozen=True)
 class CapabilityNote:
-    """索引只给标题和自述；策划步选中标题，生成步才读到对应情境说明。"""
+    """索引只给标题和自述；策划步选中标题，生成步才读到对应情境说明。
+
+    ``available=False`` 表示这一项此刻做不了（例如插件没启用）。这时 ``title``
+    是能力名，``summary`` 是它此刻的短状态（如「还没开」）；索引把同一状态的
+    合进「现在还做不了的」一句，不混进「这轮我能做的事」，并要求被明确要时
+    照那句话开口，不沉默、也不装作能做。
+    """
 
     title: str
     summary: str
     detail: str
+    available: bool = True
 
 
 def capability_index(notes: tuple[CapabilityNote, ...]) -> str:
+    """把本轮能力渲染成策划步的一段自述。
+
+    能做的逐项列标题与自述；做不了的（没启用的插件）按同一状态并成一句
+    「点歌、画图还没开。」，并要求被明确要时照着那句话开口——否则这类请求
+    会掉进普通聊天，被策划当成闲聊沉默掉，机主分不清是没开还是坏了。
+    """
     if not notes:
         return ''
-    return ('\n【这轮我能做的事】\n' + '\n'.join(f'〔{n.title}〕{n.summary}' for n in notes)
-            + '\n需要哪项的具体说明，就把标题列入 JSON 的 capabilities 数组；不用可省略。')
+    ready = [n for n in notes if n.available]
+    ready_titles = {n.title for n in ready}
+    # 同一状态归一句；summary 对不可用条目就是状态短语（如「还没开」）
+    off: dict[str, list[str]] = {}
+    for note in notes:
+        if note.available or note.title in ready_titles:
+            continue
+        titles = off.setdefault(note.summary, [])
+        if note.title not in titles:
+            titles.append(note.title)
+    blocks = []
+    if ready:
+        blocks.append('【这轮我能做的事】\n' + '\n'.join(f'〔{n.title}〕{n.summary}' for n in ready))
+        blocks.append('需要哪项的具体说明，就把标题列入 JSON 的 capabilities 数组；不用可省略。')
+    if off:
+        blocks.append('【现在还做不了的】' + ''.join(f'{"、".join(titles)}{state}。'
+                                                    for state, titles in off.items()) +
+                      '只有这条消息确实是在要其中某项，才照着这句话开口：一句话说完，不列清单，'
+                      '也别许诺以后能办；平时不用主动提。'
+                      '这是本轮索引里的确定事实：basis 用 settled，speak 用 true。'
+                      '别沉默，也别装作能做或拿别的凑数。')
+    return '\n' + '\n'.join(blocks)
 
 
 @dataclass(frozen=True)
