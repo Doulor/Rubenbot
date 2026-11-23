@@ -143,7 +143,6 @@ class PendingSelection:
     """一次待选中的选歌列表。"""
 
     songs: list[Song]
-    source_name: str
     label: str
     sender_id: str
     timestamp: float
@@ -488,7 +487,6 @@ class MusicPlayer:
         message_id = await _safe_send(adapter, event, [Segment.text(text)])
         pending = PendingSelection(
             songs=list(songs),
-            source_name=songs[0].source or request.source,
             label=label,
             sender_id=str(getattr(event, "sender_id", "") or ""),
             timestamp=self.clock(),
