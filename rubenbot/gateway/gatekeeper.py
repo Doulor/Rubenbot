@@ -111,20 +111,24 @@ class Gatekeeper:
         object_id: str = "",
         chat_type: str = "",
         params: dict[str, Any] | None = None,
+        requester: str = "",
+        requester_owner: bool = False,
         now: float | None = None,
     ) -> GateDecision:
-        """顺序检查风险、退避、冷却、对象上限与预算；审计沿用本次实际分档。"""
+        """撤回的申请人与机主身份只由固定聊天路由传入，不从动作参数读取。"""
         now = time.time() if now is None else now
         if entry.risk == RISK_DENIED:
             return GateDecision(False, "这个接口被禁止调用（账号破坏性操作）。", sensitive=True)
         sensitive = entry.risk == RISK_SENSITIVE
+        recall_authorized = False
         if entry.name == "delete_msg":
             sender = self._recall_sender(chat_key, chat_type, params or {})
             if not sender:
                 return GateDecision(False, "无法从当前会话的消息记录确认撤回目标。", sensitive=True)
             sensitive = sender != BOT_SENDER_ID
             object_id = sender
-        if sensitive and not self.settings.allow_sensitive:
+            recall_authorized = requester == sender or (bool(requester) and requester_owner)
+        if sensitive and not recall_authorized and not self.settings.allow_sensitive:
             return GateDecision(False, "这是敏感操作，当前没有开启 allow_sensitive。", sensitive=True)
         decision = self._check_limits(entry, chat_key, object_id, now)
         decision.sensitive = sensitive

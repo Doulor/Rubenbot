@@ -466,7 +466,7 @@ def test_recall_note_is_generated_from_available_catalog_without_granting_tools(
         return {n.title: n for n in bot.capability_notes(event)}
 
     note = notes()['撤回消息']
-    assert '自己' in note.summary and '别人' in note.summary and '敏感开关' in note.summary
+    assert all(word in note.summary for word in ('自己', '作者本人', '机主', '别人', '敏感开关'))
     assert '回复的是哪条' in note.detail
     assert 'adapter_call' not in [tool['function']['name'] for tool in bot.tool_definitions(event)]
     event.chat_id = '未开放的群'

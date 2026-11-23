@@ -226,9 +226,15 @@ class GatewayService:
         chat_id: str = "",
         chat_type: str = "group",
         source: str = "model",
+        requester: str = "",
+        requester_owner: bool = False,
         now: float | None = None,
     ) -> str:
-        """闸门 → 执行 → 审计；永远返回给模型看的文本，不抛异常。"""
+        """闸门 → 执行 → 审计；永远返回给模型看的文本，不抛异常。
+
+        ``requester`` / ``requester_owner`` 是发起动作的真实发送者与机主
+        判定，只用于撤回的放行规则（见 :meth:`Gatekeeper.check`）。
+        """
         action = str(action or "").strip()
         credential_action = action in CREDENTIAL_ACTIONS
         chat_recall = source == "chat" and action == "delete_msg"
@@ -305,6 +311,8 @@ class GatewayService:
             chat_type=chat_type,
             params=params,
             object_id=object_id_from_params(params),
+            requester=requester if chat_recall else "",
+            requester_owner=chat_recall and requester_owner,
             now=now,
         )
         if not decision.allowed:

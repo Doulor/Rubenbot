@@ -422,7 +422,7 @@ loader 加载时校验 manifest：缺失或字段不全的插件拒绝加载并�
 
 - **三层漏斗**：L0 全量记录事件；L1 规则门（类型/会话/安静时段过滤）；L2 由 fast 角色判定（ignore / react / message / gateway / notify_owner）。request 类事件在一期永不自动执行加好友/加群审批。
 - **闸门**：动作按风险分级——denied（硬禁名单）、sensitive（需 `gateway.allow_sensitive=true`，默认关）、safe；四维冷却：单动作×会话、人均 ≤3 次/小时、单会话每日预算（默认 20）、全局每日上限（默认 200），失败退避。
-- **聊天撤回**：明确对 bot 的撤回委托走固定网关动作 `delete_msg`，不进 `computer_task`。引用优先，按平台、会话类型、会话号和平台消息 ID 查 `raw_messages`；没有引用时，机主或明确指向 bot 上一条发言的请求可取本会话最近一条自发消息。指向不明、无回执或引用不在本会话台账，向请求者询问，不猜 ID。网关按台账发送者核定实际风险：bot 自发为 safe，他人为 sensitive，两路均记 `gateway_audit`；总开关、会话准入与原有冷却、额度不变。
+- **聊天撤回**：明确对 bot 的撤回委托走固定网关动作 `delete_msg`，不进 `computer_task`。引用优先，按平台、会话类型、会话号和平台消息 ID 查 `raw_messages`；没有引用时，明确 @ 一位目标作者可取该账号最近发言，「我刚发的」或普通成员只说「撤回」时取请求者发起委托前的最近发言；机主或明确指向 bot 上一条的请求也可取本会话最近的 bot 发言。仅 @ bot 是呼叫，不是目标消息 ID。指向不明、缺平台号或引用不在本会话台账时，询问请求者，不猜 ID。网关按台账作者分档：bot 自发为 safe；作者本人或白名单机主在本条委托中下令，不受敏感开关限制；其余人撤第三方消息仍受 `allow_sensitive` 限制。总开关、会话准入、冷却与额度不变。澄清、拒绝、平台失败与成功均写 `gateway_audit`；非 bot 消息保留敏感标记，即使已获准。
 - **作用域**：总开关 `gateway.enabled` 默认关；群聊必须显式写进 `gateway.enabled_conversations` 才放行，私聊主人会话恒可；安静时段（默认 00:00–08:00）不执行动作。
 - **硬禁动作**：`delete_friend`、`set_group_dismiss`、`set_restart`、`clean_cache`、`set_online_status` 不可通过网关调用；即使打开敏感动作也须拒绝并记审计，不向协议端发送请求。
 - **审计**：每次判定与执行写入 `gateway_audit` 表，WebUI 有只读审计卡可查。`get_cookies`、`get_csrf_token` 保留动作、会话、来源与成败，不保存参数、返回凭据或上游错误正文。

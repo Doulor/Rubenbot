@@ -272,7 +272,7 @@ gateway:
   judge_events: false          # 事件判断总开关（快判）；关时事件只落库
   # 即使打开敏感动作，以下五项仍在网关拒绝，不会请求 OneBot：
   # delete_friend、set_group_dismiss、set_restart、clean_cache、set_online_status。
-  allow_sensitive: false       # 撤他人消息、踢人、禁言、处理申请等需显式打开；撤 bot 自己的消息不需要
+  allow_sensitive: false       # 普通成员撤他人消息、踢人、禁言等仍需打开；撤 bot 自发消息、作者撤自己的、机主下令撤回均不需要
   quiet_hours: "23:00-08:00"   # 安静时段：非必判事件只记录，不当场动作
   daily_budget_per_conversation: 20   # 每会话每天主动类动作上限
   global_daily_cap: 200        # 全局每天动作上限（熔断）
