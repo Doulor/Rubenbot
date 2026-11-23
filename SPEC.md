@@ -151,6 +151,7 @@ SnowLuma 适配器（OneBot v11）：
 
 - `plugins/<name>/plugin.py`，暴露 `register(ctx)`；ctx 提供钩子注册：`on_message`（事件预处理）、`on_before_reply`、`on_after_reply`、命令注册 `command(name, handler)`
 - 插件**默认全部关闭**（显式启用制）：只有 `plugins.enabled` 里列出的插件才加载，未配置或空列表表示一个都不启用；可在 WebUI 的插件页逐个开关，保存后写回配置并热生效
+- **装后授权**：manifest 只声明权限，机主在 WebUI「插件 → 权限授权」页逐项授权后插件才能用。授权记录按插件落盘在数据库同目录的 `plugin_permissions.json`，重启不丢；新装插件默认全部未授权，已装插件在授权层首次落地时按当时 manifest 全授（一次性迁移，线上插件不断线）。执行期默认拒绝：`call_capability`（`qzone.*` 按 `qzone_write`）、读消息 / 记忆（`read_messages`）、发消息与宿主代发命令回复（`send_messages`）、出网（`network`）、调模型（`llm`）逐项检查，未授权即拒绝并记一条审计（插件名、权限、被拦动作）；插件能力说明只注入所需权限都已授权的条目；声明 `network` 未授权不分发钩子与命令；后台任务启动前再核 `scheduler` 与声明的 `network` / `llm`，未授权不拉起。插件写宿主存储不开放。
 - 插件异常不能拖垮主循环
 - 附一个示例插件：`plugins/hello`（命令 /hello 回复 + 演示 on_message 钩子）；默认不启用，需要在配置或 WebUI 里显式打开
 
@@ -164,7 +165,7 @@ SnowLuma 适配器（OneBot v11）：
 - chat：history_size、历史上下文参数；reply：多段回复的段数上限与段间打字延迟
 - decision：合并窗口、硬触发别名、发言间隔、不应期、滚动窗口上限与否决标记
 - emotion：情绪与好感度的开关、各档增减幅度、每日上限、衰减比例（见「情绪与好感度」）
-- plugins：插件目录、`enabled` 显式启用列表（留空即全部关闭）、命令前缀
+- plugins：插件目录、`enabled` 显式启用列表（留空即全部关闭）、命令前缀；逐项授权不在 config.yaml 里，落在数据库同目录的 `plugin_permissions.json`
 - adapters：启用的适配器及各自参数（snowluma 的 ws_url、http_url、access_token）
 
 ## 第一阶段交付标准（本次任务）
@@ -224,7 +225,7 @@ SnowLuma 适配器（OneBot v11）：
 ## WebUI（当前已实现）
 
 - 技术：FastAPI + uvicorn；前端不用构建链，使用原生 HTML/CSS/JS 单页，静态文件由 FastAPI 直接托管。
-- 页面：概览、机器人/人设、模型、记忆、人物、群组与决策、插件市场、日志、设置和关于。模型页支持各角色模型池与 `failover` / `round_robin` / `random` 策略编辑并热生效；人设页支持五文件编辑、热加载和预览；插件页支持索引发现、安装/更新/卸载/启停和已安装插件配置；情绪卡片与相关只读 API 已接入。
+- 页面：概览、机器人/人设、模型、记忆、人物、群组与决策、插件市场、日志、设置和关于。模型页支持各角色模型池与 `failover` / `round_robin` / `random` 策略编辑并热生效；人设页支持五文件编辑、热加载和预览；插件页支持索引发现、安装/更新/卸载/启停、已安装插件配置和逐项权限授权（`GET /api/plugins` 返回声明与授权对照，`PUT /api/plugins/{name}/permissions` 即时改授权）；情绪卡片与相关只读 API 已接入。
 - 设置之后的「关于」页通过鉴权只读接口 `GET /api/about` 展示版本、项目仓库和提交链接、MIT 许可全文，以及当前模型与角色模型池、适配器状态和插件计数；不返回密钥。提交优先读取部署盖戳 `.deploy-commit`，其次读取项目的 Git HEAD，两者均不可用时显示未知和原因。仅点击「检查更新」时调用 `GET /api/about/update` 比对 GitHub `main` 的提交，超时 10 秒；失败只在按钮旁提示，不影响其余内容，也不执行升级。
 - 群组页查看会话决策日志、群定位与手写备注；群定位注入遵循手写优先、自归纳其次，两者都空或私聊时不注入。
 - 移动端使用导航抽屉；页面切换优先使用路由缓存并隔离迟到响应。登录签名密钥持久化在数据库目录，重启后有效会话可继续验证。
@@ -315,8 +316,9 @@ loader 加载时校验 manifest：缺失或字段不全的插件拒绝加载并�
 
 - 索引仓库 `Doulor/Rubenbot-plugins`：根目录 `plugins.json`（条目：id / name / version / description / author / permissions / path），每个插件一个目录（代码 + manifest.json）。
 - bot 侧索引地址可配置（`market.index_url`），拉取失败或未配置时回退到框架内置的官方索引（随框架发布的 6 个官方插件），市场页明确标注当前索引来源与「索引不可用」状态，不许静默空白。
-- 安装 = 拉索引仓库对应插件目录落盘到 `plugins/` → 校验 manifest 与 min_core_version → 默认不启用，用户在卡片上手动启用（与「插件默认关」一致）。
-- 更新：索引 version 高于已装 manifest version 时卡片挂「可更新」角标，一键更新（保留该插件的配置段，只换代码与 manifest）。
+- 安装 = 拉索引仓库对应插件目录落盘到 `plugins/` → 校验 manifest 与 min_core_version → 默认不启用、默认零授权，用户在卡片上手动启用并在授权页逐项批准（与「插件默认关」一致）。
+- 更新：索引 version 高于已装 manifest version 时卡片挂「可更新」角标，一键更新（保留该插件的配置段、启用状态与已有授权，只换代码与 manifest；新增声明的权限默认未授权）。
+- 卸载：删除插件目录并清掉该插件的授权记录，同名重装从零授权开始。
 
 ### 市场页（WebUI，替换现插件页）
 
@@ -329,6 +331,8 @@ loader 加载时校验 manifest：缺失或字段不全的插件拒绝加载并�
 ### 安全原则（只有一条硬规矩）
 
 插件是任意 Python 代码，安装即完全信任：安装前必须过权限确认框；`qzone_write`、`scheduler` 属高权限，非官方索引来源的插件默认禁止启用这两项，需在详情里单独放行。一期不做签名、沙箱、投稿审核（无第三方投稿场景，不提前造）。
+
+装后授权（Q6，2026-11-23）在此之上收口宿主公开给插件的入口：`rubenbot/plugins/permissions.py` 存每插件授权记录，loader 在 `call_capability` / `fetch` / `llm` / `store` 读取 / 适配器 `send` / 宿主代发命令回复 / 能力说明注入 / `on_start` 后台任务分发前逐项检查，默认拒绝；`extras["bot"]` 换成按授权检查的代理，`extras["plugins"]` 对插件不可见。它不隔离任意 Python 代码，不能替代沙箱。
 
 ### 分期
 

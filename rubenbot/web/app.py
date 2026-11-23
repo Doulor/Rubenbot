@@ -73,6 +73,7 @@ from ..persona import (
     load_persona_parts,
     personafile_path,
 )
+from ..plugins.manifest import PERMISSION_INFO
 from ..stickers import KIND_PHOTO, KIND_STICKER
 from .about import check_update, project_info, runtime_info
 from .auth import COOKIE_NAME, BindSecurityError, check_bind_security, mask_secret
@@ -1094,13 +1095,51 @@ def create_app(state: WebState):
         return {
             "ok": True,
             "items": state.plugin_list(),
+            "permissions": [
+                {"id": name, **meta} for name, meta in PERMISSION_INFO.items()
+            ],
             "hot_reload": hot,
             "restart_required": not hot,
             "message": (
-                "插件默认全部关闭；开关会立即生效，并写回 config.yaml 的 plugins.enabled。"
+                "插件默认全部关闭；开关与授权会立即生效，授权记录落在数据目录。"
                 if hot
-                else "插件默认全部关闭；当前 WebUI 没有运行中的 bot，开关会写入配置，重启后生效。"
+                else "插件默认全部关闭；当前 WebUI 没有运行中的 bot，开关与授权会写入配置，重启后生效。"
             ),
+        }
+
+    @app.put("/api/plugins/{name}/permissions")
+    async def put_plugin_permissions(name: str, request: Request):
+        """逐项授权：整表替换某插件的授权，立即生效（不重启 bot）。
+
+        只接受 manifest 声明过的权限；未声明的 422 拒绝。独立 WebUI 模式
+        （没有插件管理器）不能改授权，如实返回 409。
+        """
+        require_session(request)
+        body = await _json_body(request)
+        values = body.get("permissions")
+        if not isinstance(values, list) or not all(isinstance(item, str) for item in values):
+            raise ApiError(422, "permissions 必须是权限名字符串数组")
+        manager = state.plugins
+        if manager is None:
+            raise ApiError(409, "当前 WebUI 没有运行中的 bot，无法修改插件授权")
+        if name not in manager.plugins:
+            raise ApiError(404, f"插件不存在：{name}")
+        try:
+            manager.set_permissions(name, values)
+        except KeyError:
+            raise ApiError(404, f"插件不存在：{name}") from None
+        except ValueError as exc:
+            raise ApiError(422, str(exc)) from exc
+        item = next(
+            (row for row in manager.list_plugins() if row["name"] == name), None
+        )
+        logger.info("WebUI 更新插件授权 %s：%s", name, "、".join(sorted(set(values))) or "（全部撤回）")
+        return {
+            "ok": True,
+            "item": item,
+            "items": state.plugin_list(),
+            "restart_required": False,
+            "message": "插件授权已更新，立即生效。",
         }
 
     @app.post("/api/plugins/{name}")

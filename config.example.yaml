@@ -303,6 +303,9 @@ plugins:
   # 例如只启用 hello 示例插件（也可以直接在 WebUI 设置页开关，保存后写回这里并热生效）：
   # enabled: ["hello"]
   command_prefix: "/"
+  # 装后授权：manifest 声明的权限要在 WebUI「插件 → 权限授权」页逐项批准才生效。
+  # 授权记录不在本文件里，落在数据库同目录的 plugin_permissions.json，重启不丢；
+  # 新装插件默认全部未授权，已装插件首次升级时按当时 manifest 全授（一次性迁移）。
 
 stickers:
   # 核心表情包行为默认关闭；打开 enabled 后以下设置才生效。

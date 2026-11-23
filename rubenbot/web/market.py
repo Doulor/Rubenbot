@@ -474,6 +474,10 @@ class MarketService:
             "author": manifest.get("author") or (entry.author if entry else ""),
             "permissions": list(permissions),
             "permission_meta": _permission_meta(permissions),
+            # 已授权了哪几项（逐项对照由插件页的授权开关展示）
+            "granted_permissions": list(
+                (item.get("permissions") or {}).get("granted") or []
+            ),
             "hooks": list(manifest.get("hooks") or (entry.hooks if entry else [])),
             "category": manifest.get("category")
             or (entry.category if entry else DEFAULT_CATEGORY),
@@ -686,13 +690,19 @@ class MarketService:
                 raise MarketError(f"插件已安装：{plugin_id}", status=409)
             data = read_source(entry.download_url, self.fetcher)
             installed, manifest = self._install(root, plugin_id, data, entry=entry)
+            # 新装默认全未授权：先登记空记录，再扫描目录（扫描会做首次迁移，
+            # 已有的空记录不会被当成「已装插件」补成全授）。独立 WebUI 模式
+            # 没有管理器，直接写同一份授权文件，保证下次 bot 启动时也不全授。
+            self._register_new_plugin(installed.name)
             logger.info("市场安装插件 %s %s 到 %s", plugin_id, manifest.version, installed)
             self._refresh()
         return {
             "id": plugin_id,
             "path": str(installed),
             "version": manifest.version,
-            "message": f"插件 {entry.name} 已安装，尚未启用；在卡片上手动启用后才会加载。",
+            "message": (
+                f"插件 {entry.name} 已安装，尚未启用；在插件页逐项授权、再启用后才会加载。"
+            ),
         }
 
     def update(self, plugin_id: str) -> dict[str, Any]:
@@ -738,6 +748,10 @@ class MarketService:
             manager = getattr(self.state, "plugins", None)
             if manager is not None:
                 manager.plugins.pop(local["name"], None)
+            # 更新保留已有授权；新版本新增声明的权限因为不在记录里，
+            # 自然保持未授权。已有记录不会被覆盖，缺记录时补一条空的，
+            # 避免扫描时被首次迁移误当成「已装插件」补成全授。
+            self._register_new_plugin(local["name"])
             self._refresh()
             enabled_now = False
             if was_enabled:
@@ -774,6 +788,7 @@ class MarketService:
             manager = getattr(self.state, "plugins", None)
             if manager is not None:
                 manager.plugins.pop(local["name"], None)
+            self._forget_plugin(local["name"])
             logger.info("市场卸载插件 %s（删除 %s）", plugin_id, path)
             self._refresh()
         return {
@@ -876,6 +891,35 @@ class MarketService:
         if not (directory / "plugin.py").is_file():
             raise MarketError("插件包缺少 plugin.py，已拒绝安装")
         return manifest
+
+    def _permission_store(self):
+        """市场装卸时用的授权记录：优先借管理器的，独立 WebUI 直接读同一份文件。"""
+        manager = getattr(self.state, "plugins", None)
+        if manager is not None:
+            return manager
+        from ..plugins.permissions import PluginPermissionStore, path_for_store
+
+        return PluginPermissionStore(path_for_store(self.state.store))
+
+    def _register_new_plugin(self, name: str) -> None:
+        store = self._permission_store()
+        try:
+            if hasattr(store, "register_new_plugin"):
+                store.register_new_plugin(name)
+            else:
+                store.ensure_registered(name, ())
+        except Exception as exc:  # noqa: BLE001 - 写授权记录失败不影响装卸结果
+            logger.warning("登记插件 %s 的授权记录失败：%s", name, exc)
+
+    def _forget_plugin(self, name: str) -> None:
+        store = self._permission_store()
+        try:
+            if hasattr(store, "forget_plugin"):
+                store.forget_plugin(name)
+            else:
+                store.forget(name)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("清理插件 %s 的授权记录失败：%s", name, exc)
 
     def _refresh(self) -> None:
         manager = getattr(self.state, "plugins", None)

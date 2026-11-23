@@ -183,8 +183,9 @@ bot 对每个人的好感度、以及自己当下的心情，都由确定性规�
 | `rubenbot/adapters/snowluma.py` | OneBot v11 正向 WS 收事件 + HTTP API 发送 |
 | `rubenbot/adapters/telegram.py` | Telegram Bot API 长轮询与消息段收发 |
 | `rubenbot/adapters/qq_official.py` | QQ 官方机器人适配器 |
-| `rubenbot/plugins/loader.py` | 插件发现、钩子与命令分发；加载前校验 manifest；显式启用制与热启停 |
+| `rubenbot/plugins/loader.py` | 插件发现、钩子与命令分发；加载前校验 manifest；显式启用制与热启停；按授权收口插件入口 |
 | `rubenbot/plugins/manifest.py` | 插件 manifest 规范：字段 / 权限枚举 / 版本比较与校验 |
+| `rubenbot/plugins/permissions.py` | 装后授权：每插件授权记录（`data/plugin_permissions.json`）、首次迁移、授权审计 |
 | `rubenbot/web/market.py` | 插件市场：索引拉取与内置回退、本地插件合并、安装 / 更新 / 卸载（zip 安全解压） |
 | `rubenbot/__main__.py` | 命令行入口 `rubenbot` / `python -m rubenbot` |
 | `plugins/hello/` | 示例插件：`/hello` 命令 + `on_message` 钩子（默认关闭，需显式启用） |
@@ -296,7 +297,7 @@ stdout 记录前后 PID/commit。退出码 `0` 表示发布成功，`1` 表示�
 .venv/bin/python -m pytest
 ```
 
-全量测试包含多方指向、能力自述与公开事实查证的离线回放，另覆盖存储 CRUD / 变更日志与撤销、检索打分、抽取去重、归纳校验（不许新词、20% 上限、user 来源不可删）、画像提炼与时间线压缩、记忆读取侧（索引 / 预拉取 / 预算裁剪 / 跨会话 / 分寸审查 / 隐私命令）、会话滚动摘要（触发 / 水位 / 增量折叠 / 上下文组装 / 开关与容错）、回复决策（合并窗口、查看概率、依据门、发言冷却、硬触发、生成否决）、情绪与好感度（关键词保守识别、增减幅度与每日上限、惰性衰减、档位边界、注入行省略、WebUI 只读端点）、策划/正文生成（依据注入 / 失败回退 / 用量打标）、联网搜索（渠道回退链 / 跳过无 key / DeepSeek 归一 / 旧配置兼容 / 冷却）、定时任务（到期执行 / 重启恢复 / 迟到标记 / 取消 / 执行中续命）、提醒工具（注册条件 / 会话上限 / 到点走正常发送通道 / 迟到说明）、冷场开口条件矩阵与内容过滤、语音双向（转写/合成后端解析、模式矩阵、超限跳过、平台降级）、主循环、插件（manifest 校验、显式启用制与 WebUI 开关写回）、插件市场（索引拉取与内置回退、状态合并、安装 / 更新 / 卸载与路径穿越拒绝）、群发言统计与总结插件（触发词识别、发言聚合与占比、总结取数范围与材料拼装、冷却与当日缓存复用）、感知与动作网关（统一事件通道、触发漏斗、冷却与审计）、表情包（表情库去重与原生引用回填、各适配器 send_sticker 翻译与降级、core 收集 / 概率 / 冷却决策）、SnowLuma 事件解析，以及 Console + 假 LLM 的端到端流程。
+全量测试包含多方指向、能力自述与公开事实查证的离线回放，另覆盖存储 CRUD / 变更日志与撤销、检索打分、抽取去重、归纳校验（不许新词、20% 上限、user 来源不可删）、画像提炼与时间线压缩、记忆读取侧（索引 / 预拉取 / 预算裁剪 / 跨会话 / 分寸审查 / 隐私命令）、会话滚动摘要（触发 / 水位 / 增量折叠 / 上下文组装 / 开关与容错）、回复决策（合并窗口、查看概率、依据门、发言冷却、硬触发、生成否决）、情绪与好感度（关键词保守识别、增减幅度与每日上限、惰性衰减、档位边界、注入行省略、WebUI 只读端点）、策划/正文生成（依据注入 / 失败回退 / 用量打标）、联网搜索（渠道回退链 / 跳过无 key / DeepSeek 归一 / 旧配置兼容 / 冷却）、定时任务（到期执行 / 重启恢复 / 迟到标记 / 取消 / 执行中续命）、提醒工具（注册条件 / 会话上限 / 到点走正常发送通道 / 迟到说明）、冷场开口条件矩阵与内容过滤、语音双向（转写/合成后端解析、模式矩阵、超限跳过、平台降级）、主循环、插件（manifest 校验、显式启用制与 WebUI 开关写回）、插件市场（索引拉取与内置回退、状态合并、安装 / 更新 / 卸载与路径穿越拒绝）与装后授权（默认拒绝、首次迁移、逐项授权、执行期拦截与审计）、群发言统计与总结插件（触发词识别、发言聚合与占比、总结取数范围与材料拼装、冷却与当日缓存复用）、感知与动作网关（统一事件通道、触发漏斗、冷却与审计）、表情包（表情库去重与原生引用回填、各适配器 send_sticker 翻译与降级、core 收集 / 概率 / 冷却决策）、SnowLuma 事件解析，以及 Console + 假 LLM 的端到端流程。
 
 **Q19 泛化回放**：六个合成场景共用同一个未静音账号，使用独立会话，均送达策划步。独立模型盲评中，天气播报、签到提醒、资讯推送均沉默；真人约同伴还书时旁听，直接求助与邀大家庆祝时开口，与基线提示的三条真人对照一致。pytest 重放新裁定，核对决策日志与实际出站；这不等同于所有部署模型都有相同表现。换模型后可用下方 `--only 8` 实测。
 
@@ -453,6 +454,19 @@ plugins:
 
 带高风险权限的插件，安装确认框里会额外标红提示。框架自带的 6 个官方插件（hello / qzone_post / music / image_gen / group_insights / link_parse）都已声明真实 manifest，可作参考。
 
+### 装后授权
+
+`permissions` 只是插件「声明」它需要什么；真正能不能用由机主在 WebUI 里逐项授权。授权记录按插件落在数据库同目录的 `plugin_permissions.json`（`data/plugin_permissions.json`，文件权限 0600），重启不丢：
+
+- **新装插件默认全部未授权**：市场安装、手动放进 `plugins/` 的插件都一样，需要到「插件 → 权限授权」页逐项打开。
+- **已装插件首次升级**：授权层第一次落地时，当时已经装好的插件按各自 manifest 全部视为已授权，保证线上插件不断线；迁移只发生一次，之后新增的插件与新增的权限声明都从「未授权」开始。
+- **执行期拦截（默认拒绝）**：`ctx.call_capability` 按 `capabilities`（`qzone.*` 按 `qzone_write`）、`ctx.fetch` 按 `network`、`ctx.llm` 按 `llm`、`runtime.store` / `ctx.store` 读操作按 `read_messages`、适配器 `send` / 宿主代发的命令回复按 `send_messages` 检查。未授权调用直接拒绝并记一条 WARNING 审计（插件名、权限、被拦动作）；撤回授权对已经拿到的代理也立即生效。
+- **注入收口**：插件的能力说明（策划步的能力自述）只包含所需权限都已授权的条目；声明了 `network` 却没授权的插件不分发钩子与命令；后台任务（`on_start`）启动前再核一遍 `scheduler` 与声明的 `network` / `llm`，任何一项未授权都不拉起，授权变化即时启停。
+- **插件写宿主存储不开放**：存储代理只转发读取；写方法没有对应授权项，一律拒绝。
+- 授权变更与拦截拒绝都记在 `rubenbot.plugins.permissions` logger 下，WebUI「日志」页可查。
+
+Python 插件本身仍是任意代码、安装即完全信任；授权层收口的是宿主公开给插件的入口，不是沙箱。
+
 在插件目录下新建 `plugins/<name>/plugin.py`，暴露 `register(ctx)`：
 
 ```python
@@ -474,17 +488,28 @@ def register(ctx):
 - `on_after_reply(handler)`：`handler(ctx, event, reply)`
 - `command(name, handler)`：`handler(ctx, event, args)`，返回字符串作为回复；可直接调用也可作装饰器
 
-钩子和命令都同时支持同步/异步函数，异常会被捕获并记录，不会拖垮主循环。`ctx` 上还能拿到 `store`、`config`，以及 `runtime` 中的 `persona`、`adapters`、`retriever`、`extractor`、`consolidator`；记忆读取侧与分寸审查口经 `ctx.extras["memory_reader"]` / `ctx.extras["privacy_gate"]`（或 `runtime.memory` / `runtime.gate`）取用。
+钩子和命令都同时支持同步/异步函数，异常会被捕获并记录，不会拖垮主循环。`ctx` 上还能拿到 `store`、`config`、`call_capability`、`fetch`、`llm`、`bot`，钩子拿到的 `runtime` 里有 `persona`、`adapters`、`store`、`llm`、`extras`。这些入口都按装后授权检查：
+
+| 入口 | 需要的授权 |
+| --- | --- |
+| `ctx.call_capability(...)` / 适配器 `call_capability(...)` | `capabilities`；`qzone.*` 能力按 `qzone_write` |
+| `fetch(...)` 与任何出网行为 | `network` |
+| `ctx.llm` / `runtime.llm` | `llm` |
+| `store` / `runtime.store` 的读取（`recent_*`、`list_*`、`search_*` 等） | `read_messages` |
+| 适配器 `send` / `send_file`、命令返回值的宿主代发 | `send_messages` |
+| `on_start` 后台任务 | `scheduler`（若声明）以及声明的 `network` / `llm` |
+
+`extras["bot"]` 与 `extras["plugins"]` 换成了收口视图：前者只暴露按授权检查的 store / llm / adapters / 能力入口，后者对插件不可见。`runtime.memory` / `ctx.extras["memory_reader"]` 的读取同样要 `read_messages`（`runtime.gate` / `ctx.extras["privacy_gate"]` 是分寸审查口，不设授权门槛）。未授权的调用抛 `PluginPermissionError`（命令入口会把它变成一条失败回复）并记审计。
 
 ### 插件市场
 
-WebUI 的「插件」分两页：「插件市场」在同一列表里发现、安装与启停插件；「插件配置」只列出已安装的插件。在左侧选择插件，右侧按 `config_schema` 编辑并保存，重启 bot 后生效。没有声明配置的插件会显示「无可配置项」。原来的 `#/plugins` 链接仍打开市场。
+WebUI 的「插件」分三页：「插件市场」在同一列表里发现、安装与启停插件；「插件配置」按 `config_schema` 编辑已安装插件的配置，保存后重启 bot 生效；「权限授权」逐项对照 manifest 声明并即时开关（高危项标红，声明了但未授权的项标「未授」，改动立即生效、不重启）。没有声明配置的插件会在配置页显示「无可配置项」。原来的 `#/plugins` 链接仍打开市场。
 
 - **数据来源**：配置 `market.index_url` 指向索引仓库的 `plugins.json`（raw 地址），条目字段为 `id / name / version / description / author / permissions / path`，可选 `download_url`（插件目录打包的 zip）与 `category` / `icon` / `min_core_version` / `hooks`。没配地址或 5 秒内拉不到，就回退到随框架发布的内置官方索引——页面顶部始终标注当前来源与失败原因，不会空白。
 - **状态机**：`未安装` → `已安装（未启用）` → `已启用`；附加「可更新」（索引版本更高）、「不合规」（manifest 有问题，详情里写原因）、「核心版本过低」、「仅展示」（索引没给 `download_url`）几个标记。
-- **安装**：先弹确认框逐项列出权限（含 `qzone_write` / `scheduler` 时额外标红），确认后下载 zip、校验每个条目的解压路径都在目标目录内（防路径穿越，不合规整包拒绝）、校验 manifest 与 `min_core_version`，落盘到 `plugins/<id>`。**装好默认不启用**，仍走 `plugins.enabled`。
-- **更新**：索引版本更高时卡片挂「可更新」，一键替换代码与 manifest，插件目录里的 `config.yaml` 与启用状态保持不变。
-- **卸载**：启用中先停用，再删插件目录；目录里自带的文件（含插件自己的 `config.yaml`）随目录删除，框架 `config.yaml` 里该插件的配置段保留不动，只从 `plugins.enabled` 摘除。
+- **安装**：先弹确认框逐项列出权限（含 `qzone_write` / `scheduler` 时额外标红），确认后下载 zip、校验每个条目的解压路径都在目标目录内（防路径穿越，不合规整包拒绝）、校验 manifest 与 `min_core_version`，落盘到 `plugins/<id>`。**装好默认不启用、默认零授权**，仍走 `plugins.enabled`；启用前到「权限授权」页逐项打开。
+- **更新**：索引版本更高时卡片挂「可更新」，一键替换代码与 manifest，插件目录里的 `config.yaml`、启用状态与已有授权保持不变；新版本新增声明的权限默认未授权。
+- **卸载**：启用中先停用，再删插件目录并清掉该插件的授权记录（同名重装时从零授权开始）；目录里自带的文件（含插件自己的 `config.yaml`）随目录删除，框架 `config.yaml` 里该插件的配置段保留不动，只从 `plugins.enabled` 摘除。
 
 索引仓库 `Doulor/Rubenbot-plugins` 需要你自己搭（根目录 `plugins.json` + 每个插件一个目录）；代码只依赖「可配置 URL + 拉不到就回退内置」。
 

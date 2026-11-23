@@ -150,11 +150,15 @@ class WebState:
             return self.plugins.list_plugins()
         from ..plugins.loader import discover_plugin_dirs
         from ..plugins.manifest import read_manifest
+        from ..plugins.permissions import PluginPermissionStore, path_for_store
 
+        # 独立 WebUI 读同一份授权文件（只读展示；写入需要运行中的管理器）
+        grants = PluginPermissionStore(path_for_store(self.store))
         allow = set(self.config.plugins.enabled)
         items = []
         for name, path in discover_plugin_dirs(self.config.plugins.dir):
             manifest, reason, core_too_old = read_manifest(path)
+            declared = manifest.permissions if manifest is not None else ()
             items.append(
                 {
                     "name": name,
@@ -164,6 +168,7 @@ class WebState:
                     "invalid_reason": reason,
                     "core_too_old": core_too_old,
                     "manifest": manifest.as_dict() if manifest is not None else None,
+                    "permissions": grants.summary(name, declared),
                     "commands": [],
                     "hooks": {"on_message": 0, "on_before_reply": 0, "on_after_reply": 0},
                     "path": str(path),

@@ -134,7 +134,12 @@ def write_manifest(directory, plugin_id: str | None = None, **overrides) -> Path
         "description": overrides.pop("description", f"测试插件 {name}"),
         "author": overrides.pop("author", "test"),
         "min_core_version": overrides.pop("min_core_version", "0.0.0"),
-        "permissions": overrides.pop("permissions", ["read_messages"]),
+        # 测试插件默认声明全部权限：多数用例关心的是插件行为而不是授权；
+        # 授权相关的用例自行收紧 manifest 或显式改写授权记录。
+        "permissions": overrides.pop(
+            "permissions",
+            ["read_messages", "send_messages", "capabilities", "qzone_write", "scheduler", "llm", "network"],
+        ),
         "hooks": overrides.pop("hooks", []),
     }
     data.update(overrides)

@@ -725,3 +725,55 @@ def test_api_market_falls_back_to_builtin(market_client):
     assert data["index"]["source"] == "builtin"
     assert data["index"]["available"] is False
     assert data["items"]
+
+
+# ----------------------------------------------------------------------
+# 装后授权：安装 / 卸载与插件授权记录联动
+# ----------------------------------------------------------------------
+
+
+def test_install_registers_empty_grants(tmp_path):
+    """市场新装的插件默认全未授，之后也不被首次迁移补成全授。"""
+    state = make_state(tmp_path)
+    archive = plugin_zip(tmp_path, "alpha")
+    state.config.market.index_url = "https://example.test/plugins.json"
+    state.extras["market_fetcher"] = lambda url, *, timeout: index_doc(
+        [index_entry("alpha", download_url=str(archive))]
+    )
+    market = MarketService(state)
+    market.install("alpha")
+    assert state.plugins.permissions.grants("alpha") == frozenset()
+    item = next(row for row in market.snapshot()["items"] if row["id"] == "alpha")
+    assert item["granted_permissions"] == []
+    assert item["state"] == "installed"
+
+
+def test_uninstall_forgets_grants(tmp_path):
+    root = tmp_path / "plugins"
+    alpha = root / "alpha"
+    alpha.mkdir(parents=True)
+    (alpha / "plugin.py").write_text(PLUGIN_SOURCE, encoding="utf-8")
+    write_manifest(alpha, "alpha")
+    state = make_state(tmp_path)
+    state.plugins.discover()
+    state.plugins.set_permissions("alpha", ["read_messages"])
+    assert state.plugins.permissions.grants("alpha") == {"read_messages"}
+
+    MarketService(state).uninstall("alpha")
+    assert state.plugins.permissions.grants("alpha") == frozenset()
+
+
+def test_install_without_manager_still_registers_empty_grants(tmp_path):
+    """独立 WebUI 模式（没有管理器）装机同样写一条空授权，下次启动不会全授。"""
+    from rubenbot.plugins.permissions import PluginPermissionStore, path_for_store
+
+    state = make_state(tmp_path, manager=False)
+    state.store.path = str(tmp_path / "rubenbot.db")  # 让授权文件跟数据库同目录
+    archive = plugin_zip(tmp_path, "alpha")
+    state.config.market.index_url = "https://example.test/plugins.json"
+    state.extras["market_fetcher"] = lambda url, *, timeout: index_doc(
+        [index_entry("alpha", download_url=str(archive))]
+    )
+    MarketService(state).install("alpha")
+    recorded = PluginPermissionStore(path_for_store(state.store))
+    assert "alpha" in recorded._plugins and recorded.grants("alpha") == frozenset()

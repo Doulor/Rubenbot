@@ -19,6 +19,9 @@ config.yaml
 data/*.db
 data/*.db-*
 data/*.sqlite*
+# 装后授权记录（运行时数据，随部署保留但不入库）
+data/plugin_permissions.json
+data/plugin_permissions.json.tmp
 *.log
 .claude-run*.log
 
