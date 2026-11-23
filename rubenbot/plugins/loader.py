@@ -1059,25 +1059,67 @@ class PluginManager:
         return all(store.allows(plugin.name, permission) for permission in required)
 
     def capability_notes(self, event: MessageEvent, adapter: BaseAdapter) -> list[CapabilityNote]:
+        """本轮的插件能力说明：能分发的按实际可用性注入，做不了的如实标状态。
+
+        启用状态只认 loader 自己的 ``enabled`` / ``loaded``（由
+        ``config.plugins.enabled`` 和加载结果决定），不猜、不硬编码。没启用的
+        插件不执行 ``register``，也就没有能力说明可调，这里按 manifest 的名字
+        给一条不可用条目，让它出现在索引的「现在还做不了的」里而不是凭空消失
+        ——否则机主点歌只会看到沉默，分不清是没开还是坏了。
+        """
         notes = []
-        for plugin in self.enabled_plugins:
-            if plugin.loaded and self._hooks_allowed(plugin):
-                context = PluginContext(plugin, self)
-                for spec in plugin.capability_notes:
-                    if not self._note_allowed(plugin, spec):
-                        continue
-                    try:
-                        # 说明里拿到的适配器同样收口：send 需要 send_messages
-                        note = spec.describe(
-                            event, context.adapter_view(adapter) if adapter is not None else adapter
-                        )
-                        if isinstance(note, CapabilityNote):
-                            notes.append(note)
-                    except PluginPermissionError:
-                        continue
-                    except Exception as exc:
-                        logger.warning("插件 %s 的能力说明不可用：%s", plugin.name, exc)
+        for plugin in self.plugins.values():
+            # 能真正分发的才算「能做」：启用、已加载、且钩子准入通过
+            if not (plugin.enabled and plugin.loaded and self._hooks_allowed(plugin)):
+                note = self._unavailable_note(plugin)
+                if note is not None:
+                    notes.append(note)
+                continue
+            context = PluginContext(plugin, self)
+            for spec in plugin.capability_notes:
+                if not self._note_allowed(plugin, spec):
+                    continue
+                try:
+                    # 说明里拿到的适配器同样收口：send 需要 send_messages
+                    note = spec.describe(
+                        event, context.adapter_view(adapter) if adapter is not None else adapter
+                    )
+                    if isinstance(note, CapabilityNote):
+                        notes.append(note)
+                except PluginPermissionError:
+                    continue
+                except Exception as exc:
+                    logger.warning("插件 %s 的能力说明不可用：%s", plugin.name, exc)
         return notes
+
+    @staticmethod
+    def _unavailable_note(plugin: Plugin) -> CapabilityNote | None:
+        """做不了的插件，按 manifest 和 loader 记录的真实状态报一句。
+
+        - 没启用：说「还没开」，这是机主能自己去开的开关状态。
+        - 启用但没加载起来，或钩子被授权准入拦下（如声明了 network 未授权）：
+          说「这会儿用不了」，不把故障或授权缺失说成没开。
+
+        只认 loader 记录的启用/加载结果，不回退去猜配置。manifest 不合规的
+        插件连名字都不可信，也可能根本没装对，宁可不提，也不拿目录名冒充
+        能力；这类插件在 WebUI 插件页另有「不合规」标记。
+        """
+        if not plugin.valid:
+            return None
+        name = plugin.manifest.name
+        if not plugin.enabled:
+            return CapabilityNote(
+                name,
+                "还没开",
+                f"有人明确要你{name}时，就直说还没开，别装作能做，也别拿别的凑数。",
+                available=False,
+            )
+        return CapabilityNote(
+            name,
+            "这会儿用不了",
+            f"有人明确要你{name}时，就直说这会儿用不了，别装作能做，也别拿别的凑数。",
+            available=False,
+        )
 
     def _dispatch_context(self, plugin: Plugin, ctx: Any) -> Any:
         """钩子/命令拿到的运行时上下文：store / adapters / llm 按授权收口。"""
