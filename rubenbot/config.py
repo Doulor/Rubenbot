@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 
 import yaml
 
+from .llm_budget import LLMBudgetConfig
 from .persona import DEFAULT_IDENTITY_TRIGGERS
 
 logger = logging.getLogger(__name__)
@@ -197,6 +198,8 @@ class LLMConfig:
     model_strategies: dict[str, str] = field(default_factory=dict)
     providers: list[dict[str, Any]] | None = field(default=None, repr=False)
     role_pools: dict[str, list[dict[str, str]]] | None = None
+    # 按任务类型的每日预算闸；见 rubenbot/llm_budget.py
+    budget: LLMBudgetConfig = field(default_factory=LLMBudgetConfig)
 
     def __post_init__(self) -> None:
         """归一化模型池与策略：模型名去空白、去重、空列表视为未配置。
@@ -204,6 +207,8 @@ class LLMConfig:
         未知策略在加载配置时不报错（保持旧的宽松加载），回落到默认策略并
         记 warning；WebUI 提交走严格校验，不会写进文件。
         """
+        self.budget = LLMBudgetConfig.parse(self.budget)
+
         raw = self.models if isinstance(self.models, dict) else {}
         cleaned: dict[str, str | list[str]] = {}
         for key, value in raw.items():

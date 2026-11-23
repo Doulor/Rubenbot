@@ -28,6 +28,31 @@ llm:
   temperature: 0.8
   timeout: 60          # 单次请求超时（秒）
   max_retries: 2       # 失败重试次数：408/429/5xx 退避重试，间隔 1s / 3s（仅单模型时）
+  # 按任务类型的每日预算闸（Q11）：超限只停该类任务，别的任务和 bot 都不受影响。
+  # 统计口径与 llm_usage 一致：每次上游尝试算 1 次（含重试的失败尝试），token 只算
+  # 上游实际给出的值。台账落在数据库 meta 的 llm_budget:ledger，按本地自然日分桶，
+  # 跨日/重启都按当天累计；命中上限时日志打一条「LLM 预算熔断：…」。
+  budget:
+    enabled: true                   # 总开关；关掉后不再检查也不再记账
+    default_daily_calls: 500        # 未单列任务类型的每日调用上限；null 表示不限
+    default_daily_cost_usd: null    # 未单列任务类型的每日费用上限；null 表示不限
+    # 按任务类型覆盖（任务标签就是 llm_usage.task：chat / extract / gen_stage1 …）。
+    # 不写这一项时用内置默认：gen_stage1 1500、gen_stage2 1200、extract 600、
+    # image_description 400、sticker_* 300、conversation_state 300、chat 300、
+    # rolling_summary 200、group_profile 150、consolidate 150、distill 100、
+    # gate 100、event_judge 50；未列出的任务用 default_daily_calls。
+    # 单项写 null 表示该类不限，写 0 表示该类全部拦下。示例：
+    # tasks:
+    #   chat: {daily_calls: 300, daily_cost_usd: 1.0}
+    #   extract: {daily_calls: null}
+    #
+    # 单价（美元 / 百万 token），用于费用估算。**不配就照实按 0 计，费用上限不会触发**
+    # ——中转站没公布单价时不要拍脑袋填。键可写「提供商/模型」「模型」或「*」。
+    # 仓库没有 workbuddy 的公开单价：api.heevcmlz.cn 的 /api/pricing 对未登录请求返回
+    # 空列表，配好 key 后也拿不到该端点价格，所以示例里保持注释，费用档默认关闭。
+    # pricing:
+    #   deepseek/deepseek-chat: {input: 0.27, output: 1.10}
+    #   "*": {input: 0.5, output: 1.5}
 
 persona:
   path: "data/SOUL.md"
