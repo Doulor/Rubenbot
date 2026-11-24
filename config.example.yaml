@@ -76,6 +76,7 @@ memory:
   consolidate_new_threshold: 50
   consolidate_interval_hours: 24
   consolidate_max_memories: 150
+  # 画像仍引用来源事实时，整条归纳提议跳过，不计入移除预算。
   consolidate_remove_ratio: 0.2
   consolidate_remove_min: 4
   raw_keep_per_chat: 500

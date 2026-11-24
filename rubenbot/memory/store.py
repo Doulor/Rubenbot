@@ -664,6 +664,10 @@ class LogEntry:
     reverted: bool
 
 
+class ProfileEvidenceInUse(ValueError):
+    """归纳提议试图删除仍被画像引用的原事实。"""
+
+
 class MemoryStore:
     """所有 SQLite 读写的唯一入口。"""
 
@@ -1247,6 +1251,7 @@ class MemoryStore:
         action: str,
         delete_ids: Iterable[int] = (),
         add_specs: Iterable[dict] = (),
+        protect_profile_evidence: bool = False,
         reason: str = "",
         person_id: str | None = None,
         now: float | None = None,
@@ -1259,8 +1264,16 @@ class MemoryStore:
         delete_ids = [int(i) for i in delete_ids]
         added: list[Memory] = []
         with self._lock:
-            before = self.get_memories_by_ids(delete_ids)
             try:
+                if protect_profile_evidence:
+                    # 先取得 SQLite 写锁：别的连接不能在查证据与删除之间提交新画像。
+                    self._conn.execute("BEGIN IMMEDIATE")
+                before = self.get_memories_by_ids(delete_ids)
+                if protect_profile_evidence:
+                    for owner in {mem.person_id for mem in before}:
+                        refs = self.profile_evidence_refs(owner)
+                        if any(f"memory:{mem.id}" in refs for mem in before if mem.person_id == owner):
+                            raise ProfileEvidenceInUse("来源事实仍被画像证据引用")
                 for mem in before:
                     self._conn.execute("DELETE FROM memories WHERE id = ?", (mem.id,))
                 for spec in add_specs:

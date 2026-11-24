@@ -23,7 +23,7 @@ from ..llm import LLMProtocol, parse_json_payload
 from ..privacy.gate import OWNER_AUDIENCE
 from ..privacy.sealing import merged_source_ref
 from ..memory.anchor import evaluate
-from ..memory.store import Memory, MemoryStore
+from ..memory.store import Memory, MemoryStore, ProfileEvidenceInUse
 
 logger = logging.getLogger(__name__)
 
@@ -248,42 +248,41 @@ class Consolidator:
                 # 超预算的留到下一轮
                 result.rejected.append(f"{proposal.op} {proposal.ids}: 超过本轮移除上限 {budget}")
                 continue
+            add_specs = []
             if proposal.op == "merge":
+                first = sources[0]
+                add_specs.append({
+                    "person_id": person_id,
+                    "scope_type": first.scope_type,
+                    "scope_id": first.scope_id,
+                    "content": proposal.content,
+                    # 带来源的记忆按类目复用分寸裁定，模型不能替它换一个裁定键。
+                    "category": first.category if first.audience else proposal.category or first.category,
+                    "entity": self._merged_entity(sources),
+                    "origin_chat": first.origin_chat,
+                    "audience": first.audience,
+                    "sensitivity": first.sensitivity,
+                    "stability": first.stability,
+                    "expires_at": first.expires_at,
+                    "source": "extracted",
+                    "source_ref": merged_source_ref(first.origin_chat, (m.source_ref for m in sources)),
+                })
+            try:
                 log = self.store.apply_changes(
-                    action="merge",
+                    action=proposal.op,
                     delete_ids=[m.id for m in sources],
-                    add_specs=[
-                        {
-                            "person_id": person_id,
-                            "scope_type": sources[0].scope_type,
-                            "scope_id": sources[0].scope_id,
-                            "content": proposal.content,
-                            # 带来源的记忆按类目复用分寸裁定，模型不能替它换一个裁定键。
-                            "category": sources[0].category if sources[0].audience else proposal.category or sources[0].category,
-                            # 合并结果沿用同一实体的锚点；跨实体合并本来就被校验挡下。
-                            "entity": self._merged_entity(sources),
-                            "origin_chat": sources[0].origin_chat,
-                            "audience": sources[0].audience,
-                            "sensitivity": sources[0].sensitivity,
-                            "stability": sources[0].stability,
-                            "expires_at": sources[0].expires_at,
-                            "source": "extracted",
-                            "source_ref": merged_source_ref(sources[0].origin_chat, (m.source_ref for m in sources)),
-                        }
-                    ],
+                    add_specs=add_specs,
+                    protect_profile_evidence=True,
                     reason=proposal.reason,
                     person_id=person_id,
                     now=now,
                 )
+            except ProfileEvidenceInUse as exc:
+                result.rejected.append(f"{proposal.op} {proposal.ids}: {exc}")
+                continue
+            if proposal.op == "merge":
                 result.merged += 1
             else:
-                log = self.store.apply_changes(
-                    action="drop",
-                    delete_ids=[m.id for m in sources],
-                    reason=proposal.reason,
-                    person_id=person_id,
-                    now=now,
-                )
                 result.dropped += len(sources)
             consumed.update(m.id for m in sources)
             removed_so_far += net_removed
