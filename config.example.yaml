@@ -344,6 +344,8 @@ plugins:
   enabled: []
   # 例如只启用 hello 示例插件（也可以直接在 WebUI 设置页开关，保存后写回这里并热生效）：
   # enabled: ["hello"]
+  # 群内自动回作品封面与详情：显式启用 link_detail 并在 WebUI 授权读消息、发消息、网络。
+  # 分平台开关和冷却在插件详情页设置；与主配置 link 段的通用感知独立。
   command_prefix: "/"
   # 装后授权：manifest 声明的权限要在 WebUI「插件 → 权限授权」页逐项批准才生效。
   # 授权记录不在本文件里，落在数据库同目录的 plugin_permissions.json，重启不丢；

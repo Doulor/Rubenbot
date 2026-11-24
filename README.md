@@ -213,6 +213,7 @@ bot 对每个人的好感度、以及自己当下的心情，都由确定性规�
 | `plugins/image_gen/` | 画图插件：「画一张 / 画个 <描述>」调用自定义生图端点（OpenAI 兼容，硅基流动为预设示例），带冷却、每日上限与本地黑名单（默认关闭，需配齐端点 / 密钥 / 模型） |
 | `plugins/music/` | 点歌插件（按 hydrogen 点歌插件复刻）：点歌 / 网易点歌 / QQ点歌 / 酷狗 等平台命令，多结果发选歌列表（超时自动撤回），按 语音 → 文件 → 文字 逐档降级发送，可播音频先探活过滤（默认关闭，无需 key） |
 | `plugins/group_insights/` | 群发言统计与群聊总结：「水群榜」Top5 / 「总结一下」按话题补课（默认关闭，需显式启用） |
+| [`plugins/link_detail/`](plugins/link_detail/README.md) | 链接详细解析：群内分享支持平台的公开作品时，自动引用回复封面、作者、时长及已公开的统计。默认关闭，在插件详情页启用并授权；不是 `link.mode: auto`。 |
 | `rubenbot/sticker_behavior.py` | 核心表情包行为：收集群聊表情入库、按概率与冷却补一张，只经能力层 `send_sticker` 发送（默认关闭）；图片入库即感知，触发图裁定会等描述落库 |
 | `rubenbot/vision_image.py` | 送视觉模型前的图片预处理：文件头读尺寸、按需下采样重编码成 JPEG 压耗时；Pillow 可选、缺失时用 ffmpeg，压不了就按原图 |
 | `rubenbot/linkparse/` | 核心链接理解（感知层）：任意 http(s) 链接都尝试读取，短链展开 / 平台识别 → 结构化数据 → OG/JSON-LD → 正文摘录；SSRF 校验、字节与超时上限、隔离标注都在 core |
@@ -561,7 +562,7 @@ plugins:
 | `llm` | 调用核心的大模型接口（会产生费用） | |
 | `network` | 向外部网络发起请求 | |
 
-带高风险权限的插件，安装确认框里会额外标红提示。框架自带的 5 个官方插件（hello / qzone_post / music / image_gen / group_insights）都已声明真实 manifest，可作参考。
+带高风险权限的插件，安装确认框里会额外标红提示。框架自带的 6 个官方插件（hello / qzone_post / music / image_gen / group_insights / link_detail）都已声明真实 manifest，可作参考。
 
 ### 装后授权
 

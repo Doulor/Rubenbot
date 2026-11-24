@@ -140,6 +140,12 @@ rubenbot/
 - **不落记忆**：网页正文不进聊天流水、会话摘要、群内实体说明或记忆；`decision_log.factors.links`
   只记本轮读了哪些链接、哪些失败与原因、投递方式，不记正文。
 
+### 群内链接详细解析（独立插件，第 30 项）
+
+`plugins/link_detail` 与上面的感知层分开。仅在显式启用且有读消息、发消息与网络授权时，群聊 `on_message` 展开 17 个平台的作品链接（清单、来源和设置见[插件说明](plugins/link_detail/README.md)）。相同群、相同规范化链接默认 120 秒内不重复回复；每条最多 3 个。按原群、原消息引用投递封面字节及公开字段；登录壳、缺少作品数据、Pixiv 未明确公开全年龄时均报抓不到。不将站点数据交给模型，不生成简介、不取视频。作品页/API 经 core 抓取器逐跳校验；静态封面复用同一公网地址校验与固定 IP 连接，单跳、限时、限大小，不让协议端代抓。
+
+只有详情或失败回执已送达（或同群同链接在冷却内）才算接管。纯接管链接不再触发通用回复；混合链接在流水落库后仅从本轮正文移除已接管的 URL，未覆盖、关闭、超上限或没有投递成功的 URL 沿用原有 core 触发口径。`send_video` 只是预留配置，开启也不会下载。全部平台开关与限额由 manifest schema 驱动。
+
 ## 适配器
 
 `BaseAdapter` 接口：
@@ -391,12 +397,12 @@ SnowLuma 适配器（OneBot v11）：
 
 `config_schema` 字段类型固定为 `bool` / `int` / `number` / `string` / `text` / `list`（兼容 `boolean` / `integer` / `float` / `string_list` 等别名）；`options` 既接受裸值数组，也接受 `{value, label}` 对象数组。声明里不合法的条目会被跳过并记日志，不会让插件不可加载；默认值类型不对时退回类型默认值。已知字段名含 `key` / `token` / `secret` / `password` 或显式 `secret: true` 的按密钥处理：WebUI 不回显原值，留空表示保留原值。
 
-loader 加载时校验 manifest：缺失或字段不全的插件拒绝加载并在 WebUI 标「不合规」；现有 5 个官方插件（hello / qzone_post / music / image_gen / group_insights）都声明了 manifest；表情包行为已于 2026-11-20 移入 core，emoji_react 已删除；链接理解随第 25 项移入 core 感知层，`link_parse` 插件退役；新增插件（音乐 / 画图 / 群聊总结）沿用同一规范，默认不启用。画图走**自定义生图端点（OpenAI 兼容）**：`base_url` / `api_key` / `model` 三件套齐全才注册触发，硅基流动退为预设示例、不再写死。点歌按 hydrogen 点歌插件复刻：多平台命令（点歌 / 网易点歌 / QQ点歌 / 酷狗 等十余个），多结果发选歌列表、选中 / 取消 / 超时都撤回（超时撤回走适配器 `delete_msg`，需 `capabilities` 授权），`send_modes` 默认 `record → file → text`——语音条能直接播放，OneBot 音乐卡在新版 QQ 客户端只显示「发送者版本过低」，只作为配置可选项；搜索结果先探活过滤（网易云 VIP 曲目拿到的是 404 页面），聚合子平台空结果时退回网易云。
+loader 加载时校验 manifest：缺失或字段不全的插件拒绝加载并在 WebUI 标「不合规」；现有 6 个官方插件（hello / qzone_post / music / image_gen / group_insights / link_detail）都声明了 manifest；表情包行为已于 2026-11-20 移入 core，emoji_react 已删除；链接理解随第 25 项移入 core 感知层，`link_parse` 插件退役；新增插件（音乐 / 画图 / 群聊总结）沿用同一规范，默认不启用。画图走**自定义生图端点（OpenAI 兼容）**：`base_url` / `api_key` / `model` 三件套齐全才注册触发，硅基流动退为预设示例、不再写死。点歌按 hydrogen 点歌插件复刻：多平台命令（点歌 / 网易点歌 / QQ点歌 / 酷狗 等十余个），多结果发选歌列表、选中 / 取消 / 超时都撤回（超时撤回走适配器 `delete_msg`，需 `capabilities` 授权），`send_modes` 默认 `record → file → text`——语音条能直接播放，OneBot 音乐卡在新版 QQ 客户端只显示「发送者版本过低」，只作为配置可选项；搜索结果先探活过滤（网易云 VIP 曲目拿到的是 404 页面），聚合子平台空结果时退回网易云。
 
 ### 分发：GitHub 索引仓库
 
 - 索引仓库 `Doulor/Rubenbot-plugins`：根目录 `plugins.json`（条目：id / name / version / description / author / permissions / path），每个插件一个目录（代码 + manifest.json）。
-- bot 侧索引地址可配置（`market.index_url`），拉取失败或未配置时回退到框架内置的官方索引（随框架发布的 5 个官方插件），市场页明确标注当前索引来源与「索引不可用」状态，不许静默空白。
+- bot 侧索引地址可配置（`market.index_url`），拉取失败或未配置时回退到框架内置的官方索引（随框架发布的官方插件），市场页明确标注当前索引来源与「索引不可用」状态，不许静默空白。
 - 安装 = 拉索引仓库对应插件目录落盘到 `plugins/` → 校验 manifest 与 min_core_version → 默认不启用、默认零授权，用户在卡片上手动启用并在授权页逐项批准（与「插件默认关」一致）。
 - 更新：索引 version 高于已装 manifest version 时卡片挂「可更新」角标，一键更新（保留该插件的配置段、启用状态与已有授权，只换代码与 manifest；新增声明的权限默认未授权）。
 - 卸载：删除插件目录并清掉该插件的授权记录，同名重装从零授权开始。

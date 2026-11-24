@@ -1,0 +1,169 @@
+{
+  "id": "link_detail",
+  "name": "链接详细解析",
+  "version": "1.0.0",
+  "author": "RubenBot",
+  "description": "在原群引用回复公开作品的封面和信息，不用 @，不下载视频。",
+  "min_core_version": "0.1.0",
+  "permissions": [
+    "read_messages",
+    "send_messages",
+    "network"
+  ],
+  "category": "工具",
+  "repository": "https://github.com/Doulor/Rubenbot/tree/main/plugins/link_detail",
+  "triggers": [
+    "群里分享已启用平台的作品链接（每条最多 3 个）"
+  ],
+  "hooks": [
+    "on_message",
+    "on_load",
+    "on_config_change"
+  ],
+  "config_schema": [
+    {
+      "key": "cooldown_seconds",
+      "type": "int",
+      "default": 120,
+      "min": 0,
+      "max": 86400,
+      "label": "同群同链接冷却（秒）",
+      "description": "已送达的链接不重复回复；0 关闭冷却。"
+    },
+    {
+      "key": "max_links",
+      "type": "int",
+      "default": 3,
+      "min": 1,
+      "max": 3,
+      "label": "单条消息的链接上限",
+      "description": "每条消息最多展开几个不同的已启用平台作品链接。"
+    },
+    {
+      "key": "send_video",
+      "type": "bool",
+      "default": false,
+      "label": "发送视频文件（预留）",
+      "description": "v1 无论开关状态都不下载或发送视频。"
+    },
+    {
+      "key": "enable_bilibili",
+      "type": "bool",
+      "default": true,
+      "label": "B站",
+      "description": "自动展开B站的公开作品链接。"
+    },
+    {
+      "key": "enable_douyin",
+      "type": "bool",
+      "default": true,
+      "label": "抖音",
+      "description": "自动展开抖音的公开作品链接。"
+    },
+    {
+      "key": "enable_xiaohongshu",
+      "type": "bool",
+      "default": true,
+      "label": "小红书",
+      "description": "自动展开小红书的公开作品链接。"
+    },
+    {
+      "key": "enable_xiaoheihe",
+      "type": "bool",
+      "default": true,
+      "label": "小黑盒",
+      "description": "自动展开小黑盒的公开作品链接。"
+    },
+    {
+      "key": "enable_acfun",
+      "type": "bool",
+      "default": true,
+      "label": "A站",
+      "description": "自动展开A站的公开作品链接。"
+    },
+    {
+      "key": "enable_instagram",
+      "type": "bool",
+      "default": true,
+      "label": "Instagram",
+      "description": "自动展开Instagram的公开作品链接。"
+    },
+    {
+      "key": "enable_iwara",
+      "type": "bool",
+      "default": true,
+      "label": "iwara",
+      "description": "自动展开iwara的公开作品链接。"
+    },
+    {
+      "key": "enable_kuaishou",
+      "type": "bool",
+      "default": true,
+      "label": "快手",
+      "description": "自动展开快手的公开作品链接。"
+    },
+    {
+      "key": "enable_netease_music",
+      "type": "bool",
+      "default": true,
+      "label": "网易云音乐",
+      "description": "自动展开网易云音乐的公开作品链接。"
+    },
+    {
+      "key": "enable_nga",
+      "type": "bool",
+      "default": true,
+      "label": "NGA",
+      "description": "自动展开NGA的公开作品链接。"
+    },
+    {
+      "key": "enable_shipinhao",
+      "type": "bool",
+      "default": true,
+      "label": "微信视频号",
+      "description": "自动展开微信视频号的公开作品链接。"
+    },
+    {
+      "key": "enable_tiktok",
+      "type": "bool",
+      "default": true,
+      "label": "TikTok",
+      "description": "自动展开TikTok的公开作品链接。"
+    },
+    {
+      "key": "enable_x",
+      "type": "bool",
+      "default": true,
+      "label": "X",
+      "description": "自动展开X的公开作品链接。"
+    },
+    {
+      "key": "enable_weibo",
+      "type": "bool",
+      "default": true,
+      "label": "微博",
+      "description": "自动展开微博的公开作品链接。"
+    },
+    {
+      "key": "enable_youtube",
+      "type": "bool",
+      "default": true,
+      "label": "YouTube",
+      "description": "自动展开YouTube的公开作品链接。"
+    },
+    {
+      "key": "enable_zhihu",
+      "type": "bool",
+      "default": true,
+      "label": "知乎",
+      "description": "自动展开知乎的公开作品链接。"
+    },
+    {
+      "key": "enable_pixiv",
+      "type": "bool",
+      "default": true,
+      "label": "Pixiv",
+      "description": "自动展开Pixiv的公开作品链接。"
+    }
+  ]
+}
