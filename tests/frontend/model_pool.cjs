@@ -113,3 +113,41 @@ test('非模型页保存不迁移模型配置，模型页保存不混入旧字�
   ui.run('draft.llm.role_pools.chat = []');
   assert.throws(payload, /至少要选一个模型/);
 });
+
+test('目录预览分段并可搜索，勾选只改草稿；单模型调用失败不改变列表证据', async () => {
+  const {ui, root, payload} = render(), card = providers(root)[0];
+  ui.run(`const diagnostics = [];
+    api.post = async (path, body) => {
+      diagnostics.push({path, body});
+      if (path.endsWith('/probe')) return {status:'error', error:'http_401', checked_at:'2026-11-24T12:02:00Z'};
+      return {status:'available', checked_at:'2026-11-24T12:01:00Z', cached_at:null,
+        models:['shared', ...Array.from({length: 220}, (_, i) => 'test-' + i)]};
+    }`);
+  const rows = () => card.walk().filter(node => node.dataset.model);
+  const shared = () => rows().find(node => node.dataset.model === 'shared');
+  assert.equal(rows().length, 2);
+  assert.match(card.textContent, /还没拉取过/);
+  await named(card, '获取模型').fire('click');
+  assert.equal(rows().length, 100);
+  assert.deepEqual(payload().llm.providers[0].models, ['shared', 'org/vision']);
+  assert.doesNotMatch(card.textContent, /null|undefined/);
+  assert.match(rows()[1].textContent, /未在上游列表/);
+  await named(card, '探测 shared').fire('click');
+  assert.match(shared().textContent, /可用（上游列表）/);
+  assert.match(shared().textContent, /HTTP 401/);
+  assert.equal(shared().walk().filter(node => node.tagName === 'TIME').length, 2);
+  const search = named(card, '搜索模型');
+  await change(search, 'test-219', 'input');
+  assert.equal(rows().length, 1);
+  const check = named(card, '勾选 test-219');
+  check.checked = true; await check.fire('change');
+  assert.ok(payload().llm.providers[0].models.includes('test-219'));
+  assert.equal(named(card, '探测 test-219').getAttribute('disabled'), '');
+  await named(rows()[0], '加入角色池').fire('click');
+  await change(named(card, 'test-219 加入角色'), 'fast');
+  assert.deepEqual(payload().llm.role_pools.fast, [ref('a', 'test-219')]);
+  assert.deepEqual(JSON.parse(ui.run('JSON.stringify(diagnostics)')), [
+    {path:'/api/models/discover',body:{provider:'a',refresh:false}},
+    {path:'/api/models/probe',body:{provider:'a',model:'shared'}},
+  ]);
+});

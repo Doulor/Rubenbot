@@ -3513,8 +3513,34 @@ const MODEL_POOL_STRATEGY_LABELS = {
   random: "随机",
 };
 
+/** 列表和实际调用是两份证据，列表出现不等于推理请求成功。 */
+function modelEvidence(discovery, listed, probe) {
+  const list = discovery?.status === "error" ? "error" : discovery?.status !== "available" ? "unknown" :
+    listed ? "available" : "not_listed";
+  return { list, probe, discovery, effective: probe?.status || list };
+}
+
+const MODEL_ERROR_LABELS = new Map([
+  ["timeout", "超时"], ["request_failed", "连接失败"], ["invalid_response", "响应格式错误"], ["budget_exceeded", "预算已达上限"],
+]);
+function modelErrorLabel(code) {
+  const http = /^http_(\d{3})$/.exec(code);
+  return http ? `HTTP ${http[1]}` : MODEL_ERROR_LABELS.get(code) || code;
+}
+
+function modelEvidenceTags({ list, discovery, probe }) {
+  const tag = (state, text, at, reason) => h("span", {
+    class: `tag ${state === "available" ? "good" : state === "error" ? "bad" : state === "not_listed" ? "warn" : "outline"}`,
+    dataset: { status: state },
+  }, text, reason ? `：${modelErrorLabel(reason)}` : null, at ? h("time", { datetime: at, title: at }, fmtDateTime(Date.parse(at) / 1000)) : null);
+  return h("div", { class: "model-evidence" },
+    tag(list, { available: "可用（上游列表）", not_listed: "未在上游列表", unknown: "列表未探测", error: "拉取失败" }[list],
+      discovery?.checked_at, discovery?.error),
+    tag(probe?.status || "unknown", probe ? (probe.status === "available" ? "探测可用" : "探测失败") : "未探测", probe?.checked_at, probe?.error));
+}
+
 /** 提供商名称与上游模型名共同标识一个池成员；不解析模型名中的斜线。 */
-function modelsEditor(draft) {
+function modelsEditor(draft, observations = {}, historyWarning = "") {
   const llm = draft.llm;
   const providers = llm.providers;
   const pools = Object.assign(Object.create(null), llm.role_pools);
@@ -3526,6 +3552,30 @@ function modelsEditor(draft) {
     extract: "记忆抽取", consolidate: "记忆归纳", gate: "分寸审查", distill: "画像提炼",
   }));
   const roles = new Set([...labels.keys(), ...Object.keys(pools), ...Object.keys(strategies)]);
+  const initial = JSON.stringify(llm);
+  const dirtyNote = h("span", { class: "tag warn", role: "status", hidden: true }, "有未保存的修改");
+  const markDirty = () => { dirtyNote.hidden = JSON.stringify(llm) === initial; };
+  // 草稿对象的身份不随改名而变；新建同名提供商不继承旧卡片的探测或凭据。
+  const states = new Map();
+  function providerState(p, saved = false) {
+    const old = saved && Object.hasOwn(observations, p.name) ? observations[p.name] : {};
+    const s = { saved: saved ? { name: p.name, url: p.base_url, models: new Set(p.models), key: p.has_api_key } : null,
+      discovery: old.discovery, listed: new Set(old.discovery?.models), probes: new Map(Object.entries(old.probes || {})),
+      pending: new Set(), query: "", limit: 100, editingName: false, message: "" };
+    states.set(p, s);
+    return s;
+  }
+  providers.forEach(p => providerState(p, true));
+  function sameIdentity(p) {
+    const s = states.get(p);
+    return s?.saved && !s.editingName && p.name === s.saved.name && p.base_url === s.saved.url && p.api_key === undefined;
+  }
+  function evidence(p, model) {
+    if (!p || !sameIdentity(p)) return modelEvidence(null, false, null);
+    const s = states.get(p);
+    return modelEvidence(s.discovery, s.listed.has(model), s.saved.models.has(model) ? s.probes.get(model) : null);
+  }
+  const btn = (label, fn, props = {}) => h("button", { type: "button", class: "btn btn-sm", onclick: fn, ...props }, label);
   const providerHost = h("div", { class: "model-pool-list" });
   const roleHost = h("div", { class: "model-pool-list" });
   const addButton = (label, fn) => h("button", {
@@ -3557,21 +3607,36 @@ function modelsEditor(draft) {
   }
 
   function providerRow(provider) {
-    const originalName = provider.name;
+    const s = states.get(provider) || providerState(provider);
+    const nameInput = h("input", { class: "input", value: provider.name, onchange: rename,
+      oninput: event => { s.editingName = event.target.value.trim() !== provider.name; identityChanged(); },
+    });
+    const header = h("div", { class: "model-provider-heading" });
+    const status = h("div", { class: "model-discovery-status", role: "status" });
+    const controls = h("div", { class: "model-actions" });
+    const count = h("span", { class: "field-hint", role: "status" });
+    const modelRows = h("div", { class: "model-catalog-list" });
+    const search = h("input", { type: "search", class: "input", placeholder: "搜索此提供商的模型", "aria-label": "搜索模型",
+      oninput: event => { s.query = event.target.value.trim().toLowerCase(); s.limit = 100; renderModels(); },
+    });
+    function identityChanged() {
+      s.roleModel = null; s.message = "";
+      renderPanel(); renderRoles();
+    }
     const keyInput = h("input", { class: "input", type: "password", autocomplete: "new-password",
       "aria-label": "API Key", value: provider.api_key || "",
       placeholder: provider.has_api_key ? "已设置，留空保留" : "未设置，可留空",
       oninput: event => {
         if (event.target.value) provider.api_key = event.target.value;
         else delete provider.api_key;
-        updateKeyAction();
+        updateKeyAction(); identityChanged();
       },
     });
     const clearKey = h("button", { class: "btn btn-sm btn-ghost", type: "button", onclick: () => {
       if (provider.api_key === "") delete provider.api_key;
       else provider.api_key = "";
       keyInput.value = "";
-      updateKeyAction();
+      updateKeyAction(); identityChanged();
     } });
     function updateKeyAction() {
       clearKey.hidden = !provider.has_api_key;
@@ -3580,75 +3645,148 @@ function modelsEditor(draft) {
         provider.has_api_key ? "已设置，留空保留" : "未设置，可留空";
     }
     updateKeyAction();
-    const deauthorize = () => {
-      provider.has_api_key = false;
+    const syncSavedKey = () => {
+      provider.has_api_key = !!(s.saved && provider.name === s.saved.name && provider.base_url === s.saved.url && s.saved.key);
       updateKeyAction();
-      keyInput.placeholder = "名称或地址变更，请按需重新填写";
+      if (s.saved && (provider.name !== s.saved.name || provider.base_url !== s.saved.url)) keyInput.placeholder = "名称或地址变更，请按需重新填写";
     };
     function rename(event) {
+      s.editingName = false;
       const name = event.target.value.trim();
       if (!name || providers.some(other => other !== provider && other.name === name)) {
         event.target.value = provider.name;
-        toast("提供商名称不能为空或重复", "error");
+        toast("提供商名称不能为空或重复", "error"); identityChanged();
         return;
       }
       event.target.value = name;
-      if (name === provider.name) return;
+      if (name === provider.name) { identityChanged(); return; }
       for (const { ref } of references(provider.name)) ref.provider = name;
       provider.name = name;
-      deauthorize();
-      renderRoles();
+      syncSavedKey(); identityChanged();
     }
     const field = (label, control) => h("label", { class: "settings-field" },
       h("span", { class: "field-label" }, label), control);
-    const modelRows = h("div", { class: "model-pool-list" });
-    function renderModels() {
-      modelRows.replaceChildren(...provider.models.map((model, index) => h("div", { class: "model-pool-row" },
-        h("input", { class: "input mono", value: model, "aria-label": "上游模型名",
-          onchange: event => {
-            const name = event.target.value.trim();
-            if (!name || provider.models.some((item, i) => i !== index && item === name)) {
-              event.target.value = provider.models[index]; toast("模型名不能为空或在同一提供商内重复", "error"); return;
-            }
-            event.target.value = name;
-            for (const { ref } of references(provider.name, provider.models[index])) ref.model = name;
-            provider.models[index] = name;
-            renderRoles();
-          },
-        }),
-        action("删除此上游模型", "trash", () => {
-          if (!canRemove(provider.name, provider.models[index])) return;
-          provider.models.splice(index, 1); renderModels(); renderRoles();
-        })
-      )));
+    // 请求只引用已保存名称，绝不把表单中的地址或密钥交给诊断接口。
+    async function diagnose(model = null, refresh = false) {
+      if (!sameIdentity(provider) || s.pending.has(model) || (model !== null && !s.saved.models.has(model))) return;
+      s.pending.add(model); s.message = ""; renderPanel();
+      try {
+        if (model === null) {
+          const result = await api.post("/api/models/discover", { provider: provider.name, refresh });
+          s.discovery = result; s.listed = new Set(result.models);
+        } else {
+          const result = await api.post("/api/models/probe", { provider: provider.name, model });
+          s.probes.set(model, result);
+        }
+      } catch (err) {
+        if (!(err instanceof Unauthorized) && sameIdentity(provider)) s.message = err.message || "请求失败，请重试";
+      } finally {
+        s.pending.delete(model);
+        // 可能已增删卡片或编辑地址，只更新该对象当前的视图。
+        if (providers.includes(provider)) { s.repaint(); renderRoles(); }
+      }
     }
-    renderModels();
-    return h("article", { class: "model-pool-item" },
-      h("div", { class: "model-pool-head" },
-        field("提供商名称", h("input", { class: "input", value: originalName, onchange: rename })),
-        action("删除此提供商", "trash", () => {
+    function renderPanel() {
+      const ready = sameIdentity(provider), d = ready ? s.discovery : null, busy = ready && s.pending.has(null);
+      const label = !ready ? "待保存" : d?.status === "available" ? "拉取成功" : d?.status === "error" ? "拉取失败" : "未拉取";
+      header.replaceChildren(h("div", { class: "model-provider-id" }, h("strong", {}, provider.name),
+        h("span", { class: "mono", title: provider.base_url }, provider.base_url || "未填写接口地址")),
+        h("span", { class: `model-health ${d?.status || "unknown"}` }, label));
+      status.replaceChildren(...[h("span", {}, !ready ? "请先保存提供商，再获取模型或探测。" : d ?
+        `最近拉取 ${fmtDateTime(Date.parse(d.checked_at) / 1000)}${d.error ? `，${modelErrorLabel(d.error)}` : ""}` : historyWarning || "还没拉取过，点获取模型"),
+        d?.cached_at ? h("span", {}, `来自缓存（${fmtDateTime(Date.parse(d.cached_at) / 1000)}）`) : null,
+        s.message && ready ? h("span", { class: "tag bad" }, s.message) : null].filter(Boolean));
+      controls.replaceChildren(...[btn(busy ? "拉取中…" : "获取模型", () => diagnose(), { disabled: !ready || busy }),
+        btn("测连通性", () => diagnose(null, true), { disabled: !ready || busy, title: "强制刷新上游模型列表，不调用模型" }),
+        (d?.status === "error" || s.message) && ready ? btn("重试拉取", () => diagnose(null, true), { disabled: busy }) : null].filter(Boolean));
+      renderModels();
+    }
+    function changeCatalog(add, model, focus = false) {
+      if (!add && !canRemove(provider.name, model)) return false;
+      if (add) { if (!provider.models.includes(model)) provider.models.push(model); }
+      else provider.models = provider.models.filter(name => name !== model);
+      s.roleModel = null; renderModels(focus ? model : null); renderRoles();
+      return true;
+    }
+    function modelRow(model, joined, focus) {
+      const check = h("input", { type: "checkbox", checked: joined, "aria-label": `勾选 ${model}`,
+        onchange: event => { if (!changeCatalog(event.target.checked, model, true)) event.target.checked = joined; } });
+      if (focus) Promise.resolve().then(() => check.focus?.({ preventScroll: true }));
+      const saved = sameIdentity(provider) && s.saved.models.has(model);
+      const proof = modelEvidenceTags(evidence(provider, model));
+      const probeButton = btn(s.pending.has(model) && saved ? "探测中…" : "测一下", () => diagnose(model), {
+        disabled: !saved || s.pending.has(model), title: saved ? "发送一次最小调用，可能产生费用" : "请先保存提供商与模型",
+        "aria-label": `探测 ${model}` });
+      const name = joined ? h("input", { class: "input mono", value: model, "aria-label": "上游模型名",
+        oninput: event => { proof.hidden = event.target.value.trim() !== model; probeButton.disabled = proof.hidden || !saved || s.pending.has(model); },
+        onchange: event => {
+          const next = event.target.value.trim();
+          if (!next || (next !== model && provider.models.includes(next))) { toast("模型名不能为空或在同一提供商内重复", "error"); }
+          else if (next !== model) {
+            for (const { ref } of references(provider.name, model)) ref.model = next;
+            provider.models[provider.models.indexOf(model)] = next;
+          }
+          renderModels(); renderRoles();
+        },
+      }) : h("span", { class: "model-id mono" }, model);
+      const rolePicker = s.roleModel === model && joined ? selectField("", [{ value: "", label: "选择要加入的角色" },
+        ...[...roles].filter(role => !(pools[role] || []).some(ref => ref.provider === provider.name && ref.model === model))
+          .map(role => ({ value: role, label: labels.get(role) || role }))], role => {
+        if (role && roles.has(role) && !(pools[role] || []).some(ref => ref.provider === provider.name && ref.model === model)) {
+          pools[role] = [...(pools[role] || []), { provider: provider.name, model }];
+        }
+        s.roleModel = null; renderModels(); renderRoles();
+      }) : null;
+      rolePicker?.setAttribute("aria-label", `${model} 加入角色`);
+      return h("div", { class: "model-catalog-row", dataset: { model } },
+        h("div", { class: "model-catalog-name" }, check, name, h("span", { class: "field-hint" }, joined ? "已在目录" : "未加入")),
+        proof,
+        h("div", { class: "model-actions" }, joined ? probeButton : null,
+          joined ? btn("加入角色池", () => { s.roleModel = s.roleModel === model ? null : model; renderModels(); }) : null,
+          joined ? btn("移除目录", () => changeCatalog(false, model), { "aria-label": "删除此上游模型" }) : btn("加入目录", () => changeCatalog(true, model)),
+          rolePicker));
+    }
+    function renderModels(focusModel = null) {
+      const catalog = new Set(provider.models), listed = sameIdentity(provider) ? s.listed : null;
+      // 固定本轮已保存目录及上游列表顺序，勾选发现项不会跳到页首。
+      const names = new Set([...(s.saved?.models || []), ...(listed || []), ...catalog]);
+      const filtered = [...names].filter(m => (catalog.has(m) || listed?.has(m)) && m.toLowerCase().includes(s.query));
+      modelRows.replaceChildren(...filtered.slice(0, s.limit).map(m => modelRow(m, catalog.has(m), m === focusModel)), ...[
+        filtered.length === 0 ? h("span", { class: "field-hint" }, s.query ? "没有匹配的模型，试试其他关键词。" : "目录为空，可获取上游列表或手动添加模型。") : null,
+        filtered.length > s.limit ? btn(`加载更多（已显示 ${s.limit} / ${filtered.length}）`, () => { s.limit += 100; renderModels(); }) : null].filter(Boolean));
+      count.textContent = `已加入 ${catalog.size} 个模型`;
+    }
+    s.repaint = renderPanel;
+    search.value = s.query;
+    renderPanel();
+    return h("article", { class: "model-pool-item model-provider-card", dataset: { provider: provider.name } },
+      header,
+      h("details", { class: "model-connection", open: !s.saved }, h("summary", {}, "编辑连接"),
+        h("div", { class: "settings-fields" }, field("提供商名称", nameInput),
+          field("接口地址", h("input", { class: "input mono", type: "url", value: provider.base_url,
+            placeholder: "https://api.example.com/v1", oninput: event => {
+              provider.base_url = event.target.value.trim(); syncSavedKey(); identityChanged();
+            } })), h("div", { class: "settings-field" }, field("API Key", keyInput), clearKey)),
+        btn("删除提供商", () => {
           if (!canRemove(provider.name)) return;
-          providers.splice(providers.indexOf(provider), 1); renderProviders(); renderRoles();
-        })),
-      h("div", { class: "settings-fields" },
-        field("接口地址", h("input", { class: "input mono", type: "url", value: provider.base_url,
-          placeholder: "https://api.example.com/v1", oninput: event => {
-            if (event.target.value.trim() !== provider.base_url) deauthorize();
-            provider.base_url = event.target.value.trim();
-          } })), h("div", { class: "settings-field" }, field("API Key", keyInput), clearKey)),
-      h("span", { class: "field-label" }, "上游模型名"), modelRows,
-      addText("添加模型", "输入此接口接受的模型名", name => {
+          providers.splice(providers.indexOf(provider), 1); states.delete(provider); renderProviders(); renderRoles();
+        }, { "aria-label": "删除此提供商" })),
+      h("div", { class: "model-discovery-tools" }, controls, status),
+      h("div", { class: "model-searchbar" }, field("搜索模型", search), count), modelRows,
+      addText("添加模型", "手动输入上游模型名", name => {
         if (provider.models.includes(name)) { toast("此提供商已有这个模型", "error"); return false; }
-        provider.models.push(name); renderModels(); renderRoles(); return true;
+        return changeCatalog(true, name);
       })
     );
   }
   function renderProviders() { providerHost.replaceChildren(...providers.map(providerRow)); }
 
   function renderRoles() {
+    markDirty();
     const options = providers.flatMap(p => p.models.map(model => ({
-      provider: p.name, model, value: JSON.stringify([p.name, model]), label: `${p.name} · ${model}`,
+      provider: p.name, model, value: JSON.stringify([p.name, model]), label: `${p.name} · ${model}`, evidence: evidence(p, model),
     })));
+    const byKey = new Map(options.map(opt => [opt.value, opt]));
     roleHost.replaceChildren(...[...roles].map(role => {
       const refs = pools[role] || [];
       const key = ref => JSON.stringify([ref.provider, ref.model]);
@@ -3661,40 +3799,44 @@ function modelsEditor(draft) {
         { value: "", label: "跟随默认策略" }, ...MODEL_POOL_STRATEGIES.map(name => ({
           value: name, label: MODEL_POOL_STRATEGY_LABELS[name],
         })),
-      ], `${role} 调用策略`, name => { if (name) strategies[role] = name; else delete strategies[role]; });
+      ], `${role} 调用策略`, name => { if (name) strategies[role] = name; else delete strategies[role]; markDirty(); });
       const move = (i, j) => { [refs[i], refs[j]] = [refs[j], refs[i]]; renderRoles(); };
       const asRef = value => { const [provider, model] = JSON.parse(value); return { provider, model }; };
+      const add = value => { if (value) { pools[role] = [...refs, asRef(value)]; renderRoles(); } };
+      const verified = available.filter(opt => opt.evidence.effective === "available");
       return h("article", { class: "model-pool-item", dataset: { role } },
         h("div", { class: "model-pool-head" }, h("strong", { class: "field-label" },
           labels.has(role) ? `${labels.get(role)}（${role}）` : role), strategy,
           labels.has(role) ? null : action(`删除自定义角色 ${role}`, "trash", () => {
             roles.delete(role); delete pools[role]; delete strategies[role]; renderRoles();
           })),
-        refs.length ? refs.map((ref, i) => h("div", { class: "model-pool-row" },
-          h("span", { class: "model-pool-order" }, String(i + 1)),
+        refs.length ? refs.map((ref, i) => {
+          const proof = byKey.get(key(ref))?.evidence || modelEvidence(null, false, null);
+          return h("div", { class: `model-role-entry${i === 0 ? " first" : ""}`, dataset: { status: proof.effective } },
+          h("div", { class: "model-pool-row" }, h("span", { class: "model-pool-order" }, String(i + 1)),
           picker(key(ref), options.filter(opt => opt.value === key(ref) || available.includes(opt)),
             `${role} 第 ${i + 1} 个模型`, value => { refs[i] = asRef(value); renderRoles(); }),
           action(`上移 ${role} 第 ${i + 1} 项`, "up", () => move(i, i - 1), i === 0),
           action(`下移 ${role} 第 ${i + 1} 项`, "down", () => move(i, i + 1), i === refs.length - 1),
           action(`删除 ${role} 第 ${i + 1} 项`, "trash", () => {
             refs.splice(i, 1); if (!refs.length) delete pools[role]; renderRoles();
-          }, role === "chat" && refs.length === 1)
-        )) : h("span", { class: "field-hint" }, role === "chat" ? "请至少选择一个对话模型。" :
+          }, role === "chat" && refs.length === 1)),
+          h("div", { class: "model-actions" }, i === 0 ? h("span", { class: "tag accent" }, "首选") : null, modelEvidenceTags(proof)));
+        }) : h("span", { class: "field-hint" }, role === "chat" ? "请至少选择一个对话模型。" :
           role === "distill" ? "跟随记忆归纳模型池，未配置时跟随对话。" : "未单独配置，跟随对话模型池。"),
-        available.length ? picker("", [{ value: "", label: "＋ 选择模型加入池" }, ...available], `${role} 新增模型`, value => {
-          if (value) { pools[role] = [...refs, asRef(value)]; renderRoles(); }
-        }) : h("span", { class: "field-hint" }, "暂无其他可选模型。")
+        h("div", { class: "model-actions" }, verified.length ? picker("", [{ value: "", label: "加入可用模型" }, ...verified], `${role} 加入可用模型`, add) : null,
+          available.length ? picker("", [{ value: "", label: "从全部目录选择" }, ...available], `${role} 新增模型`, add) : h("span", { class: "field-hint" }, "暂无其他可选模型。"))
       );
     }));
   }
   renderProviders(); renderRoles();
   return h("div", { class: "model-layer-editor" },
-    h("h3", {}, "提供商与模型"),
-    h("span", { class: "field-hint" }, "每个提供商使用独立接口和密钥。改名或修改接口地址不会沿用已保存的密钥。"),
+    h("div", { class: "model-actions" }, h("h3", {}, "提供商与模型"), dirtyNote),
+    h("span", { class: "field-hint" }, "获取列表不消耗 token；单模型探测会发送一次最小请求。目录和角色池的修改需保存后才生效。"),
     providerHost, addButton("添加提供商", () => {
       let n = providers.length + 1;
       while (providers.some(p => p.name === `provider-${n}`)) n++;
-      providers.push({ name: `provider-${n}`, base_url: "", models: [] }); renderProviders();
+      providers.push({ name: `provider-${n}`, base_url: "", models: [] }); renderProviders(); markDirty();
     }),
     h("h3", {}, "角色模型池"),
     h("span", { class: "field-hint" }, "优先级由上到下；遇到超时、限流或服务端故障时尝试下一项。轮询和随机策略改变每次调用的起点。"),
@@ -4184,13 +4326,13 @@ function settingsMenu(layout, group, page) {
  * 每张卡用 ``path`` 标出它覆盖的代表字段，具体归到哪个二级页面由后端
  * ``layout.rules`` 决定；这里不再维护第二份「字段 → 页面」表。
  */
-function settingsCardSpecs(draft, secrets, pluginsAvailable) {
+function settingsCardSpecs(draft, secrets, pluginsAvailable, observations, historyWarning) {
   return [
     {
       path: "llm.providers",
       node: card("模型配置", {
         hint: "从提供商目录组装跨接口的角色池",
-        body: modelsEditor(draft),
+        body: modelsEditor(draft, observations, historyWarning),
       }),
     },
     {
@@ -5038,7 +5180,9 @@ async function renderSettingsGroup(view, groupId, sub, entry = {}) {
     errorBox.hidden = true;
     noticeBox.hidden = true;
     try {
-      const result = await api.put("/api/config", { config: settingsPayload(draft, group.id) });
+      const payload = settingsPayload(draft, group.id);
+      const result = group.id === "models" ? await api.put("/api/models/pool", payload.llm) :
+        await api.put("/api/config", { config: payload });
       toast("配置已保存");
       if (result.relogin) {
         // 口令变了，当前会话立即作废；重新登录后再看结果
@@ -5072,7 +5216,22 @@ async function renderSettingsGroup(view, groupId, sub, entry = {}) {
   });
 
   // 卡片按后端规则落到当前二级页面；同页卡片保持清单里的顺序
-  const cards = settingsCardSpecs(draft, secrets, data.plugins_available || [])
+  let observations, historyWarning;
+  if (group.id === "models") {
+    try {
+      const snapshot = await api.get("/api/models/pool");
+      // 目录、策略与诊断记录以同一份快照为准，其他配置仍由 /api/config 提供。
+      draft.llm.providers = snapshot.providers ?? draft.llm.providers;
+      draft.llm.role_pools = snapshot.role_pools ?? draft.llm.role_pools;
+      draft.llm.model_strategy = snapshot.strategy ?? draft.llm.model_strategy;
+      draft.llm.model_strategies = snapshot.strategies ?? draft.llm.model_strategies;
+      observations = snapshot.observations;
+    } catch (err) {
+      if (err instanceof Unauthorized) throw err;
+      historyWarning = "上次诊断记录读取失败，可重新获取模型。";
+    }
+  }
+  const cards = settingsCardSpecs(draft, secrets, data.plugins_available || [], observations, historyWarning)
     .filter((spec) => pageOf(layout, spec.path) === page.id)
     .map((spec) => spec.node);
 

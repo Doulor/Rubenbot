@@ -12,6 +12,7 @@ function setup() {
     api.get = async path => {
       if (path === '/api/plugins') return {items: [{name: 'demo', valid: true, manifest: {id: 'demo', config_schema: schema}}]};
       if (path === '/api/chats?limit=300') return {items: []};
+      if (path === '/api/models/pool') return {observations: {}};
       return new Promise((resolve, reject) => { pending[path] = {resolve, reject}; });
     };`);
   const route = hash => run(`location.hash = ${JSON.stringify(hash)}; renderRoute()`);

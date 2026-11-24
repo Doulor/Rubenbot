@@ -3,6 +3,7 @@
 
 llm:
   # 每个提供商有自己的 OpenAI 兼容端点、密钥和可选模型目录。
+  # WebUI「获取模型」只预览 /models；勾选并保存才写入 models，不自动填充角色池。
   providers:
     - name: deepseek
       base_url: "https://api.deepseek.com/v1"
@@ -45,6 +46,7 @@ llm:
     # tasks:
     #   chat: {daily_calls: 300, daily_cost_usd: 1.0}
     #   extract: {daily_calls: null}
+    #   model_probe: {daily_calls: 20}  # 只限制手动「测一下」，不限制获取模型列表
     #
     # 单价（美元 / 百万 token），用于费用估算。**不配就照实按 0 计，费用上限不会触发**
     # ——中转站没公布单价时不要拍脑袋填。键可写「提供商/模型」「模型」或「*」。
