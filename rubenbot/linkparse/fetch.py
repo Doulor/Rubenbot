@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import ipaddress
+import logging
 import math
 import socket
 from collections.abc import Callable
@@ -14,7 +15,9 @@ import httpcore
 import httpx
 from httpx._utils import URLPattern, get_environment_proxies
 
-from rubenbot.http_body import CompressedBodyError, read_compressed_body
+from ..http_body import CompressedBodyError, read_compressed_body
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -26,6 +29,19 @@ class FetchResult:
 
 class FetchError(ValueError):
     """链接不安全、不可达或超过限额；调用方可静默跳过。"""
+
+
+# 浏览器形态的请求头：不少资讯站对没有 UA 的请求直接回 403 或登录页。
+# 这是公开页面的普通抓取（链接预览），不带 Cookie、不在重定向间传递凭据。
+BASE_HEADERS = {
+    'User-Agent': (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+        '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+    ),
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    'Accept-Encoding': 'gzip, deflate',
+}
 
 
 def _url(value: str, base: httpx.URL | None = None) -> httpx.URL:
@@ -70,8 +86,17 @@ async def _resolve(host: str, port: int) -> str:
 
 def _proxy_for(url: httpx.URL) -> httpx.Proxy | None:
     # 使用核心 httpx 客户端相同的环境代理与 NO_PROXY 匹配规则，按原域名选路。
+    # 单条 NO_PROXY 写成无法解析的形式（例如 ``*[::1]``）时 httpx 自己也会
+    # 在构造客户端时失败；这里跳过该条并沿用其余规则，不让链接抓取因此静默全断。
     routes = get_environment_proxies()
-    for pattern in sorted(URLPattern(key) for key in routes):
+    patterns: list[URLPattern] = []
+    for key in routes:
+        try:
+            patterns.append(URLPattern(key))
+        except (httpx.InvalidURL, ValueError) as exc:
+            logger.warning("忽略无法解析的代理规则 %r：%s", key, exc)
+            continue
+    for pattern in sorted(patterns):
         if pattern.matches(url):
             proxy = routes[pattern.pattern]
             return httpx.Proxy(proxy) if proxy else None
@@ -79,7 +104,7 @@ def _proxy_for(url: httpx.URL) -> httpx.Proxy | None:
 
 
 @asynccontextmanager
-async def _open(url: httpx.URL, ip: str, port: int):
+async def _open(url: httpx.URL, ip: str, port: int, extra_headers: dict[str, str] | None = None):
     proxy = _proxy_for(url)
     if proxy and proxy.url.scheme not in ('http', 'https'):
         raise FetchError('不支持该代理类型，不回退直连')
@@ -115,8 +140,9 @@ async def _open(url: httpx.URL, ip: str, port: int):
                 stream = await stream.start_tls(tls, host)
             target = httpcore.URL(str(url))
             connection = httpcore.AsyncHTTP11Connection(target.origin, stream)
+            headers = {'Host': url.netloc, **BASE_HEADERS, **(extra_headers or {})}
             response = await stack.enter_async_context(connection.stream(
-                'GET', target, headers={'Host': url.netloc, 'Accept-Encoding': 'gzip, deflate'},
+                'GET', target, headers=headers,
             ))
             yield response
     finally:
@@ -126,26 +152,38 @@ async def _open(url: httpx.URL, ip: str, port: int):
 async def fetch(
     url: str, max_bytes: int, timeout_seconds: float, *, max_redirects: int = 5,
     allow_url: Callable[[str], bool] | None = None,
+    prepare: Callable[[str], tuple[str, dict[str, str]]] | None = None,
 ) -> FetchResult:
-    """限字节、限总耗时；max_redirects=0 禁跳转，allow_url 可在每跳解析前按站点拒绝。"""
+    """限字节、限总耗时；max_redirects=0 禁跳转，allow_url 可在每跳解析前按站点拒绝。
+
+    ``prepare`` 按平台改写这一跳实际请求的地址与请求头（例如 B 站视频页改走
+    移动站）；改写后的地址仍走同一套 DNS / SSRF 校验与限额，不做例外。
+    """
     if (not isinstance(max_bytes, int) or max_bytes <= 0 or not math.isfinite(timeout_seconds)
             or timeout_seconds <= 0 or not isinstance(max_redirects, int) or max_redirects < 0):
         raise FetchError('抓取限额无效')
     try:
         async with asyncio.timeout(timeout_seconds):
             current = _url(url)
+            extra_headers: dict[str, str] = {}
             for hop in range(max_redirects + 1):
                 if allow_url is not None and not allow_url(str(current)):
                     raise FetchError('站点策略拒绝目标链接')
-                port = current.port or (443 if current.scheme == 'https' else 80)
-                ip = await _resolve(current.raw_host.decode('ascii'), port)
-                async with _open(current, ip, port) as response:
+                target_url = current
+                if prepare is not None:
+                    target, extra_headers = prepare(str(current))
+                    target_url = _url(target)
+                    if allow_url is not None and target_url != current and not allow_url(str(target_url)):
+                        raise FetchError('站点策略拒绝目标链接')
+                port = target_url.port or (443 if target_url.scheme == 'https' else 80)
+                ip = await _resolve(target_url.raw_host.decode('ascii'), port)
+                async with _open(target_url, ip, port, extra_headers) as response:
                     headers = httpx.Headers(response.headers)
                     if response.status in (301, 302, 303, 307, 308):
                         locations = headers.get_list('location')
                         if hop == max_redirects or len(locations) != 1:
                             raise FetchError('重定向超限或缺少唯一目标')
-                        current = _url(locations[0], current)
+                        current = _url(locations[0], target_url)
                         continue
                     if not 200 <= response.status < 300:
                         raise FetchError(f'站点返回 HTTP {response.status}')
@@ -170,6 +208,8 @@ async def fetch(
                                        'windows-1252', 'iso-8859-1', 'utf-16', 'utf-16le', 'utf-16be'}:
                         charset = 'utf-8'
                     text = body.decode(charset, errors='replace')
+                    # final_url 报告逻辑地址（跟随跳转后、平台改写前）：移动站只是
+                    # 读取手段，不该让模型看到「链接」变成另一个域名。
                     return FetchResult(str(current), content_type, text)
     except FetchError:
         raise

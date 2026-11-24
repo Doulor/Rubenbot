@@ -30,6 +30,7 @@ from ..config import (
     _expand_env, normalize_muted_senders,
 )
 from ..decision import parse_quiet_hours
+from ..linkparse.settings import DELIVERIES, MODES
 
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 MODEL_NAME_MAX_LEN = 120
@@ -140,6 +141,7 @@ _SETTINGS_PAGE_RULES: tuple[tuple[str, str], ...] = (
     ("emotion", "emotion"),
     ("voice", "voice"),
     ("stickers", "emoji"),
+    ("link", "chat"),
     # persona 页是 SOUL 编辑器
     # ---- 模型 ----
     ("llm", "models"),
@@ -337,6 +339,7 @@ def structured_config(config: Config) -> dict[str, Any]:
             "vision_image_max_side": config.stickers.vision_image_max_side,
             "vision_image_quality": config.stickers.vision_image_quality,
         },
+        "link": asdict(config.link),
         "plugins": {
             "dir": config.plugins.dir,
             "enabled": list(config.plugins.enabled),
@@ -1297,6 +1300,42 @@ def _validate_adapters(section: dict[str, Any], v: _Validator) -> dict[str, Any]
     return out
 
 
+def _validate_link(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
+    """链接理解（core 感知层）：模式 / 投递 / 限额都从表单可改。"""
+    out: dict[str, Any] = {}
+    if "enabled" in section:
+        value = v.boolean(section["enabled"], "link.enabled")
+        if value is not None:
+            out["enabled"] = value
+    for key, allowed in (("mode", MODES), ("delivery", DELIVERIES)):
+        if key in section:
+            value = str(section[key] or "").strip()
+            if value not in allowed:
+                v.fail(f"link.{key}", f"只能是 {' / '.join(allowed)} 之一")
+            else:
+                out[key] = value
+    for key, minimum, maximum in (("cooldown_seconds", 0, 86400),
+                                  ("cache_ttl_seconds", 0, 604800),
+                                  ("timeout_seconds", 0.1, 30)):
+        if key in section:
+            value = v.number(section[key], f"link.{key}", minimum=minimum, maximum=maximum)
+            if value is not None:
+                out[key] = float(value)
+    for key, minimum, maximum in (("daily_limit", 0, 100000),
+                                  ("max_bytes", 1, 4 * 1024 * 1024),
+                                  ("max_links", 1, 10),
+                                  ("max_body_chars", 200, 5000)):
+        if key in section:
+            value = v.number(section[key], f"link.{key}", integer=True, minimum=minimum, maximum=maximum)
+            if value is not None:
+                out[key] = int(value)
+    if "fallback_tool" in section:
+        value = v.text(section["fallback_tool"], "link.fallback_tool", allow_empty=True, max_len=120)
+        if value is not None:
+            out["fallback_tool"] = value
+    return out
+
+
 def _validate_webui(section: dict[str, Any], v: _Validator) -> dict[str, Any]:
     out: dict[str, Any] = {}
     if "enabled" in section:
@@ -1398,6 +1437,9 @@ def validate_structured(payload: dict[str, Any]) -> dict[str, Any]:
     stickers = _section(payload, "stickers", v)
     if stickers is not None:
         update["stickers"] = _validate_stickers(stickers, v)
+    link = _section(payload, "link", v)
+    if link is not None:
+        update["link"] = _validate_link(link, v)
     plugins = _section(payload, "plugins", v)
     if plugins is not None:
         update["plugins"] = _validate_plugins(plugins, v)

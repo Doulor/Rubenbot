@@ -21,7 +21,7 @@ from rubenbot.plugins.config_schema import (
     validate_values,
 )
 from rubenbot.plugins.manifest import load_manifest
-from rubenbot.web.market import MarketError, MarketService
+from rubenbot.web.market import MarketService
 from rubenbot.web.plugin_detail import PluginDetailError, plugin_detail
 from rubenbot.web.state import WebState
 
@@ -132,29 +132,21 @@ def test_validate_values_skips_empty_secret_and_reports_fields():
     assert errors == [{"field": "count", "message": "不能小于 0"}]
 
 
-def test_official_link_parse_schema_is_fully_expressive():
-    """第 25 项要用的投递方式必须能用 schema 表达（可选值 + 默认 direct）。"""
-    manifest = load_manifest(OFFICIAL / "link_parse")
+def test_official_music_schema_is_fully_expressive():
+    """schema 要能表达枚举、范围与列表这类配置面。"""
+    manifest = load_manifest(OFFICIAL / "music")
     fields = {field.key: field for field in normalize_schema(manifest.config_schema)}
-    delivery = fields["delivery"]
-    assert delivery.type == "string"
-    assert delivery.default == "direct"
-    assert [option["value"] for option in delivery.options] == ["direct", "planner"]
-    assert fields["mode"].options
-    assert fields["sites"].type == "list"
-    assert fields["timeout_seconds"].min == pytest.approx(0.1)
-    assert fields["timeout_seconds"].max == pytest.approx(30)
+    assert fields["select_mode"].options
+    assert fields["song_limit"].min == pytest.approx(1)
+    assert fields["song_limit"].max == pytest.approx(20)
 
 
-def test_music_and_link_parse_declare_all_runtime_keys():
-    """music / link_parse 的全部可配项都要进 schema，否则 UI 改不到。"""
-    from plugins.link_parse.plugin import Settings as LinkSettings
+def test_official_plugins_declare_all_runtime_keys():
+    """官方插件的全部可配项都要进 schema，否则 UI 改不到。"""
     from plugins.music.plugin import MusicConfig
 
     music = {field.key for field in normalize_schema(load_manifest(OFFICIAL / "music").config_schema)}
     assert music == set(MusicConfig.__dataclass_fields__)
-    link = {field.key for field in normalize_schema(load_manifest(OFFICIAL / "link_parse").config_schema)}
-    assert link == set(LinkSettings.__dataclass_fields__)
 
 
 # ----------------------------------------------------------------------
@@ -350,42 +342,6 @@ def test_music_config_roundtrip_through_schema(tmp_path):
     assert detail["config"]["values"] == wanted
 
 
-def test_link_parse_all_options_roundtrip_and_validation(tmp_path):
-    root = tmp_path / "plugins"
-    shutil.copytree(OFFICIAL / "link_parse", root / "link_parse")
-    state = make_state(tmp_path, root)
-    state.plugins.discover()
-    market = MarketService(state)
-
-    wanted = {
-        "mode": "auto",
-        "cooldown_seconds": 30,
-        "daily_limit": 5,
-        "cache_ttl_seconds": 120,
-        "max_bytes": 4096,
-        "timeout_seconds": 2.5,
-        "sites": ["generic"],
-        "delivery": "planner",
-    }
-    saved = market.save_plugin_config("link_parse", wanted)
-    assert saved["values"] == wanted
-    assert market.get_plugin_config("link_parse")["values"] == wanted
-    # 插件自己的 Settings 能读到保存后的值
-    from plugins.link_parse.plugin import Settings
-
-    settings = Settings.load(root / "link_parse")
-    assert settings.delivery == "planner" and settings.mode == "auto"
-    assert settings.sites == frozenset({"generic"})
-
-    with pytest.raises(MarketError) as excinfo:
-        market.save_plugin_config("link_parse", {"delivery": "broadcast", "timeout_seconds": 99})
-    assert excinfo.value.status == 422
-    fields = {item["field"]: item["message"] for item in excinfo.value.fields}
-    assert "delivery" in fields and "timeout_seconds" in fields
-    # 校验失败不写盘
-    assert market.get_plugin_config("link_parse")["values"] == wanted
-
-
 def test_save_config_keeps_unknown_yaml_keys_and_drops_empty_secret(tmp_path):
     root = tmp_path / "plugins"
     directory = make_plugin(
@@ -451,8 +407,8 @@ def test_detail_route_uses_manifest_id(tmp_path):
 
 
 def test_registry_json_is_valid_after_schema_upgrade():
-    """两份官方 manifest 仍能被市场解析（schema 只是多了可选字段）。"""
-    for name in ("music", "link_parse"):
+    """官方 manifest 仍能被市场解析（schema 只是多了可选字段）。"""
+    for name in ("music", "image_gen"):
         path = OFFICIAL / name / "manifest.json"
         data = json.loads(path.read_text(encoding="utf-8"))
         manifest = load_manifest(OFFICIAL / name)

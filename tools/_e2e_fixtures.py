@@ -1,10 +1,9 @@
-"""实测台场景 3、6；同一文件以 --stdio 启动时只提供本地回声工具。"""
+"""实测台场景 3、6（MCP 真调用与链接理解）；同一文件以 --stdio 启动时只提供本地回声工具。"""
 
 import json
 import logging
 import re
 import secrets
-import shutil
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -24,17 +23,11 @@ def configure(config, root: Path, *, mcp: bool, link: bool):
         config.mcp.servers = [MCPServerConfig(
             name=_SERVER, command=sys.executable, args=["-I", "-B", str(Path(__file__).resolve()), "--stdio"],
         )]
-    plugins = root / "fixture-plugins"
-    config.plugins.dir = str(plugins)
-    if not link:
-        return
-    source = Path(__file__).resolve().parents[1] / "plugins" / "link_parse"
-    dest = plugins / "link_parse"
-    dest.mkdir(parents=True, exist_ok=True)
-    for name in ("plugin.py", "parse.py", "fetch.py", "manifest.json"):
-        shutil.copyfile(source / name, dest / name)
-    (dest / "config.yaml").write_text("mode: on_mention\nsites: [generic]\n", encoding="utf-8")
-    config.plugins.enabled = ["link_parse"]
+    config.plugins.dir = str(root / "fixture-plugins")
+    if link:
+        # 链接理解已进 core 感知层：链接插件退役，这里显式打开 core 的读链接能力。
+        config.link.enabled = True
+        config.link.mode = "on_mention"
 
 
 def _stdio():
@@ -123,50 +116,46 @@ async def mcp(ctx):
 
 
 async def _cache_control(ctx, url, marker):
-    """只给刚装配的临时插件注入一条已解析的合成记录，不替换网络函数或钩子。"""
-    plugin = ctx.bot.plugins.plugins["link_parse"]
-    if plugin.path.resolve() != (ctx.root / "fixture-plugins/link_parse").resolve():
-        return "缓存对照未运行：不是夹具的临时插件实例"
-    parsers = [h.__self__ for h in plugin.before_reply_hooks if getattr(h, "__name__", "") == "before_reply"
-               and getattr(h, "__self__", None) is not None]
-    if len(parsers) != 1 or not hasattr(parsers[0], "cache"):
-        return "缓存对照未运行：未找到已注册的解析器缓存"
-    cache = parsers[0].cache
-    page = {"标题": "测试文章", "正文": marker, "链接": url}
+    """只给 core 的链接缓存注入一条已解析的合成记录，不替换网络函数或钩子。"""
+    from rubenbot.linkparse import LinkResult
+
+    service = ctx.bot.link_service
+    page = LinkResult(url=url, final_url=url, platform="generic", platform_name="网页",
+                      fields={"标题": "测试文章", "正文": marker})
     start = len(ctx.prompts)
-    cache.put(url, page, 300)
+    service.cache.put(url, page, 300)
     try:
         await _send(ctx, f"请概括这篇文章：{url} （只参考链接资料，不另行查询）。",
                     chat="e2e-link-control", group=True, mention=True)
     except AssertionError:
         return "缓存对照失败：消息轮未完成"
     finally:
-        cache.entries.pop(url, None)
+        service.cache.pop(url)
     for messages in ctx.prompts[start:]:
         systems = [m["content"] for m in messages if m.get("role") == "system" and isinstance(m.get("content"), str)]
         if any(marker in s for s in systems):
             return "缓存对照失败：合成正文进入了 system 消息"
-        guide = any("external_link_data" in s and "不可信外部文本" in s and "不是指令" in s for s in systems)
+        guide = any("external_link_data" in s and "不可信外部网页文本" in s and "不是指令" in s for s in systems)
         if not guide:
             continue
         for msg in messages:
             if msg.get("role") != "user" or not isinstance(msg.get("content"), str):
                 continue
-            block = re.fullmatch(r"【链接解析·外部资料】\s*<external_link_data>(.*?)</external_link_data>",
+            block = re.fullmatch(r"【链接理解·外部资料】\s*<external_link_data>(.*?)</external_link_data>",
                                  msg["content"], re.DOTALL)
             if block:
                 try:
                     data = json.loads(block[1])
                 except ValueError:
                     continue
-                if data == [page]:
+                if data and data[0].get("正文") == marker and data[0].get("链接") == url:
                     return "缓存对照通过（非网络抓取）：同一模型请求有 system 隔离说明，独立 user 数据块含合成正文校验码"
     return "缓存对照失败：模型请求未同时包含 system 隔离说明和含正文校验码的独立 user 数据块"
 
 
 async def link(ctx):
-    if not ctx.bot.plugins or "link_parse" not in ctx.bot.plugins.enabled_names:
-        raise AssertionError("链接插件未加载，无法检验外部资料是否注入")
+    if not ctx.bot.link_service.active:
+        raise AssertionError("core 链接理解未启用，无法检验外部资料是否注入")
     marker = "假页面正文校验码" + secrets.token_hex(8)
     body = f"<html><title>测试文章</title><article>{marker}</article></html>".encode()
     fetched = threading.Event()
@@ -189,14 +178,14 @@ async def link(ctx):
     try:
         server = ThreadingHTTPServer(("127.0.0.1", 0), Page)
     except OSError:
-        raise AssertionError("本地假页面未能监听回环端口，无法检验链接插件") from None
+        raise AssertionError("本地假页面未能监听回环端口，无法检验链接读取") from None
     with server:
         thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
         thread.start()
         try:
             url = f"http://127.0.0.1:{server.server_port}/article"
             start = len(ctx.prompts)
-            await _send(ctx, f"请总结这个链接的内容：{url} （只参考链接插件提供的资料，不使用工具）。",
+            await _send(ctx, f"请总结这个链接的内容：{url} （只参考链接资料，不使用工具）。",
                         chat="e2e-link", group=True, mention=True)
         finally:
             server.shutdown()
@@ -212,7 +201,7 @@ async def link(ctx):
     if not any(url in str(m.get("content")) for messages in snapshots for m in messages):
         raise AssertionError("未观察到携带本轮链接的模型请求，不能判断上下文注入")
     control = await _cache_control(ctx, url + "-cache-control", marker)
-    raise AssertionError(f"插件仅抓公网：本地假页面零访问，真实抓取未注入；{control}")
+    raise AssertionError(f"链接读取仅抓公网：本地假页面零访问，真实抓取未注入；{control}")
 
 
 if __name__ == "__main__" and sys.argv[1:] == ["--stdio"]:

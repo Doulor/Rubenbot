@@ -8,7 +8,7 @@ import zlib
 import httpcore
 import pytest
 
-from plugins.link_parse import fetch as mod
+from rubenbot.linkparse import fetch as mod
 
 
 PUBLIC = '1.1.1.1'
@@ -254,3 +254,29 @@ def test_total_deadline_includes_dns_and_body(net, monkeypatch, block_at):
     with pytest.raises(mod.FetchError, match='超时'):
         run('http://site.example/', timeout=0.03)
     assert not net.connections if block_at == 'dns' else s.closed
+
+
+def test_platform_request_hint_rewrites_target_but_keeps_checks(net):
+    """B 站视频页改走移动站：改的是这一跳的地址与 UA，DNS 校验照做。"""
+    from rubenbot.linkparse import sites
+
+    net.answers['m.bilibili.com'] = [[PUBLIC]]
+    s = net.serve(reply(headers=['Content-Type: text/html', 'Content-Length: 2'], body=b'ok'))
+    result = run('https://www.bilibili.com/video/BV1xx411c7mD/', prepare=sites.prepare)
+    # 报告的是逻辑地址（移动站只是读取手段），请求实际打到移动站
+    assert result.final_url == 'https://www.bilibili.com/video/BV1xx411c7mD/'
+    assert net.lookups == [('m.bilibili.com', 443)] and net.connections == [(PUBLIC, 443)]
+    assert b'GET /video/BV1xx411c7mD/ HTTP/1.1\r\n' in s.writes
+    assert b'Host: m.bilibili.com\r\n' in s.writes
+    assert sites.MOBILE_UA.encode() in s.writes
+    # 非视频页不改写
+    assert sites.prepare('https://www.bilibili.com/read/cv123') == ('https://www.bilibili.com/read/cv123', {})
+
+
+def test_platform_request_hint_still_runs_site_filter(net):
+    from rubenbot.linkparse import sites
+
+    with pytest.raises(mod.FetchError, match='站点策略'):
+        run('https://www.bilibili.com/video/BV1xx411c7mD/', prepare=sites.prepare,
+            allow_url=lambda url: 'www.bilibili.com' in url)
+    assert not net.lookups and not net.connections

@@ -49,7 +49,7 @@ REPORT = Path.home() / 'workspace/rubenbot-night/e2e-results.md'
 SCENARIOS = (
     ('节奏守卫', _e2e_dialog.rhythm), ('附和闸门', _e2e_dialog.echo_gate),
     ('MCP 真调用', _e2e_fixtures.mcp), ('访客沙盒', _e2e_computer.sandbox),
-    ('白名单真机', _e2e_computer.host), ('链接插件', _e2e_fixtures.link),
+    ('白名单真机', _e2e_computer.host), ('链接理解', _e2e_fixtures.link),
     ('决策书落盘', _e2e_dialog.decision), ('社交信号泛化', _e2e_dialog.social_signal),
     ('星驰装熟', _e2e_dialog.xingchi), ('panda 绕答', _e2e_dialog.panda),
     ('Argon 自领属性', _e2e_dialog.argon), ('破甲／依据门', _e2e_dialog.basis_gate),

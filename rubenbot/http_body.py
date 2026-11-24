@@ -13,7 +13,7 @@ async def read_compressed_body(
 ) -> bytearray:
     """解压正文，最多输出 ``limit`` 字节。
 
-    默认超限抛 :class:`CompressedBodyError`（链接插件、表情下载等需要完整正文）。
+    默认超限抛 :class:`CompressedBodyError`（链接理解、表情下载等需要完整正文）。
     ``allow_truncated=True`` 时按「截断」处理：解到额度就停，返回已解出的部分，
     由调用方补截断标记。抓页只需要前几 KiB 正文，不能因为页面正文比读取
     额度大就整页放弃（实测多数资讯站解压后 35–100 KiB）。

@@ -814,6 +814,41 @@ def test_search_section_structured_view_and_secret(config):
     assert "search.deepseek.api_key" in SECRET_PATHS
 
 
+def test_link_section_structured_view_and_validation(config):
+    """链接理解（core 感知层）也在设置页里可读可改。"""
+    config.link.mode = "auto"
+    config.link.delivery = "planner"
+    view = structured_config(config)
+    assert view["link"]["mode"] == "auto"
+    assert view["link"]["delivery"] == "planner"
+    assert view["link"]["max_bytes"] == 1024 * 1024
+    assert resolve_page("link.mode") == "chat"
+    assert assign_pages(view)["chat"]
+
+    update = validate_structured({
+        "link": {
+            "enabled": True, "mode": "on_mention", "delivery": "direct",
+            "cooldown_seconds": "30", "daily_limit": "5", "cache_ttl_seconds": "120",
+            "max_bytes": "4096", "timeout_seconds": "2.5", "max_links": "4",
+            "max_body_chars": "800", "fallback_tool": " mcp__fetch__read ",
+        }
+    })
+    assert update["link"]["cooldown_seconds"] == 30
+    assert update["link"]["daily_limit"] == 5
+    assert update["link"]["max_bytes"] == 4096
+    assert update["link"]["fallback_tool"] == "mcp__fetch__read"
+    with pytest.raises(ConfigValidationError) as excinfo:
+        validate_structured({"link": {"mode": "always"}})
+    assert excinfo.value.fields == [{"field": "link.mode", "message": "只能是 on_mention / auto 之一"}]
+
+
+def test_put_structured_link_rejects_bad_mode(client):
+    response = client.put("/api/config", json={"config": {"link": {"mode": "always", "max_bytes": 0}}})
+    assert response.status_code == 422
+    fields = {item["field"] for item in response.json()["fields"]}
+    assert {"link.mode", "link.max_bytes"} <= fields
+
+
 def test_put_structured_search_section(client, config_path, state):
     response = client.put(
         "/api/config",

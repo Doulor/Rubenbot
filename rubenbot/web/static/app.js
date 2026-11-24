@@ -4470,6 +4470,31 @@ function settingsCardSpecs(draft, secrets, pluginsAvailable) {
       }),
     },
     {
+      path: "link.enabled",
+      node: card("链接理解", {
+        hint: "任意 http(s) 链接都尝试读取；结果只作外部资料，不当指令",
+        body: fieldGrid([
+          { path: "link.enabled", label: "读链接", kind: "switch", hint: "关掉后完全不发外部请求，链接只当普通文字" },
+          { path: "link.mode", label: "触发口径", kind: "select", options: [
+            { value: "on_mention", label: "被点名或被问到时读" },
+            { value: "auto", label: "收到链接就预取" },
+          ] },
+          { path: "link.delivery", label: "投递方式", kind: "select", options: [
+            { value: "direct", label: "直接喂本轮回复" },
+            { value: "planner", label: "交给策划步决定" },
+          ] },
+          { path: "link.cooldown_seconds", label: "自动模式冷却（秒）", kind: "number", step: "1", min: 0, max: 86400 },
+          { path: "link.daily_limit", label: "每日抓取上限", kind: "number", step: "1", min: 0, max: 100000, hint: "自动模式每天的新抓取总次数；0 表示不新抓" },
+          { path: "link.cache_ttl_seconds", label: "缓存时间（秒）", kind: "number", step: "1", min: 0, max: 604800 },
+          { path: "link.max_bytes", label: "单页读取上限（字节）", kind: "number", step: "1024", min: 1, max: 4194304 },
+          { path: "link.timeout_seconds", label: "单链接超时（秒）", kind: "number", step: "0.1", min: 0.1, max: 30, hint: "含 DNS、跳转和读正文" },
+          { path: "link.max_links", label: "每条消息最多读几个", kind: "number", step: "1", min: 1, max: 10 },
+          { path: "link.max_body_chars", label: "正文摘录上限（字）", kind: "number", step: "100", min: 200, max: 5000 },
+          { path: "link.fallback_tool", label: "兜底 MCP 工具", mono: true, wide: true, hint: "主链路读不到时才调用，形如 mcp__server__tool，参数 {\"url\": …}；留空不兜底" },
+        ], draft),
+      }),
+    },
+    {
       path: "attention.talk_value",
       node: card("群聊回复时机", {
         hint: "先查看一批消息，再决定要不要开口。私聊和硬触发消息始终会查看。",

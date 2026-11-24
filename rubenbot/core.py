@@ -65,6 +65,14 @@ from .llm import (
     normalize_dsml_message,
     strip_dsml,
 )
+from .linkparse.service import (
+    LINK_CAPABILITY_TITLE,
+    LinkContext,
+    LinkService,
+    asks_about_link,
+    capability_note,
+    directed_at_bot,
+)
 from .mcp_client import MCPManager
 from .memory.consolidate import Consolidator
 from .memory.entities import EntityLedger
@@ -534,6 +542,9 @@ class RubenBot:
         self.states = StateDistiller(llm, store, config.memory)
         # 联网搜索（LLM 工具）：没配 api_key 时为 None，工具不开放
         self.searcher: WebSearcher | None = build_searcher(config.search)
+        # 链接理解（感知层）：任何 http(s) 链接都尝试读取；默认 on_mention。
+        # 抓取受 SSRF 校验、字节与总耗时上限约束，结果只作外部资料注入。
+        self.link_service = self._build_link_service(config.link)
         # MCP 连接与适配器一样，按启动时的配置建连，重启后才切换。
         self.mcp = MCPManager(config.mcp)
         # 语音双向（STT/TTS）：转写与合成都没配时为 None，全部降级为文字
@@ -616,6 +627,17 @@ class RubenBot:
         # 事件通道：能解析 notice/request 的适配器把事件交给核心入口
         adapter.set_platform_event_callback(self.handle_platform_event)
 
+    def _build_link_service(self, config) -> LinkService:
+        """构造链接读取服务；MCP 兜底按调用时的配置判断是否需要。
+
+        兜底只在主链路读不到、且 ``link.fallback_tool`` 指向已发布工具时调用一次，
+        属于可选路径，不参与主链路，也不把工具故障当成读到了内容。
+        """
+        async def fallback(name: str, url: str) -> str:
+            return await self.mcp.call(name, {"url": url})
+
+        return LinkService(config, fallback=fallback)
+
     @property
     def stickers(self) -> StickerStore:
         """表情库（惰性创建：测试里不碰磁盘，真正用到时才建目录）。"""
@@ -673,6 +695,9 @@ class RubenBot:
                     pass
         # 情绪规则：参数换新，已落库的好感度/心情不受影响
         self.emotion.config = config.emotion
+        # 链接理解：参数换新；缓存、冷却与当日额度按新参数继续用，不重置。
+        if getattr(self, "link_service", None) is not None:
+            self.link_service.config = config.link
         # 网关与事件路由：配置对象换新；冷却/预算状态落库，不受影响
         self.gateway.config = config
         self.gateway.gatekeeper.config = config
@@ -1356,6 +1381,15 @@ class RubenBot:
                 return
 
         hard = self.decision_engine.is_hard_trigger(event)
+        # 自动模式：收到链接就预取，本轮的裁定/回复只取已抓到的资料。
+        # 一条消息里的多个链接并发抓取，整批最坏等一个总超时；单个链接失败
+        # 不影响其它链接，也不向上抛。on_mention 模式不在这里抓，等确认要
+        # 回复后再按触发口径读。
+        if self.link_service.active and self.link_service.config.mode == "auto":
+            try:
+                await self.link_service.prefetch(event)
+            except Exception as exc:  # noqa: BLE001 - 预取失败按普通消息处理
+                logger.warning("链接预取异常：%s", type(exc).__name__)
         # 主人按已配置的平台账号白名单识别，只提高查看优先级，不改必回规则。
         owner = computer.is_host(self.config.computer, event)
         # 逐条处理明确的平台委托，避免混入电脑任务或借用合批中他人的引用与权限。
@@ -1494,6 +1528,8 @@ class RubenBot:
                 visual_wait = report
         visual_snapshots = self._visual_snapshots(round_.events)
         decision.visual_note = self._decision_visual_note(event, round_.events, visual_snapshots)
+        link_context: LinkContext | None = None
+        link_note: dict[str, Any] | None = None
         messages = await self.build_context(event, now=now, stage="planner", batch=round_.events,
                                             visual_snapshots=visual_snapshots)
         # 让模型知道「可以不接话」的出口
@@ -1506,6 +1542,27 @@ class RubenBot:
                 messages = await self.plugins.run_before_reply(self.context, event, messages) or messages
             except Exception as exc:  # noqa: BLE001
                 logger.warning("插件 on_before_reply 异常：%s", exc)
+        # 链接理解（感知层）：与图片描述同性质，不是插件。
+        # 插件钩子跑完再决定「这句是不是在问我」：被 @ / 叫名字 / 回复 bot，
+        # 或正文（插件可能改写）本身在问/让看链接；auto 模式取预取结果。
+        if self.link_service.active:
+            directed = directed_at_bot(event, self.decision_engine.match_alias)
+            asking = asks_about_link(event.text)
+            if self.link_service.config.mode == "auto" or directed or asking:
+                try:
+                    link_context = await self.link_service.collect(
+                        event, store=self.store, directed=directed, asking=asking,
+                    )
+                except Exception as exc:  # noqa: BLE001 - 读链接失败按普通消息处理
+                    logger.warning("链接读取异常：%s", type(exc).__name__)
+            link_note = link_context.factor() if link_context is not None else None
+        # 策划步只拿索引（标题/摘要/状态）；direct 投递把正文也一并给策划。
+        # 链接数据块追加在末尾，插件注入的资料保持原位置。
+        planner_messages = messages
+        if link_context is not None:
+            planner_messages = LinkService.inject(
+                messages, link_context, full=self.link_service.config.delivery == "direct",
+            )
 
         # 是否允许策划选择操作，只认同一真实账号的本轮请求；不能借另一人的 @ 授权。
         tools_allowed = not flight.used_action and all(item.sender_id == event.sender_id for item in round_.events)
@@ -1513,21 +1570,33 @@ class RubenBot:
                           and (computer.is_host(self.config.computer, event) or hard)
                           and all(item.mentions_bot or not (item.mentions or item.reply_to_id)
                                   or item.reply_sender_id == BOT_SENDER_ID for item in round_.events))
-        expression = await self.plan_expression(messages, event, decision, now=now, computer_route=computer_route)
+        # planner 投递时本轮能力只作为「看链接」索引项；direct 已经把资料给了
+        # 策划，不再需要它自己选。
+        extra_notes = (
+            (capability_note(link_context),)
+            if link_context is not None and self.link_service.config.delivery == "planner"
+            else ()
+        )
+        expression = await self.plan_expression(
+            planner_messages, event, decision, now=now, computer_route=computer_route,
+            extra_notes=extra_notes,
+        )
         if flight.updates:
             return
         # 单纯传来画面不是文字提问，即使来自私聊也不替策划强行开口。
         visual_only = _visual_only(round_.events)
         if expression.speak is False and (retry or visual_only or not hard):
             decision.should_reply, decision.reason = False, "planner_silence"
-            self._log_decision(event, decision, now, expression, visual_wait=visual_wait)
+            self._log_decision(event, decision, now, expression, visual_wait=visual_wait,
+                               links=link_note)
             return
         # 明确裁定沉默而被必回覆盖时，原裁定照常审计；只替换给生成端的指导。
         override_silence = bool(hard and expression.speak is False)
         if expression.intent == "沉默" and not override_silence:
             decision.should_reply = False
             decision.reason = "expression_silence"
-            self._log_decision(event, decision, now, expression, must=hard, visual_wait=visual_wait)
+            self._log_decision(event, decision, now, expression, must=hard, visual_wait=visual_wait,
+                               links=link_note)
             return
 
         operation = expression.intent == COMPUTER_INTENT
@@ -1539,14 +1608,16 @@ class RubenBot:
         ):
             if proactive:
                 self.decision_engine.note_source_reply(event, round_.events, time.time())
-            self._log_decision(event, decision, now, expression, must=hard, visual_wait=visual_wait)
+            self._log_decision(event, decision, now, expression, must=hard, visual_wait=visual_wait,
+                               links=link_note)
             return
         if flight.updates:
             return
         if expression.intent == '表情回应':
             # 本来只想用表情回应；无图、未启用或发送失败都不换成硬挤一句话。
             decision.should_reply, decision.reason = False, 'sticker_unavailable'
-            self._log_decision(event, decision, now, expression, must=hard, visual_wait=visual_wait)
+            self._log_decision(event, decision, now, expression, must=hard, visual_wait=visual_wait,
+                               links=link_note)
             return
         # 生成步换成人格 + 回复风格；场景/记忆/工具说明原样保留。
         # 策划步的前缀按同一规则重新组装（确定性，正常必定一致）；万一
@@ -1563,6 +1634,13 @@ class RubenBot:
         correction = self.opener_guard.correction(round_.key)
         if correction:
             messages[0]["content"] += "\n\n" + correction
+        # 链接正文交给生成步：direct 一律给；planner 只有策划选中「看链接」才给。
+        # 未选中时不塞正文，避免把没被采用的网页内容带进草稿。
+        if link_context is not None and (
+            self.link_service.config.delivery == "direct"
+            or LINK_CAPABILITY_TITLE in expression.capabilities
+        ):
+            messages = LinkService.inject(messages, link_context, full=True)
         generation_plan = expression
         if override_silence and expression.intent == "沉默":
             generation_plan = replace(expression, intent="短附和", length_band="碎片", increment="")
@@ -1580,6 +1658,8 @@ class RubenBot:
             for note in self.capability_notes(event):
                 if note.title in generation_plan.capabilities:
                     guidance += f"\n〔{note.title}〕{note.detail}"
+            if link_context is not None and LINK_CAPABILITY_TITLE in generation_plan.capabilities:
+                guidance += f"\n〔{LINK_CAPABILITY_TITLE}〕{capability_note(link_context).detail}"
         messages = [*messages, {"role": "system", "content": guidance}]
         if operation:
             # 不把其他账号的历史、群内引文、策划生成的参数或记忆交给真机执行器。
@@ -1627,7 +1707,8 @@ class RubenBot:
                 decision.should_reply = sent
                 if not sent:
                     decision.reason = "computer_task_send_failed"
-                self._log_decision(event, decision, now, expression, must=hard, visual_wait=visual_wait)
+                self._log_decision(event, decision, now, expression, must=hard,
+                                   visual_wait=visual_wait, links=link_note)
                 self.opener_guard.clear_pending(round_.key)
                 return
             if flight.computer_failed or (operation and not raw):
@@ -1639,7 +1720,8 @@ class RubenBot:
                                              begin_send=flight.begin_send)
                 if sent and proactive:
                     self.decision_engine.note_source_reply(event, round_.events, time.time())
-                self._log_decision(event, decision, now, expression, must=hard, visual_wait=visual_wait)
+                self._log_decision(event, decision, now, expression, must=hard,
+                                   visual_wait=visual_wait, links=link_note)
                 self.opener_guard.clear_pending(round_.key)
                 return
             body = clean_reply_patterns(strip_transcript_prefix(raw))
@@ -1700,7 +1782,7 @@ class RubenBot:
             break
         if not decision.should_reply:
             self._log_decision(event, decision, now, expression, must=hard,
-                               paraphrase=paraphrase_note, visual_wait=visual_wait)
+                               paraphrase=paraphrase_note, visual_wait=visual_wait, links=link_note)
             # 没发出去：本轮纠偏没兑现，下轮可以继续提醒
             self.opener_guard.clear_pending(round_.key)
             return
@@ -1718,7 +1800,7 @@ class RubenBot:
         if flight.updates:
             return
         self._log_decision(event, decision, now, expression, must=hard,
-                           paraphrase=paraphrase_note, visual_wait=visual_wait)
+                           paraphrase=paraphrase_note, visual_wait=visual_wait, links=link_note)
         self.opener_guard.clear_pending(round_.key)
         if not visual_only:
             await self.sticker_behavior.on_after_reply(self.context, event, reply)
@@ -1764,11 +1846,15 @@ class RubenBot:
         must: str | None = None,
         paraphrase: dict[str, Any] | None = None,
         visual_wait: dict[str, Any] | None = None,
+        links: dict[str, Any] | None = None,
     ) -> None:
         """把护栏与策划裁定写入同一条 decision_log。"""
         factor_data = {}
         if decision.effective_talk_value is not None:
             factor_data["effective_talk_value"] = decision.effective_talk_value
+        # 链接理解：本轮读了哪些、哪些没抓到、怎么投递；只记链接与原因，不记正文。
+        if links:
+            factor_data["links"] = links
         # 等图留痕：等到了多久、哪张等满超时、哪张压根没描述请求。只有真的
         # 为触发图等过才写，普通文字轮次不受影响。
         if visual_wait:
@@ -2706,8 +2792,13 @@ class RubenBot:
         *,
         now: float | None = None,
         computer_route: bool = False,
+        extra_notes: tuple[CapabilityNote, ...] = (),
     ) -> ExpressionDecision:
-        """策划步：一次快速调用拿到长度档、增量与开口裁定。"""
+        """策划步：一次快速调用拿到长度档、增量与开口裁定。
+
+        ``extra_notes`` 是本轮临时能力（如「看链接」），只参与本次索引，
+        不进常驻能力表。
+        """
         casual = event.is_group and decision.hard_trigger is None
         question = is_question(event.text)
         band = choose_length_band(
@@ -2727,6 +2818,10 @@ class RubenBot:
                            + f"\n本轮原话：{json.dumps(event.text, ensure_ascii=False)}；"
                            + "如果有人在问，再区分通用的做法和需要本群近况才能回答的部分。\n")
         notes = self.capability_notes(event)
+        if extra_notes:
+            # 本轮临时能力（如读到的链接）只参与本次索引，不进常驻能力表。
+            titles = {note.title for note in notes}
+            notes = tuple(notes) + tuple(note for note in extra_notes if note.title not in titles)
         sticker_option = ""
         if (self.sticker_behavior.enabled and self.config.stickers.nonverbal_probability > 0
                 and not self._capability_block_reason(self.adapters.get(event.platform), SEND_STICKER)):

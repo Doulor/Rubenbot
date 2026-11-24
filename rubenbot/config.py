@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 
 import yaml
 
+from .linkparse.settings import LinkConfig
 from .llm_budget import LLMBudgetConfig
 from .persona import DEFAULT_IDENTITY_TRIGGERS
 
@@ -1293,6 +1294,8 @@ class Config:
     gateway: GatewayConfig = field(default_factory=GatewayConfig)
     mcp: MCPConfig = field(default_factory=MCPConfig)
     computer: ComputerConfig = field(default_factory=ComputerConfig)
+    # 链接理解（core 感知层）：任何 http(s) 链接都尝试读取，不再是插件
+    link: LinkConfig = field(default_factory=LinkConfig)
     persona_path: str = "data/SOUL.md"
     # 五文件人设目录：默认为 persona_path 同级的 persona/；不存在时回退单文件
     persona_dir: str = ""
@@ -1468,6 +1471,7 @@ class Config:
             gateway=gateway,
             mcp=_load_mcp(data.get("mcp")),
             computer=ComputerConfig.parse(data.get("computer", {})),
+            link=LinkConfig.parse(data.get("link")),
             **basics,
         )
 

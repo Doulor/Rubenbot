@@ -22,8 +22,6 @@ from rubenbot.plugins.permissions import (
 from conftest import RecordingAdapter, ScriptedLLM, write_manifest
 
 
-DIR = Path(__file__).resolve().parents[1] / "plugins" / "link_parse"
-
 
 PLUGIN_SOURCE = '''
 def register(ctx):
@@ -484,99 +482,6 @@ def test_webui_grants_unavailable_without_manager(client):
     state.plugins = None
     response = client_obj.put("/api/plugins/demo/permissions", json={"permissions": []})
     assert response.status_code == 409
-
-
-# ----------------------------------------------------------------------
-# 线上唯一已启用插件：link_parse 授权落地后行为不变
-# ----------------------------------------------------------------------
-
-
-def test_link_parse_still_works_after_migration(tmp_path, monkeypatch):
-    """真实 link_parse 插件在首次迁移（全授）后照常解析与注入（线上回放）。"""
-    import json
-    import shutil
-
-    from plugins.link_parse.fetch import FetchResult
-
-    url = "https://page.example/story?chapter=2"
-    html = "<article><p>公开段落</p></article>"
-
-    async def fake_fetch(target, **kwargs):
-        assert kwargs["allow_url"](target)
-        return FetchResult(target, "text/html", html)
-
-    directory = tmp_path / "plugins" / "link_parse"
-    shutil.copytree(DIR, directory)
-    (directory / "config.yaml").write_text("mode: on_mention\n", encoding="utf-8")
-    config = Config()
-    config.plugins.dir = str(directory.parent)
-    config.plugins.enabled = ["link_parse"]
-    config.reply.segment_delay_enabled = False
-    config.decision.merge_window_seconds = 0
-    config.decision.hard_merge_window_seconds = 0
-    store = MemoryStore(":memory:")
-    manager = PluginManager(config, store, permissions=PluginPermissionStore(tmp_path / "perm.json"))
-    assert [plugin.name for plugin in manager.load_all()] == ["link_parse"]
-    # 首次迁移：线上已装插件按 manifest 全授，不断线
-    assert manager.permissions.grants("link_parse") == {"read_messages", "network"}
-
-    # 装载器以独立包名导入插件；从已注册实例换掉网络，保留真实解析器和钩子
-    parser = manager.plugins["link_parse"].before_reply_hooks[0].__self__
-    monkeypatch.setattr(parser, "fetch", lambda target: fake_fetch(target, allow_url=parser.allow_url))
-
-    llm = ScriptedLLM({"chat": ["它介绍了一个公开案例。"]})
-    bot = RubenBot(config, store, llm, Persona("Ruben", "你是 Ruben"), plugins=manager)
-    adapter = RecordingAdapter()
-    bot.register_adapter(adapter)
-    manager.extras["bot"] = bot
-
-    asked = MessageEvent(
-        platform="recording",
-        chat_type="group",
-        chat_id="1",
-        sender_id="reader",
-        sender_name="读者",
-        platform_msg_id="shared",
-        text=url,
-    )
-    asyncio.run(bot.handle_event(asked))
-    # 自动模式关着，只在被点名/追问时解析；发链接本身不抓取
-    assert not adapter.sent
-    followup = MessageEvent(
-        platform="recording",
-        chat_type="group",
-        chat_id="1",
-        sender_id="other",
-        sender_name="群友",
-        text=f"这个讲了什么？ {url}",
-        mentions_bot=True,
-    )
-    asyncio.run(bot.handle_event(followup))
-    assert len(adapter.sent) == 1
-    # 外部资料照旧进入本轮上下文，且不落进记忆流水
-    assert any(
-        "公开段落" in message["content"]
-        for message in llm.chat_messages[-1]
-        if message["role"] == "user"
-    )
-    assert not any("公开段落" in message.text for message in store.recent_messages("1"))
-
-    # 授权被撤回后，同一插件立即被跳过（不需要重启）：钩子不再注入外部资料，
-    # 消息改走普通回复通道，插件能力入口也随即拒绝
-    manager.set_permissions("link_parse", [])
-    assert manager._hooks_allowed(manager.plugins["link_parse"]) is False
-    asyncio.run(bot.handle_event(followup))
-    assert len(adapter.sent) == 2 and adapter.texts[-1] == "嗯嗯"
-    assert not any(
-        "公开段落" in message["content"]
-        for message in llm.chat_messages[-1]
-        if message["role"] == "user"
-    )
-    assert json.loads(json.dumps(manager.list_plugins()[0]["permissions"]["granted"])) == []
-    from rubenbot.plugins.loader import PluginContext
-
-    with pytest.raises(PluginPermissionError):
-        PluginContext(manager.plugins["link_parse"], manager).store.recent_messages("1")
 
 
 def test_corrupt_grants_file_fails_closed(tmp_path):
