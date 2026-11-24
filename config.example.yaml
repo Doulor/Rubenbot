@@ -103,8 +103,8 @@ memory:
   profile_inject_max_chars: 600  # 说话人核心画像注入的最大字符数
   inject_budget_tokens: 1200     # 本轮记忆注入预算；超了先砍事实、再砍时间线
   timeline_hit_limit: 6          # T1 每人最多带几条相关旧事（不是自动查账上限）
-  timeline_recent_hours: 24      # 上下文补入其他会话近多少小时发生的事
-  timeline_max_chars: 1800       # 近期事件流整段字符上限，最新的优先
+  timeline_recent_hours: 24      # 别处近况与私聊「对方在别群参与的事」共用的回看窗口
+  timeline_max_chars: 1800       # 别处近况主预算；私聊的相关群事件另外最多 6 条、600 字
   # 自动查账固定每轮最多 3 条原话、每条正文最多 160 字，带出处与时间；
   # 不按询问句式筛选，也不重复本轮或已经展示的流水，此行为没有单独配置键。
   cross_session_hours: 24        # 私聊跨会话摘要回看的小时数
@@ -344,6 +344,8 @@ plugins:
   enabled: []
   # 例如只启用 hello 示例插件（也可以直接在 WebUI 设置页开关，保存后写回这里并热生效）：
   # enabled: ["hello"]
+  # 群内自动回作品封面与详情：显式启用 link_detail 并在 WebUI 授权读消息、发消息、网络。
+  # 分平台开关和冷却在插件详情页设置；与主配置 link 段的通用感知独立。
   command_prefix: "/"
   # 装后授权：manifest 声明的权限要在 WebUI「插件 → 权限授权」页逐项批准才生效。
   # 授权记录不在本文件里，落在数据库同目录的 plugin_permissions.json，重启不丢；

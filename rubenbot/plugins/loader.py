@@ -26,6 +26,7 @@ ctx 提供：
   返回 ``(是否成功, 说明/原因)``；适配器不支持、配置关闭或执行失败都只返回原因
 - ``llm``：核心的 LLM 客户端（需要 bot 已就绪，否则为 None）
 - ``store`` / ``fetch``：读消息、出网；分别需要 ``read_messages`` / ``network`` 授权
+- ``fetch_public_page`` / ``fetch_public_cover``：需 ``network`` 授权，受检读取公网链接或封面
 - ``bot`` / ``runtime``：宿主 bot 与最近一次分发时的运行时上下文
 
 **装后授权**：manifest 只声明权限，机主在 WebUI 里逐项授权后插件才能真正使用。
@@ -70,6 +71,9 @@ import httpx
 
 from ..adapters.base import BaseAdapter, MessageEvent, Segment
 from ..expression import CapabilityNote
+from ..linkparse import fetch as public_web
+from ..linkparse import sites
+from . import public_cover
 from .manifest import Manifest, ManifestError, load_manifest
 from .permissions import (
     PluginPermissionError,
@@ -239,11 +243,29 @@ class PermissionedAdapter:
 
     async def send(self, chat_id: str, segments: list[Segment], *, chat_type: str = "group") -> Any:
         self._context._require("send_messages", "发送消息")
-        return await self._adapter.send(chat_id, segments, chat_type=chat_type)
+        result = await self._adapter.send(chat_id, segments, chat_type=chat_type)
+        if self._context.plugin.name == "music":
+            # 只有音乐卡、语音段能证明发歌；列表、错误提示和附加说明都是文字。
+            for seg in segments:
+                if seg.get("type") in ("music", "record"):
+                    self._note_music_delivery(chat_id, chat_type, (seg.get("data") or {}).get("title", ""))
+                    break
+        return result
 
     async def send_file(self, chat_id: str, filename: str, content: bytes, *, chat_type: str) -> None:
         self._context._require("send_messages", "发送文件")
-        return await self._adapter.send_file(chat_id, filename, content, chat_type=chat_type)
+        result = await self._adapter.send_file(chat_id, filename, content, chat_type=chat_type)
+        if self._context.plugin.name == "music" and Path(filename).suffix.lower() in (".mp3", ".m4a"):
+            self._note_music_delivery(chat_id, chat_type, Path(filename).stem)
+        return result
+
+    def _note_music_delivery(self, chat_id: str, chat_type: str, title: str) -> None:
+        callback = self._context.manager.on_music_delivery
+        if callback is not None:
+            try:
+                callback(self._adapter.name, chat_type, chat_id, title)
+            except Exception as exc:  # noqa: BLE001 - 记账失败不能触发插件重发
+                logger.warning("记录点歌投递失败：%s", exc)
 
     async def call_capability(self, name: str, **kwargs: Any) -> Any:
         self._context._require(capability_permission(name), f"能力 {name}")
@@ -607,7 +629,7 @@ class PluginContext:
         headers: Mapping[str, str] | None = None,
         timeout: float = 10.0,
     ) -> httpx.Response:
-        """插件出网的唯一入口（需 ``network`` 授权）：返回 ``httpx.Response``。
+        """插件通用 HTTP 入口（需 ``network`` 授权），不可信链接请走受检 API。
 
         未授权时抛 :class:`PluginPermissionError` 并记审计；网络错误照常
         向上抛，由插件自己决定如何降级。
@@ -615,6 +637,20 @@ class PluginContext:
         self._require("network", f"出网请求 {method} {url}")
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             return await client.request(method, url, headers=dict(headers or {}))
+
+    async def fetch_public_page(
+        self, url: str, *, allow_url: Callable[[str], bool] | None = None,
+    ) -> public_web.FetchResult:
+        """受检读取公网文本（1 MiB、共 6 秒）；可用 allow_url 在每跳限制站点。"""
+        self._require("network", "读取公网网页")
+        return await public_web.fetch(url, 1 << 20, 6.0, allow_url=allow_url, prepare=sites.prepare)
+
+    async def fetch_public_cover(
+        self, url: str, *, allow_url: Callable[[str], bool] | None = None,
+    ) -> bytes:
+        """受检读取静态封面（4 MiB、共 6 秒、不跟随跳转）；不返回远程地址。"""
+        self._require("network", "读取公网封面")
+        return await public_cover.fetch(url, allow_url=allow_url)
 
     def capability_note(
         self,
@@ -760,6 +796,7 @@ class PluginManager:
         self.plugins: dict[str, Plugin] = {}
         # 最近一次分发时的运行时上下文（BotContext）：插件可从它拿 bot、persona 等
         self.current_runtime: Any = None
+        self.on_music_delivery: Callable[[str, str, str, str], None] | None = None
         # 装后授权：构造时没给就按数据库同目录的独立文件读；内存库只驻内存
         self.permissions = permissions or PluginPermissionStore(path_for_store(store))
         # 适配器收口代理缓存：(插件名, id(真实适配器)) -> 代理，保证同一真实

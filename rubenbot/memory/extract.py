@@ -332,18 +332,53 @@ class MemoryExtractor:
 
         added_events: list[str] = []
         skipped_events = 0
+        # 只认抽取前已在账的原话；不能把本轮从历史流水新建的第一条当作预写行。
+        prewritten = self._prewritten_sources(person_id, messages)
+        if prewritten:
+            # 沿用 register_extraction 对全批事实/事件及无出处提案的保密裁定，
+            # 原话事件不能比其出处更宽松；追封或先前的 sealed 也不能降成 high。
+            blocked = prewritten - self.store.available_raw_ids(prewritten, unblocked=True)
+            with self.store._lock, self.store._conn:
+                self.store._conn.executemany(
+                    """UPDATE events SET sensitivity=? WHERE person_id=? AND kind='inbound'
+                       AND source_raw_id=? AND sensitivity!='sealed'""",
+                    (("sealed" if rid in sealed_sources else "high", person_id, rid) for rid in blocked),
+                )
         for event in extraction.events:
-            ts = resolve_event_ts(event.time_hint, base_ts) if event.ts is None else event.ts
             # 事件贴近原文：只有「指代 + 评价」同时出现才拦，普通叙事不挡。
             decision = self._check_anchor(event, messages, known_names, event=True)
             if not decision.ok:
                 dropped.append(event.summary)
                 self._record_dropped(person_id, "event", event.summary, decision, sender, now, event.source_msg_id)
                 continue
+            target, sensitivity = route(event, event.summary)
+            if event.source_msg_id in prewritten:
+                source = by_id[event.source_msg_id]
+                # 只提炼能回指原话或已落库视觉描述的提案；模型的猜测连显著度也不提升。
+                if not any(_grounded(event.summary, text) for text in (source.text, source.visual_text) if text):
+                    skipped_events += 1
+                    continue
+                # owner 会带出整行原话；不能凭一个片段给整行或视觉附注授权。
+                owner = target == OWNER_AUDIENCE and _grounded(source.text, event.summary)
+                with self.store._lock, self.store._conn:
+                    self.store._conn.execute(
+                        """UPDATE events SET salience=max(salience, ?),
+                               audience=CASE WHEN ? AND sensitivity!='sealed' AND summary=?
+                                             THEN ? ELSE audience END
+                           WHERE person_id=? AND kind='inbound' AND source_raw_id=?""",
+                        (event.salience, owner, source.text.strip(), OWNER_AUDIENCE,
+                         person_id, source.id),
+                    )
+                skipped_events += 1
+                continue
+            if prewritten and event.source_msg_id not in by_id:
+                # 缺失或无效的出处不能指认是哪条原话，也不另记模型猜出的事件。
+                skipped_events += 1
+                continue
+            ts = resolve_event_ts(event.time_hint, base_ts) if event.ts is None else event.ts
             if self._event_exists(person_id, event.summary, ts):
                 skipped_events += 1
                 continue
-            target, sensitivity = route(event, event.summary)
             self.store.add_event(
                 person_id,
                 event.summary,
@@ -522,6 +557,17 @@ class MemoryExtractor:
             days = 3
         days = min(high, max(low, int(days)))
         return base_ts + days * 86400.0
+
+    def _prewritten_sources(self, person_id: str, messages: list[RawMessage]) -> set[int]:
+        """按本批流水定位原有事件，不按模型猜的事件时间或摘要去碰别的行。"""
+        params = [m.id for m in messages]
+        placeholders = ",".join("?" for _ in params)
+        with self.store._lock:
+            rows = self.store._conn.execute(
+                f"""SELECT DISTINCT source_raw_id FROM events WHERE person_id=? AND kind='inbound'
+                    AND source_raw_id IN ({placeholders})""", (person_id, *params),
+            )
+            return {row[0] for row in rows}
 
     def _event_exists(self, person_id: str, summary: str, ts: float) -> bool:
         """同一人一天内同一句话（归一化后相同）的事件视为重复。"""

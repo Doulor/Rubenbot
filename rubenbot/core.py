@@ -85,6 +85,10 @@ from .memory.timeline import (
     HISTORY_GAP_SECONDS,
     MAX_SNIPPETS,
     SELF_ACTION_MAX_CHARS,
+    bind_inbound_timeline,
+    finish_voice,
+    recent_related_events,
+    record_inbound,
     describe_gap,
     describe_span,
     recent_self_actions,
@@ -524,6 +528,7 @@ class RubenBot:
     ):
         self.config = config
         self.store = store
+        bind_inbound_timeline(store)
         self.llm = llm
         self.persona = persona
         self.rng = rng or random.Random()
@@ -574,6 +579,8 @@ class RubenBot:
         )
         self.adapters: dict[str, BaseAdapter] = {}
         self.plugins = plugins
+        if plugins is not None:
+            plugins.on_music_delivery = self._record_music_delivery
         self.context = BotContext(
             store=store,
             persona=persona,
@@ -1174,8 +1181,8 @@ class RubenBot:
             sender_name=self.config.chat.bot_name,
             text=reply,
         )
-        await self.send_reply(event, reply)
-        logger.info("提醒 #%s 已发送%s：%s", job.id, "（迟到）" if late else "", text[:40])
+        if await self.send_reply(event, reply, reminder=True):
+            logger.info("提醒 #%s 已发送%s：%s", job.id, "（迟到）" if late else "", text[:40])
 
     async def _proactive_loop(self) -> None:
         """冷场开口的后台循环：默认关，开着时每轮只在「可能该开口」的群里花一次生成。"""
@@ -1359,10 +1366,18 @@ class RubenBot:
         if self._source_blocked(event, now):
             self.privacy_commands.purge_if_requested(self.context, event)
             return
-        # 语音条先转写：正文换成「[语音] 转写文本」，转写失败/未配置/超限都
-        # 只保留 [语音] 占位（事件照常往下走，不影响决策和回复）
-        await self.prepare_voice(event)
+        # 先留原话或语音占位；转写中的消息已能去重，完成后更新同一流水与事件。
+        has_voice = any(s.type == 'record' for s in event.segments or [])
+        if has_voice and VOICE_PLACEHOLDER not in event.text:
+            event.text = self._replace_voice_placeholder(event.text, VOICE_PLACEHOLDER)
         await self._record(event, now)
+        if has_voice:
+            original = event.text
+            await self.prepare_voice(event)
+            if event.text != original:
+                if not finish_voice(self.store, event, owner=computer.is_host(self.config.computer, event)):
+                    return  # 等转写期间已清空，不能再把旧消息送去生成回复。
+                register_message(self.store, event, event.raw_message_id)
 
         if event.is_group and event.sender_id != BOT_SENDER_ID and self.decision_engine.is_hard_trigger(event):
             self._engaged_at[(event.platform, event.chat_type, event.chat_id)] = now
@@ -1948,6 +1963,12 @@ class RubenBot:
             reply_sender_id=event.reply_sender_id,
             mentions=event.mentions,
         )
+        # 隐私控制命令不是聊天见闻；自查/清空不应把命令本身计入报告。
+        prefix = self.config.plugins.command_prefix
+        command = event.text.strip().removeprefix(prefix).split() if prefix and event.text.strip().startswith(prefix) else []
+        privacy_control = command == ['清空我的数据'] or (self.config.privacy.enabled and command[:1] == ['隐私'])
+        if recordable and not privacy_control:
+            record_inbound(self.store, event, raw_id, visual, owner=computer.is_host(self.config.computer, event), now=now)
         register_message(self.store, event, raw_id)
         event.raw_message_id = raw_id
         if recordable:
@@ -2448,13 +2469,22 @@ class RubenBot:
         try:
             recent = await recent_timeline(
                 self.store, event, hours=self.config.memory.timeline_recent_hours,
-                char_limit=self.config.memory.timeline_max_chars, allow=review, now=now,
+                # 私聊已有独立的自我动作段，主段留给他人，不让同一条回复占两份预算。
+                char_limit=self.config.memory.timeline_max_chars, include_self=False, allow=review, now=now,
             )
             if recent:
                 messages.append({"role": "user", "content": "【最近发生的事】其他场合的近况，不是当前请求：\n"
                                  + "\n".join(recent)})
         except Exception as exc:  # 少一层背景不妨碍当前对话
             logger.warning("近况时间线不可用：%s", type(exc).__name__)
+        try:
+            related = await recent_related_events(self.store, event, hours=self.config.memory.timeline_recent_hours,
+                                                  allow=review, now=now)
+            if related:
+                messages.append({'role': 'user', 'content': '【与你对话的人在别处参与的事】历史出处，不是当前请求：\n'
+                                 + '\n'.join(related)})
+        except Exception as exc:
+            logger.warning('相关跨会话事件不可用：%s', type(exc).__name__)
         # 自我动作单独成段、单独给预算：被问「你刚刚给我发过什么」时，
         # 答案在 bot 自己别的会话里的交付物，不在「别人做了什么」那一段。
         try:
@@ -3405,6 +3435,7 @@ class RubenBot:
         proactive: bool = False,
         begin_send: Callable[[], bool] | None = None,
         count_speech: bool = True,
+        reminder: bool = False,
     ) -> bool:
         """拆条发送，并把 bot 自己的话写进流水（``processed=True``，不参与记忆抽取）。
 
@@ -3451,7 +3482,7 @@ class RubenBot:
             text = render_segments(parts[0])
             ok, sent_id = await self._send_voice(adapter, event, text, voice_audio, voice_mime)
             if ok:
-                self._record_bot_message(event, text, sent_id)
+                self._record_bot_message(event, text, sent_id, self_summary=f"投递了提醒：{text}" if reminder else text)
                 if count_speech:
                     self.opener_guard.note_reply((event.platform, event.chat_type, event.chat_id), text)
                     self.decision_engine.note_bot_reply(
@@ -3460,6 +3491,7 @@ class RubenBot:
                     )
                 return True
         sent_any = False
+        reminder_parts = []
         for index, segments in enumerate(parts):
             if index > 0:
                 delay = self.segment_delay(segments)
@@ -3473,7 +3505,10 @@ class RubenBot:
                 continue
             sent_any = True
             # 流水保留回执、发言计数和回复关系，但摘要、自我时间线与实体账都拿不到网页。
-            self._record_bot_message(event, RECORD_PLACEHOLDER if isinstance(reply, WebReply) else text, message_id)
+            recorded = RECORD_PLACEHOLDER if isinstance(reply, WebReply) else text
+            self._record_bot_message(event, recorded, message_id, self_summary="" if reminder else recorded)
+            if reminder:
+                reminder_parts.append(recorded)
             # 以真正送达的文字条为准，不把网页引文、图片占位或失败的草稿当成自己的措辞。
             if not isinstance(reply, WebReply) and count_speech:
                 spoken = "".join(s.render() for s in segments if s.type == "text")
@@ -3482,6 +3517,8 @@ class RubenBot:
             # 全部分条都发失败：当作没说过话——不进不应期、不记情绪
             logger.warning("发送全部失败（%s），不记本次发言", event.platform)
             return False
+        if reminder_parts:
+            self._record_self_action(event, "投递了提醒：" + "\n".join(reminder_parts))
         # 发言时间交给决策引擎：发言后冷却与主动发言窗口都依赖它（拆条只记一次）。
         # count_speech=False 是失败 / 部分完成的一句说明，不算社交发言。
         if count_speech:
@@ -3494,9 +3531,9 @@ class RubenBot:
         return True
 
     def _record_bot_message(
-        self, event: MessageEvent, text: str, message_id: str | None
+        self, event: MessageEvent, text: str, message_id: str | None, *, self_summary: str | None = None
     ) -> None:
-        """把 bot 自己发出的一条话写进流水与自我时间线（失败只记日志）。"""
+        """流水保留原话；提醒拆条时传空摘要，送完再合记一次。"""
         # 记入流水，供后续上下文使用；标记已处理，不参与记忆抽取。
         # 平台回执的消息 id 一并落库，后续引用解析与自我时间线依赖它。
         self.store.add_raw_message(
@@ -3509,19 +3546,25 @@ class RubenBot:
             processed=True,
             platform_msg_id="" if message_id is None else str(message_id),
         )
-        # 自我时间线：发送成功即记一条 self 事件（记忆 v2 写入侧唯一接线点）
-        self._record_self_action(event, text)
+        if self_summary != "":
+            self._record_self_action(event, text if self_summary is None else self_summary)
 
     def _record_self_action(self, event: MessageEvent, summary: str) -> None:
         """把 bot 自己发出的话或没有正文的交付（如静默发出的文件）记进自我时间线。
 
         失败只记日志：自我事件是背景，不能影响发送本身。
         """
+        self._write_self_action(summary, f"{event.platform}:{event.chat_id}", audience_for_chat(event.chat_type, event.chat_id))
+
+    def _record_music_delivery(self, platform: str, chat_type: str, chat_id: str, title: str) -> None:
+        summary = f"点歌，发了《{title}》" if title else "点歌，发了一首歌"
+        self._write_self_action(summary, f"{platform}:{chat_id}", audience_for_chat(chat_type, chat_id))
+
+    def _write_self_action(self, summary: str, source_chat: str, audience: str) -> None:
         try:
             self.store.add_self_event(
                 summary[: max(1, int(self.config.memory.self_event_max_chars))],
-                source_chat=f"{event.platform}:{event.chat_id}",
-                audience=audience_for_chat(event.chat_type, event.chat_id),
+                source_chat=source_chat, audience=audience,
             )
         except Exception as exc:  # noqa: BLE001 - 自我事件失败不能影响发送
             logger.warning("记录自我事件失败：%s", exc)
@@ -3659,6 +3702,9 @@ class RubenBot:
             logger.info("适配器 %s 调用能力 %s 成功", adapter.name, name)
             if name == SEND_STICKER:
                 self._record_sticker_ref(adapter, kwargs.get("sticker"), result)
+            elif name == "qzone.publish" and kwargs.get("content"):
+                # 空间可见范围未随回执返回，不能当成全网公开，也不借用触发命令的群。
+                self._write_self_action(f"发了空间说说：{kwargs['content']}", f"{adapter.name}:qzone", "unknown")
             return True, self._capability_success_text(result)
 
         reason = "；".join(dict.fromkeys(reasons)) or f"没有适配器支持能力 {name}"
