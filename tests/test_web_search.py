@@ -1051,9 +1051,10 @@ def test_local_notes_require_current_scope_and_enabled_tool(monkeypatch):
     def titles(e):
         return {note.title for note in bot.capability_notes(e)}
 
-    assert not titles(group)
+    # 提醒与工具注册表同源：工具在就说能记，不等本进程先记过一条。
+    assert titles(group) == {'记提醒'} and titles(event()) == {'记提醒'}
     asyncio.run(bot._record(group, 1.0))
-    assert titles(group) == {'查实体账'} and '查实体账' not in titles(event())
+    assert titles(group) == {'记提醒', '查实体账'} and '查实体账' not in titles(event())
     assert '查实体账' not in titles(replace(group, chat_id='其他群'))
     asyncio.run(bot.recall('阿花', event=group))
     assert '翻记忆' in titles(group)
@@ -1067,6 +1068,8 @@ def test_local_notes_require_current_scope_and_enabled_tool(monkeypatch):
     asyncio.run(bot.set_reminder({'delay_minutes': 1, 'text': '喝水'}, event=group))
     assert '记提醒' in titles(group)
     bot.config.reminder.max_pending_per_chat = 1
+    assert '记提醒' not in titles(group)
+    bot.config.reminder.enabled = False
     assert '记提醒' not in titles(group)
 
 
