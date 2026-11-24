@@ -55,10 +55,11 @@ def register(ctx):
     def note(runtime, event, args):
         return "note"
 
-    @ctx.capability_note
     def describe(event, adapter):
         from rubenbot.expression import CapabilityNote
-        return CapabilityNote("点歌", "我能分享歌曲。", "想听歌时用。")
+        return CapabilityNote("命令回执", "我能回复 note。", "收到 /note 时用。")
+
+    ctx.capability_note(describe, entry=note)
 '''
 
 
@@ -399,12 +400,14 @@ def test_capability_notes_only_include_granted_permissions(tmp_path):
         tmp_path / "plugins", permissions=_migrated_store(tmp_path / "plugin_permissions.json")
     )
     adapter = RecordingAdapter()
-    event = _private("点歌")
+    event = _private("/note")
     manager.set_permissions("demo", ["read_messages"])
     assert manager.capability_notes(event, adapter) == []
     manager.set_permissions("demo", ["read_messages", "send_messages"])
     notes = manager.capability_notes(event, adapter)
-    assert [note.title for note in notes] == ["点歌"]
+    note, = notes
+    assert note.title == "命令回执"
+    assert note.evidence == ("plugin:demo:loaded", "entry:command:note", "permissions:granted")
 
 
 def test_list_plugins_exposes_declared_vs_granted(tmp_path):

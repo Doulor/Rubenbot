@@ -2717,20 +2717,20 @@ class RubenBot:
         ) else set()
         if ('web_search' in tools and self.searcher and self.searcher.verified_pages_read
                 and self.searcher.available_for(f'{event.platform}:{event.chat_id}')):
-            notes.extend((CapabilityNote('搜网', '我能搜索公开资料。', '拿不准公开事实时，用眼前问题的公开关键词找出处；知道的直接答。'),
-                          CapabilityNote('读原文', '我能打开搜索结果页核对原文。', '标题和摘要不是证据；读到能回答问题的正文才引用，没查实就直说。')))
+            notes.extend((CapabilityNote('搜网', '我能搜索公开资料。', '拿不准公开事实时，用眼前问题的公开关键词找出处；知道的直接答。', evidence=('web_search:result-page-read',)),
+                          CapabilityNote('读原文', '我能打开搜索结果页核对原文。', '标题和摘要不是证据；读到能回答问题的正文才引用，没查实就直说。', evidence=('web_search:result-page-read',))))
         if 'recall' in tools and self._recall_checked:
-            notes.append(CapabilityNote('翻记忆', '我能翻一翻以前聊过的事。', '眼前的话接着某个人或一段旧事时，按这次聊天可以提起的范围回忆。'))
+            notes.append(CapabilityNote('翻记忆', '我能翻一翻以前聊过的事。', '眼前的话接着某个人或一段旧事时，按这次聊天可以提起的范围回忆。', evidence=('tool:recall', 'recall:read-ok')))
         if (event.is_group and (event.platform, event.chat_id) in self._ledger_read
                 and event.sender_id and not event.sender_id.startswith('__')
                 and self.store.get_privacy_mode(make_person_id(event.platform, event.sender_id)) == 'normal'):
-            notes.append(CapabilityNote('查实体账', '我能对照本群提过的名字和原话。', '眼熟的名字未必知道含义；只有本群有说明原文时才说它在这里指什么。'))
+            notes.append(CapabilityNote('查实体账', '我能对照本群提过的名字和原话。', '眼熟的名字未必知道含义；只有本群有说明原文时才说它在这里指什么。', evidence=('ledger:group-read', 'privacy:normal')))
         # 提醒能力与工具注册表同源：set_reminder 在工具清单里就报能记，
         # 不等本进程此前记过一条才承认（否则第一次被托提醒时策划会判「不在能力里」，
         # 直接沉默或只发表情，见第 29 项）。只剩会话上限这一条事实性条件。
         if ('set_reminder' in tools and self.store.count_pending_jobs(
                 kind='reminder', platform=event.platform, chat_id=event.chat_id) < self.config.reminder.max_pending_per_chat):
-            notes.append(CapabilityNote('记提醒', '我能为这个会话记下提醒。', '对方明确托我在某时提醒一件事，时间和事情都清楚了再记。'))
+            notes.append(CapabilityNote('记提醒', '我能为这个会话记下提醒。', '对方明确托我在某时提醒一件事，时间和事情都清楚了再记。', evidence=('tool:set_reminder', 'pending:below-limit')))
         if tools & computer.COMPUTER_TOOLS:
             host = computer.is_host(self.config.computer, event)
             scope = '真机' if host else '你的访客工作区'
@@ -2740,10 +2740,10 @@ class RubenBot:
                                         ('write_file', '写文件', '保存文本')):
                 if name in verified:
                     notes.append(CapabilityNote(title, f'我能在{scope}里{action}。',
-                                                f'对方请我处理{scope}里的文件，范围明确时再动手。'))
+                                                f'对方请我处理{scope}里的文件，范围明确时再动手。', evidence=(f'computer:{name}:audit-ok',)))
         try:
             if not self._capability_block_reason(adapter, SEND_STICKER) and self.sticker_behavior.available_for(event, adapter):
-                notes.append(CapabilityNote('发表情', '我能从图库挑表情回应。', '轻松接梗、表情比文字贴切时，从现有图库挑，不把表情当问题的答案。'))
+                notes.append(CapabilityNote('发表情', '我能从图库挑表情回应。', '轻松接梗、表情比文字贴切时，从现有图库挑，不把表情当问题的答案。', evidence=('sticker:adapter-send-ok', 'sticker:local-file-ready')))
         except Exception as exc:
             logger.debug('本轮表情说明不可用：%s', type(exc).__name__)
         if self.plugins is not None:

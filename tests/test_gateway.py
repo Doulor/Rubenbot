@@ -466,7 +466,8 @@ def test_recall_note_is_generated_from_available_catalog_without_granting_tools(
         return {n.title: n for n in bot.capability_notes(event)}
 
     note = notes()['撤回消息']
-    assert all(word in note.summary for word in ('自己', '作者本人', '机主', '别人', '敏感开关'))
+    assert note.summary == '我能撤回自己刚在私聊发的消息。'
+    assert note.evidence == ('snowluma:delete_msg:docs/gateway-e2e-results.md#D′5–D′7',)
     assert '回复的是哪条' in note.detail
     assert 'adapter_call' not in [tool['function']['name'] for tool in bot.tool_definitions(event)]
     event.chat_id = '未开放的群'
@@ -479,7 +480,7 @@ def test_recall_note_is_generated_from_available_catalog_without_granting_tools(
         {'name': '别的动作', 'risk': 'safe', 'capability_note': {'title': '测试能力', 'summary': '自述', 'detail': '情境'}},
         {'name': '禁止动作', 'risk': 'denied', 'capability_note': {'title': '隐藏', 'summary': '自述', 'detail': '情境'}},
     ])
-    assert set(notes()) == {'测试能力'}
+    assert not notes()  # 仅有目录自述、没有真机验收记录，不进索引。
 
 
 def test_service_cooldown_message_includes_seconds():

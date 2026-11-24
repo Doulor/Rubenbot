@@ -4,8 +4,6 @@ import asyncio
 from dataclasses import replace
 from unittest.mock import AsyncMock
 
-import pytest
-
 from rubenbot.expression import CapabilityNote, capability_index, parse_plan
 from rubenbot.gateway.catalog import ActionCatalog
 from rubenbot.linkparse.service import LinkContext, LinkResult, capability_note
@@ -76,22 +74,7 @@ def test_link_counts_only_readable_results():
     assert '读到了 1 个' in capability_index((note,))
 
 
-@pytest.fixture
-def wired_core_notes(monkeypatch):
-    """在原有检查的成功分支模拟 SPEC 中待合入的 evidence 参数，不替换任何检查。"""
-    import rubenbot.core as core
-
-    evidence = {'记提醒': ('tool:set_reminder', 'pending:below-limit'),
-                '搜网': ('web_search:result-page-read',), '读原文': ('web_search:result-page-read',)}
-
-    def checked(title, summary, detail, **kwargs):
-        kwargs.setdefault('evidence', evidence.get(title, ()))
-        return CapabilityNote(title, summary, detail, **kwargs)
-
-    monkeypatch.setattr(core, 'CapabilityNote', checked)
-
-
-def test_first_job_and_planner_index_agree_after_wiring(store, wired_core_notes):
+def test_first_job_and_planner_index_agree(store):
     llm = ToolLLM([reminder_message({'text': '吃药', 'delay_minutes': 1}), {'content': '好'}])
     bot, _ = make_bot(store, llm)
     bot.config.reminder.max_pending_per_chat = 1
@@ -101,11 +84,11 @@ def test_first_job_and_planner_index_agree_after_wiring(store, wired_core_notes)
     assert [j.payload['text'] for j in store.list_scheduled_jobs(status='pending')] == ['吃药']
     assert '〔记提醒〕' not in capability_index(bot.capability_notes(event))
     planner = llm.stages['gen_stage1'][-1]['content']
-    assert '〔记提醒〕' in planner, 'core.py:2703 须传递工具注册和会话余量的证据；见 SPEC 接线 diff'
-    assert 'pending:below-limit' in planner
+    assert '〔记提醒〕' in planner
+    assert 'tool:set_reminder；pending:below-limit' in planner
 
 
-def test_search_requires_successful_lookup_and_page_after_wiring(store, wired_core_notes, monkeypatch):
+def test_search_requires_successful_lookup_and_page(store, monkeypatch):
     llm = ToolLLM()
     bot, _ = make_bot(store, llm)
     searcher, _ = make_searcher(tavily_handler(), cooldown=0)

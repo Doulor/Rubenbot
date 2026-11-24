@@ -113,7 +113,7 @@ def group_song_request() -> MessageEvent:
 
 
 def test_index_keeps_unavailable_notes_out_of_ready_section():
-    ready = CapabilityNote("搜网", "我能搜公开资料。", "拿不准就查。")
+    ready = CapabilityNote("搜网", "我能搜公开资料。", "拿不准就查。", evidence=("web_search:result-page-read",))
     off = CapabilityNote("点歌", "还没开", "有人要就说没开。", available=False)
     text = capability_index((ready, off))
     ready_part, off_part = text.split("【现在还做不了的】")
@@ -136,7 +136,7 @@ def test_index_groups_unavailable_titles_by_state():
 
 def test_index_does_not_repeat_title_listed_as_ready():
     # 同一显示名确实能做时，不能同时又报成没开
-    ready = CapabilityNote("点歌", "我能按歌名分享歌曲。", "想听时用。")
+    ready = CapabilityNote("点歌", "我能按歌名分享歌曲。", "想听时用。", evidence=("entry:on_message",))
     off = CapabilityNote("点歌", "还没开", "有人要就说没开。", available=False)
     text = capability_index((ready, off))
     assert "【现在还做不了的】" not in text

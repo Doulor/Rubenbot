@@ -302,22 +302,16 @@ SnowLuma 适配器（OneBot v11）：
 - 网关要求本会话已开放该目录，且动作有对应适配器的真机验收记录。当前可自述的是 SnowLuma 私聊撤回自发消息（[D′5–D′7](docs/gateway-e2e-results.md)），不把第三方撤回或仅在目录中的其他动作称为已验通。
 - 「看链接」以本轮成功读取数为证据，全部失败时只投递原有失败状态和原因。「搜网 / 读原文」沿用当前搜索实例实际查到结果并读到非空原文的记录，工具或冷却不允许时也不列。索引不发探测请求。
 
-**阶段 C 集成说明（合入前必接）**：本分支不改 `rubenbot/core.py`。内置条目仍在已有条件成立后构造，但缺少 `evidence`；在接线前它们不会出现在策划索引中，实际工具不受影响。以 `e13d665` 为基线，在下列成功分支给原构造器加关键字参数，不更改判断、不按标题推断证据。第 3571 项的完整两行 diff（`rubenbot/core.py:2703`）：
+**阶段 C 集成说明（已接线）**：`rubenbot/core.py` 的 `_current_capabilities` 在下列检查通过时直接给构造器传 `evidence`，不按标题推断证据，不改变工具注册或执行条件。
 
-```diff
--            notes.append(CapabilityNote('记提醒', '我能为这个会话记下提醒。', '对方明确托我在某时提醒一件事，时间和事情都清楚了再记。'))
-+            notes.append(CapabilityNote('记提醒', '我能为这个会话记下提醒。', '对方明确托我在某时提醒一件事，时间和事情都清楚了再记。', evidence=('tool:set_reminder', 'pending:below-limit')))
-```
-
-其余同文件构造点在末个位置参数后补如下关键字（均已在该分支检查通过）：
-
-| 行 | 条目 | 参数 |
+| 条目 | 已通过的检查 | `evidence` |
 |---|---|---|
-| 2690、2691 | 搜网、读原文 | `evidence=('web_search:result-page-read',)` |
-| 2693 | 翻记忆 | `evidence=('tool:recall', 'recall:read-ok')` |
-| 2697 | 查实体账 | `evidence=('ledger:group-read', 'privacy:normal')` |
-| 2713 | 电脑文件操作 | `evidence=(f'computer:{name}:audit-ok',)` |
-| 2716 | 发表情 | `evidence=('sticker:adapter-send-ok', 'sticker:local-file-ready')` |
+| 搜网、读原文 | 本轮有搜索工具，当前搜索实例读到结果页原文且会话可搜索 | `('web_search:result-page-read',)` |
+| 翻记忆 | 本轮有回忆工具，且有成功读取记录 | `('tool:recall', 'recall:read-ok')` |
+| 查实体账 | 已读本群实体账，当前发送者隐私档为正常 | `('ledger:group-read', 'privacy:normal')` |
+| 记提醒 | 本轮有提醒工具，本会话待执行提醒未达上限 | `('tool:set_reminder', 'pending:below-limit')` |
+| 电脑文件操作 | 当前账号在相应操作范围内有该工具的成功审计，且本轮有此工具 | `(f'computer:{name}:audit-ok',)` |
+| 发表情 | 适配器可发、已有成功发送记录，且图库有可发送的本地文件 | `('sticker:adapter-send-ok', 'sticker:local-file-ready')` |
 
 能力事实必须与执行行为同源：提醒工具在 `chat_tools` 清单里、且本会话未达待执行上限，「记提醒」就出现在索引里，不要求本进程此前真的记过一条（旧实现要求在内存里留过「本进程记过」的标记，第一次被托提醒时策划会判「定时提醒不在能力里」，随后模型却建了 job 并准时触发，reason 与行为相反）。没启用仍如实不出现在「这轮我能做的事」里。
 
