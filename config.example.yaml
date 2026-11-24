@@ -351,6 +351,8 @@ plugins:
   # enabled: ["hello"]
   # 群内自动回作品封面与详情：显式启用 link_detail 并在 WebUI 授权读消息、发消息、网络。
   # 分平台开关和冷却在插件详情页设置；与主配置 link 段的通用感知独立。
+  # group-faq 的 cards 在插件详情页维护，格式为「群标识｜标题｜正文｜有效期」；
+  # 只会把当前群的少量未过期卡片交给策划，插件默认关闭。
   command_prefix: "/"
   # 装后授权：manifest 声明的权限要在 WebUI「插件 → 权限授权」页逐项批准才生效。
   # 授权记录不在本文件里，落在数据库同目录的 plugin_permissions.json，重启不丢；
