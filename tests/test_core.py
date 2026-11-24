@@ -354,7 +354,7 @@ def test_decision_logged(config, store, caplog):
 
 
 def test_adapter_crash_does_not_kill_run(config, store, monkeypatch):
-    import rubenbot.core as core_module
+    import rubenbot.core_ingress as core_module
 
     monkeypatch.setattr(core_module, "ADAPTER_RESTART_MIN", 0.02)
 
