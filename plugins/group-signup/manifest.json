@@ -1,0 +1,56 @@
+{
+  "id": "group-signup",
+  "name": "限额报名",
+  "version": "1.0.0",
+  "description": "在群里开限额活动、按活动卡报名退报、查询余位并由发起人收队",
+  "author": "RubenBot",
+  "min_core_version": "0.1.0",
+  "permissions": ["read_messages", "send_messages", "llm"],
+  "config_schema": [
+    {
+      "key": "allowed_groups",
+      "type": "string_list",
+      "default": [],
+      "label": "允许的群",
+      "description": "允许使用报名功能的群号；空列表表示不限制"
+    },
+    {
+      "key": "max_capacity",
+      "type": "integer",
+      "default": 20,
+      "label": "单队人数上限",
+      "description": "单个活动最多可报名人数",
+      "min": 1,
+      "max": 500,
+      "step": 1
+    },
+    {
+      "key": "max_open_hours",
+      "type": "number",
+      "default": 72,
+      "label": "最长开放时长（小时）",
+      "description": "活动从创建起最长开放多久；读取和提交时惰性截止",
+      "min": 0.1,
+      "max": 720,
+      "step": 0.1
+    },
+    {
+      "key": "retention_days",
+      "type": "integer",
+      "default": 30,
+      "label": "活动保留天数",
+      "description": "结束或过期后的活动保留多久供查询最终名单",
+      "min": 1,
+      "max": 3650,
+      "step": 1
+    }
+  ],
+  "triggers": [
+    "「/开队 人数 活动名」创建活动",
+    "回复活动卡说「算我一个」或「我退出」",
+    "「/报名」「/退出」「/余位」「/收队」"
+  ],
+  "hooks": ["command", "on_message"],
+  "category": "互动",
+  "icon": "📝"
+}

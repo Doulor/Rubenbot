@@ -349,6 +349,10 @@ plugins:
   enabled: []
   # 例如只启用 hello 示例插件（也可以直接在 WebUI 设置页开关，保存后写回这里并热生效）：
   # enabled: ["hello"]
+  # 限额报名插件默认关闭；启用后还要在 WebUI 逐项授权 read_messages / send_messages / llm：
+  # enabled: ["group-signup"]
+  # group-signup 的配置在插件详情页保存；允许群、人数上限、最长开放时长和活动保留天数
+  # 均由 manifest 的 config_schema 驱动，不写进宿主聊天库。
   # 群内自动回作品封面与详情：显式启用 link_detail 并在 WebUI 授权读消息、发消息、网络。
   # 分平台开关和冷却在插件详情页设置；与主配置 link 段的通用感知独立。
   command_prefix: "/"
