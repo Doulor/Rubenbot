@@ -562,14 +562,9 @@ class GenerationMixin:
     def split_reply(self, reply: str) -> list[str]:
         """把一条回复拆成要发送的若干段。
 
-        生成契约用换行表示「另发一条」，这里一定按换行拆开；句内逗号/
-        顿号/分号/空格按总长度概率合并，让条数自然浮动而不是一刀切。
-        切点避开引号、括号（颜文字）、URL、行内代码与英文/数字词内部；
-        纯标点段丢弃，总条数以 ``reply.max_segments`` 为上限。
+        完整换行段优先，连接标点收尾的行接上下文；具体句界与保护规则见分段器。
         """
         reply = clean_reply_patterns(strip_transcript_prefix(reply.strip()))
         if not reply:
             return []
-        return split_segments(
-            reply, max_segments=max(1, self.config.reply.max_segments), rng=self.rng,
-        )
+        return split_segments(reply, max_segments=self.config.reply.max_segments)

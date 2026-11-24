@@ -70,7 +70,7 @@ def test_unmatched_bracket_falls_back_to_plain_text():
 
 
 # ----------------------------------------------------------------------
-# 概率合并：总长越长越倾向多条
+# 分段回放：连接标点不收尾，先保留自然段，再按完整句组织长解释
 # ----------------------------------------------------------------------
 
 
@@ -79,16 +79,49 @@ def test_short_reply_stays_one_segment():
     assert split_segments("好累啊，今天加班", rng=random.Random(0)) == ["好累啊，今天加班"]
 
 
-def test_long_reply_more_likely_split():
-    long = "今天累死我了，加班到十点，回家路上还下雨，鞋全湿了，真的绝"
-    assert len(split_segments(long, rng=random.Random(1))) >= 2
+@pytest.mark.parametrize("mark", list("，,；;、"))
+def test_clause_boundaries_are_not_message_boundaries(mark):
+    sentence = f"还在调呢{mark}等把最后 两项设置核对完{mark}就可以请大家再试一次了。"
+    assert split_segments(sentence, rng=random.Random(1)) == [sentence]
+    wrapped = sentence.replace(mark, mark + "\n")
+    assert split_segments(wrapped + "\n辛苦了！") == [sentence, "辛苦了！"]
 
 
-def test_merge_is_deterministic_with_seed():
-    long = "今天累死我了，加班到十点，回家路上还下雨，鞋全湿了，真的绝"
-    assert split_segments(long, rng=random.Random(1)) == split_segments(
-        long, rng=random.Random(1)
-    )
+@pytest.mark.parametrize("limit", [1, 2, 3])
+def test_dangling_final_separator_without_continuation(limit):
+    assert split_segments("还在调呢， ；", max_segments=limit) == ["还在调呢"]
+    assert split_segments("还在调呢，\n，", max_segments=limit) == ["还在调呢"]
+
+
+def test_store_region_explanation_groups_sentences(config, store):
+    conclusion = "先看商店地区，不用急着换账号。"
+    facts = ["开发者可以选择上架地区。", "商店按账号地区展示应用。", "改系统语言，不会改变商店地区。"]
+    draft = conclusion + "".join(facts)
+    bot, adapter = make_bot(config, store, ScriptedLLM({"chat": [draft]}))
+    asyncio.run(bot.handle_event(private_event("为什么搜不到外区的 App？")))
+    assert 2 <= len(adapter.texts) <= 3
+    assert adapter.texts[0] == conclusion
+    assert "".join(adapter.texts) == draft
+    assert all(part.endswith("。") for part in adapter.texts)
+
+
+def test_explicit_paragraphs_take_priority_over_internal_sentences():
+    first = "本地搜不到，不一定是地区限制。先看开发者的上架说明。"
+    second = "如果是设备不兼容，切换地区也没有用。可以去官网确认支持的系统版本。"
+    assert split_segments(first + "\n" + second) == [first, second]
+
+
+def test_protected_content_with_sentence_marks_is_unchanged():
+    for span in ["`a，\nb？`", "（他说「真的？！」）", "https://example.com/a?list=a,b;c"]:
+        text = f"这是一个很长但还没有说完的句子，中间有{span}，后面还有内容。"
+        assert split_segments(text) == [text]
+
+
+@pytest.mark.parametrize("mark", [",", ";"])
+def test_url_ending_in_ascii_separator_remains_copyable(mark):
+    url = "https://example.com/path" + mark
+    assert split_segments(f"看这里：{url}，") == [f"看这里：{url}。"]
+    assert split_segments(f"看这里：{url}\n再试一次。") == [f"看这里：{url} 再试一次。"]
 
 
 def test_segment_cap_merges_overflow_into_last():

@@ -456,7 +456,7 @@ stdout 记录前后 PID/commit。退出码 `0` 表示发布成功，`1` 表示�
 | | `history_ttl_hours` | 超过这个时间的旧消息不再拼进上下文 |
 | | `dedupe_ttl_seconds` | 入站去重窗口：同一平台消息 id 在此窗口内重复到达即丢弃（默认 300 秒，0 关闭） |
 | | `strip_action_parens` | 发送前移除「（笑）」这类括号动作描写（默认关） |
-| `reply` | `max_segments` | 一条回复最多发成几段（默认 3；生成端用换行分 1~3 段短句） |
+| `reply` | `max_segments` | 一条回复最多发成几段（默认 3）。完整换行段另发，逗号、顿号、分号收尾的半句接下行；没有换行的长解释可把首句与后续事实分开发 |
 | | `segment_delay_per_char_ms` `segment_delay_min_ms` `segment_delay_max_ms` | 段间打字延迟：按下一段字数 × 每字毫秒，再截到上下限（默认 130 / 1500 / 4000 毫秒） |
 | | `segment_delay_enabled` | 段间延迟开关；关掉后连发（第一段始终立即发） |
 | `attention` | `talk_value` `engaged_window_seconds` | 普通群批次进入查看/策划步的概率与被点名后的全看窗口；默认 `0.75` / `120`，不是最终回复概率 |
