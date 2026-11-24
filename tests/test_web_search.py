@@ -1100,7 +1100,7 @@ def test_verification_fault_cannot_fall_back_to_free_generation(monkeypatch, fau
     bot, adapter = make_bot(llm, search=SearchConfig(tavily=SearchChannelConfig(api_key='offline')))
     def unavailable(*args, **kwargs):
         raise RuntimeError('查证管线未完成')
-    monkeypatch.setattr('rubenbot.core.' + fault, unavailable)
+    monkeypatch.setattr('rubenbot.core_generation.' + fault, unavailable)
     asyncio.run(bot.handle_event(event('今天有什么新闻')))
     assert adapter.texts == [NO_EVIDENCE] and list(llm.stages) == ['gen_stage1']
 
