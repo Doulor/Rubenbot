@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import traceback
 
 import httpx
 import pytest
@@ -502,6 +503,68 @@ def test_photo_download_failure_keeps_placeholder_segment():
     assert event.segments[0].data == {"file_id": "only", "width": 640, "height": 480}
 
 
+@pytest.mark.parametrize("status", [404, 500])
+def test_voice_download_error_keeps_placeholder_and_logs_only_safe_fields(status, caplog):
+    caplog.set_level("INFO")  # 同时检查 httpx 的请求日志
+    path = "voice/private-file.oga"
+    file_id = "private-file-id"
+
+    def handler(request):
+        if request.method == "POST":
+            return _ok({"file_path": path})
+        assert request.url.path == f"/file/bot{TOKEN}/{path}"
+        return httpx.Response(status, text=str(request.url))
+
+    async def scenario():
+        async with _client_with(handler) as client:
+            adapter = TelegramAdapter(TOKEN, http_client=client)
+            return await adapter.parse_update(make_update(make_message(voice={"file_id": file_id, "duration": 3})))
+
+    event = asyncio.run(scenario())
+    assert event.segments == [Segment("record", {"file_id": file_id, "duration": 3})]
+    assert caplog.messages == [f"下载 Telegram 语音失败：stage=download_voice status={status} error=HTTPStatusError"]
+    for secret in (TOKEN, f"https://api.telegram.org/file/bot{TOKEN}/{path}", file_id):
+        assert secret not in caplog.text
+
+
+def test_voice_download_success(caplog):
+    caplog.set_level("INFO")
+    fake = FakeTelegram()
+    fake.get_file_result = {"file_path": "voice/clip.oga"}
+    fake.file_bytes = b"OggS-test"
+    adapter = make_adapter(fake)
+
+    async def scenario():
+        try:
+            message = make_message(voice={"file_id": "voice-id", "mime_type": "audio/ogg"})
+            return await adapter.parse_update(make_update(message))
+        finally:
+            await close(adapter)
+
+    segment = asyncio.run(scenario()).segments[0]
+    assert segment == Segment("record", {
+        "file_id": "voice-id", "mime_type": "audio/ogg", "filename": "clip.oga",
+        "base64": base64.b64encode(fake.file_bytes).decode(),
+    })
+    assert TOKEN not in caplog.text
+
+
+def test_get_file_failure_does_not_log_response_body(caplog):
+    caplog.set_level("INFO")
+
+    def handler(request):
+        return httpx.Response(200, json={"ok": False, "description": str(request.url)})
+
+    async def scenario():
+        async with _client_with(handler) as client:
+            adapter = TelegramAdapter(TOKEN, http_client=client)
+            return await adapter.parse_update(make_update(make_message(voice={"file_id": "voice-id"})))
+
+    assert asyncio.run(scenario()).segments == [Segment("record", {"file_id": "voice-id"})]
+    assert caplog.messages == ["下载 Telegram 语音失败：stage=getFile status=200 error=ValueError"]
+    assert TOKEN not in caplog.text
+
+
 def test_entity_text_uses_utf16_offsets():
     text = "😀@bot"
     # emoji 占 2 个 UTF-16 码元，@bot 从 offset=2 开始
@@ -643,8 +706,9 @@ def test_send_api_error_raises():
     )
 
     async def scenario():
-        with pytest.raises(RuntimeError, match="Forbidden"):
+        with pytest.raises(RuntimeError, match="^stage=sendMessage status=403 error=HTTPStatusError$") as caught:
             await adapter.send("111", [Segment.text("x")])
+        assert TOKEN not in "".join(traceback.format_exception(caught.value))
         await close(adapter)
 
     asyncio.run(scenario())
@@ -811,7 +875,7 @@ def test_start_polls_and_dispatches(monkeypatch):
     assert "offset" not in received[0]
 
 
-def test_start_retries_with_backoff(monkeypatch):
+def test_start_retries_with_backoff(monkeypatch, caplog):
     """getUpdates 连续异常时退避重试，恢复后继续，stop 能干净退出。"""
     import rubenbot.adapters.telegram as module
 
@@ -826,7 +890,7 @@ def test_start_retries_with_backoff(monkeypatch):
             return _ok({"id": BOT_ID, "is_bot": True, "username": BOT_USERNAME, "first_name": "Ruben"})
         attempts.append(1)
         if len(attempts) <= 2:
-            raise httpx.ConnectError("连不上", request=request)
+            raise httpx.ConnectError(f"连不上 {request.url}", request=request)
         if len(attempts) == 3:
             return _ok([make_update(make_message(text="恢复了"), update_id=1)])
         await asyncio.Event().wait()
@@ -856,6 +920,8 @@ def test_start_retries_with_backoff(monkeypatch):
     asyncio.run(scenario())
     assert received == ["恢复了"]
     assert adapter.poll_error_count == 2
+    assert "stage=getUpdates status=- error=ConnectError" in caplog.text
+    assert TOKEN not in caplog.text
     # 恢复后 offset 已推进，下一次 getUpdates 会带上
     assert adapter._offset == 2
 
