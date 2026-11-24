@@ -1,0 +1,22 @@
+{
+  "id": "group-faq",
+  "name": "本群办事卡",
+  "version": "1.0.0",
+  "description": "按群提供机主维护的少量办事说明，过期卡片不会注入回复上下文",
+  "author": "RubenBot",
+  "min_core_version": "0.1.0",
+  "permissions": ["read_messages", "send_messages"],
+  "config_schema": [
+    {
+      "key": "cards",
+      "type": "list",
+      "default": [],
+      "max_length": 80,
+      "description": "每项一张卡，格式：群标识｜标题｜正文｜有效期；有效期留空表示长期有效，日期写 YYYY-MM-DD 或 ISO 时间"
+    }
+  ],
+  "triggers": ["在群里询问办事安排时由现有策划判断是否引用本群办事卡"],
+  "hooks": ["on_before_reply", "on_config_change"],
+  "category": "工具",
+  "icon": "🗂️"
+}
