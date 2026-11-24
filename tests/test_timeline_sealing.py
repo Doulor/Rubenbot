@@ -37,7 +37,9 @@ def test_followup_after_missing_id_extraction(config, store, initially_enabled):
             bot.apply_config(changed, rebuild_llm=False)
             context = '\n'.join(m['content'] for m in await bot.build_context(target, now=now))
             recall = await bot.recall('', '灯塔项目', event=target, now=now)
-            for text in [source.text, '在灯塔项目负责蓝杉配色', '已为灯塔项目选定蓝杉色']:
+            # 无出处的模型改写不另立一条账；可见性只围绕真正写入的事件与事实判断。
+            assert '已为灯塔项目选定蓝杉色' not in context + recall
+            for text in [source.text, '在灯塔项目负责蓝杉配色']:
                 assert (text in recall) is not enabled, (enabled, recall)
                 assert (text in context) is not enabled, (enabled, context)
         assert not store.available_raw_ids([source.raw_message_id], unblocked=True)

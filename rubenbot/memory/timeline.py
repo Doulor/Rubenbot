@@ -23,8 +23,10 @@ from dataclasses import dataclass, field, fields
 from datetime import datetime
 
 from ..adapters.base import MessageEvent
-from ..privacy.gate import OWNER_AUDIENCE
-from .store import SELF_PERSON_ID, Event, MemoryStore
+from ..privacy.gate import OWNER_AUDIENCE, has_high_sensitivity_hint
+from ..privacy.sealing import requests_secrecy
+from .owner_statement import is_owner_self_statement
+from .store import SELF_PERSON_ID, Event, MemoryStore, make_person_id
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +47,71 @@ def _clip(text: str, length: int) -> str:
 
 def _one_line(text: str) -> str:
     return ' '.join(text.split())
+
+
+def _inbound_summary(text: str, visual: str) -> str:
+    """保留字面出处；区分用户正文、画面描述，避免长配文挤掉图里内容。"""
+    if visual:
+        return f'〔画面：{_clip(_one_line(visual), 500)}〕 {_clip(_one_line(text), 160)}'.strip()
+    return _clip(_one_line(text), 500)
+
+
+def _sensitivity(text: str, visual: str) -> str:
+    full = text + '\n' + visual
+    return 'sealed' if requests_secrecy(full) else 'high' if has_high_sensitivity_hint(full) else 'normal'
+
+
+def bind_inbound_timeline(store: MemoryStore) -> None:
+    """在同一写事务里跟随感知回填和追封，不轮询、不重新插入已清空的行。
+
+    临时触发器只服务当前连接，不给独立 WebUI 或旧版程序留下依赖 Python 函数的触发器。
+    """
+    with store._lock, store._conn:
+        db = store._conn
+        db.create_function('inbound_summary', 2, _inbound_summary)
+        db.create_function('inbound_sensitivity', 2, _sensitivity)
+        db.execute('CREATE INDEX IF NOT EXISTS idx_events_raw_id ON events(source_raw_id) WHERE source_raw_id IS NOT NULL')
+        db.execute('''CREATE TEMP TRIGGER IF NOT EXISTS sync_inbound_media AFTER UPDATE OF text,visual_text
+            ON raw_messages WHEN NEW.text<>OLD.text OR NEW.visual_text<>OLD.visual_text BEGIN
+              UPDATE events SET summary=inbound_summary(NEW.text,NEW.visual_text), sensitivity=CASE
+                WHEN sensitivity='sealed' OR inbound_sensitivity(NEW.text,NEW.visual_text)='sealed' THEN 'sealed'
+                WHEN sensitivity='high' THEN 'high' ELSE inbound_sensitivity(NEW.text,NEW.visual_text) END
+              WHERE source_raw_id=NEW.id AND kind='inbound'; END''')
+        # 封存在独立连接也生效，不依赖 Python 函数；周梗概不得绕过迟到的追封。
+        db.execute('''CREATE TRIGGER IF NOT EXISTS seal_inbound AFTER INSERT ON sealed_sources BEGIN
+            UPDATE events SET sensitivity='sealed' WHERE kind='inbound' AND source_raw_id=NEW.raw_id;
+            UPDATE events SET sensitivity='sealed' WHERE kind='digest' AND person_id=NEW.person_id
+              AND source_chat=NEW.origin AND ts BETWEEN NEW.ts AND NEW.ts+604800 AND EXISTS
+              (SELECT 1 FROM events c WHERE c.kind='inbound' AND c.source_raw_id=NEW.raw_id AND c.compressed=1
+               AND c.source_chat_type=events.source_chat_type AND c.audience=events.audience);
+            END''')
+
+
+def record_inbound(store: MemoryStore, event: MessageEvent, raw_id: int, visual: str, *, owner: bool, now: float) -> None:
+    from .retrieve import audience_for_chat
+
+    has_media = any(s.type in ('image', 'sticker', 'record') for s in event.segments)
+    audience = (OWNER_AUDIENCE if owner and not has_media and is_owner_self_statement(event.text)
+                else audience_for_chat(event.chat_type, event.chat_id))
+    store.add_event(make_person_id(event.platform, event.sender_id), _inbound_summary(event.text, visual),
+                    kind='inbound', ts=now, now=now, salience=0.1, source_raw_id=raw_id,
+                    source_chat=f'{event.platform}:{event.chat_id}', source_chat_type=event.chat_type,
+                    sensitivity=_sensitivity(event.text, visual), audience=audience)
+
+
+def finish_voice(store: MemoryStore, event: MessageEvent, *, owner: bool) -> bool:
+    """转写到达时唤醒抽取；期间被清空就不重建事件。"""
+    with store._lock, store._conn:
+        db = store._conn
+        updated = db.execute('UPDATE raw_messages SET text=?, processed=extraction_blocked WHERE id=?',
+                             (event.text, event.raw_message_id))
+        if not updated.rowcount:
+            return False
+        if (owner and not any(s.type in ('image', 'sticker') for s in event.segments)
+                and is_owner_self_statement(event.text.removeprefix('[语音]').strip())):
+            db.execute("UPDATE events SET audience=? WHERE source_raw_id=? AND kind='inbound'",
+                       (OWNER_AUDIENCE, event.raw_message_id))
+        return True
 
 
 def describe_gap(seconds: float) -> str:
@@ -140,8 +207,8 @@ def read_timeline(store: MemoryStore, *, since: float | None = None, now: float 
 
 async def recent_timeline(store: MemoryStore, event: MessageEvent, *, hours: float = 24,
                           char_limit: int = 1800, allow: AllowBatch | None = None,
-                          now: float | None = None) -> list[str]:
-    """本地历史通道之外的近况。已有蒸馏事件的场合不用流水；其余每个场合取一行。"""
+                          now: float | None = None, include_self: bool | None = None) -> list[str]:
+    """别处近况；私聊默认也可看到群里的自我动作，不把别人的私聊交付摊开。"""
     if hours <= 0 or char_limit <= 0:
         return []
     now = time.time() if now is None else now
@@ -150,10 +217,12 @@ async def recent_timeline(store: MemoryStore, event: MessageEvent, *, hours: flo
     offset = 0
     while True:
         page = read_timeline(store, since=now - hours * 3600, now=now, exclude_chat=event,
+                             include_self=event.is_private if include_self is None else include_self,
                              prefer_events=True, latest_raw=allow is None, limit=_PAGE, offset=offset)
         if not page:
             return lines
-        candidates = [r for r in page if r.kind != 'raw' or (r.platform, r.chat_type, r.chat_id) not in raw_places]
+        candidates = [r for r in page if (r.person_id != SELF_PERSON_ID or r.chat_type == 'group')
+                      and (r.kind != 'raw' or (r.platform, r.chat_type, r.chat_id) not in raw_places)]
         for row in (await allow(candidates) if allow and candidates else candidates):
             place = row.platform, row.chat_type, row.chat_id
             if row.kind == 'raw' and place in raw_places:
@@ -172,6 +241,59 @@ async def recent_timeline(store: MemoryStore, event: MessageEvent, *, hours: flo
         if len(page) < _PAGE or not char_limit:
             return lines
         offset += len(page)
+
+
+async def recent_related_events(store: MemoryStore, event: MessageEvent, *, hours: float = 24,
+                                allow: AllowBatch | None = None, now: float | None = None) -> list[str]:
+    """私聊独立的 600 字预算：本人在群里的发言，以及群里明确 @ / 回复本人的事件。"""
+    if not event.is_private or not event.sender_id or hours <= 0:
+        return []
+    now = time.time() if now is None else now
+    # 最近的一张图通常靠时间就能找回；明确问一个话题时让相关旧事件排在闲聊之前。
+    from .normalize import expand_query
+
+    terms = _query_terms(expand_query(event.text))
+    weights = '+'.join(f'(instr(lower(e.summary),:q{i})>0)*{w}' for i, (_, w) in enumerate(terms)) or '0.0'
+    params = {f'q{i}': term for i, (term, _) in enumerate(terms)}
+    person = make_person_id(event.platform, event.sender_id)
+    lines: list[str] = []
+    remaining = SELF_ACTION_MAX_CHARS
+    offset = 0
+    while True:
+        # 在分页前按真实账号筛选，不让热闹的无关群耗光预算。老蒸馏事件可能已没有流水。
+        # weights 只含内部整数权重与命名参数；所有查询词通过 params 绑定。
+        with store._lock:
+            rows = store._conn.execute(f'''SELECT e.*, substr(e.source_chat,instr(e.source_chat, ':')+1) chat_id,
+                COALESCE(NULLIF(r.sender_name,''), NULLIF(p.display_name,''), e.person_id) speaker,
+                COALESCE(i.name,'') chat_name, COALESCE(r.entity_blocked,0) blocked
+                FROM events e LEFT JOIN raw_messages r ON r.id=e.source_raw_id AND r.platform=:platform
+                  AND r.platform||':'||r.chat_id=e.source_chat AND r.chat_type='group'
+                LEFT JOIN people p ON p.person_id=e.person_id
+                LEFT JOIN identity_cache i ON i.platform=:platform AND i.kind='group' AND i.group_id=''
+                  AND :platform||':'||i.object_id=e.source_chat
+                WHERE e.ts BETWEEN :since AND :now AND e.compressed=0 AND e.person_id<>'self'
+                  AND substr(e.source_chat,1,instr(e.source_chat,':')-1)=:platform
+                  AND (e.source_chat_type='group' OR (e.source_chat_type='' AND e.audience LIKE 'group:%'))
+                  AND (e.person_id=:person OR r.reply_sender_id=:uid OR EXISTS
+                      (SELECT 1 FROM json_each(r.mentions) WHERE key=:uid))
+                ORDER BY ({weights}) DESC,e.ts DESC,e.id DESC LIMIT :limit OFFSET :offset''',
+                dict(**params, platform=event.platform, uid=event.sender_id, person=person, since=now-hours*3600,
+                     now=now, limit=_PAGE, offset=offset)).fetchall()
+        entries = [TimelineEntry('event', r['id'], event.platform, 'group', r['chat_id'], r['chat_name'],
+                                 r['person_id'], r['speaker'], r['summary'], r['ts'], r['audience'], r['sensitivity'],
+                                 r['source_raw_id'], bool(r['blocked'])) for r in rows]
+        for row in (await allow(entries) if allow and entries else entries):
+            prefix = row.label(now=now) + ' '
+            if remaining <= len(prefix) + 1:
+                return lines
+            line = prefix + _clip(_one_line(row.text), min(500, remaining - len(prefix)))
+            lines.append(line)
+            remaining -= len(line) + 1
+            if len(lines) >= SELF_ACTION_MAX_LINES:
+                return lines
+        if len(rows) < _PAGE:
+            return lines
+        offset += len(rows)
 
 
 async def recent_self_actions(store: MemoryStore, event: MessageEvent, *, hours: float = 24,
@@ -266,7 +388,7 @@ async def search_timeline(store: MemoryStore, query: str, *, exclude_chat: Messa
                       and _text_key(e.text) not in omitted]
         for e in (await allow(candidates) if allow and candidates else candidates):
             # 同一句被不同人说过，不能把甲的证词归给乙。
-            key = (e.kind, e.person_id, _text_key(e.excerpt()))
+            key = (e.person_id, _text_key(e.excerpt()))
             if key not in seen:
                 result.append(e)
                 seen.add(key)
@@ -323,7 +445,7 @@ class TimelineCompressor:
             event
             for event in self.store.list_events(until=cutoff, include_compressed=False, newest_first=False)
             # 机主事件保留原 id 和逐条来源，不能用 digest 的新键绕过 deny 或事后封存。
-            if event.kind == "event" and event.audience != OWNER_AUDIENCE
+            if event.kind in ('event', 'inbound') and event.audience != OWNER_AUDIENCE
         ]
         groups: dict[tuple[str, tuple[int, int], str, str, str], list[Event]] = {}
         for event in candidates:

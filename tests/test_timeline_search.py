@@ -186,7 +186,8 @@ def test_recent_fallback_uses_one_row_per_place_and_real_sources(store, monkeypa
         return rows
 
     monkeypatch.setattr(store, 'timeline_rows', count)
-    lines = asyncio.run(recent_timeline(store, event(), now=NOW))
+    # 此例隔离无人物事件时的流水回退；私聊默认包含 self 的行为另测。
+    lines = asyncio.run(recent_timeline(store, event(), now=NOW, include_self=False))
     assert len(lines) == 1
     assert all(word in lines[0] for word in ['流水319', '群聊', '周末聚会', 'console:42', '同名'])
     assert calls == [1]

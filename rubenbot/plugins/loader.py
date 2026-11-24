@@ -238,11 +238,29 @@ class PermissionedAdapter:
 
     async def send(self, chat_id: str, segments: list[Segment], *, chat_type: str = "group") -> Any:
         self._context._require("send_messages", "发送消息")
-        return await self._adapter.send(chat_id, segments, chat_type=chat_type)
+        result = await self._adapter.send(chat_id, segments, chat_type=chat_type)
+        if self._context.plugin.name == "music":
+            # 只有音乐卡、语音段能证明发歌；列表、错误提示和附加说明都是文字。
+            for seg in segments:
+                if seg.get("type") in ("music", "record"):
+                    self._note_music_delivery(chat_id, chat_type, (seg.get("data") or {}).get("title", ""))
+                    break
+        return result
 
     async def send_file(self, chat_id: str, filename: str, content: bytes, *, chat_type: str) -> None:
         self._context._require("send_messages", "发送文件")
-        return await self._adapter.send_file(chat_id, filename, content, chat_type=chat_type)
+        result = await self._adapter.send_file(chat_id, filename, content, chat_type=chat_type)
+        if self._context.plugin.name == "music" and Path(filename).suffix.lower() in (".mp3", ".m4a"):
+            self._note_music_delivery(chat_id, chat_type, Path(filename).stem)
+        return result
+
+    def _note_music_delivery(self, chat_id: str, chat_type: str, title: str) -> None:
+        callback = self._context.manager.on_music_delivery
+        if callback is not None:
+            try:
+                callback(self._adapter.name, chat_type, chat_id, title)
+            except Exception as exc:  # noqa: BLE001 - 记账失败不能触发插件重发
+                logger.warning("记录点歌投递失败：%s", exc)
 
     async def call_capability(self, name: str, **kwargs: Any) -> Any:
         self._context._require(capability_permission(name), f"能力 {name}")
@@ -758,6 +776,7 @@ class PluginManager:
         self.plugins: dict[str, Plugin] = {}
         # 最近一次分发时的运行时上下文（BotContext）：插件可从它拿 bot、persona 等
         self.current_runtime: Any = None
+        self.on_music_delivery: Callable[[str, str, str, str], None] | None = None
         # 装后授权：构造时没给就按数据库同目录的独立文件读；内存库只驻内存
         self.permissions = permissions or PluginPermissionStore(path_for_store(store))
         # 适配器收口代理缓存：(插件名, id(真实适配器)) -> 代理，保证同一真实

@@ -470,6 +470,8 @@ def test_llm_client_records_usage_with_task_labels(config, store):
 
     # 私聊必回 → chat 任务
     asyncio.run(bot.handle_event(private_event("在吗")))
+    # 此例只验抽取费用；新入站事件本来就是画像维护的原料，不触发到期的画像作业。
+    store.set_meta('distill:last_at', str(time.time()))
     # 同一私聊批次只花一次抽取费用；同号群聊是另一批，不混作同一会话。
     store.add_raw_message(platform="recording", chat_type="private", chat_id="u1", sender_id="u1",
                           sender_name="阿花", text="我住在杭州")

@@ -93,8 +93,10 @@ def test_owner_answers_across_places(config, store, monkeypatch, route, source, 
             if route == "recent":
                 assert any("【相关原话摘录】" in c and STATEMENT in c for c in contents)
             else:
-                assert any("机主今晚吃了鸭腿" in c for c in contents)
-                assert all(STATEMENT not in c for c in contents)
+                # raw 已清理，但直落事件仍有原话；抽取不再凭模型改写覆盖原文。
+                expected = '机主今晚吃了鸭腿' if route == 'fact' else STATEMENT
+                assert any(expected in c for c in contents)
+                assert not any('【相关原话摘录】' in c and STATEMENT in c for c in contents)
         assert adapter.texts[-1] == "鸭腿"
 
     start = time.time()
