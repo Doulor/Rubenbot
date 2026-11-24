@@ -550,15 +550,7 @@ class VerdictMixin:
         self.opener_guard.clear_pending(round_.key)
         if not sent:
             return
-        reply = "\n".join(sent.delivered_parts)
-        if not visual_only:
-            await self.sticker_behavior.on_after_reply(self.context, event, reply)
-        await self.privacy_commands.after_reply(self.context, event)
-        if self.plugins is not None:
-            try:
-                await self.plugins.run_after_reply(self.context, event, reply)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("插件 on_after_reply 异常：%s", exc)
+        await self._after_reply(event, sent, visual_only)
 
     def _decision_addressing(
         self, event: MessageEvent, decision: ReplyDecision,
