@@ -86,6 +86,19 @@ MAX_PHOTO_BYTES = 10 * 1024 * 1024
 _CHAT_TYPES = {"private": "private", "group": "group", "supergroup": "group"}
 
 
+class _TelegramError(RuntimeError):
+    """可直接写日志或交给调用方的请求错误，不保存 URL 或响应正文。"""
+
+
+def _safe_error(stage: str, exc: Exception, status: int | None = None) -> _TelegramError:
+    if isinstance(exc, _TelegramError):
+        return exc  # 保留最内层的具体阶段（例如 getFile 而非语音下载）
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+    status_field = status if status is not None else "-"
+    return _TelegramError(f"stage={stage} status={status_field} error={type(exc).__name__}")
+
+
 class TelegramAdapter(BaseAdapter):
     """Telegram Bot API 长轮询适配器。"""
 
@@ -155,7 +168,7 @@ class TelegramAdapter(BaseAdapter):
                 if self._stop.is_set():
                     break
                 self.poll_error_count += 1
-                logger.warning("Telegram 轮询异常：%s（%.0fs 后重试）", exc, delay)
+                logger.warning("Telegram 轮询异常：%s（%.0fs 后重试）", _safe_error("poll", exc), delay)
                 await self._sleep_or_stop(delay)
                 delay = min(delay * 2, POLL_BACKOFF_MAX)
 
@@ -200,27 +213,24 @@ class TelegramAdapter(BaseAdapter):
         files: Mapping[str, Any] | None = None,
     ) -> Any:
         """调用一个 Bot API 方法，返回 ``result`` 字段；失败抛 RuntimeError。"""
-        client = await self._get_client()
-        if files is not None:
-            # multipart 表单的值必须是字符串/字节，数字 id 先转字符串
-            form = {key: str(value) for key, value in (payload or {}).items()}
-            resp = await client.post(self._api_path(method), data=form, files=files)
-        else:
-            resp = await client.post(self._api_path(method), json=dict(payload or {}))
+        status = None
         try:
-            data = resp.json()
-        except ValueError:
+            client = await self._get_client()
+            if files is not None:
+                # multipart 表单的值必须是字符串/字节，数字 id 先转字符串
+                form = {key: str(value) for key, value in (payload or {}).items()}
+                resp = await client.post(self._api_path(method), data=form, files=files)
+            else:
+                resp = await client.post(self._api_path(method), json=dict(payload or {}))
+            status = resp.status_code
             resp.raise_for_status()
-            raise RuntimeError(f"Telegram API {method} 返回了非 JSON 响应")
-        if isinstance(data, dict) and data.get("ok"):
-            return data.get("result")
-        if isinstance(data, dict) and data.get("description"):
-            raise RuntimeError(
-                f"Telegram API {method} 失败：{data.get('description')}"
-                f"（code {data.get('error_code')}）"
-            )
-        resp.raise_for_status()
-        raise RuntimeError(f"Telegram API {method} 失败：{data!r}")
+            data = resp.json()
+            if isinstance(data, dict) and data.get("ok"):
+                return data.get("result")
+            raise ValueError("Bot API 未返回成功结果")
+        except Exception as exc:
+            # 调用方可能打印整个回溯，不能链接原异常或转述平台错误正文。
+            raise _safe_error(method, exc, status) from None
 
     async def _fetch_me(self) -> None:
         """getMe：拿 bot 自己的 id / username，用于识别 @ 与“回复 bot”。"""
@@ -313,14 +323,14 @@ class TelegramAdapter(BaseAdapter):
             try:
                 event = await self.parse_update(update)
             except Exception as exc:  # noqa: BLE001 - 坏 update 不能打死循环
-                logger.warning("解析 Telegram update 失败：%s", exc)
+                logger.warning("解析 Telegram update 失败：%s", _safe_error("parse_update", exc))
                 continue
             if event is None or self._on_event is None:
                 continue
             try:
                 await self._on_event(event)
             except Exception as exc:  # noqa: BLE001 - 事件回调失败也不能打死循环
-                logger.warning("处理 Telegram 事件失败：%s", exc)
+                logger.warning("处理 Telegram 事件失败：%s", _safe_error("on_event", exc))
         self._save_offset()
 
     async def parse_update(self, update: Mapping[str, Any]) -> MessageEvent | None:
@@ -461,8 +471,8 @@ class TelegramAdapter(BaseAdapter):
             if not isinstance(path, str) or not path.lower().endswith((".webp", ".png")):
                 return None
             raw = await self._download_file(path)
-        except (ValueError, RuntimeError, httpx.HTTPError) as exc:
-            logger.debug("下载 Telegram 静态贴纸失败：%s", type(exc).__name__)
+        except Exception as exc:
+            logger.debug("下载 Telegram 静态贴纸失败：%s", _safe_error("download_sticker", exc))
             return None
         if not raw:
             return None
@@ -486,7 +496,7 @@ class TelegramAdapter(BaseAdapter):
                     data["base64"] = base64.b64encode(raw).decode("ascii")
                     data["mime_type"] = mimetypes.guess_type(str(file_path))[0] or "image/jpeg"
             except Exception as exc:  # noqa: BLE001 - 下载失败仍保留图片段占位
-                logger.warning("下载 Telegram 图片失败：%s", type(exc).__name__)
+                logger.warning("下载 Telegram 图片失败：%s", _safe_error("download_photo", exc))
         if not data:
             return None
         return Segment("image", data)
@@ -534,7 +544,7 @@ class TelegramAdapter(BaseAdapter):
                         or "audio/ogg"
                     )
             except Exception as exc:  # noqa: BLE001 - 下载失败仍保留语音段占位
-                logger.warning("下载 Telegram 语音失败（file_id=%s）：%s", file_id, exc)
+                logger.warning("下载 Telegram 语音失败：%s", _safe_error("download_voice", exc))
         if not data:
             return None
         return Segment("record", data)
@@ -712,7 +722,7 @@ class TelegramAdapter(BaseAdapter):
                 reply_to=None,
             )
         except Exception as exc:  # noqa: BLE001 - 能力失败收敛成统一异常
-            raise CapabilityError(f"message.voice 失败：{exc}") from exc
+            raise CapabilityError(f"message.voice 失败：{_safe_error('message.voice', exc)}") from None
         return result
 
     async def _send_sticker(self, kwargs: dict[str, Any]) -> Any:
@@ -752,7 +762,7 @@ class TelegramAdapter(BaseAdapter):
         except CapabilityError:
             raise
         except Exception as exc:  # noqa: BLE001 - 能力失败收敛成统一异常
-            raise CapabilityError(f"send_sticker 失败：{exc}") from exc
+            raise CapabilityError(f"send_sticker 失败：{_safe_error('send_sticker', exc)}") from None
 
 
 # ----------------------------------------------------------------------
