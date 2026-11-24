@@ -26,6 +26,7 @@ ctx 提供：
   返回 ``(是否成功, 说明/原因)``；适配器不支持、配置关闭或执行失败都只返回原因
 - ``llm``：核心的 LLM 客户端（需要 bot 已就绪，否则为 None）
 - ``store`` / ``fetch``：读消息、出网；分别需要 ``read_messages`` / ``network`` 授权
+- ``fetch_public_page`` / ``fetch_public_cover``：需 ``network`` 授权，受检读取公网链接或封面
 - ``bot`` / ``runtime``：宿主 bot 与最近一次分发时的运行时上下文
 
 **装后授权**：manifest 只声明权限，机主在 WebUI 里逐项授权后插件才能真正使用。
@@ -70,6 +71,9 @@ import httpx
 
 from ..adapters.base import BaseAdapter, MessageEvent, Segment
 from ..expression import CapabilityNote
+from ..linkparse import fetch as public_web
+from ..linkparse import sites
+from . import public_cover
 from .manifest import Manifest, ManifestError, load_manifest
 from .permissions import (
     PluginPermissionError,
@@ -624,7 +628,7 @@ class PluginContext:
         headers: Mapping[str, str] | None = None,
         timeout: float = 10.0,
     ) -> httpx.Response:
-        """插件出网的唯一入口（需 ``network`` 授权）：返回 ``httpx.Response``。
+        """插件通用 HTTP 入口（需 ``network`` 授权），不可信链接请走受检 API。
 
         未授权时抛 :class:`PluginPermissionError` 并记审计；网络错误照常
         向上抛，由插件自己决定如何降级。
@@ -632,6 +636,20 @@ class PluginContext:
         self._require("network", f"出网请求 {method} {url}")
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             return await client.request(method, url, headers=dict(headers or {}))
+
+    async def fetch_public_page(
+        self, url: str, *, allow_url: Callable[[str], bool] | None = None,
+    ) -> public_web.FetchResult:
+        """受检读取公网文本（1 MiB、共 6 秒）；可用 allow_url 在每跳限制站点。"""
+        self._require("network", "读取公网网页")
+        return await public_web.fetch(url, 1 << 20, 6.0, allow_url=allow_url, prepare=sites.prepare)
+
+    async def fetch_public_cover(
+        self, url: str, *, allow_url: Callable[[str], bool] | None = None,
+    ) -> bytes:
+        """受检读取静态封面（4 MiB、共 6 秒、不跟随跳转）；不返回远程地址。"""
+        self._require("network", "读取公网封面")
+        return await public_cover.fetch(url, allow_url=allow_url)
 
     def capability_note(
         self,
