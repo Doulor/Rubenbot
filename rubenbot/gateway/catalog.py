@@ -35,6 +35,15 @@ RISK_SENSITIVE = "sensitive"
 RISK_SAFE = "safe"
 _VALID_RISKS = (RISK_DENIED, RISK_SENSITIVE, RISK_SAFE)
 
+# 只收已有真机验收记录的聊天动作，文案不超出实测范围。目录里新增自述不会自动发布。
+_E2E_NOTES = {
+    ('snowluma', 'delete_msg'): CapabilityNote(
+        '撤回消息', '我能撤回自己刚在私聊发的消息。',
+        '先看对方回复的是哪条；目标不清就问，不猜消息号。不承诺能撤掉别人的消息。',
+        evidence=('snowluma:delete_msg:docs/gateway-e2e-results.md#D′5–D′7',),
+    ),
+}
+
 
 @dataclass(frozen=True)
 class ActionEntry:
@@ -56,7 +65,7 @@ class ActionEntry:
     capability_note: CapabilityNote | None = None
 
     @classmethod
-    def from_dict(cls, name: str, data: dict[str, Any]) -> "ActionEntry":
+    def from_dict(cls, name: str, data: dict[str, Any], *, adapter: str = '') -> "ActionEntry":
         risk = str(data.get("risk") or RISK_SAFE).strip().lower()
         if risk not in _VALID_RISKS:
             logger.warning("网关目录动作 %s 的风险级 %r 不认识，按 safe 处理", name, risk)
@@ -71,7 +80,7 @@ class ActionEntry:
         fields = ("title", "summary", "detail")
         capability_note = None
         if isinstance(note, dict) and all(isinstance(note.get(k), str) and note[k].strip() for k in fields):
-            capability_note = CapabilityNote(*(note[k].strip() for k in fields))
+            capability_note = _E2E_NOTES.get((adapter, name)) if risk != RISK_DENIED else None
         return cls(
             name=name,
             capability_note=capability_note,
@@ -171,7 +180,7 @@ class ActionCatalog:
             name = str(item.get("name") or "").strip()
             if not name or name in actions:
                 continue
-            actions[name] = ActionEntry.from_dict(name, item)
+            actions[name] = ActionEntry.from_dict(name, item, adapter=adapter)
         return cls(adapter=adapter, actions=actions)
 
     @classmethod

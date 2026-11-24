@@ -17,18 +17,32 @@ MAX_REASON = 60
 
 @dataclass(frozen=True)
 class CapabilityNote:
-    """索引只给标题和自述；策划步选中标题，生成步才读到对应情境说明。
+    """索引给标题、自述和验通依据；生成步才读到选中条目的情境说明。
 
     ``available=False`` 表示这一项此刻做不了（例如插件没启用）。这时 ``title``
     是能力名，``summary`` 是它此刻的短状态（如「还没开」）；索引把同一状态的
     合进「现在还做不了的」一句，不混进「这轮我能做的事」，并要求被明确要时
     照那句话开口，不沉默、也不装作能做。
+
+    ``evidence`` 由生产者在通过检查的分支填写，只写检查项或验收记录引用，
+    不含账号、参数和网页内容。空元组表示只有自述，不能作为可用能力。
     """
 
     title: str
     summary: str
     detail: str
     available: bool = True
+    evidence: tuple[str, ...] = ()
+
+    @property
+    def verified_ready(self) -> bool:
+        """既可用又验通过——只有这样的条目算「这轮我能做的事」。"""
+        return self.available and any(item.strip() for item in self.evidence)
+
+
+def ready_notes(notes: tuple[CapabilityNote, ...]) -> tuple[CapabilityNote, ...]:
+    """本轮真正能列进索引的条目：可用且验通。"""
+    return tuple(note for note in notes if note.verified_ready)
 
 
 def capability_index(notes: tuple[CapabilityNote, ...]) -> str:
@@ -37,10 +51,13 @@ def capability_index(notes: tuple[CapabilityNote, ...]) -> str:
     能做的逐项列标题与自述；做不了的（没启用的插件）按同一状态并成一句
     「点歌、画图还没开。」，并要求被明确要时照着那句话开口——否则这类请求
     会掉进普通聊天，被策划当成闲聊沉默掉，机主分不清是没开还是坏了。
+
+    只渲染已验通的可用条目：``available=False`` 是状态说明可以照实说，
+    没有验通依据的宣称直接丢弃（不混进能做，也不装作没开）。
     """
     if not notes:
         return ''
-    ready = [n for n in notes if n.available]
+    ready = ready_notes(notes)
     ready_titles = {n.title for n in ready}
     # 同一状态归一句；summary 对不可用条目就是状态短语（如「还没开」）
     off: dict[str, list[str]] = {}
@@ -52,7 +69,9 @@ def capability_index(notes: tuple[CapabilityNote, ...]) -> str:
             titles.append(note.title)
     blocks = []
     if ready:
-        blocks.append('【这轮我能做的事】\n' + '\n'.join(f'〔{n.title}〕{n.summary}' for n in ready))
+        blocks.append('【这轮我能做的事】\n' + '\n'.join(
+            f'〔{n.title}〕{n.summary}（验通：{"；".join(n.evidence)}）' for n in ready
+        ))
         blocks.append('需要哪项的具体说明，就把标题列入 JSON 的 capabilities 数组；不用可省略。')
     if off:
         blocks.append('【现在还做不了的】' + ''.join(f'{"、".join(titles)}{state}。'
@@ -61,7 +80,7 @@ def capability_index(notes: tuple[CapabilityNote, ...]) -> str:
                       '也别许诺以后能办；平时不用主动提。'
                       '这是本轮索引里的确定事实：basis 用 settled，speak 用 true。'
                       '别沉默，也别装作能做或拿别的凑数。')
-    return '\n' + '\n'.join(blocks)
+    return '\n' + '\n'.join(blocks) if blocks else ''
 
 
 @dataclass(frozen=True)
@@ -181,5 +200,8 @@ def parse_plan(raw: str, band: str, recent: list[str], notes: tuple[CapabilityNo
     return ExpressionDecision(intent, '碎片' if intent == '短附和' else band, increment,
                               repetition_list(recent, data.get('avoid_repetition')),
                               basis=basis, speak=speak, reason=reason,
-                              capabilities=tuple(n.title for n in notes if isinstance(data.get('capabilities'), list)
+                              # 只认本轮验通、确实列进索引的条目；模型回填没验通的
+                              # 标题（或旧提示词的残留）不展开情境说明。
+                              capabilities=tuple(n.title for n in ready_notes(notes)
+                                                 if isinstance(data.get('capabilities'), list)
                                                  and n.title in data['capabilities']))

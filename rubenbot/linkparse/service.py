@@ -140,7 +140,8 @@ def capability_note(context: "LinkContext") -> CapabilityNote:
     else:
         summary = f"本轮有 {total} 个链接，都没读到。"
         detail = "读不到就如实说读不到，可说明原因；不要编造页面内容。"
-    return CapabilityNote(LINK_CAPABILITY_TITLE, summary, detail)
+    return CapabilityNote(LINK_CAPABILITY_TITLE, summary, detail,
+                          evidence=(f'link:read={read}/{total}',) if read else ())
 
 
 class TimedCache:

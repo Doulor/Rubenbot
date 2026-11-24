@@ -62,7 +62,7 @@ import inspect
 import logging
 import shutil
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
@@ -108,6 +108,7 @@ class CapabilityNoteSpec:
 
     describe: Callable[[MessageEvent, BaseAdapter], CapabilityNote | None]
     requires: tuple[str, ...] | None = None
+    entry: Callable[..., Any] | None = None
 
 
 @dataclass
@@ -620,8 +621,9 @@ class PluginContext:
         describe: Callable[[MessageEvent, BaseAdapter], CapabilityNote | None],
         *,
         requires: str | Iterable[str] | None = None,
+        entry: Callable[..., Any] | None = None,
     ) -> None:
-        """登记一个无副作用的本轮能力说明，不代替行为钩子的注册或鉴权。
+        """登记无副作用的说明；多行为入口的插件用 entry 指向这条能力的处理函数。
 
         ``requires`` 指定这条说明成立所需的授权；省略时按插件声明的全部权限
         计——只要有一项没授权，这条说明就不会出现在注入内容里。
@@ -632,7 +634,7 @@ class PluginContext:
             items = (requires,)
         else:
             items = tuple(requires)
-        self.plugin.capability_notes.append(CapabilityNoteSpec(describe, items))
+        self.plugin.capability_notes.append(CapabilityNoteSpec(describe, items, entry))
 
     def on_message(self, handler: MessageHook) -> MessageHook:
         self.plugin.message_hooks.append(handler)
@@ -1066,31 +1068,49 @@ class PluginManager:
         插件不执行 ``register``，也就没有能力说明可调，这里按 manifest 的名字
         给一条不可用条目，让它出现在索引的「现在还做不了的」里而不是凭空消失
         ——否则机主点歌只会看到沉默，分不清是没开还是坏了。
+
+        说明函数不算行为入口：加载和授权通过后，还要在实际分发表找到可调用的
+        钩子或命令。只查入口，不为生成索引试发消息。
         """
         notes = []
         for plugin in self.plugins.values():
-            # 能真正分发的才算「能做」：启用、已加载、且钩子准入通过
-            if not (plugin.enabled and plugin.loaded and self._hooks_allowed(plugin)):
+            if not (plugin.valid and plugin.enabled and plugin.loaded and self._hooks_allowed(plugin)):
                 note = self._unavailable_note(plugin)
                 if note is not None:
                     notes.append(note)
                 continue
+            if not plugin.capability_notes:
+                continue
             context = PluginContext(plugin, self)
             for spec in plugin.capability_notes:
-                if not self._note_allowed(plugin, spec):
+                entry = self._callable_entry(plugin, spec)
+                if not entry or not self._note_allowed(plugin, spec):
                     continue
                 try:
                     # 说明里拿到的适配器同样收口：send 需要 send_messages
                     note = spec.describe(
                         event, context.adapter_view(adapter) if adapter is not None else adapter
                     )
-                    if isinstance(note, CapabilityNote):
-                        notes.append(note)
+                    if (isinstance(note, CapabilityNote) and note.title.strip()
+                            and note.summary.strip() and note.detail.strip()):
+                        notes.append(replace(note, evidence=(f'plugin:{plugin.name}:loaded',
+                                                             f'entry:{entry}', 'permissions:granted')))
                 except PluginPermissionError:
                     continue
                 except Exception as exc:
                     logger.warning("插件 %s 的能力说明不可用：%s", plugin.name, exc)
         return notes
+
+    @staticmethod
+    def _callable_entry(plugin: Plugin, spec: CapabilityNoteSpec) -> str | None:
+        entries = [(name, hook) for name, hooks in (('on_message', plugin.message_hooks),
+                                                     ('on_before_reply', plugin.before_reply_hooks),
+                                                     ('on_after_reply', plugin.after_reply_hooks)) for hook in hooks]
+        entries.extend((f'command:{name}', cmd.handler) for name, cmd in plugin.commands.items())
+        # 兼容点歌等只有一个行为入口的插件；多个入口不能拿无关命令替另一条能力背书。
+        if spec.entry is None:
+            return entries[0][0] if len(entries) == 1 and callable(entries[0][1]) else None
+        return next((name for name, handler in entries if callable(handler) and handler == spec.entry), None)
 
     @staticmethod
     def _unavailable_note(plugin: Plugin) -> CapabilityNote | None:
