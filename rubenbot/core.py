@@ -98,7 +98,13 @@ from .search import WebSearcher, build_searcher
 from .verification import NO_EVIDENCE, RECORD_PLACEHOLDER, WebReply, verify
 from .proactive import ProactiveOpener, is_acceptable_opener
 from .reply_segments import split_segments
-from .reminder import REMINDER_TOOL, build_reminder_prompt, describe_fire_at, resolve_fire_at
+from .reminder import (
+    REMINDER_TOOL,
+    build_reminder_prompt,
+    describe_fire_at,
+    parties_from_payload,
+    resolve_fire_at,
+)
 from .scheduler import Scheduler
 from .stickers import StickerStore
 from .sticker_behavior import VISUAL_SEGMENTS, StickerBehavior, segment_description
@@ -525,7 +531,6 @@ class RubenBot:
         self.entities = EntityLedger(store)
         self._ledger_read: set[tuple[str, str]] = set()
         self._recall_checked = False
-        self._reminder_saved = False
         self.store.privacy_enabled = config.privacy.enabled
         self.gate = PrivacyGate(store, llm, config.memory) if config.privacy.enabled else None
         self.privacy_commands = PrivacyCommands()
@@ -660,7 +665,7 @@ class RubenBot:
         self.config = config
         self.sticker_behavior.config = config.stickers
         if rebuild_llm:
-            self._recall_checked = self._reminder_saved = False
+            self._recall_checked = False
             # 重建 LLM 客户端（改了 base_url / api_key / 超时等都需要新客户端）
             self.llm = LLMClient(config.llm, usage_recorder=make_usage_recorder(self.store))
         # 各模块持有的是配置对象引用，换成新对象即可让参数立即生效
@@ -1146,12 +1151,15 @@ class RubenBot:
         if adapter is None:
             logger.warning("提醒 #%s 的平台 %s 不在线，无法发送", job.id, job.platform)
             return
-        requester = str(job.payload.get("requester_name") or job.created_by or "")
+        is_private = job.chat_type == "private"
+        parties = parties_from_payload(
+            job.payload, platform=job.platform, chat_type=job.chat_type, chat_id=job.chat_id,
+        )
         messages = build_reminder_prompt(
             persona=self.persona.system_prompt(),
             text=text,
-            requester=requester,
-            is_private=job.chat_type == "private",
+            parties=parties,
+            is_private=is_private,
             late=late,
         )
         reply = await self.generate(messages)
@@ -2687,7 +2695,10 @@ class RubenBot:
                 and event.sender_id and not event.sender_id.startswith('__')
                 and self.store.get_privacy_mode(make_person_id(event.platform, event.sender_id)) == 'normal'):
             notes.append(CapabilityNote('查实体账', '我能对照本群提过的名字和原话。', '眼熟的名字未必知道含义；只有本群有说明原文时才说它在这里指什么。'))
-        if ('set_reminder' in tools and self._reminder_saved and self.store.count_pending_jobs(
+        # 提醒能力与工具注册表同源：set_reminder 在工具清单里就报能记，
+        # 不等本进程此前记过一条才承认（否则第一次被托提醒时策划会判「不在能力里」，
+        # 直接沉默或只发表情，见第 29 项）。只剩会话上限这一条事实性条件。
+        if ('set_reminder' in tools and self.store.count_pending_jobs(
                 kind='reminder', platform=event.platform, chat_id=event.chat_id) < self.config.reminder.max_pending_per_chat):
             notes.append(CapabilityNote('记提醒', '我能为这个会话记下提醒。', '对方明确托我在某时提醒一件事，时间和事情都清楚了再记。'))
         if tools & computer.COMPUTER_TOOLS:
@@ -3297,7 +3308,16 @@ class RubenBot:
             platform=event.platform,
             chat_id=event.chat_id,
             chat_type=event.chat_type,
-            payload={"text": text, "requester_name": event.sender_name},
+            payload={
+                "text": text,
+                # 台账：谁提的、提醒谁。到点渲染只认下面两个结构化 id，
+                # 不拿姓名推断「谁让提醒谁」（见 reminder.parties_from_payload）。
+                "requester_name": event.sender_name,
+                "requester_id": make_person_id(event.platform, event.sender_id),
+                # 一期工具只支持「提醒我」：接收者就是发话的这个人。到点是一条
+                # 发回本会话的消息，群聊里旁人也能看见，但话是说给这个人听的。
+                "recipient_id": make_person_id(event.platform, event.sender_id),
+            },
             created_by=make_person_id(event.platform, event.sender_id),
             now=now,
         )
@@ -3305,7 +3325,6 @@ class RubenBot:
             "设置提醒 #%s：%s/%s %s（%s）", job.id, event.platform, event.chat_id, text, describe_fire_at(fire_at, now),
             extra=_log_identity(event),
         )
-        self._reminder_saved = True
         return f"已设好提醒：{describe_fire_at(fire_at, now)}提醒「{text}」。"
 
     def split_reply(self, reply: str) -> list[str]:
