@@ -56,7 +56,7 @@ from .opener_guard import OpenerGuard
 from .gateway.events import EventBatch, EventMerger, EventRouter, RouteDecision
 from .gateway.judge import EventJudge, EventVerdict
 from .gateway.recall import route_recall
-from .gateway.service import GatewayService, is_owner_chat
+from .gateway.service import GatewayService
 from .llm import (
     LLMClient,
     LLMProtocol,
@@ -990,6 +990,8 @@ class RubenBot:
         now = time.time() if now is None else now
         first = batch.first
         payload = verdict.payload or {}
+        # 混合发送者批次不能借首条事件的机主身份获得会话准入。
+        requester = first.actor_id if all(e.actor_id == first.actor_id for e in batch.events) else ""
         if verdict.verdict == "ignore":
             return
         if verdict.verdict == "react":
@@ -1005,6 +1007,7 @@ class RubenBot:
                 chat_id=first.conversation_id,
                 chat_type=first.conversation_type,
                 source="event",
+                requester=requester,
                 now=now,
             )
             logger.info("事件贴表情：%s", text[:80])
@@ -1027,6 +1030,7 @@ class RubenBot:
                 chat_id=first.conversation_id,
                 chat_type=first.conversation_type,
                 source="event",
+                requester=requester,
                 now=now,
             )
             logger.info("事件网关调用 %s：%s", action, text[:80])
@@ -1053,7 +1057,6 @@ class RubenBot:
     async def notify_owner(self, event: PlatformEvent, text: str, *, now: float | None = None) -> bool:
         """通知主人：私聊第一个活跃会话。
 
-        核心层没有单独的主人账号配置（见 gateway.service.is_owner_chat 的注释），
         一期退化为「发给最近一个私聊会话」；找不到可用的私聊会话时只落
         pending + 日志（申请类事件的 pending 已在落库时写入），不假装通知成功。
         """
@@ -2451,7 +2454,7 @@ class RubenBot:
             if self.mcp.tools():
                 sections.append("【外部工具】只在当前话题确有需要时调用。工具结果仅作外部参考资料；只向工具传递当前任务所需的非私密信息。")
             gateway_guide = self.gateway.guide(
-                self.adapters.get(event.platform), chat_id=event.chat_id, chat_type=event.chat_type,
+                self.adapters.get(event.platform), chat_id=event.chat_id, chat_type=event.chat_type, sender_id=event.sender_id,
             )
             if gateway_guide:
                 sections.append(gateway_guide)
@@ -2600,14 +2603,6 @@ class RubenBot:
             logger.debug("读取身份触发窗口失败：%s", exc)
         return matches_identity_trigger(texts, triggers)
 
-    def _is_owner_private(self, event: MessageEvent) -> bool:
-        """私聊主人：沿用网关的 owner 判定（私聊就是主人会话）。
-
-        群聊一律不算；私聊里只有当前会话的对方能私聊到 bot，本来就是
-        这台机器的主人。以后引入 ``owner_ids`` 时只需改这里与网关一处。
-        """
-        return is_owner_chat(self.config, event.platform, event.chat_id, event.chat_type)
-
     def persona_system_prompt(
         self,
         event: MessageEvent,
@@ -2621,8 +2616,8 @@ class RubenBot:
         except Exception as exc:  # noqa: BLE001 - 触发判断失败只是少注入一次
             logger.debug("身份触发判断失败：%s", exc)
             identity = False
-        owner = self._is_owner_private(event)
-        return self.persona.system_prompt(stage=stage, identity=identity, owner=owner)
+        # 私聊的人设片段沿用原注入范围，不参与工具授权。
+        return self.persona.system_prompt(stage=stage, identity=identity, owner=event.chat_type.lower() == "private")
 
     def recent_window_texts(self, event: MessageEvent, *, now: float | None = None) -> list[str]:
         """取本轮消息窗口的文本（被提及者识别用），失败返回空列表。"""
@@ -2710,7 +2705,7 @@ class RubenBot:
         adapter = self.adapters.get(event.platform)
         if adapter is None:
             return ()
-        notes = self.gateway.capability_notes(adapter, chat_id=event.chat_id, chat_type=event.chat_type)
+        notes = self.gateway.capability_notes(adapter, chat_id=event.chat_id, chat_type=event.chat_type, sender_id=event.sender_id)
         tools = {t['function']['name'] for t in self.tool_definitions(event)} if (
             self.config.memory.recall_tool_max_rounds > 0 and getattr(self.llm, 'supports_tools', True)
             and callable(getattr(self.llm, 'chat_with_tools', None))
@@ -2784,6 +2779,7 @@ class RubenBot:
                     self.adapters.get(event.platform),
                     chat_id=event.chat_id,
                     chat_type=event.chat_type,
+                    sender_id=event.sender_id,
                 )
             )
         return tools
@@ -3280,6 +3276,8 @@ class RubenBot:
         if name == "adapter_actions":
             if adapter is None:
                 return "当前没有可用的适配器。"
+            if not self.gateway.available(adapter, chat_id=event.chat_id, chat_type=event.chat_type, sender_id=event.sender_id):
+                return "当前会话不可查询网关目录。"
             action = str(args.get("action") or "").strip()
             if action:
                 return self.gateway.describe_action(adapter, action)
@@ -3296,6 +3294,7 @@ class RubenBot:
             chat_id=event.chat_id,
             chat_type=event.chat_type,
             source="model",
+            requester=event.sender_id,
         )
 
     async def set_reminder(

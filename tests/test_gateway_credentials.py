@@ -26,6 +26,7 @@ ACTIONS = ("get_cookies", "get_csrf_token")
 def service(store, config, caplog):
     config.gateway.enabled = True
     config.gateway.allow_sensitive = True
+    config.gateway.enabled_conversations = ['snowluma:owner']
     caplog.set_level(logging.DEBUG)
     return GatewayService(store, config)
 
@@ -99,6 +100,6 @@ def test_credential_event_log(service, adapter, caplog, action, outcome):
 def test_credential_audit_write_error(service, adapter, caplog, monkeypatch):
     monkeypatch.setattr(service.store, "add_gateway_audit", Mock(side_effect=RuntimeError(VALUE)))
     adapter.call_action.return_value = VALUE
-    reply = asyncio.run(service.call(adapter, "get_cookies", {"domain": PARAM}, chat_type="private"))
+    reply = asyncio.run(service.call(adapter, "get_cookies", {"domain": PARAM}, chat_id="owner", chat_type="private"))
     assert VALUE in reply and "写网关审计失败" in caplog.text
     assert_no_details([], caplog)

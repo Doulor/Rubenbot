@@ -533,8 +533,10 @@ def test_service_disabled_gateway_returns_text():
 def test_tool_registration_gate():
     service, _ = make_service(enabled=True, enabled_conversations=["snowluma:g_allowed"])
     adapter = ActionAdapter()
-    # 私聊恒可（依据见 is_owner_chat 注释）
-    assert [tool["function"]["name"] for tool in service.tools(adapter, chat_id="owner", chat_type="private")] == [
+    # 会话号不是发送者凭证，只有事件携带白名单账号才免显式配置。
+    service.config.computer.whitelist = ['snowluma:owner']
+    assert service.tools(adapter, chat_id="owner", chat_type="private") == []
+    assert [tool["function"]["name"] for tool in service.tools(adapter, chat_id="dm", chat_type="private", sender_id="owner")] == [
         "adapter_actions",
         "adapter_call",
     ]
@@ -558,7 +560,9 @@ def test_tools_are_openai_shape():
 def test_guide_is_single_line_and_only_when_available():
     service, _ = make_service(enabled=True, enabled_conversations=[])
     adapter = ActionAdapter()
-    guide = service.guide(adapter, chat_id="owner", chat_type="private")
+    service.config.computer.whitelist = ['snowluma:owner']
+    assert not service.guide(adapter, chat_id="owner", chat_type="private", sender_id="guest")
+    guide = service.guide(adapter, chat_id="dm", chat_type="private", sender_id="owner")
     assert guide.count("\n") == 0
     assert "adapter_actions" in guide and "set_msg_emoji_like" in guide
     assert service.guide(adapter, chat_id="g1") == ""  # 群聊未开
@@ -602,6 +606,41 @@ def test_core_tool_definitions_include_gateway_when_enabled():
     assert "adapter_call" not in [t["function"]["name"] for t in bot.tool_definitions()]
 
 
+@pytest.mark.parametrize(('kind', 'chat', 'sender', 'whitelist', 'computer_on', 'allowed'), [
+    ('private', 'owner', 'guest', ['snowluma:owner'], False, False),
+    ('private', 'owner', '', ['snowluma:owner'], False, False),
+    ('private', 'dm', 'owner', ['other:owner'], False, False),
+    ('private', 'dm', 'owner', [], False, False),
+    ('private', 'dm', 'owner', ['snowluma:owner'], False, True),
+    ('private', 'dm', 'owner', ['snowluma:owner'], True, True),
+    ('private', 'listed', 'guest', [], False, True),
+    ('group', 'listed', 'guest', [], False, True),
+    ('group', 'listed', 'guest', [], True, False),
+    ('group', 'other', 'owner', ['snowluma:owner'], False, False),
+])
+def test_gateway_registration_and_dispatch(store, kind, chat, sender, whitelist, computer_on, allowed):
+    bot, adapter = make_bot(store, ScriptedLLM(), enabled=True, enabled_conversations=['snowluma:listed'])
+    bot.config.computer.enabled = computer_on
+    bot.config.computer.whitelist = whitelist
+    event = group_event()
+    event.chat_type, event.chat_id, event.sender_id = kind, chat, sender
+    event.sender_name = 'owner'
+    names = {t['function']['name'] for t in bot.tool_definitions(event)}
+    assert names & {'adapter_actions', 'adapter_call'} == ({'adapter_actions', 'adapter_call'} if allowed else set())
+
+    def dispatch(name, args):
+        call = {'function': {'name': name, 'arguments': args}}
+        return run(bot._tool_result_message(call, event))['content']
+
+    action = 'set_msg_emoji_like'
+    assert (action in dispatch('adapter_actions', {'keyword': '表情'})) == allowed
+    assert ('message_id' in dispatch('adapter_actions', {'action': action})) == allowed
+    params = {'message_id': 3, 'emoji_id': '66'}
+    result = dispatch('adapter_call', {'action': action, 'params': params, 'sender_id': 'owner'})
+    assert ('成功' in result) == allowed
+    assert adapter.calls == ([(action, params)] if allowed else [])
+
+
 def test_core_gateway_tool_dispatch():
     bot, adapter = make_bot(MemoryStore(":memory:"), ScriptedLLM(), enabled=True)
     event = group_event()
@@ -618,6 +657,36 @@ def test_core_gateway_tool_dispatch():
     )
     assert "成功" in result
     assert adapter.calls == [("set_msg_emoji_like", {"message_id": 3, "emoji_id": "66"})]
+
+
+@pytest.mark.parametrize('verdict', ['react', 'gateway'])
+@pytest.mark.parametrize(('actors', 'allowed'), [(['owner'], True), (['guest'], False), (['owner', 'guest'], False)])
+def test_private_event_dispatch_uses_actor(store, verdict, actors, allowed):
+    from rubenbot.adapters.platform import PlatformEvent
+    from rubenbot.gateway.events import EventBatch
+    from rubenbot.gateway.judge import EventVerdict
+
+    bot, adapter = make_bot(store, ScriptedLLM(), enabled=True)
+    bot.config.computer.whitelist = ['snowluma:owner']
+    events = [PlatformEvent('snowluma', 'notice', 'poke', actor_id=actor, conversation_id='dm') for actor in actors]
+    batch = EventBatch(events[0].dedupe_key(), events)
+    action = 'set_msg_emoji_like'
+    params = {'message_id': 3, 'emoji_id': '66'}
+    payload = params if verdict == 'react' else {'action': action, 'params': params}
+    run(bot.apply_event_verdict(batch, EventVerdict(verdict, payload)))
+    assert adapter.calls == ([(action, params)] if allowed else [])
+
+
+def test_owner_private_admission_does_not_grant_sensitive_actions(store):
+    bot, adapter = make_bot(store, ScriptedLLM(), enabled=True)
+    bot.config.computer.whitelist = ['snowluma:owner']
+    event = group_event()
+    event.chat_type, event.chat_id, event.sender_id = 'private', 'dm', 'owner'
+    args = {'action': 'set_group_kick', 'params': {'group_id': 1, 'user_id': 2}}
+    assert '敏感' in run(bot._gateway_tool('adapter_call', args, event))
+    assert not adapter.calls
+    row, = store.list_gateway_audit()
+    assert (row['chat_id'], row['ok'], row['sensitive']) == ('dm', 0, 1)
 
 
 def test_core_system_prompt_has_gateway_pointer():

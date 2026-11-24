@@ -185,9 +185,14 @@ _SAFE_PLATFORM = re.compile(r"[a-zA-Z0-9_-]+")
 _SAFE_ID = re.compile(r"[\w:.@-]{1,200}")
 
 
+def is_host_account(config: ComputerConfig, platform: str, sender_id: str) -> bool:
+    """只按平台与发送者账号认机主，不依赖电脑功能开关。"""
+    return bool(_SAFE_PLATFORM.fullmatch(platform) and sender_id
+                and make_person_id(platform, sender_id) in config.whitelist)
+
+
 def is_host(config: ComputerConfig, event: MessageEvent | RawMessage | None) -> bool:
-    return bool(event and _SAFE_PLATFORM.fullmatch(event.platform) and event.sender_id
-                and make_person_id(event.platform, event.sender_id) in config.whitelist)
+    return bool(event and is_host_account(config, event.platform, event.sender_id))
 
 
 def guest_session(config: ComputerConfig, event: MessageEvent | None) -> bool:

@@ -10,8 +10,7 @@
 - :meth:`GatewayService.call`：闸门 → 执行 → 审计，结果/错误摘要回模型。
 
 注册条件（三个同时满足）：配置 ``gateway.enabled``、当前适配器有目录、
-会话在 ``enabled_conversations`` 内——**私聊主人会话恒可**，依据见
-:func:`is_owner_chat` 的注释。
+会话显式开放或私聊发送者在机主白名单内。
 """
 
 from __future__ import annotations
@@ -22,6 +21,7 @@ import logging
 from typing import Any
 
 from ..adapters.base import ActionNotSupported, BaseAdapter
+from ..computer import is_host_account
 from ..config import Config
 from ..expression import CapabilityNote
 from .catalog import RISK_DENIED, RISK_SENSITIVE, ActionCatalog, ActionEntry, catalog_for
@@ -91,18 +91,6 @@ GATEWAY_GUIDE = (
 )
 
 
-def is_owner_chat(config: Config, platform: str, chat_id: str, chat_type: str = "private") -> bool:
-    """这个会话是不是「私聊主人」——网关与敏感动作恒可的会话。
-
-    依据：本项目没有单独的主人账号配置（插件 qzone_post 用 ``owner_ids``，
-    核心层不引入第二套主人概念）。私聊就是「只对一个人说话」的场合：
-    能私聊到 bot 的人就是这台机器的主人/维护者自己，因此在私聊会话里
-    开放网关不会把平台接口暴露给群里任何人。这是「私聊主人恒可」在
-    当前配置模型下的等价实现；以后若引入 ``owner_ids``，这里改一处即可。
-    """
-    return str(chat_type).lower() == "private"
-
-
 class GatewayService:
     """一次进程内的网关服务。目录按适配器缓存，闸门状态落库。"""
 
@@ -126,6 +114,7 @@ class GatewayService:
         *,
         chat_id: str = "",
         chat_type: str = "group",
+        sender_id: str = "",
     ) -> bool:
         """工具注册的总条件：开关、目录、适配器能力、会话白名单。"""
         if not self.config.gateway.enabled:
@@ -134,7 +123,7 @@ class GatewayService:
             return False
         if self.catalog_for(adapter) is None:
             return False
-        return self.conversation_allowed(adapter, chat_id=chat_id, chat_type=chat_type)
+        return self.conversation_allowed(adapter, chat_id=chat_id, chat_type=chat_type, sender_id=sender_id)
 
     def conversation_allowed(
         self,
@@ -142,6 +131,7 @@ class GatewayService:
         *,
         chat_id: str,
         chat_type: str = "group",
+        sender_id: str = "",
     ) -> bool:
         """会话是否在允许范围：私聊主人恒可；其余必须在 enabled_conversations 里。
 
@@ -150,7 +140,7 @@ class GatewayService:
         """
         name = adapter if isinstance(adapter, str) else getattr(adapter, "name", "")
         name = str(name or "")
-        if is_owner_chat(self.config, name, chat_id, chat_type):
+        if chat_type == "private" and is_host_account(self.config.computer, name, sender_id):
             return True
         allowed = set(self.config.gateway.enabled_conversations)
         if not allowed:
@@ -163,22 +153,23 @@ class GatewayService:
         *,
         chat_id: str = "",
         chat_type: str = "group",
+        sender_id: str = "",
     ) -> list[dict[str, Any]]:
         """当前会话可用的网关工具；不可用时返回空列表。"""
-        if not self.available(adapter, chat_id=chat_id, chat_type=chat_type):
+        if not self.available(adapter, chat_id=chat_id, chat_type=chat_type, sender_id=sender_id):
             return []
         return [ADAPTER_ACTIONS_TOOL, ADAPTER_CALL_TOOL]
 
-    def capability_notes(self, adapter: BaseAdapter, *, chat_id: str, chat_type: str) -> list[CapabilityNote]:
+    def capability_notes(self, adapter: BaseAdapter, *, chat_id: str, chat_type: str, sender_id: str = "") -> list[CapabilityNote]:
         """从本会话开放目录生成聊天能力说明；说明不授予原始工具权限。"""
-        if not self.available(adapter, chat_id=chat_id, chat_type=chat_type):
+        if not self.available(adapter, chat_id=chat_id, chat_type=chat_type, sender_id=sender_id):
             return []
         catalog = self.catalog_for(adapter)
         return [entry.capability_note for entry in catalog.visible() if entry.capability_note]
 
-    def guide(self, adapter: BaseAdapter | None, *, chat_id: str = "", chat_type: str = "group") -> str:
+    def guide(self, adapter: BaseAdapter | None, *, chat_id: str = "", chat_type: str = "group", sender_id: str = "") -> str:
         """系统提示里的一行指针；工具不可用时为空。"""
-        if not self.available(adapter, chat_id=chat_id, chat_type=chat_type):
+        if not self.available(adapter, chat_id=chat_id, chat_type=chat_type, sender_id=sender_id):
             return ""
         catalog = self.catalog_for(adapter)
         if catalog is not None and REACT_ACTION not in catalog:
@@ -232,8 +223,8 @@ class GatewayService:
     ) -> str:
         """闸门 → 执行 → 审计；永远返回给模型看的文本，不抛异常。
 
-        ``requester`` / ``requester_owner`` 是发起动作的真实发送者与机主
-        判定，只用于撤回的放行规则（见 :meth:`Gatekeeper.check`）。
+        ``requester`` 来自入站事件，用于会话准入；``requester_owner``
+        只用于聊天撤回的动作级判定（见 :meth:`Gatekeeper.check`）。
         """
         action = str(action or "").strip()
         credential_action = action in CREDENTIAL_ACTIONS
@@ -259,7 +250,7 @@ class GatewayService:
         catalog = self.catalog_for(adapter)
         if catalog is None:
             return unavailable("当前适配器没有接口目录。")
-        if not self.conversation_allowed(adapter, chat_id=chat_id, chat_type=chat_type):
+        if not self.conversation_allowed(adapter, chat_id=chat_id, chat_type=chat_type, sender_id=requester):
             return unavailable("这个会话不在网关允许范围内。")
         entry = catalog.get(action)
         if entry is None:

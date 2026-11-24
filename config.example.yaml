@@ -301,7 +301,7 @@ proactive:
 # 平台推送的 notice / request 事件也会进事件流（judge_events 打开时才做快判）。
 gateway:
   enabled: false               # 总开关：关时模型看不见网关工具
-  enabled_conversations: []    # 允许用网关的会话（platform:chat_id）；群聊要显式列出，私聊主人恒可
+  enabled_conversations: []    # 显式开放的会话（platform:chat_id）。只有 computer.whitelist 内账号的私聊可免列，不依赖 computer.enabled
   judge_events: false          # 事件判断总开关（快判）；关时事件只落库
   # 即使打开敏感动作，以下五项仍在网关拒绝，不会请求 OneBot：
   # delete_friend、set_group_dismiss、set_restart、clean_cache、set_online_status。
