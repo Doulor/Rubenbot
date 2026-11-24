@@ -182,7 +182,13 @@ bot 对每个人的好感度、以及自己当下的心情，都由确定性规�
 | `rubenbot/persona.py` | 加载人格：五文件目录（`data/persona/`）优先，缺目录时回退单文件 SOUL.md |
 | `rubenbot/llm.py` | OpenAI 兼容客户端；按角色（`chat` / `extract` / `consolidate` / `fast` / `summary` / `vision` 及自定义）选模型，支持模型池（故障转移 / 轮询 / 随机）；408/429/5xx 指数退避重试；每次调用写用量表（按实际出结果的模型记）；发请求前查每日预算闸 |
 | `rubenbot/llm_budget.py` | 按任务类型的每日预算闸：调用次数与费用估算两档，超限只停该类任务并记「LLM 预算熔断」日志；台账存 `meta`、按自然日分桶，跨重启保留、跨日清零 |
-| `rubenbot/core.py` | 消息主循环、合并窗口调度、决策、上下文拼装、拆条发送、后台维护 |
+| `rubenbot/core.py` | `RubenBot` 的公开入口：组装流水线、管理生命周期、热配置与后台任务 |
+| `rubenbot/core_ingress.py` | 接入适配器，记录入站消息与平台事件，调度合批 |
+| `rubenbot/core_verdict.py` | 裁定每批事件或消息，调用策划、执行守门与重裁，记录决策 |
+| `rubenbot/core_context.py` | 渲染历史、引用和视觉注记，拼装人格、记忆与本轮上下文 |
+| `rubenbot/core_generation.py` | 生成正文，运行工具循环，拆分回复 |
+| `rubenbot/core_delivery.py` | 管理发送航班，投递分段，记录实际出站并分发后置钩子 |
+| `rubenbot/core_shared.py` | 各段共用的 `BotContext`、`SendResult`、文本清理与场景格式化 |
 | `rubenbot/search.py` | Tavily / DeepSeek / Bing 渠道回退、Bing SERP 解析、结果链接归一、按会话冷却 |
 | `rubenbot/verification.py` | 限时读取结果页，用隔离的阅读步骤选原句与出处；无法核对就不作答 |
 | `rubenbot/voice.py` | 语音双向：入站语音条转写（硅基流动 / OpenAI 兼容 / QQ 原生）、出站语音合成（自定义 OpenAI 兼容 TTS / 硅基流动） |
