@@ -459,6 +459,40 @@ def _parse_tool_arguments(arguments: Any) -> dict[str, Any] | None:
 
 
 @dataclass
+class SendResult:
+    """一次回复的分段投递结果。正文仅供本轮后置钩子使用，不写进决策日志。"""
+
+    raw_ids: list[int] = field(default_factory=list)
+    delivered_parts: list[str] = field(default_factory=list)
+    failed_parts: int = 0
+    reason_code: str = ""
+
+    @property
+    def sent_parts(self) -> int:
+        return len(self.raw_ids)
+
+    def __bool__(self) -> bool:
+        return self.sent_parts > 0
+
+    @property
+    def status(self) -> str:
+        if self:
+            return "partial" if self.failed_parts else "sent"
+        return "superseded" if self.reason_code == "new_input" else "send_failed"
+
+    def audit(self) -> dict[str, Any]:
+        return {"status": self.status, "sent_parts": self.sent_parts, "failed_parts": self.failed_parts,
+                "reason_code": self.reason_code, "raw_ids": self.raw_ids}
+
+
+def _send_error_code(event: MessageEvent, exc: Exception) -> str:
+    # 现有适配器没有结构化拒发异常。只识别明确的收件人限制，不落错误原文。
+    if event.is_private and re.search(r"\bresult=16\s+err=发送失败[，,]\s*请先添加对方为好友", str(exc)):
+        return "private_recipient_refused"
+    return "adapter_error"
+
+
+@dataclass
 class ReplyFlight:
     """持锁的首稿在飞期间，接走会使该草稿过时的入站消息。"""
 
@@ -1423,9 +1457,9 @@ class RubenBot:
                                      hard_trigger=hard, owner=owner)
         if receipt is not None:
             sent = await self.send_reply(event, [Segment.text(receipt)], now=now)
-            decision = ReplyDecision(sent, reason='gateway_recall', hard_trigger=hard)
+            decision = ReplyDecision(bool(sent), reason='gateway_recall', hard_trigger=hard)
             self.last_decision[self.decision_engine.chat_key(event)] = decision
-            self._log_decision(event, decision, now)
+            self._log_decision(event, decision, now, delivery=sent)
             return
         priority = hard is not None or owner
         key = (event.platform, event.chat_type, event.chat_id)
@@ -1518,7 +1552,7 @@ class RubenBot:
             event.chat_id,
             "群聊" if event.is_group else "私聊",
             event.sender_name,
-            decision.log_text(),
+            f"进入策划（{decision.reason}）" if decision.should_reply else decision.log_text(),
             extra=_log_identity(event),
         )
         if not decision.should_reply:
@@ -1607,7 +1641,13 @@ class RubenBot:
             planner_messages, event, decision, now=now, computer_route=computer_route,
             extra_notes=extra_notes,
         )
+
+        def log_superseded() -> None:
+            self._log_decision(event, decision, now, expression, visual_wait=visual_wait,
+                               links=link_note, delivery=SendResult(reason_code="new_input"))
+
         if flight.updates:
+            log_superseded()
             return
         # 单纯传来画面不是文字提问，即使来自私聊也不替策划强行开口。
         visual_only = _visual_only(round_.events)
@@ -1629,15 +1669,18 @@ class RubenBot:
         if operation:
             decision.reason = 'computer_task'
         proactive = event.is_group and decision.hard_trigger is None and not operation
-        if (not visual_only or expression.intent == '表情回应') and await self.try_sticker_reply(
-            event, expression, proactive=proactive, now=now, begin_send=flight.begin_send,
-        ):
+        sticker = None
+        if not visual_only or expression.intent == '表情回应':
+            sticker = await self.try_sticker_reply(event, expression, proactive=proactive, now=now,
+                                                  begin_send=flight.begin_send)
+        if sticker:
             if proactive:
                 self.decision_engine.note_source_reply(event, round_.events, time.time())
             self._log_decision(event, decision, now, expression, must=hard, visual_wait=visual_wait,
-                               links=link_note)
+                               links=link_note, delivery=sticker)
             return
         if flight.updates:
+            log_superseded()
             return
         if expression.intent == '表情回应':
             # 本来只想用表情回应；无图、未启用或发送失败都不换成硬挤一句话。
@@ -1708,6 +1751,7 @@ class RubenBot:
                                       task="gen_agreement_retry" if attempt else "gen_stage2",
                                       computer_task=operation, deliver_file=expression.deliver_file)
             if flight.updates:
+                log_superseded()
                 return
             if operation and isinstance(raw, computer.TaskOutcome):
                 # 工具循环给出结束状态：已交付或没有动作 = 静默；失败 = 一句说明。
@@ -1730,11 +1774,8 @@ class RubenBot:
                 decision.should_reply = True
                 sent = await self.send_reply(event, [Segment.text(reply)], now=now, count_speech=False,
                                              begin_send=flight.begin_send)
-                decision.should_reply = sent
-                if not sent:
-                    decision.reason = "computer_task_send_failed"
                 self._log_decision(event, decision, now, expression, must=hard,
-                                   visual_wait=visual_wait, links=link_note)
+                                   visual_wait=visual_wait, links=link_note, delivery=sent)
                 self.opener_guard.clear_pending(round_.key)
                 return
             if flight.computer_failed or (operation and not raw):
@@ -1747,7 +1788,7 @@ class RubenBot:
                 if sent and proactive:
                     self.decision_engine.note_source_reply(event, round_.events, time.time())
                 self._log_decision(event, decision, now, expression, must=hard,
-                                   visual_wait=visual_wait, links=link_note)
+                                   visual_wait=visual_wait, links=link_note, delivery=sent)
                 self.opener_guard.clear_pending(round_.key)
                 return
             body = clean_reply_patterns(strip_transcript_prefix(raw))
@@ -1823,11 +1864,12 @@ class RubenBot:
         )
         if sent and proactive:
             self.decision_engine.note_source_reply(event, round_.events, time.time())
-        if flight.updates:
-            return
         self._log_decision(event, decision, now, expression, must=hard,
-                           paraphrase=paraphrase_note, visual_wait=visual_wait, links=link_note)
+                           paraphrase=paraphrase_note, visual_wait=visual_wait, links=link_note, delivery=sent)
         self.opener_guard.clear_pending(round_.key)
+        if not sent:
+            return
+        reply = "\n".join(sent.delivered_parts)
         if not visual_only:
             await self.sticker_behavior.on_after_reply(self.context, event, reply)
         await self.privacy_commands.after_reply(self.context, event)
@@ -1873,9 +1915,15 @@ class RubenBot:
         paraphrase: dict[str, Any] | None = None,
         visual_wait: dict[str, Any] | None = None,
         links: dict[str, Any] | None = None,
+        delivery: SendResult | None = None,
     ) -> None:
-        """把护栏与策划裁定写入同一条 decision_log。"""
+        """把本轮护栏、原始策划与实际投递分开记在同一条 decision_log。"""
         factor_data = {}
+        if delivery is not None:
+            decision.should_reply = bool(delivery)
+            factor_data["delivery"] = delivery.audit()
+            if not delivery:
+                decision.reason = delivery.status
         if decision.effective_talk_value is not None:
             factor_data["effective_talk_value"] = decision.effective_talk_value
         # 链接理解：本轮读了哪些、哪些没抓到、怎么投递；只记链接与原因，不记正文。
@@ -3399,10 +3447,10 @@ class RubenBot:
     async def try_sticker_reply(
         self, event: MessageEvent, expression: ExpressionDecision | None, *, proactive: bool, now: float,
         begin_send: Callable[[], bool] | None = None,
-    ) -> bool:
+    ) -> SendResult | None:
         """执行策划选中的表情意图；普通接梗、短附和仍可按配置尝试非文字回应。"""
         if expression is None or expression.intent not in ("接梗", "短附和", "表情回应"):
-            return False
+            return None
         probability = self.config.stickers.nonverbal_probability
         if expression.intent == '表情回应' and probability > 0:
             probability = 1.0  # 明确选择的表达方式不再掷意愿；零概率仍视为禁用。
@@ -3410,9 +3458,9 @@ class RubenBot:
             self.context, event, probability=probability,
             emotion_hint=_sticker_emotion_hint(expression), begin_send=begin_send,
         ):
-            return False
+            return None
         reply = "[表情]"
-        self._record_bot_message(event, reply, None)
+        raw_id = self._record_bot_message(event, reply, None)
         self.decision_engine.note_bot_reply(
             self.decision_engine.chat_key(event), now, proactive=proactive,
         )
@@ -3423,7 +3471,7 @@ class RubenBot:
                 await self.plugins.run_after_reply(self.context, event, reply)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("插件 on_after_reply 异常：%s", exc)
-        return True
+        return SendResult(raw_ids=[raw_id], delivered_parts=[reply])
 
     async def send_reply(
         self,
@@ -3435,7 +3483,7 @@ class RubenBot:
         begin_send: Callable[[], bool] | None = None,
         count_speech: bool = True,
         reminder: bool = False,
-    ) -> bool:
+    ) -> SendResult:
         """拆条发送，并把 bot 自己的话写进流水（``processed=True``，不参与记忆抽取）。
 
         ``reply`` 可以是纯文本（换行分段 + 标点处概率合并），也可以是一组
@@ -3446,12 +3494,12 @@ class RubenBot:
         ``count_speech=False`` 用于失败 / 部分完成说明：仍落流水与自我时间线，
         但不计正常发言冷却与主动发言窗口（没办成不算接了一次话）。
 
-        至少发出一条才返回 True 并记冷却，拆条连发只算一轮。
+        结果只计成功出站的流水；至少发出一条才计冷却，拆条连发只算一轮。
         """
         adapter = self.adapters.get(event.platform)
         if adapter is None:
             logger.warning("没有平台 %s 的适配器，无法回复", event.platform)
-            return False
+            return SendResult(reason_code="no_adapter")
         strip_actions = bool(getattr(self.config.chat, "strip_action_parens", False))
         # 语音回复：只对「没被拆开的单条短回复」生效；拆条/长文一律发文字
         voice_audio: bytes | None = None
@@ -3473,24 +3521,26 @@ class RubenBot:
             parts = [segments] if segments else []
         if not parts:
             # 拆条后什么都不剩（例如动作括号清理后为空）：不发，也不记发言
-            return False
+            return SendResult(reason_code="empty_reply")
         if begin_send and not begin_send():
-            return False
+            return SendResult(reason_code="new_input")
         if voice_audio:
-            # 语音回复：成功就不再补发文字；平台不支持或失败都照常发文字
+            # 语音与文字兜底是同一段。明确拒收不换媒介再发。
             text = render_segments(parts[0])
-            ok, sent_id = await self._send_voice(adapter, event, text, voice_audio, voice_mime)
-            if ok:
-                self._record_bot_message(event, text, sent_id, self_summary=f"投递了提醒：{text}" if reminder else text)
+            voice_error, sent_id = await self._send_voice(adapter, event, text, voice_audio, voice_mime)
+            if voice_error == "private_recipient_refused":
+                return SendResult(failed_parts=1, reason_code=voice_error)
+            if not voice_error:
+                raw_id = self._record_bot_message(event, text, sent_id,
+                                                  self_summary=f"投递了提醒：{text}" if reminder else text)
                 if count_speech:
                     self.opener_guard.note_reply((event.platform, event.chat_type, event.chat_id), text)
                     self.decision_engine.note_bot_reply(
                         self.decision_engine.chat_key(event), time.time() if now is None else now,
                         proactive=proactive,
                     )
-                return True
-        sent_any = False
-        reminder_parts = []
+                return SendResult(raw_ids=[raw_id], delivered_parts=[text])
+        result = SendResult()
         for index, segments in enumerate(parts):
             if index > 0:
                 delay = self.segment_delay(segments)
@@ -3500,24 +3550,27 @@ class RubenBot:
             try:
                 message_id = await adapter.send(event.chat_id, segments, chat_type=event.chat_type)
             except Exception as exc:  # noqa: BLE001 - 一条发失败不影响后续
-                logger.warning("发送失败（%s 第 %s 条）：%s", event.platform, index + 1, exc)
+                result.failed_parts += 1
+                result.reason_code = _send_error_code(event, exc)
+                logger.warning("发送失败（%s 第 %s 条）：%s", event.platform, index + 1, result.reason_code)
+                if result.reason_code == "private_recipient_refused":
+                    break  # 收件人受限，不重试这段，也不向同一私聊续发。
                 continue
-            sent_any = True
             # 流水保留回执、发言计数和回复关系，但摘要、自我时间线与实体账都拿不到网页。
             recorded = RECORD_PLACEHOLDER if isinstance(reply, WebReply) else text
-            self._record_bot_message(event, recorded, message_id, self_summary="" if reminder else recorded)
-            if reminder:
-                reminder_parts.append(recorded)
+            raw_id = self._record_bot_message(event, recorded, message_id, self_summary="" if reminder else recorded)
+            result.raw_ids.append(raw_id)
+            result.delivered_parts.append(recorded)
             # 以真正送达的文字条为准，不把网页引文、图片占位或失败的草稿当成自己的措辞。
             if not isinstance(reply, WebReply) and count_speech:
                 spoken = "".join(s.render() for s in segments if s.type == "text")
                 self.opener_guard.note_reply((event.platform, event.chat_type, event.chat_id), spoken)
-        if not sent_any:
+        if not result:
             # 全部分条都发失败：当作没说过话——不进不应期、不记情绪
             logger.warning("发送全部失败（%s），不记本次发言", event.platform)
-            return False
-        if reminder_parts:
-            self._record_self_action(event, "投递了提醒：" + "\n".join(reminder_parts))
+            return result
+        if reminder:
+            self._record_self_action(event, "投递了提醒：" + "\n".join(result.delivered_parts))
         # 发言时间交给决策引擎：发言后冷却与主动发言窗口都依赖它（拆条只记一次）。
         # count_speech=False 是失败 / 部分完成的一句说明，不算社交发言。
         if count_speech:
@@ -3527,15 +3580,15 @@ class RubenBot:
             )
             # 情绪侧：刚说过话 = 有人理；群里热闹就兴奋一下
             self.note_emotion_after_reply(event, now=now)
-        return True
+        return result
 
     def _record_bot_message(
         self, event: MessageEvent, text: str, message_id: str | None, *, self_summary: str | None = None
-    ) -> None:
+    ) -> int:
         """流水保留原话；提醒拆条时传空摘要，送完再合记一次。"""
         # 记入流水，供后续上下文使用；标记已处理，不参与记忆抽取。
         # 平台回执的消息 id 一并落库，后续引用解析与自我时间线依赖它。
-        self.store.add_raw_message(
+        raw_id = self.store.add_raw_message(
             platform=event.platform,
             chat_id=event.chat_id,
             chat_type=event.chat_type,
@@ -3547,6 +3600,7 @@ class RubenBot:
         )
         if self_summary != "":
             self._record_self_action(event, text if self_summary is None else self_summary)
+        return raw_id
 
     def _record_self_action(self, event: MessageEvent, summary: str) -> None:
         """把 bot 自己发出的话或没有正文的交付（如静默发出的文件）记进自我时间线。
@@ -3617,23 +3671,22 @@ class RubenBot:
         text: str,
         audio: bytes,
         mime: str,
-    ) -> tuple[bool, str | None]:
-        """经适配器的 ``message.voice`` 能力发语音；返回 ``(是否已发出, 消息 id)``。
+    ) -> tuple[str, str | None]:
+        """经适配器的 ``message.voice`` 能力发语音；返回 ``(安全原因码或空串, 消息 id)``。
 
-        平台不支持、能力被配置关闭、发送出错都返回 ``(False, None)``，由调用方
-        照常发文字——语音失败绝不能让回复整个丢掉。
+        不支持、未启用或普通语音故障可回退文字；收件人明确受限则不再投递。
         """
         name = "message.voice"
         declared = set(getattr(adapter, "capabilities", frozenset()) or ())
         if name not in declared:
             logger.info("适配器 %s 不支持语音回复，照常发文字", adapter.name)
-            return False, None
+            return "voice_unavailable", None
         config_key = (getattr(adapter, "capability_config_keys", None) or {}).get(name)
         if config_key:
             default = (getattr(adapter, "capability_defaults", None) or {}).get(name, True)
             if not self.config.adapter_capability_enabled(adapter.name, config_key, default=default):
                 logger.info("适配器 %s 的语音回复已在配置中关闭，照常发文字", adapter.name)
-                return False, None
+                return "voice_unavailable", None
         try:
             result = await adapter.call_capability(
                 name,
@@ -3644,15 +3697,16 @@ class RubenBot:
                 chat_type=event.chat_type,
             )
         except Exception as exc:  # noqa: BLE001 - 语音失败只降级，不影响主循环
-            logger.warning("发送语音失败（%s），改为发文字：%s", adapter.name, exc)
-            return False, None
+            code = _send_error_code(event, exc)
+            logger.warning("发送语音失败（%s）：%s", adapter.name, code)
+            return code, None
         message_id: str | None = None
         if isinstance(result, Mapping):
             for key in ("message_id", "id"):
                 if result.get(key) is not None:
                     message_id = str(result[key])
                     break
-        return True, message_id
+        return "", message_id
 
     # ------------------------------------------------------------------
     # 平台能力

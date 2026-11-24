@@ -48,7 +48,11 @@ def test_stale_replans_even_when_hard_trigger_now_silent(config, store, blocked_
         prompt = next(m['content'] for m in llm.calls[-1]['messages'] if '【本批消息·' in m['content'])
         assert '请帮我看看' in prompt and update.text in prompt
         assert [m.text for m in store.recent_messages('room')] == ['请帮我看看？', update.text]
-        log, = store.list_decision_logs()
+        log, obsolete = store.list_decision_logs()
+        assert not obsolete['should_reply'] and obsolete['factors']['planner']['speak']
+        assert obsolete['factors']['delivery'] == {
+            'status': 'superseded', 'sent_parts': 0, 'failed_parts': 0, 'raw_ids': [], 'reason_code': 'new_input',
+        }
         assert log['reason'] == 'planner_silence' and 'planner_override' not in log['factors']
 
     asyncio.run(scenario())
@@ -79,6 +83,6 @@ def test_retry_budget_and_noninterrupting_chatter(config, store):
         assert len(calls) == 2 and adapter.texts == ['按补充说明回答']
         pending, = bot.merger.pending
         assert [e.text for e in pending.events] == ['无关插话', '更晚的消息']
-        assert len(store.list_decision_logs()) == 1
+        assert [r['factors']['delivery']['status'] for r in store.list_decision_logs()] == ['sent', 'superseded']
 
     asyncio.run(scenario())

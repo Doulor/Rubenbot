@@ -253,6 +253,8 @@ SnowLuma 适配器（OneBot v11）：
 4. **策划与否决**：收到查看机会才进入策划；依据门和发送前复核见下节，生成后仍允许用否决标记静默。
 5. **可观测**：`decision_log` 记录回/不回、原因、硬触发类型，以及适用的护栏、有效查看概率、策划结论与依据；有明确指向时另记 `factors.addressing`（含折扣明细），发送前复核压下草稿时记 `factors.paraphrase`（触发消息 id 与判定结果）。冷场主动开口另按 `proactive` 配置评分。
 
+进入策划不等于已回复。决策行保留 `factors.planner`、`expression_decision` 和适用的 `planner_override`；回复投递另记 `factors.delivery`。`status` 为 `sent`（全发出）、`partial`（有成有败）、`send_failed`（未发出）或 `superseded`（首稿被新输入替代，重裁另记一行）。`sent_parts` / `failed_parts` 按实际成功 / 失败的消息段计，未尝试的不计；`raw_ids` 按发送顺序指向本地出站流水，不是平台消息号。`reason_code` 只用固定原因码，不存异常原文或草稿。进入投递的回复至少发出一段才记 `should_reply=1`；普通回复的发送后钩子每轮至多一次，只接收已发段。Web 引文即使成功也不交给钩子。明确拒发的非好友私聊不续发剩余段。
+
 ### 发送者静音、疲劳刹车与开口标准 v3
 
 - `decision.muted_senders` 以真实发送者账号匹配，默认 `["4012701880"]`，空列表关闭。命中记 `muted_sender`，不回复、不唤起插件、合批、动量或疲劳计数；优先于直接呼叫。本人请求清空既有数据仍执行，但不发回执。
