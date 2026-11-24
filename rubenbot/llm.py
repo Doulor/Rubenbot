@@ -77,6 +77,15 @@ class LLMUsage:
 UsageRecorder = Callable[[LLMUsage], Any | Awaitable[Any]]
 
 
+@dataclass
+class CompletionAudit:
+    """单次调用私有的观测值；用量 ID 来自实际插入，不按时间猜测。"""
+
+    usage_id: int | None = None
+    finish_reason: str | None = None
+    completion_tokens: int | None = None
+
+
 class LLMProtocol(Protocol):
     """主循环只依赖这个最小接口，方便 mock。"""
 
@@ -89,6 +98,7 @@ class LLMProtocol(Protocol):
         temperature: float | None = None,
         json_mode: bool = False,
         max_tokens: int | None = None,
+        audit: CompletionAudit | None = None,
     ) -> str: ...
 
 
@@ -98,6 +108,10 @@ class LLMError(RuntimeError):
 
 class ToolUnsupported(LLMError):
     """当前中转/模型不支持 OpenAI 工具调用（拿它当正常退化信号，不当异常上报）。"""
+
+
+class LLMInvalidResponse(LLMError):
+    """上游响应不是可读取的聊天补全结构。"""
 
 
 class LLMResponseError(LLMError):
@@ -122,6 +136,21 @@ class LLMBudgetExceeded(LLMError):
         self.kind = denial.kind
         self.limit = denial.limit
         self.current = denial.current
+
+
+def request_result_code(exc: BaseException | None) -> str:
+    """按异常类型归因，不解析或记录可能含上游正文的异常消息。"""
+    while exc is not None:
+        if isinstance(exc, (TimeoutError, httpx.TimeoutException)):
+            return "timeout"
+        if isinstance(exc, LLMResponseError):
+            return f"http_{exc.status}"
+        if isinstance(exc, LLMBudgetExceeded):
+            return "budget_exceeded"
+        if isinstance(exc, LLMInvalidResponse):
+            return "invalid_response"
+        exc = exc.__cause__
+    return "request_failed"
 
 
 def is_retryable_status(status: int) -> bool:
@@ -225,6 +254,7 @@ class LLMClient:
         temperature: float | None = None,
         json_mode: bool = False,
         max_tokens: int | None = None,
+        audit: CompletionAudit | None = None,
     ) -> str:
         """调用 chat/completions，返回第一条回复的文本内容。
 
@@ -246,20 +276,23 @@ class LLMClient:
             payload["response_format"] = {"type": "json_object"}
 
         def on_success(data: Any) -> str:
-            choices = (data.get("choices") if isinstance(data, dict) else None) or []
-            if not choices:
-                # 已经被 _call_single 的 choices 检查拦下来，这里只是兜底
-                return ""
-            content = choices[0].get("message", {}).get("content") or ""
-            # 普通生成路径用不到工具，残留的 DSML 文本只剥不留
-            return strip_dsml(content)
+            choices = data["choices"]
+            first = choices[0] if isinstance(choices, list) and choices else None
+            message = first.get("message") if isinstance(first, dict) else None
+            if not isinstance(message, dict):
+                raise LLMInvalidResponse("LLM 响应缺少有效的 message")
+            content = message.get("content")
+            if content is not None and not isinstance(content, str):
+                raise LLMInvalidResponse("LLM 响应的 content 不是文本")
+            # 部分中转在输出额度耗尽时只给空内容和结束标记。
+            return strip_dsml(content or "")
 
         return await self._call_pool(
             role,
             task_name,
             payload,
             on_success=on_success,
-            allow_tool_unsupported=False,
+            allow_tool_unsupported=False, audit=audit,
         )
 
     async def chat_with_tools(
@@ -312,6 +345,7 @@ class LLMClient:
         *,
         on_success: Callable[[Any], Any],
         allow_tool_unsupported: bool,
+        audit: CompletionAudit | None = None,
     ) -> Any:
         """按角色的模型池与策略发请求；返回 ``on_success`` 的结果。
 
@@ -332,7 +366,7 @@ class LLMClient:
         if len(order) == 1:
             return await self._call_single(
                 order[0], task, payload, on_success=on_success,
-                allow_tool_unsupported=allow_tool_unsupported,
+                allow_tool_unsupported=allow_tool_unsupported, audit=audit,
                 # 工具调用一直只做一次往返，不因 max_retries 变成多次
                 retries=0 if allow_tool_unsupported else None,
             )
@@ -344,7 +378,7 @@ class LLMClient:
             try:
                 return await self._call_single(
                     target, task, payload, on_success=on_success,
-                    allow_tool_unsupported=allow_tool_unsupported, retries=0,
+                    allow_tool_unsupported=allow_tool_unsupported, audit=audit, retries=0,
                 )
             except ToolUnsupported:
                 raise
@@ -366,7 +400,7 @@ class LLMClient:
             if last_error is not None and index + 1 < len(order):
                 logger.warning(
                     "模型 %s / %s 调用失败（%s），切换到下一个：%s",
-                    target.provider, target.model, strategy, last_error,
+                    target.provider, target.model, strategy, request_result_code(last_error) if audit else last_error,
                 )
         assert last_error is not None
         # 全部失败时沿用与单模型一致的错误形状（信息里带最后一次的模型/状态），
@@ -398,6 +432,7 @@ class LLMClient:
         *,
         on_success: Callable[[Any], Any],
         allow_tool_unsupported: bool,
+        audit: CompletionAudit | None = None,
         retries: int | None = None,
     ) -> Any:
         """用指定模型调一次（失败时按 ``retries`` 退避重试，默认 ``max_retries``）。
@@ -418,10 +453,15 @@ class LLMClient:
             started = time.perf_counter()
             try:
                 resp = await client.post("/chat/completions", json=body)
+            except asyncio.CancelledError:
+                # 策划外层等待到期取消在途请求，也是一笔实际尝试。取消仍向上传播。
+                if audit is not None:
+                    await self._record_usage(task, model, None, started, ok=False, provider=target.provider, audit=audit)
+                raise
             except httpx.HTTPError as exc:
                 # 网络/超时层失败：这次尝试没有响应，token 记 NULL
                 await self._record_usage(
-                    task, model, None, started, ok=False, provider=target.provider
+                    task, model, None, started, ok=False, provider=target.provider, audit=audit
                 )
                 last_error = exc
             else:
@@ -432,7 +472,7 @@ class LLMClient:
                 if resp.status_code >= 400:
                     # 429/5xx 也可能带 usage 计费信息，能读到就记上
                     await self._record_usage(
-                        task, model, data, started, ok=False, provider=target.provider
+                        task, model, data, started, ok=False, provider=target.provider, audit=audit
                     )
                     text = resp.text[:300]
                     if allow_tool_unsupported and resp.status_code in (400, 404, 422, 501):
@@ -452,22 +492,26 @@ class LLMClient:
                     last_error = error
                 else:
                     choices = (data.get("choices") if isinstance(data, dict) else None) or []
-                    if not choices:
-                        await self._record_usage(
-                            task, model, data, started, ok=False, provider=target.provider
-                        )
-                        last_error = LLMError(f"LLM 响应缺少 choices: {str(data)[:300]}")
-                    else:
+                    try:
+                        if not choices:
+                            raise LLMInvalidResponse("LLM 响应缺少 choices")
                         result = on_success(data)
+                    except LLMInvalidResponse as exc:
                         await self._record_usage(
-                            task, model, data, started, ok=True, provider=target.provider
+                            task, model, data, started, ok=False, provider=target.provider, audit=audit
+                        )
+                        last_error = exc
+                    else:
+                        await self._record_usage(
+                            task, model, data, started, ok=True, provider=target.provider, audit=audit
                         )
                         return result
             if attempt >= retries:
                 break
             delay = retry_delay(attempt, self._retry_delays)
             logger.warning(
-                "LLM 调用失败（第 %s 次），%.1fs 后重试：%s", attempt + 1, delay, last_error
+                "LLM 调用失败（第 %s 次），%.1fs 后重试：%s", attempt + 1, delay,
+                request_result_code(last_error) if audit else last_error,
             )
             await asyncio.sleep(delay)
         raise LLMError(f"LLM 调用最终失败: {last_error}") from last_error
@@ -481,6 +525,7 @@ class LLMClient:
         *,
         ok: bool,
         provider: str = "",
+        audit: CompletionAudit | None = None,
     ) -> None:
         """写一条用量；没配回调或写失败都只记 debug，绝不影响调用结果。
 
@@ -494,6 +539,14 @@ class LLMClient:
             prompt_tokens=prompt,
             completion_tokens=completion,
         )
+        if audit is not None:
+            audit.usage_id = None
+            audit.completion_tokens = completion
+            choices = data.get("choices") if ok and isinstance(data, dict) else None
+            finish = choices[0].get("finish_reason") if choices and isinstance(choices[0], dict) else None
+            # 兼容端点可能给出任意正文；只保存已知结束标记。
+            known = ("stop", "length", "content_filter", "tool_calls", "function_call", "max_tokens")
+            audit.finish_reason = finish if finish in known else "other" if finish is not None else None
         recorder = self._usage_recorder
         if recorder is None:
             return
@@ -510,7 +563,9 @@ class LLMClient:
         try:
             result = recorder(usage)
             if inspect.isawaitable(result):
-                await result
+                result = await result
+            if audit is not None and type(result) is int:
+                audit.usage_id = result
         except Exception as exc:  # noqa: BLE001 - 统计失败不能影响主流程
             logger.debug("LLM 用量记录失败：%s", exc)
 
@@ -524,8 +579,8 @@ def make_usage_recorder(store: Any) -> UsageRecorder | None:
     if not callable(add):
         return None
 
-    def record(usage: LLMUsage) -> None:
-        add(
+    def record(usage: LLMUsage) -> int:
+        return add(
             task=usage.task,
             model=usage.model,
             prompt_tokens=usage.prompt_tokens,

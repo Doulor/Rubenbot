@@ -191,7 +191,8 @@ def test_stage1_veto_marker_is_not_guidance(config, store):
     asyncio.run(bot.handle_event(MessageEvent("recording", "group", "g", "u", "群友", "今天好累")))
     assert not adapter.sent and not llm.chat_messages
     row, = store.list_decision_logs()
-    assert row["factors"]["planner"]["reason"] == "veto_marker"
+    assert row["factors"]["planner"]["reason"] == ""
+    assert row["factors"]["planner"]["result_code"] == "veto_marker"
 
 
 def test_stage1_timeout_falls_back(config, store):

@@ -256,6 +256,10 @@ SnowLuma 适配器（OneBot v11）：
 
 进入策划不等于已回复。决策行保留 `factors.planner`、`expression_decision` 和适用的 `planner_override`；回复投递另记 `factors.delivery`。`status` 为 `sent`（全发出）、`partial`（有成有败）、`send_failed`（未发出）或 `superseded`（首稿被新输入替代，重裁另记一行）。`sent_parts` / `failed_parts` 按实际成功 / 失败的消息段计，未尝试的不计；`raw_ids` 按发送顺序指向本地出站流水，不是平台消息号。`reason_code` 只用固定原因码，不存异常原文或草稿。进入投递的回复至少发出一段才记 `should_reply=1`；普通回复的发送后钩子每轮至多一次，只接收已发段。Web 引文即使成功也不交给钩子。明确拒发的非好友私聊不续发剩余段。
 
+`factors.planner.reason` 只记模型给出的简短理由，普通与「操作电脑」共用同一解析。程序归因另存 `result_code`：`ok` 为正常解析；`http_<状态码>`、`timeout`、`budget_exceeded`、`invalid_response`、`request_failed` 区分请求层问题；`invalid_json`、`plan_too_long`、`invalid_structure`、`missing_intent` / `invalid_intent`、`missing_basis` / `invalid_basis`、`missing_speak` / `invalid_speak`、`missing_reason` / `invalid_reason` 区分策划文本问题。单独的否决标记记 `veto_marker`，不冒充模型理由。依据门和顶层裁定口径不变。
+
+上游明确返回 `finish_reason=length` / `max_tokens` 记 `truncated`；否则只有 JSON 解码失败且用满本轮额度才记 `output_limit_hit`，不凭完整裁定恰好满额诊断截断。`planner` 同存已知结束标记、实际请求的 `max_tokens`（普通路由 256，操作路由 1024）及最后一次上游尝试的 `usage_id`（对应 `llm_usage.id`）；没有证据的字段留空。新增审计不保存提示词、消息正文或错误页。旧记录不迁移，[历史复算](docs/planner-reason-reconciliation.sql)仅用双向唯一时间配对与扫查已核实的日志证据。
+
 ### 发送者静音、疲劳刹车与开口标准 v3
 
 - `decision.muted_senders` 以真实发送者账号匹配，默认 `["4012701880"]`，空列表关闭。命中记 `muted_sender`，不回复、不唤起插件、合批、动量或疲劳计数；优先于直接呼叫。本人请求清空既有数据仍执行，但不发回执。

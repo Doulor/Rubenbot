@@ -98,6 +98,14 @@ class ExpressionDecision:
     # 缺报、非法值或策划失败都没有提供依据，不能默认为常识。
     basis: str = "guess"
     deliver_file: bool = False
+    result_code: str = "ok"
+    finish_reason: str | None = None
+    max_tokens: int | None = None
+    usage_id: int | None = None
+
+    @classmethod
+    def fallback(cls, recent: list[str], code: str, reason: str = '') -> ExpressionDecision:
+        return cls("短附和", "碎片", "", repetition_list(recent), "fallback", reason=reason, result_code=code)
 
     def prompt_block(self) -> str:
         uncertainty = "没把握就明说不确定，不把推测写成事实。" if self.basis == "guess" else ""
@@ -169,24 +177,31 @@ def parse_plan(raw: str, band: str, recent: list[str], notes: tuple[CapabilityNo
         # 裁定后偶尔夹一行聊天正文，不执行、不采用，只解析首个完整 JSON 对象。
         data, end = json.JSONDecoder().raw_decode(text[:MAX_PLAN_CHARS + 1])
         if end > MAX_PLAN_CHARS:
-            data = None
+            return ExpressionDecision.fallback(recent, "plan_too_long")
     except ValueError:
-        data = None
+        return ExpressionDecision.fallback(recent, "plan_too_long" if len(text) > MAX_PLAN_CHARS else "invalid_json")
     if not isinstance(data, dict):
-        return ExpressionDecision("短附和", "碎片", "", repetition_list(recent), "fallback")
+        return ExpressionDecision.fallback(recent, "invalid_structure")
+    value = data.get('reason')
+    reason = ' '.join(value.split())[:MAX_REASON] if isinstance(value, str) else ''
+    code = 'ok' if reason else 'missing_reason' if 'reason' not in data else 'invalid_reason'
     basis = data.get('basis')
     if basis not in ('ledger', 'settled', 'common', 'guess'):
+        if code == 'ok':
+            code = 'invalid_basis' if 'basis' in data else 'missing_basis'
         basis = 'guess'
     speak = coerce_speak(data.get('speak'))
+    if speak is None and code == 'ok':
+        code = 'invalid_speak' if 'speak' in data else 'missing_speak'
     intent = data.get('intent')
     # 有些旧裁定用空意图表示「看过就划走」；明确的 false 仍是有效裁定。
     if speak is False and intent in (None, ''):
         intent = '沉默'
     if intent == COMPUTER_INTENT and computer_route and speak is not False:
         return ExpressionDecision(COMPUTER_INTENT, band, '', repetition_list(recent), speak=True, basis=basis,
-                                  deliver_file=data.get('deliver_file') is True)
+                                  reason=reason, result_code=code, deliver_file=data.get('deliver_file') is True)
     if intent not in INTENTS:
-        return ExpressionDecision("短附和", "碎片", "", repetition_list(recent), "fallback")
+        return ExpressionDecision.fallback(recent, "invalid_intent" if "intent" in data else "missing_intent", reason)
     increment = data.get('increment')
     increment = ' '.join(increment.split())[:MAX_INCREMENT] if isinstance(increment, str) else ''
     if increment.strip('。.!！ ') in ('无', '没有', '无增量', '没有新信息', '无新信息'):
@@ -195,11 +210,9 @@ def parse_plan(raw: str, band: str, recent: list[str], notes: tuple[CapabilityNo
         intent = '沉默'
     if speak is None:
         speak = False if intent == '沉默' else True
-    reason = data.get('reason')
-    reason = ' '.join(reason.split())[:MAX_REASON] if isinstance(reason, str) else ''
     return ExpressionDecision(intent, '碎片' if intent == '短附和' else band, increment,
                               repetition_list(recent, data.get('avoid_repetition')),
-                              basis=basis, speak=speak, reason=reason,
+                              basis=basis, speak=speak, reason=reason, result_code=code,
                               # 只认本轮验通、确实列进索引的条目；模型回填没验通的
                               # 标题（或旧提示词的残留）不展开情境说明。
                               capabilities=tuple(n.title for n in ready_notes(notes)

@@ -26,7 +26,7 @@ llm:
   model_strategies: {}
   #   chat: "round_robin"
   temperature: 0.8
-  timeout: 60          # 单次请求超时（秒）
+  timeout: 60          # 单次请求超时（秒）；策划超时另记 factors.planner.result_code=timeout，不算模型主动沉默
   max_retries: 2       # 失败重试次数：408/429/5xx 退避重试，间隔 1s / 3s（仅单模型时）
   # 按任务类型的每日预算闸（Q11）：超限只停该类任务，别的任务和 bot 都不受影响。
   # 统计口径与 llm_usage 一致：每次上游尝试算 1 次（含重试的失败尝试），token 只算

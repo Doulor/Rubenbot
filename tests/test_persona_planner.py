@@ -258,7 +258,10 @@ def test_old_empty_intent_silence_is_audited(config, store, tmp_path, mentioned)
     assert adapter.texts == (["在"] if mentioned else [])
     assert len(llm.calls) == (2 if mentioned else 1)
     factors = store.list_decision_logs()[0]["factors"]
-    assert factors["planner"] == {"basis": "settled", "speak": False, "reason": "在看"}
+    planner = factors["planner"]
+    assert {key: planner[key] for key in ("basis", "speak", "reason", "result_code")} == {
+        "basis": "settled", "speak": False, "reason": "在看", "result_code": "ok",
+    }
     assert factors["expression_decision"]["intent"] == "沉默"
     if mentioned:
         assert factors["planner_override"] == "mentioned"
@@ -294,7 +297,10 @@ def test_speak_false_stops_before_stage2(config, store, tmp_path):
     assert [c["role"] for c in llm.calls] == ["fast"]
     entry = store.list_decision_logs()[0]
     assert entry["should_reply"] is False and entry["reason"] == "planner_silence"
-    assert entry["factors"]["planner"] == {"basis": "settled", "speak": False, "reason": ""}
+    planner = entry["factors"]["planner"]
+    assert {key: planner[key] for key in ("basis", "speak", "reason", "result_code")} == {
+        "basis": "settled", "speak": False, "reason": "", "result_code": "missing_reason",
+    }
 
 
 def test_speak_false_does_not_stop_must_reply(config, store, tmp_path):
@@ -320,7 +326,10 @@ def test_speak_true_generates(config, store, tmp_path):
     asyncio.run(bot.handle_event(group_event()))
     assert adapter.texts == ["累就别硬撑"]
     entry = store.list_decision_logs()[0]
-    assert entry["factors"]["planner"] == {"basis": "settled", "speak": True, "reason": "正好能接"}
+    planner = entry["factors"]["planner"]
+    assert {key: planner[key] for key in ("basis", "speak", "reason", "result_code")} == {
+        "basis": "settled", "speak": True, "reason": "正好能接", "result_code": "ok",
+    }
 
 
 def test_two_stage_persona_swap(config, store, tmp_path):

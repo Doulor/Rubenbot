@@ -434,7 +434,10 @@ def test_group_decision_log_has_factors(config, store):
     entry = store.list_decision_logs(chat_id="g1")[0]
     assert entry["should_reply"] is False
     assert entry["reason"] == "planner_silence"
-    assert entry["factors"]["planner"] == {"basis": "guess", "speak": False, "reason": ""}
+    planner = entry["factors"]["planner"]
+    assert {key: planner[key] for key in ("basis", "speak", "reason", "result_code")} == {
+        "basis": "guess", "speak": False, "reason": "", "result_code": "missing_reason",
+    }
     assert entry["score"] == entry["threshold"] == 0
 
 

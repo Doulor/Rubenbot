@@ -43,7 +43,8 @@ class Model:
         if '【操作委托】' not in prompt:
             return '{"intent":"沉默","speak":false}'
         assert kwargs['max_tokens'] > 256
-        data = {'intent': '操作电脑', 'basis': 'guess', 'speak': True, 'deliver_file': self.deliver}
+        data = {'intent': '操作电脑', 'basis': 'guess', 'speak': True, 'deliver_file': self.deliver,
+                'reason': '明确委托\n  实际操作'}
         return '```json\n' + json.dumps(data, ensure_ascii=False) + '\n```\n\n行，这就去看。'
 
     async def chat_with_tools(self, messages, tools, *, tool_choice, **kwargs):
@@ -95,6 +96,8 @@ def test_owner_task_between_guests_executes_in_own_group_turn(instance, store, t
     assert [(a['tool'], a['context'], a['success']) for a in reversed(store.recent_computer_actions())] == [
         (tool, 'host', True) for tool in ('list_dir', 'write_file', 'send_file')]
     log = next(r for r in store.list_decision_logs() if r['reason'] == 'computer_task')
+    assert log['factors']['planner']['reason'] == '明确委托 实际操作'
+    assert log['factors']['planner']['result_code'] == 'ok'
     assert not log['should_reply']  # 交付完成即静默：决策日志记不发言，群里只有附件
     assert 'console:room' not in bot.decision_engine._last_reply_at
     assert bot.decision_engine.active_reply_count('console:room', 0) == 0
