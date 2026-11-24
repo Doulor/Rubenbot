@@ -25,10 +25,9 @@ import time
 from dataclasses import dataclass, field
 
 from ..llm import LLMProtocol, parse_json_payload
-from ..privacy.gate import OWNER_AUDIENCE
 from ..memory.anchor import annotate, evaluate
 from ..memory.retrieve import jaccard
-from ..memory.store import Event, Memory, MemoryStore, Profile, ProfileLine
+from ..memory.store import DistillInput, Event, Memory, MemoryStore, Profile, ProfileLine
 
 logger = logging.getLogger(__name__)
 
@@ -210,31 +209,14 @@ class ProfileDistiller:
 
     async def distill_person(self, person_id: str, *, now: float | None = None) -> ProfileUpdate:
         now = time.time() if now is None else now
-        if self.store.is_norecord(person_id):
+        inputs = self.store.distill_input(person_id, self.config.distill_max_events, self.config.distill_max_facts)
+        if inputs is None:
             return ProfileUpdate(person_id=person_id)
-        last_at = self.store.get_meta_float("distill:last_at", 0.0)
-        events = self.store.list_events(
-            person_id=person_id,
-            created_since=last_at,
-            newest_first=False,
-            limit=self.config.distill_max_events,
-        )
-        facts = [
-            mem
-            for mem in self.store.list_memories(person_id=person_id, limit=self.config.distill_max_facts)
-            if mem.created_at > last_at
-        ]
-        # 机主专属与封存项保留原始裁定键，不经通用画像再次抽象或派生钩子。
-        facts = [m for m in facts if m.audience != OWNER_AUDIENCE and m.sensitivity != "sealed"]
-        events = [e for e in events if e.audience != OWNER_AUDIENCE and e.sensitivity != "sealed"]
-        old = self.store.get_profile(person_id)
-        if not events and not facts:
-            return ProfileUpdate(person_id=person_id)
-
+        old = inputs.reusable_profile
         raw = await self.llm.complete(
             [
                 {"role": "system", "content": DISTILL_SYSTEM_PROMPT},
-                {"role": "user", "content": self._render_input(old, events, facts)},
+                {"role": "user", "content": self._render_input(inputs)},
             ],
             role="distill",
             temperature=0.3,
@@ -242,27 +224,19 @@ class ProfileDistiller:
         )
         stable, status, hooks = parse_profile(raw)
         # 私聊画像行照常保留证据，钩子没有逐条证据，不能用私聊原料发布新钩子。
-        if any(item.audience == "private" for item in [*events, *facts]):
+        if any(item.audience == "private" for item in inputs.sources.values()):
             hooks = []
         if not stable and not status and not hooks:
             # 模型什么都没给（多半是坏输出）：保留旧画像，别把已有的画像清空
             logger.info("画像提炼没有产出有效内容（%s），保留旧画像", person_id, extra={"person_id": person_id})
             return ProfileUpdate(person_id=person_id)
 
-        allowed = {f"event:{e.id}" for e in events} | {f"memory:{m.id}" for m in facts}
-        # 旧画像的既有证据也算有效证据：模型顺带保留仍有效的旧行时，可直接沿用原证据
-        for refs in self.store.get_profile_evidence(person_id).values():
-            allowed.update(refs)
-        sources = self._source_texts(events, facts, allowed)
-
-        stable_lines, dropped_stable = self._validate(stable, allowed, sources, person_id, now=now)
-        status_lines, dropped_status = self._validate(status, allowed, sources, person_id, now=now)
+        # 校验只读请求前的快照；丢弃行的正文也要等整轮通过事务复核后才可留痕。
+        discarded: list[tuple[str, str, str]] = []
+        stable_lines, dropped_stable = self._validate(stable, inputs.sources, discarded)
+        status_lines, dropped_status = self._validate(status, inputs.sources, discarded)
         dropped = dropped_stable + dropped_status
-        if old is not None and not stable_lines and not status_lines and dropped:
-            # 模型给的行全被证据校验挡下（或漏写旧行）：宁可保留旧画像，
-            # 也不要因为一次坏输出把画像清空
-            logger.info("画像提炼的结果全部无有效证据（%s），保留旧画像", person_id, extra={"person_id": person_id})
-            return ProfileUpdate(person_id=person_id, dropped_lines=dropped)
+        keep_old = old is not None and not stable_lines and not status_lines and dropped > 0
 
         expires_days = [
             clamp_expiry_days(
@@ -274,31 +248,29 @@ class ProfileDistiller:
         ]
         status_expires_at = max(expires_days) * 86400.0 + now if expires_days else None
 
-        changed = (
+        changed = not keep_old and (
             old is None
             or old.stable_text != "\n".join(line.text for line in stable_lines)
             or old.status_text != "\n".join(line.text for line in status_lines)
             or old.hooks != hooks
         )
-        log_id = None
-        if changed:
-            self.store.save_profile(
-                person_id,
-                stable_lines=stable_lines,
-                status_lines=status_lines,
-                status_expires_at=status_expires_at,
-                hooks=hooks or (old.hooks if old else []),
-                now=now,
-                log_reason=self._change_reason(old, stable_lines, status_lines),
-            )
-            log_id = self.store.latest_log_id(person_id, action="profile_update")
+        hooks = hooks or (old.hooks if old else [])
+        accepted, log_id = self.store.commit_distillation(
+            inputs, stable_lines=stable_lines, status_lines=status_lines, status_expires_at=status_expires_at,
+            hooks=hooks, now=now, discarded=discarded,
+            log_reason=self._change_reason(old, stable_lines, status_lines) if changed else "",
+        )
+        if not accepted:
+            return ProfileUpdate(person_id=person_id)
+        if keep_old:
+            return ProfileUpdate(person_id=person_id, dropped_lines=dropped)
         return ProfileUpdate(
             person_id=person_id,
             changed=changed,
             stable_lines=len(stable_lines),
             status_lines=len(status_lines),
             dropped_lines=dropped,
-            hooks=hooks or (old.hooks if old else []),
+            hooks=hooks,
             log_id=log_id,
         )
 
@@ -307,11 +279,8 @@ class ProfileDistiller:
     def _validate(
         self,
         lines: list[_CandidateLine],
-        allowed: set[str],
-        sources: dict[str, str],
-        person_id: str,
-        *,
-        now: float,
+        sources: dict[str, Event | Memory],
+        discarded: list[tuple[str, str, str]],
     ) -> tuple[list[ProfileLine], int]:
         """只保留证据链指向输入（或旧画像已有证据）的行；同节近重复也丢掉。
 
@@ -321,27 +290,22 @@ class ProfileDistiller:
         kept: list[ProfileLine] = []
         dropped = 0
         for line in lines:
-            refs = [ref for ref in dict.fromkeys(line.refs) if ref in allowed]
+            refs = [ref for ref in dict.fromkeys(line.refs) if ref in sources]
             if not refs:
                 dropped += 1
                 continue
+            evidence = [sources[ref] for ref in refs]
+            entities = {item.entity for item in evidence if isinstance(item, Memory) and item.entity}
             decision = evaluate(
                 line.text,
-                source_text="\n".join(sources.get(ref, "") for ref in refs),
+                source_text="\n".join(e.summary if isinstance(e, Event) else e.content for e in evidence),
                 # 证据记忆自己已经锚在实体上时，直接沿用，别让画像行再猜一次。
-                entity=self._anchored_entity(refs),
+                entity=entities.pop() if len(entities) == 1 else "",
                 model_entity=line.entity,
             )
             if not decision.ok:
                 dropped += 1
-                self.store.log_dropped_unanchored(
-                    person_id=person_id,
-                    origin_chat=self._origin_hint(refs),
-                    kind="profile",
-                    content=line.text,
-                    reason=decision.reason or "无实体锚点",
-                    now=now,
-                )
+                discarded.append((self._origin_hint(refs), line.text, decision.reason or "无实体锚点"))
                 continue
             if any(jaccard(line.text, existing.text) >= 0.9 for existing in kept):
                 dropped += 1
@@ -357,59 +321,18 @@ class ProfileDistiller:
             )
         return kept, dropped
 
-    def _source_texts(
-        self, events: list[Event], facts: list[Memory], allowed: set[str]
-    ) -> dict[str, str]:
-        """证据引用 → 原文（event 摘要 / memory 正文）；旧证据从库里补读。"""
-        sources: dict[str, str] = {}
-        for event in events:
-            sources[f"event:{event.id}"] = event.summary
-        for mem in facts:
-            sources[f"memory:{mem.id}"] = mem.content
-        for ref in allowed:
-            if ref in sources:
-                continue
-            kind, _, value = ref.partition(":")
-            try:
-                ident = int(value)
-            except ValueError:
-                continue
-            if kind == "event":
-                event = self.store.get_event(ident)
-                if event is not None:
-                    sources[ref] = event.summary
-            elif kind == "memory":
-                mem = self.store.get_memory(ident)
-                if mem is not None:
-                    sources[ref] = mem.content
-        return sources
-
-    def _anchored_entity(self, refs: list[str]) -> str:
-        """证据引用里唯一已核实的实体锚点；多条证据指向不同实体时不猜。"""
-        entities: set[str] = set()
-        for ref in refs:
-            kind, _, value = ref.partition(":")
-            if kind != "memory":
-                continue
-            try:
-                mem = self.store.get_memory(int(value))
-            except ValueError:
-                continue
-            if mem is not None and mem.entity:
-                entities.add(mem.entity)
-        return entities.pop() if len(entities) == 1 else ""
-
     @staticmethod
     def _origin_hint(refs: list[str]) -> str:
         """丢弃记录里的来源提示：列出证据引用（event/memory id），方便回查原话。"""
         return ",".join(refs[:3])
 
-    def _render_input(self, old: Profile | None, events: list[Event], facts: list[Memory]) -> str:
+    def _render_input(self, inputs: DistillInput) -> str:
         from ..memory.extract import format_ts
 
         parts: list[str] = []
+        old = inputs.reusable_profile
         if old is not None:
-            evidence = self.store.get_profile_evidence(old.person_id)
+            evidence = inputs.evidence
 
             def render(section: str, lines: list[str]) -> str:
                 if not lines:
@@ -431,14 +354,14 @@ class ProfileDistiller:
             "新时间线事件：\n"
             + (
                 "\n".join(
-                    f"- event:{event.id} [{format_ts(event.ts)}] {event.summary}" for event in events
+                    f"- event:{event.id} [{format_ts(event.ts)}] {event.summary}" for event in inputs.events
                 )
                 or "- （无）"
             )
         )
         parts.append(
             "新事实：\n"
-            + ("\n".join(f"- memory:{mem.id} {mem.content}" for mem in facts) or "- （无）")
+            + ("\n".join(f"- memory:{mem.id} {mem.content}" for mem in inputs.facts) or "- （无）")
         )
         return "\n\n".join(parts)
 

@@ -507,6 +507,24 @@ class Profile:
 
 
 @dataclass
+class DistillInput:
+    person_id: str
+    version: int
+    profile: Profile | None
+    evidence: dict[tuple[str, int], list[str]]
+    events: list[Event]
+    facts: list[Memory]
+    sources: dict[str, Event | Memory]
+
+    @property
+    def reusable_profile(self) -> Profile | None:
+        """旧链在请求前就已断开时，仅从有效的新原料重建，不沿用旧正文或钩子。"""
+        if all(ref in self.sources for refs in self.evidence.values() for ref in refs):
+            return self.profile
+        return None
+
+
+@dataclass
 class Ruling:
     id: int
     person_id: str
@@ -1347,16 +1365,18 @@ class MemoryStore:
         这条动作本身不可被 restore 回滚成一条记忆。
         """
         now = time.time() if now is None else now
+        with self._lock, self._conn:
+            return self._insert_unanchored(person_id, origin_chat, kind, content, reason, source_msg_id, now)
+
+    def _insert_unanchored(self, person_id: str, origin_chat: str, kind: str, content: str,
+                           reason: str, source_msg_id: int | None, now: float) -> LogEntry:
         before = [{
             "content": content,
             "kind": kind,
             "origin_chat": origin_chat,
             "source_msg_id": source_msg_id,
         }]
-        with self._lock:
-            log = self._insert_log("dropped_unanchored", person_id, before, [], reason, now)
-            self._conn.commit()
-        return log
+        return self._insert_log("dropped_unanchored", person_id, before, [], reason, now)
 
     def latest_log_id(self, person_id: str, *, action: str | None = None) -> int | None:
         """某人的最新一条日志 id（画像提炼写日志后取回用）。"""
@@ -1720,6 +1740,117 @@ class MemoryStore:
             )
         return profiles
 
+    def _distill_version(self, person_id: str) -> int:
+        return int(self.get_meta(f"distill:version:{person_id}") or 0)
+
+    def _invalidate_distillation(self, person_id: str) -> None:
+        """与清空或切档同一事务递增；即使随后恢复记录，也不接受旧提议。"""
+        self._conn.execute(
+            """INSERT INTO meta(key, value) VALUES (?, '1')
+            ON CONFLICT(key) DO UPDATE SET value = value + 1""",
+            (f"distill:version:{person_id}",),
+        )
+
+    def _distill_sources(self, refs: set[str]) -> dict[str, Event | Memory]:
+        events, facts = [], []
+        for ref in refs:
+            kind, _, value = ref.partition(":")
+            if (
+                kind in {"event", "memory"}
+                and value.isascii()
+                and value.isdecimal()
+                and len(value) <= 19
+            ):
+                ident = int(value)
+                if ident < 2**63:
+                    (events if kind == "event" else facts).append(ident)
+        return {
+            **{f"event:{e.id}": e for e in self.get_events_by_ids(events)},
+            **{f"memory:{m.id}": m for m in self.get_memories_by_ids(facts)},
+        }
+
+    def distill_input(self, person_id: str, max_events: int, max_facts: int) -> DistillInput | None:
+        """在一个只读快照中取模型原料；退出事务后才等待模型。"""
+        from ..privacy.gate import OWNER_AUDIENCE
+
+        def eligible(item: Event | Memory) -> bool:
+            return (
+                item.person_id == person_id
+                and item.audience != OWNER_AUDIENCE
+                and item.sensitivity != "sealed"
+            )
+
+        with self._lock, self._conn:
+            self._conn.execute("BEGIN")
+            if self.is_norecord(person_id):
+                return None
+            since = self.get_meta_float("distill:last_at", 0.0)
+            events = [
+                e
+                for e in self.list_events(
+                    person_id=person_id, created_since=since, newest_first=False, limit=max_events
+                )
+                if eligible(e)
+            ]
+            facts = [
+                m
+                for m in self.list_memories(person_id=person_id, limit=max_facts)
+                if m.created_at > since and eligible(m)
+            ]
+            if not events and not facts:
+                return None
+            evidence = self.get_profile_evidence(person_id)
+            sources = {
+                **{f"event:{e.id}": e for e in events},
+                **{f"memory:{m.id}": m for m in facts},
+            }
+            historical = {ref for refs in evidence.values() for ref in refs} - sources.keys()
+            extra = self._distill_sources(historical)
+            if historical == extra.keys() and all(eligible(item) for item in extra.values()):
+                sources.update(extra)
+            return DistillInput(
+                person_id,
+                self._distill_version(person_id),
+                self.get_profile(person_id),
+                evidence,
+                events,
+                facts,
+                sources,
+            )
+
+    def commit_distillation(
+        self,
+        inputs: DistillInput,
+        *,
+        stable_lines: Sequence[ProfileLine],
+        status_lines: Sequence[ProfileLine],
+        status_expires_at: float | None,
+        hooks: Sequence[str],
+        log_reason: str,
+        discarded: Sequence[tuple[str, str, str]],
+        now: float,
+    ) -> tuple[bool, int | None]:
+        """写事务先锁定再复核，返回是否接受本轮及本轮画像日志 ID。"""
+        person_id = inputs.person_id
+        with self._lock, self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            if (
+                self.is_norecord(person_id)
+                or self._distill_version(person_id) != inputs.version
+                or self.get_profile(person_id) != inputs.profile
+                or self.get_profile_evidence(person_id) != inputs.evidence
+                or self._distill_sources(set(inputs.sources)) != inputs.sources
+            ):
+                return False, None
+            for origin, content, reason in discarded:
+                self._insert_unanchored(person_id, origin, "profile", content, reason, None, now)
+            if not log_reason:
+                return True, None
+            log_id = self._replace_profile(
+                person_id, stable_lines, status_lines, status_expires_at, hooks, now, log_reason
+            )
+            return True, log_id
+
     def save_profile(
         self,
         person_id: str,
@@ -1736,52 +1867,54 @@ class MemoryStore:
         每行结论的证据链存进 ``profile_evidence``，行号与文本行一一对应。
         """
         now = time.time() if now is None else now
+        with self._lock, self._conn:
+            self._replace_profile(person_id, stable_lines, status_lines, status_expires_at, hooks, now, log_reason)
+            return self.get_profile(person_id)  # type: ignore[return-value]
+
+    def _replace_profile(
+        self, person_id: str, stable_lines: Sequence[ProfileLine], status_lines: Sequence[ProfileLine],
+        status_expires_at: float | None, hooks: Sequence[str], now: float, log_reason: str,
+    ) -> int | None:
         stable_text = "\n".join(line.text.strip() for line in stable_lines if line.text.strip())
         status_text = "\n".join(line.text.strip() for line in status_lines if line.text.strip())
         hooks_text = ",".join(dict.fromkeys(h.strip() for h in hooks if h and h.strip()))
-        with self._lock:
-            try:
-                old = self.get_profile(person_id)
+        old = self.get_profile(person_id)
+        self._conn.execute(
+            """
+            INSERT INTO profiles(person_id, stable_text, status_text, status_expires_at, hooks, updated_at)
+            VALUES(?, ?, ?, ?, ?, ?)
+            ON CONFLICT(person_id) DO UPDATE SET
+                stable_text = excluded.stable_text,
+                status_text = excluded.status_text,
+                status_expires_at = excluded.status_expires_at,
+                hooks = excluded.hooks,
+                updated_at = excluded.updated_at
+            """,
+            (person_id, stable_text, status_text, status_expires_at, hooks_text, now),
+        )
+        self._conn.execute("DELETE FROM profile_evidence WHERE person_id = ?", (person_id,))
+        for section, lines in (("stable", stable_lines), ("status", status_lines)):
+            line_no = 0
+            for line in lines:
+                if not line.text.strip():
+                    continue
                 self._conn.execute(
                     """
-                    INSERT INTO profiles(person_id, stable_text, status_text, status_expires_at, hooks, updated_at)
-                    VALUES(?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(person_id) DO UPDATE SET
-                        stable_text = excluded.stable_text,
-                        status_text = excluded.status_text,
-                        status_expires_at = excluded.status_expires_at,
-                        hooks = excluded.hooks,
-                        updated_at = excluded.updated_at
+                    INSERT INTO profile_evidence(person_id, section, line_no, evidence_refs, entity)
+                    VALUES(?, ?, ?, ?, ?)
                     """,
-                    (person_id, stable_text, status_text, status_expires_at, hooks_text, now),
+                    (
+                        person_id,
+                        section,
+                        line_no,
+                        json.dumps(list(line.evidence_refs), ensure_ascii=False),
+                        (line.entity or "").strip(),
+                    ),
                 )
-                self._conn.execute("DELETE FROM profile_evidence WHERE person_id = ?", (person_id,))
-                for section, lines in (("stable", stable_lines), ("status", status_lines)):
-                    line_no = 0
-                    for line in lines:
-                        if not line.text.strip():
-                            continue
-                        self._conn.execute(
-                            """
-                            INSERT INTO profile_evidence(person_id, section, line_no, evidence_refs, entity)
-                            VALUES(?, ?, ?, ?, ?)
-                            """,
-                            (
-                                person_id,
-                                section,
-                                line_no,
-                                json.dumps(list(line.evidence_refs), ensure_ascii=False),
-                                (line.entity or "").strip(),
-                            ),
-                        )
-                        line_no += 1
-                if log_reason:
-                    self._insert_profile_log(person_id, old, stable_text, status_text, log_reason, now)
-                self._conn.commit()
-            except Exception:
-                self._conn.rollback()
-                raise
-        return self.get_profile(person_id)  # type: ignore[return-value]
+                line_no += 1
+        if log_reason:
+            return self._insert_profile_log(person_id, old, stable_text, status_text, log_reason, now).id
+        return None
 
     def _insert_profile_log(
         self,
@@ -1852,7 +1985,7 @@ class MemoryStore:
         if mode not in VALID_PRIVACY_MODES:
             raise ValueError(f"未知隐私档位：{mode}")
         now = time.time() if now is None else now
-        with self._lock:
+        with self._lock, self._conn:
             self._conn.execute(
                 """
                 INSERT INTO privacy_settings(person_id, mode, updated_at) VALUES(?, ?, ?)
@@ -1860,10 +1993,10 @@ class MemoryStore:
                 """,
                 (person_id, mode, now),
             )
+            self._invalidate_distillation(person_id)
             if self.privacy_enabled and mode != "normal":
                 self._forget_entities(person_id)
                 self._invalidate_states_for_person(person_id)
-            self._conn.commit()
         return mode
 
     def is_norecord(self, person_id: str) -> bool:
@@ -2670,6 +2803,7 @@ class MemoryStore:
         now = time.time() if now is None else now
         with self._lock:
             try:
+                self._invalidate_distillation(person_id)
                 counts = {
                     "memories": int(
                         self._conn.execute(

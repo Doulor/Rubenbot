@@ -85,7 +85,8 @@ memory:
   distill_max_events: 120        # 一次提炼最多喂多少条新事件
   distill_max_facts: 80          # 一次提炼最多喂多少条新事实
   # 指称完整性：评价型断言（「认为它……」「觉得不错」）必须能回指到实体，
-  # 挂不上的会被丢弃并写 memory_log 的 dropped_unanchored 记录；此行为无配置键，
+  # 挂不上的会被丢弃并写 memory_log 的 dropped_unanchored 记录；若画像提炼期间本人清空、
+  # 切到不记或源证据失效，整轮作废，连丢弃正文也不记。此行为无配置键，
   # 不要用配置关掉。存量账本用 `python -m tools.scan_unanchored_memories --db data/rubenbot.db`
   # 先只读扫描，确认报告后再加 --apply。
   status_expiry_min_days: 1      # 近况过期天数夹取下限
