@@ -39,6 +39,8 @@
 - ``PUT  /api/config``          编辑并校验后保存，返回需重启提示
 - ``GET  /api/models/pool``     模型池视图：每角色模型列表、实际策略与来源
 - ``PUT  /api/models/pool``     保存模型池（整表替换，热生效，严格校验）
+- ``POST /api/models/discover`` 按已保存的提供商获取上游模型目录
+- ``POST /api/models/probe``    通过预算闸实际探测一个已保存的模型
 - ``GET  /api/persona``         查看人格文件内容与当前实际生效的人格
 - ``PUT  /api/persona``         保存人格并热加载到运行中的 bot
 - ``POST /api/persona/reset``   恢复默认人格（同样热加载）
@@ -48,7 +50,8 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
 import logging
 import sqlite3
 import time
@@ -62,7 +65,8 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from ..adapters.base import MessageEvent
-from ..config import Config, MODEL_ROLES, is_loopback_host
+from ..config import Config, MODEL_ROLES, ModelTarget, is_loopback_host
+from ..llm import LLMClient, LLMError, make_usage_recorder, request_result_code
 from ..core import format_scene
 from ..identity import IdentityService, avatar_url
 from ..emotion import EmotionEngine
@@ -128,6 +132,23 @@ MEMORY_CATEGORIES = {
     "promise",
     "fact",
 }
+
+
+MODEL_LIST_TTL = 600
+
+
+@dataclass
+class _ModelObservations:
+    """同一提供商身份下的最近观测；超期只影响缓存命中，不抹去观测时间。"""
+
+    discovery: dict | None = None
+    probes: dict[str, dict] = field(default_factory=dict)
+    expires: float = 0.0
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+def _checked_at() -> str:
+    return datetime.now(UTC).isoformat()
 
 
 class ApiError(Exception):
@@ -1411,6 +1432,81 @@ def create_app(state: WebState):
     # 模型池（结构化设置页之外的轻量管理接口）
     # ------------------------------------------------------------------
 
+    observations: dict[ModelTarget, _ModelObservations] = {}
+    standalone_client: LLMClient | None = None
+
+    def diagnostic_client() -> LLMClient:
+        # 在线 bot 必须共用其预算台账；独立 WebUI 才建自己的带持久化预算的客户端。
+        nonlocal standalone_client
+        live = getattr(state.bot, "llm", None)
+        if isinstance(live, LLMClient):
+            return live
+        if standalone_client is None or standalone_client.config is not state.config.llm:
+            standalone_client = LLMClient(state.config.llm, usage_recorder=make_usage_recorder(state.store))
+        return standalone_client
+
+    def observed_catalog():
+        # 密钥/地址随配置热更新。旧请求可以结束，但其锁和结果不能进入新端点的视图。
+        catalog, _ = state.config.llm.catalog_view()
+        rows = {}
+        current = set()
+        for row in catalog:
+            target = ModelTarget(row["name"], "", row["base_url"], row["api_key"])
+            current.add(target)
+            obs = observations.setdefault(target, _ModelObservations())
+            models = set(row["models"])
+            for removed in obs.probes.keys() - models:
+                del obs.probes[removed]
+            rows[target.provider] = (target, models, obs)
+        for obsolete in observations.keys() - current:
+            del observations[obsolete]
+        return rows
+
+    def diagnostic_target(body, *, probe=False):
+        if body.keys() - ({"provider", "model"} if probe else {"provider", "refresh"}):
+            raise ApiError(422, "只接受已保存的提供商与诊断参数")
+        provider = body.get("provider")
+        if not isinstance(provider, str) or provider not in (rows := observed_catalog()):
+            raise ApiError(422, "请先保存提供商")
+        target, models, obs = rows[provider]
+        if probe:
+            model = body.get("model")
+            if not isinstance(model, str) or model not in models:
+                raise ApiError(422, "只能探测已保存在该提供商目录中的单个模型")
+            target = ModelTarget(provider, model, target.base_url, target.api_key)
+        elif not isinstance(body.get("refresh", False), bool):
+            raise ApiError(422, "refresh 必须是布尔值")
+        return target, obs
+
+    @app.post("/api/models/discover")
+    async def discover_models(request: Request):
+        require_session(request)
+        body = await _json_body(request)
+        target, obs = diagnostic_target(body)
+        async with obs.lock:
+            if obs.discovery and not body.get("refresh") and time.monotonic() < obs.expires:
+                return {**obs.discovery, "cached_at": obs.discovery["checked_at"]}
+            try:
+                ids = await diagnostic_client().discover_models(target)
+                result = {"status": "available", "models": ids}
+            except LLMError as exc:
+                result = {"status": "error", "models": [], "error": request_result_code(exc)}
+            obs.discovery = {**result, "checked_at": _checked_at(), "cached_at": None}
+            obs.expires = time.monotonic() + MODEL_LIST_TTL
+            return obs.discovery
+
+    @app.post("/api/models/probe")
+    async def probe_model(request: Request):
+        require_session(request)
+        target, obs = diagnostic_target(await _json_body(request), probe=True)
+        try:
+            await diagnostic_client().probe_model(target)
+            result = {"status": "available"}
+        except LLMError as exc:
+            result = {"status": "error", "error": request_result_code(exc)}
+        obs.probes[target.model] = {**result, "checked_at": _checked_at()}
+        return obs.probes[target.model]
+
     def _pool_snapshot(config) -> dict[str, Any]:
         """当前模型池视图：角色顺序、模型列表与实际策略。"""
         llm = config.llm
@@ -1419,6 +1515,10 @@ def create_app(state: WebState):
         roles = dict.fromkeys((*MODEL_ROLES, *configured, *llm.model_strategies))
         return {
             **catalog,
+            "observations": {
+                name: {"discovery": obs.discovery, "probes": dict(obs.probes)}
+                for name, (_, _, obs) in observed_catalog().items()
+            },
             "strategy": config.llm.model_strategy,
             "strategies": dict(config.llm.model_strategies),
             "roles": [
@@ -1444,7 +1544,8 @@ def create_app(state: WebState):
         require_session(request)
         body = await _json_body(request)
         aliases = {"strategy": "model_strategy", "strategies": "model_strategies"}
-        fields = {"providers", "role_pools", "models", "model_strategy", "model_strategies"}
+        fields = {"providers", "role_pools", "models", "model_strategy", "model_strategies",
+                  "temperature", "chat_temperature", "chat_frequency_penalty", "timeout", "max_retries"}
         llm = {aliases.get(key, key): value for key, value in body.items() if aliases.get(key, key) in fields}
         if not llm:
             raise ApiError(400, "至少要提交一个模型目录、池或策略字段")

@@ -1,6 +1,6 @@
 """OpenAI 兼容的 LLM 客户端。
 
-只实现 chat/completions 这一条路径，够用且不引入额外依赖。
+聊天使用 chat/completions；手动诊断另外支持只读的 models 目录。
 ``complete(role=...)`` 里的 role 决定使用哪个模型池（chat / extract / consolidate，
 以及 fast / summary / vision 等预置角色），回退规则见 :class:`LLMConfig.model_for`，
 模型池与策略见 :meth:`LLMConfig.models_for` / :meth:`LLMConfig.strategy_for`。
@@ -37,8 +37,11 @@ import logging
 import random
 import re
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Protocol
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -48,6 +51,28 @@ from .llm_budget import BudgetDenial, LLMBudgetGate
 logger = logging.getLogger(__name__)
 
 _JSON_BLOCK = re.compile(r"```(?:json)?\s*(.*?)```", re.S)
+
+_DIAGNOSTIC_TIMEOUT = 15.0
+_DIAGNOSTIC_MAX_BYTES = 2 * 1024 * 1024
+_in_diagnostic = ContextVar("llm_diagnostic", default=False)
+
+
+def _outside_diagnostic(record: logging.LogRecord) -> bool:
+    return not _in_diagnostic.get()
+
+
+@contextmanager
+def _private_http_logs():
+    # httpx 的 INFO 含上游自定的 reason phrase，httpcore 的 DEBUG 还含响应头；
+    # 两者都可能回显 Bearer。过滤器只屏蔽诊断协程，不改其它并发请求的日志级别。
+    for name in ("httpx", "httpcore.http11", "httpcore.http2", "httpcore.connection",
+                 "httpcore.proxy", "httpcore.socks"):
+        logging.getLogger(name).addFilter(_outside_diagnostic)
+    token = _in_diagnostic.set(True)
+    try:
+        yield
+    finally:
+        _in_diagnostic.reset(token)
 
 # 值得重试的 HTTP 状态：超时/限流/服务端故障
 RETRYABLE_STATUS = frozenset({408, 429})
@@ -106,6 +131,25 @@ class LLMError(RuntimeError):
     """LLM 调用失败。"""
 
 
+class _LLMDiagnosticTimeout(LLMError):
+    """手动诊断超时；不透传可能带凭据的传输层异常。"""
+
+
+def _diagnostic_url(target: ModelTarget, path: str) -> str:
+    # 旧版配置不校验端点；避免凭据进 URL、查询参数或日志。
+    url = target.base_url
+    try:
+        parts = urlsplit(url)
+        _ = parts.port
+        valid = (parts.scheme in ("http", "https") and parts.hostname
+                 and parts.username is None and not re.search(r"[?#\\\s\x00-\x1f\x7f]", url))
+    except ValueError:
+        valid = False
+    if not valid:
+        raise LLMError("提供商地址必须是不含凭据、查询或片段的 HTTP(S) 地址")
+    return f"{url.rstrip('/')}/{path}"
+
+
 class ToolUnsupported(LLMError):
     """当前中转/模型不支持 OpenAI 工具调用（拿它当正常退化信号，不当异常上报）。"""
 
@@ -141,7 +185,7 @@ class LLMBudgetExceeded(LLMError):
 def request_result_code(exc: BaseException | None) -> str:
     """按异常类型归因，不解析或记录可能含上游正文的异常消息。"""
     while exc is not None:
-        if isinstance(exc, (TimeoutError, httpx.TimeoutException)):
+        if isinstance(exc, (TimeoutError, httpx.TimeoutException, _LLMDiagnosticTimeout)):
             return "timeout"
         if isinstance(exc, LLMResponseError):
             return f"http_{exc.status}"
@@ -188,7 +232,7 @@ def _as_token_count(value: Any) -> int | None:
         return None
     try:
         number = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return number if number >= 0 else None
 
@@ -226,6 +270,96 @@ class LLMClient:
         return not self._tools_unsupported and any(
             (t.provider, t.model) not in self._no_tools for t in self.config.targets_for("chat")
         )
+
+    async def _diagnostic_request(self, url: str, key: str, body: dict | None) -> tuple[int, Any]:
+        """只向指定地址发一次；不沿重定向、不借用聊天角色的凭据或 Cookie。"""
+        status = None
+        try:
+            with _private_http_logs():
+                async with asyncio.timeout(_DIAGNOSTIC_TIMEOUT), httpx.AsyncClient(
+                    headers={"Authorization": f"Bearer {key}"} if key else {},
+                    timeout=_DIAGNOSTIC_TIMEOUT, transport=self._transport,
+                ) as client, client.stream(
+                    "GET" if body is None else "POST", url, json=body,
+                ) as response:
+                    status = response.status_code
+                    if body is None and not 200 <= status < 300:
+                        return status, None  # 查目录只需状态码，不必读错误页。
+                    raw = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        if len(raw) + len(chunk) > _DIAGNOSTIC_MAX_BYTES:
+                            return status, None
+                        raw.extend(chunk)
+                    try:
+                        return status, json.loads(raw)
+                    except (ValueError, RecursionError):
+                        return status, None
+        except (TimeoutError, httpx.HTTPError, httpx.InvalidURL, ValueError) as exc:
+            # 探测会尽力从错误页取 usage；正文传输失败不应覆盖已收到的 HTTP 状态。
+            if status is not None and not 200 <= status < 300:
+                return status, None
+            if isinstance(exc, (TimeoutError, httpx.TimeoutException)):
+                raise _LLMDiagnosticTimeout("上游请求超时") from None
+            raise LLMError("无法请求提供商端点") from None
+
+    @staticmethod
+    def _check_diagnostic_status(status: int) -> None:
+        if not 200 <= status < 300:
+            raise LLMResponseError(f"上游返回 HTTP {status}", status=status)
+
+    async def discover_models(self, target: ModelTarget) -> list[str]:
+        """读取提供商目录，只返回去重排序后的模型 ID；目录读取不占生成预算。"""
+        url = _diagnostic_url(target, "models")
+        status, data = await self._diagnostic_request(url, target.api_key, None)
+        self._check_diagnostic_status(status)
+        rows = data.get("data") if isinstance(data, dict) and data.get("error") is None else None
+        if not isinstance(rows, list):
+            raise LLMInvalidResponse("上游响应不是模型目录")
+        names = set()
+        for row in rows:
+            value = row.get("id") if isinstance(row, dict) else None
+            if not isinstance(value, str) or not value.strip():
+                raise LLMInvalidResponse("上游模型目录含无效 ID")
+            try:
+                value.encode("utf-8")  # JSON 转义可携带孤立代理字符，WebUI 不能返回它。
+            except UnicodeEncodeError:
+                raise LLMInvalidResponse("上游模型 ID 编码无效") from None
+            # 上游可控字段里也可能回显本站密钥，不能因它位于 id 字段就透传。
+            if not target.api_key or target.api_key not in value:
+                names.add(value.strip())
+        return sorted(names)
+
+    async def probe_model(self, target: ModelTarget) -> int:
+        """单独测试所选模型，返回毫秒数；无论成败，每次上游尝试只记一笔。"""
+        url = _diagnostic_url(target, "chat/completions")
+        task = "model_probe"
+        denial = self.budget.denial(task)
+        if denial is not None:
+            raise LLMBudgetExceeded(denial)
+        started = time.perf_counter()
+        data = None
+        ok = False
+        try:
+            status, data = await self._diagnostic_request(url, target.api_key, {
+                "model": target.model, "messages": [{"role": "user", "content": "Hi"}],
+                "max_tokens": 1,
+            })
+            self._check_diagnostic_status(status)
+            choices = data.get("choices") if isinstance(data, dict) and data.get("error") is None else None
+            first = choices[0] if isinstance(choices, list) and choices else None
+            message = first.get("message") if isinstance(first, dict) else None
+            content = message.get("content") if isinstance(message, dict) else None
+            # 单 token 可能耗在推理上：仅在明确截断时接受空正文。
+            if not (isinstance(message, dict) and (
+                isinstance(content, str) and content.strip() or
+                content in (None, "") and first.get("finish_reason") in ("length", "max_tokens")
+            )):
+                raise LLMInvalidResponse("上游响应不是有效的聊天补全")
+            ok = True
+            return int((time.perf_counter() - started) * 1000)
+        finally:
+            # 外层取消仍向上传播；在途尝试不能因此绕过预算台账。
+            await self._record_usage(task, target.model, data, started, ok=ok, provider=target.provider)
 
     async def _get_client(self, target: ModelTarget | None = None) -> httpx.AsyncClient:
         # 按提供商隔离认证头、Cookie 和连接池；兼容回放工具预取聊天端点的钩子。

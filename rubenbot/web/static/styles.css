@@ -2351,6 +2351,50 @@ button {
   min-width: 0;
 }
 
+/* 连接、列表证据与推理证据分层展示；长地址与上游模型名不会顶宽卡片。 */
+.model-pool-item, .model-pool-list, .model-layer-editor, .model-catalog-list { min-width: 0; }
+.model-layer-editor [hidden] { display: none !important; }
+.model-provider-heading, .model-searchbar, .model-catalog-name, .model-actions, .model-evidence {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.model-provider-heading { justify-content: space-between; }
+.model-provider-id { display: grid; gap: 3px; min-width: 0; }
+.model-provider-id strong, .model-id { overflow-wrap: anywhere; }
+.model-provider-id .mono { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 12px; }
+.model-health { flex: none; color: var(--muted); font-size: 12px; }
+.model-health::before { content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 6px; background: currentColor; border-radius: 50%; }
+.model-health.available { color: var(--good); }
+.model-health.error { color: var(--bad); }
+.model-connection summary { cursor: pointer; color: var(--text-soft); font-size: 13px; }
+.model-connection[open] > * + * { margin-top: 10px; }
+.model-discovery-tools, .model-catalog-list { display: grid; gap: 8px; }
+.model-discovery-status { display: grid; gap: 4px; color: var(--text-soft); font-size: 12px; overflow-wrap: anywhere; }
+.model-discovery-status .tag { justify-self: start; max-width: 100%; height: auto; white-space: normal; }
+.model-actions, .model-evidence, .model-searchbar { flex-wrap: wrap; }
+.model-searchbar { align-items: flex-end; justify-content: space-between; }
+.model-searchbar label { flex: 1 1 160px; min-width: 0; }
+.model-catalog-row, .model-role-entry { display: grid; gap: 7px; min-width: 0; padding: 10px 12px; border-radius: var(--r-inner); background: var(--card-fill); }
+.model-catalog-name input[type=checkbox] { flex: none; width: 17px; height: 17px; accent-color: var(--accent); }
+.model-catalog-name .input, .model-catalog-name .model-id { flex: 1; min-width: 0; }
+.model-catalog-name .field-hint { flex: none; }
+.model-evidence .tag { height: auto; min-height: 23px; padding-block: 2px; flex-wrap: wrap; white-space: normal; overflow-wrap: anywhere; }
+.model-evidence time { font-size: 10.5px; font-variant-numeric: tabular-nums; }
+.model-actions .select { width: auto; max-width: 100%; min-width: 0; }
+.model-role-entry.first { box-shadow: inset 3px 0 var(--accent); }
+.model-role-entry:is([data-status="error"], [data-status="not_listed"]) { background: var(--inset-fill); }
+.model-role-entry:is([data-status="error"], [data-status="not_listed"]) .select { color: var(--muted); }
+.model-catalog-list > .btn { justify-self: start; }
+@media (max-width: 640px) {
+  .model-layer-editor .model-pool-item { padding: 12px; }
+  .model-connection .settings-fields { grid-template-columns: minmax(0, 1fr); }
+  .model-searchbar { align-items: stretch; flex-direction: column; }
+  .model-searchbar label { flex-basis: auto; }
+  .model-role-entry .model-pool-row { gap: 3px; }
+}
+
 .advanced-yaml {
   overflow: hidden;
 }
