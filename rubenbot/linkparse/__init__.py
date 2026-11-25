@@ -8,6 +8,7 @@
 - :mod:`~rubenbot.linkparse.urls`：链接抽取、规范化（去片段/跟踪参数）与平台识别；
 - :mod:`~rubenbot.linkparse.fetch`：受检的公网抓取（每跳校验、固定地址、限额）；
 - :mod:`~rubenbot.linkparse.extract`：结构化数据 → 通用元数据 → 正文提取；
+- :mod:`~rubenbot.linkparse.xapi`：X 推文的 fxtwitter 公开 JSON 取值（插件共用）；
 - :mod:`~rubenbot.linkparse.service`：缓存、冷却、每日额度与交给模型的隔离数据块；
 - :mod:`~rubenbot.linkparse.settings`：``config.yaml`` 的 ``link`` 段。
 

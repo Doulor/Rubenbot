@@ -64,7 +64,7 @@ CASES = {
 def run(key, url, payload, *, landing=None):
     seen = []
 
-    async def read(target):
+    async def read(target, **kwargs):
         seen.append(target)
         h = urlsplit(target).hostname
         assert any(h == d or h.endswith('.' + d) for d in public.HOSTS[key])

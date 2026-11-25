@@ -640,10 +640,18 @@ class PluginContext:
 
     async def fetch_public_page(
         self, url: str, *, allow_url: Callable[[str], bool] | None = None,
+        timeout: float = 6.0,
     ) -> public_web.FetchResult:
-        """受检读取公网文本（1 MiB、共 6 秒）；可用 allow_url 在每跳限制站点。"""
+        """受检读取公网文本（1 MiB、默认共 6 秒）；可用 allow_url 在每跳限制站点。
+
+        ``timeout`` 只放宽总耗时（0.1～30 秒），单页字节上限与逐跳安全校验不变；
+        出站慢的公开接口（如 fxtwitter）需要更多余量时由插件显式指定。
+        """
         self._require("network", "读取公网网页")
-        return await public_web.fetch(url, 1 << 20, 6.0, allow_url=allow_url, prepare=sites.prepare)
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+            timeout = 6.0
+        timeout = min(max(float(timeout), 0.1), 30.0)
+        return await public_web.fetch(url, 1 << 20, timeout, allow_url=allow_url, prepare=sites.prepare)
 
     async def fetch_public_cover(
         self, url: str, *, allow_url: Callable[[str], bool] | None = None,

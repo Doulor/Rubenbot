@@ -7,6 +7,9 @@
 
 ### Fixed
 
+- **X 链接解析不了——加 fxtwitter 路（第 37 项）**：2026-11-25 20:48 群友在群里让 bot 总结一条 `x.com/.../status/...`，bot 没解析出来。家里云实测根因不是解析器坏了，而是缺一条路：那台出口上 x.com 完全连不上，`publish.twitter.com` 的 oEmbed 也返回空，fxtwitter 能通（200，约 5.7 秒）。现在 core 感知层（`rubenbot/linkparse/service.py`）与链接详细解析插件（`plugins/link_detail/public.py`）用同一套顺序读推文：**fxtwitter 公开 JSON（`api.fxtwitter.com/<user>/status/<id>`）优先**，取它实际返回的作者、正文、发布时间与媒体信息；失败再走 x.com 网页，插件另保留 oEmbed 作中间后备（空 oEmbed 不再直接判失败，继续读网页）。镜像返回的作品 ID 与所请求的不一致时按读不到处理，不拿别的帖子或网页标题顶替；镜像只是读取手段，对外仍报原链接。镜像单次总耗时放宽到 10 秒（实测要 5～6 秒，默认 6 秒预算没余量），字节上限与逐跳 DNS / SSRF 校验不变；插件侧 `fetch_public_page` 增加可选的 `timeout` 参数，限制在 0.1～30 秒，X 那一跳显式传 10 秒。公开 JSON 的取值抽在 `rubenbot/linkparse/xapi.py`，两路共用而不各写一份。实测的 Frenchie_ 法语长帖在 `tests/test_link_x_fxtwitter.py` 里用构造响应回放：作者、正文、发布时间能取到；oEmbed 返回空时继续往后走；其他平台的提取器不受影响。线上实测仍待合并部署后由机主在群里重发同一条链接确认。
+  - **机主验收用例**：在群里发一条公开的 X 推文链接并 @ bot 让它总结，bot 应能说出推文的作者和正文大意（不是「抓不到」）；发一条已被删除或不存在的推文 ID，bot 仍应如实说抓不到，不编内容。
+
 - **群聊起哄不等于来问原理（第 36 项）**：策划和正文共用本批呼叫、疑问和求助线索，配四对固定口吻示例；被点名时仍正面答足。只改场景上下文，不动开口裁定。[人设改写](PERSONA-DRAFT-register36.md)是待审草案，未替换运行文件。
 - **快手短链误报「抓不到」**：桌面作品页改用 `VisionVideoDetailPhoto` 后，链接详细解析仍能按落地页作品 ID 取到封面和公开信息；保留旧 `VisionVideoPhoto` 支持，不用推荐作品顶替。
 

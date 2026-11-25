@@ -34,7 +34,7 @@ def setup(config, store, monkeypatch):
     config.link.mode = 'auto'
     reads, images, generic = [], [], []
 
-    async def page(self, url, *, allow_url):
+    async def page(self, url, *, allow_url, **kwargs):
         assert allow_url(url)
         reads.append(url)
         if url.startswith('https://api.bilibili.com/x/web-interface/view?bvid='):
@@ -105,7 +105,8 @@ def test_limit_and_config_hot_apply(setup):
     assert s.loader.apply_config_change('link_detail', {}, {'max_links': 1, 'send_video': True})[0]
     event = message(f'{BILI} {X}')
     asyncio.run(s.bot.handle_event(event))
-    assert s.generic == [X] and s.images == [COVER]
+    # X 超出插件上限后交给 core：core 先读 fxtwitter 镜像，再读 x.com 网页。
+    assert s.generic == ['https://api.fxtwitter.com/author/status/123456', X] and s.images == [COVER]
     assert all(seg.type != 'video' for _, _, segs in s.adapter.sent for seg in segs)
     assert s.loader.apply_config_change('link_detail', {}, {'enable_bilibili': False})[0]
     asyncio.run(s.bot.handle_event(message(BILI, group='another')))

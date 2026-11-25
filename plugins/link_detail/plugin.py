@@ -43,7 +43,9 @@ class LinkDetail:
     async def preview(self, key, link):
         read = partial(self.ctx.fetch_public_page, allow_url=partial(allowed, key))
         try:
-            async with asyncio.timeout(14):
+            # X 依次试镜像、oEmbed、网页三路（镜像单次预算就是 10 秒），
+            # 总时限要容得下逐级后备，否则前面的超时会把整次提取掐断。
+            async with asyncio.timeout(30 if key == 'x' else 14):
                 detail = await extractor(key).extract(key, link.normalized, read)
             if detail is not None:
                 detail.url = link.url

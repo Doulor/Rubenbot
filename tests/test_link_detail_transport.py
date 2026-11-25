@@ -83,6 +83,16 @@ def test_page_delegates_with_host_limits(ctx, monkeypatch):
     fetch.assert_awaited_once_with(page.final_url, 1 << 20, 6.0, allow_url=policy, prepare=sites.prepare)
 
 
+@pytest.mark.parametrize(('requested', 'applied'), [(10, 10.0), (60, 30.0), (0, 0.1), ('bad', 6.0)])
+def test_page_custom_timeout_is_clamped(ctx, monkeypatch, requested, applied):
+    """插件只能放宽总耗时，且仍落在 0.1～30 秒；字节上限与逐跳校验不变。"""
+    page = public_web.FetchResult('https://example.com/', 'application/json', '{}')
+    fetch = AsyncMock(return_value=page)
+    monkeypatch.setattr(public_web, 'fetch', fetch)
+    asyncio.run(ctx.fetch_public_page(page.final_url, timeout=requested))
+    fetch.assert_awaited_once_with(page.final_url, 1 << 20, applied, allow_url=None, prepare=sites.prepare)
+
+
 @pytest.mark.parametrize('allow_mobile', [False, True])
 def test_page_prepares_and_checks_shortlink_destination(ctx, monkeypatch, allow_mobile):
     short = 'https://b23.tv/sample'

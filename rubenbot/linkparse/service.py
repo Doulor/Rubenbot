@@ -22,11 +22,11 @@ from typing import Any
 
 from ..decision import is_reply_to_bot
 from ..expression import CapabilityNote, is_question
-from . import sites
+from . import sites, xapi
 from .extract import clean, extract
 from .fetch import FetchError, FetchResult, fetch
 from .settings import LinkConfig
-from .urls import extract as extract_urls, platform_for, strip_urls
+from .urls import extract as extract_urls, platform_for, strip_urls, x_json_api, x_status
 
 logger = logging.getLogger(__name__)
 
@@ -78,10 +78,16 @@ class LinkResult:
         return data
 
     def index(self) -> dict[str, Any]:
-        """规划步只拿索引（标题/摘要/状态），正文留给生成步。"""
+        """规划步只拿索引（标题/摘要/状态），正文留给生成步。
+
+        X 推文的镜像结果没有页面摘要，用正文开头充当索引摘要，否则策划
+        只看到作者和时间、看不出这条讲什么。其他平台的索引口径不变。
+        """
         data = self.payload()
-        for key in ("正文", "简介"):
-            data.pop(key, None)
+        body = data.pop("正文", "")
+        data.pop("简介", None)
+        if self.source == "mirror" and not data.get("摘要") and isinstance(body, str) and body:
+            data["摘要"] = body[:200]
         if isinstance(data.get("摘要"), str):
             data["摘要"] = data["摘要"][:200]
         return data
@@ -241,6 +247,17 @@ class LinkService:
             prepare=sites.prepare,
         )
 
+    def _mirror_fetcher(self):
+        """X 推文镜像请求：唯一区别是总耗时下限，安全校验与限额完全相同。"""
+        if self.fetch is not None:
+            return self.fetch
+        return partial(
+            fetch,
+            max_bytes=self.config.max_bytes,
+            timeout_seconds=max(self.config.timeout_seconds, xapi.TIMEOUT_SECONDS),
+            prepare=sites.prepare,
+        )
+
     @staticmethod
     def _reason(exc: Exception) -> str:
         if isinstance(exc, FetchError):
@@ -270,12 +287,26 @@ class LinkService:
         return text
 
     async def _resolve(self, url: str) -> LinkResult:
+        platform = platform_for(url)
+        requested = x_status(url)
+        attempted: set[str] = set()
+        # X 推文先走 fxtwitter：x.com 在家里云出口上连不上，直连只作后备。
+        if platform.key == "x":
+            mirrored = await self._read_x_mirror(url, url, platform, attempted)
+            if mirrored is not None:
+                return mirrored
         try:
             page = await self._fetcher()(url)
         except Exception as exc:  # noqa: BLE001 - 失败按普通消息处理，不中断对话
             return LinkResult(url=url, error=self._reason(exc))
         final_url = str(page.final_url or url)
         platform = platform_for(final_url)
+        landed = x_status(final_url)
+        if requested and landed and requested[1] != landed[1]:
+            # 跳到了另一条推文（例如登录回跳或平台改写）：不把它当成本轮这条。
+            return LinkResult(url=url, final_url=final_url, platform=platform.key,
+                              platform_name=platform.name,
+                              error="链接跳转到了另一条推文")
         mime = (page.content_type or "").partition(";")[0].strip().lower()
         if mime not in ("text/html", "application/xhtml+xml"):
             return LinkResult(url=url, final_url=final_url, platform=platform.key,
@@ -287,6 +318,11 @@ class LinkService:
             return LinkResult(url=url, final_url=final_url, platform=platform.key,
                               platform_name=platform.name, error=f"页面无法解析：{type(exc).__name__}")
         source = "page"
+        if platform.key == "x" and not fields.keys() & {"正文", "摘要"}:
+            # 短链落地、或网页里只有站点名标题时，再补一次镜像（同一地址不重复读）。
+            mirrored = await self._read_x_mirror(url, final_url, platform, attempted)
+            if mirrored is not None:
+                return mirrored
         if not fields:
             text = await self._fallback_text(final_url)
             if text:
@@ -298,6 +334,33 @@ class LinkService:
                               error="页面没有可读内容（可能要求登录或依赖脚本）")
         return LinkResult(url=url, final_url=final_url, platform=platform.key,
                           platform_name=platform.name, fields=fields, source=source)
+
+    async def _read_x_mirror(
+        self, url: str, final_url: str, platform, attempted: set[str] | None = None,
+    ) -> LinkResult | None:
+        """走 fxtwitter 读推文；镜像失败时返回 None，由调用方沿用原结论。
+
+        镜像返回的 ID 必须与所请求的那条一致，否则当作读不到（不拿别的推文顶替）。
+        镜像只是读取手段：对外仍报原链接，失败原因也不覆盖调用方的判断。
+        """
+        api = x_json_api(final_url) or x_json_api(url)
+        status = x_status(final_url) or x_status(url)
+        if not api or status is None or (attempted is not None and api in attempted):
+            return None
+        if attempted is not None:
+            attempted.add(api)
+        try:
+            page = await self._mirror_fetcher()(api)
+        except Exception as exc:  # noqa: BLE001 - 镜像失败按没读到处理
+            logger.info("X 镜像读取失败：%s", self._reason(exc))
+            return None
+        fields = xapi.fields(xapi.parse(page.text), status[1])
+        if not fields:
+            logger.info("X 镜像没有返回这条推文")
+            return None
+        fields.pop("封面", None)  # 封面地址只给需要发图的调用方，不进给模型的数据
+        return LinkResult(url=url, final_url=final_url, platform=platform.key,
+                          platform_name=platform.name, fields=fields, source="mirror")
 
     async def read(self, url: str, *, auto_chat=None) -> LinkResult | None:
         """读取一个链接：命中缓存直接返回，同 URL 并发合并；额度不足返回 None。"""

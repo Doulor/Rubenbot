@@ -54,6 +54,42 @@ _TRACKING_PREFIX = ("utm_",)
 
 _URL = re.compile(r'''https?://[^\s<>"'`，。！？；、【】「」《》]+''', re.I)
 
+# X（Twitter）的推文地址；``i/web/status`` 是网页端的中转形态，与 ``<user>/status`` 同义。
+# fxtwitter 的公开 JSON 只认这个形态，t.co 展开后的落地地址同样适用。
+_X_STATUS = re.compile(r"/([A-Za-z0-9_]+|i/web)/status/(\d+)(?:/(?:photo|video)/\d+)?/?$", re.ASCII)
+_X_JSON = "https://api.fxtwitter.com/"
+
+
+def x_status(url: str) -> tuple[str, str] | None:
+    """``https://x.com/<user>/status/<id>`` → ``(用户名段, 状态 ID)``。
+
+    只做纯字符串判断，不联网；t.co 之类短链要先由抓取层展开再调用。
+    不是 X 的推文地址时返回 ``None``。
+    """
+    if platform_for(url).key != "x":
+        return None
+    try:
+        path = urlsplit(url).path
+    except ValueError:
+        return None
+    match = _X_STATUS.fullmatch(path)
+    return (match[1], match[2]) if match else None
+
+
+def x_json_api(url: str) -> str:
+    """该推文的 fxtwitter 公开 JSON 地址；不是推文地址时返回空串。
+
+    x.com 在部分出口上完全连不上，fxtwitter 的 JSON 能给出作者、正文、时间与
+    媒体；这是读取手段，不是对外的链接改写（对外仍报原地址）。
+
+    ``i/web`` 形态没有用户名，fxtwitter 的接口按 ``<用户名>/status/<id>`` 取帖，
+    这里如实返回空串，让调用方改走 oEmbed 或直连网页，不拿别的名字去猜。
+    """
+    status = x_status(url)
+    if not status or status[0] == "i/web":
+        return ""
+    return f"{_X_JSON}{status[0]}/status/{status[1]}"
+
 
 def _is_domain(host: str, domain: str) -> bool:
     return host == domain or host.endswith("." + domain)
