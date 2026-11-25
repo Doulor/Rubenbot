@@ -213,6 +213,22 @@ def test_on_message_can_block(plugin_dir):
     assert llm.calls == []
 
 
+def test_plugin_intercept_leaves_decision_log_record(plugin_dir, caplog):
+    """入库了却没进裁定：拦截要留可查记录，不能再是静默空白（第 38 项）。"""
+    bot, adapter, _, _ = make_bot(plugin_dir, replies=["不该出现"])
+    with caplog.at_level("INFO", logger="rubenbot.core"):
+        asyncio.run(bot.handle_event(private("屏蔽我")))
+    assert any("插件拦截" in record.getMessage() and "demo" in record.getMessage()
+               for record in caplog.records)
+    log, = bot.store.list_decision_logs(chat_id="u1")
+    assert log["reason"] == "plugin_intercept:demo"
+    assert log["should_reply"] is False
+    assert log["factors"]["plugin"] == "demo"
+    assert log["factors"]["raw_message_id"]
+    # 拦截语义不变：既不发回复，也不进合批/裁定
+    assert adapter.sent == []
+
+
 def test_hooks_before_and_after(plugin_dir):
     bot, adapter, manager, llm = make_bot(plugin_dir, replies=["好的呀"])
     asyncio.run(bot.handle_event(private("你好")))

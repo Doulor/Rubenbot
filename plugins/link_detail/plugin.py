@@ -10,7 +10,7 @@ from functools import partial
 import yaml
 
 from rubenbot.adapters.base import Segment
-from rubenbot.decision import BOT_SENDER_ID
+from rubenbot.decision import BOT_SENDER_ID, is_reply_to_bot
 from rubenbot.linkparse.fetch import FetchError
 from rubenbot.plugins.config_schema import effective_values, normalize_schema, validate_values
 
@@ -101,6 +101,11 @@ class LinkDetail:
             return
         adapter = runtime.adapters.get(event.platform)
         if adapter is None or event.sender_id in (BOT_SENDER_ID, getattr(adapter, 'self_id', None)):
+            return
+        # 指向 bot 的消息（@ 或回复 bot）是在向 bot 提问，不是单纯分享作品：
+        # 插件只做被动详情展开，不认领、不拦截，整条交给 core 的合批、裁定与
+        # 链接理解。否则「@bot 总结这条链接」会被详情回执吞掉、进不了裁定。
+        if event.mentions_bot or is_reply_to_bot(event):
             return
         seen = list(links(event.text))
         selected = {}

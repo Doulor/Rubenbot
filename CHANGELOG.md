@@ -7,6 +7,9 @@
 
 ### Fixed
 
+- **@bot 的提问连同链接被插件吞了（第 38 项）**：2026-11-25 20:48 群友在群 1059662053 @bot 让总结一条 X 链接，4 分钟后 `decision_log` 里没有这条消息——没裁定、没回复、没预取日志。家里云查实的死点不在入库、合批或裁定，而在插件钩子：链接详细解析插件收到「单链接」消息时，即使详情读取失败也会把「抓不到」当成功送出，随后把整条消息认领掉（`on_message` 返回 `False`），core 只打了一条 DEBUG 日志就 `return`，消息从此不进合并器与裁定。现在是一般边界而不是单条特判：**消息 @ 了 bot 或回复 bot 时插件不认领、不拦截**，那是在向 bot 提问而不是分享作品，整条交给 core 的合批、裁定与链接理解；普通分享链接照旧由插件展开。可见性同时补上：`run_message_hooks` 改为返回拦截者插件名，core 被拦截时按 INFO 记日志并在 `decision_log` 写一条 `reason = plugin_intercept:<插件名>`（`factors` 带插件名与被拦截的流水 id），「入库了却没进裁定」以后一眼可查。回归用例见 `tests/test_link_detail_plugin.py`（@bot 单链接、回复 bot 单链接均进裁定，普通分享仍被展开并留拦截记录）与 `tests/test_plugins.py`（插件拦截留 decision_log 记录，去重/拦截语义不变）。线上复测待合并部署后由机主在该群重发等价 @ 消息确认。
+  - **机主验收用例**：在群 1059662053 发一条 `@bot 总结一下这个的内容` + 一条 X 链接，`decision_log` 里应出现这条消息的裁定（正常回复或明确拒答），插件不再单独回「抓不到」把它吞掉；同时发一条不带 @ 的普通作品链接，插件仍照常展开详情，并在 `decision_log` 留 `plugin_intercept:link_detail`。
+
 - **X 链接解析不了——加 fxtwitter 路（第 37 项）**：2026-11-25 20:48 群友在群里让 bot 总结一条 `x.com/.../status/...`，bot 没解析出来。家里云实测根因不是解析器坏了，而是缺一条路：那台出口上 x.com 完全连不上，`publish.twitter.com` 的 oEmbed 也返回空，fxtwitter 能通（200，约 5.7 秒）。现在 core 感知层（`rubenbot/linkparse/service.py`）与链接详细解析插件（`plugins/link_detail/public.py`）用同一套顺序读推文：**fxtwitter 公开 JSON（`api.fxtwitter.com/<user>/status/<id>`）优先**，取它实际返回的作者、正文、发布时间与媒体信息；失败再走 x.com 网页，插件另保留 oEmbed 作中间后备（空 oEmbed 不再直接判失败，继续读网页）。镜像返回的作品 ID 与所请求的不一致时按读不到处理，不拿别的帖子或网页标题顶替；镜像只是读取手段，对外仍报原链接。镜像单次总耗时放宽到 10 秒（实测要 5～6 秒，默认 6 秒预算没余量），字节上限与逐跳 DNS / SSRF 校验不变；插件侧 `fetch_public_page` 增加可选的 `timeout` 参数，限制在 0.1～30 秒，X 那一跳显式传 10 秒。公开 JSON 的取值抽在 `rubenbot/linkparse/xapi.py`，两路共用而不各写一份。实测的 Frenchie_ 法语长帖在 `tests/test_link_x_fxtwitter.py` 里用构造响应回放：作者、正文、发布时间能取到；oEmbed 返回空时继续往后走；其他平台的提取器不受影响。线上实测仍待合并部署后由机主在群里重发同一条链接确认。
   - **机主验收用例**：在群里发一条公开的 X 推文链接并 @ bot 让它总结，bot 应能说出推文的作者和正文大意（不是「抓不到」）；发一条已被删除或不存在的推文 ID，bot 仍应如实说抓不到，不编内容。
 

@@ -246,16 +246,23 @@ class IngressMixin:
             self._engaged_at[(event.platform, event.chat_type, event.chat_id)] = now
         if await self.privacy_commands.handle(self.context, event):
             return
-        # 插件 on_message：可修改事件或直接拦截（返回 False）
+        # 插件 on_message：可修改事件或直接拦截（返回拦截者插件名）
         if self.plugins is not None:
             self.context.event = event
             try:
-                proceed = await self.plugins.run_message_hooks(self.context, event)
+                blocked_by = await self.plugins.run_message_hooks(self.context, event)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("插件 on_message 异常：%s", exc)
-                proceed = True
-            if not proceed:
-                logger.debug("消息被插件拦截：%s", event.text[:40])
+                blocked_by = None
+            if blocked_by is not None:
+                # 消息已入库却没进裁定：以前只有 debug 日志，线上看起来是静默
+                # 空白。按 INFO 记下来，并在 decision_log 留一条可查的拦截记录。
+                logger.info(
+                    "消息被插件拦截，未进裁定：%s %s msg=%s 插件=%s 正文=%s",
+                    event.platform, event.chat_id, event.platform_msg_id,
+                    blocked_by, event.text[:40],
+                )
+                self._log_plugin_intercept(event, blocked_by, now)
                 return
             # 命令处理（命令不参与合并，直接响应）
             try:
@@ -375,6 +382,29 @@ class IngressMixin:
             except Exception as exc:  # 账本不可用仍照常处理这条消息
                 self._ledger_read.discard((event.platform, event.chat_id))
                 logger.warning("群实体查账失败：%s", exc)
+
+    def _log_plugin_intercept(self, event: MessageEvent, plugin_name: str, now: float) -> None:
+        """插件拦截了消息：写一条 ``plugin_intercept:<插件名>`` 决策记录。
+
+        这类消息已按原文入库，但不会进合批与裁定。留这条记录是为了让
+        「入库了却没有裁定」在 decision_log 里可查，而不是一段静默空白。
+        观测失败不能反过来影响插件行为，只记警告。
+        """
+        try:
+            self.store.add_decision_log(
+                platform=event.platform,
+                chat_id=event.chat_id,
+                chat_type=event.chat_type,
+                sender_id=event.sender_id,
+                sender_name=event.sender_name,
+                text=event.text,
+                should_reply=False,
+                reason=f"plugin_intercept:{plugin_name}",
+                factors={"plugin": plugin_name, "raw_message_id": event.raw_message_id},
+                now=now,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("写入插件拦截记录失败：%s", exc)
 
     def _is_duplicate(self, event: MessageEvent, now: float) -> bool:
         """入站去重检查；去掉重或没有平台消息 id 时返回 False。"""

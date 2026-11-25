@@ -387,6 +387,8 @@ stdout 记录前后 PID/commit。退出码 `0` 表示发布成功，`1` 表示�
 
 **回复投递对账**：日志里的「进入策划」不是发送回执。查 `decision_log.factors.delivery.status` 区分 `sent`、`partial`、`send_failed` 和 `superseded`；`raw_ids` 可定位实际出站的本地流水，包括独立表情回复。`factors.planner.speak` 仍是策划原判，即使私聊必回覆盖它也不改写。全败不补表情、不触发发送后插件。旧决策不回填，不能按 `planned` 推断历史送达。
 
+**消息入库了却没进裁定**：先看 `decision_log.reason` 是不是 `plugin_intercept:<插件名>`。这表示消息已按原文入库，但插件 `on_message` 返回了 `False` 把它拦截下来，不会进合批与裁定；`factors.plugin` 是拦截者，`factors.raw_message_id` 指向对应的流水行。日志里同时有一条 INFO 级「消息被插件拦截，未进裁定」。这是第 38 项补的可见性：被插件认领的消息不再是静默空白，一眼能查到是谁吃掉的。
+
 **群聊语气（第 36 项）**：策划和正文共用一句本批房间状态，分得清「有人 @ 我」和「别人问别人」；同一场景里有四对固定的语气示例。大家喊「抄底了」时可以接一句自己的感受，也可以旁听；有人认真问词义或世界知识，就把问题答清楚。不动态找旧话，也不加开口门槛。[六份人设的对照草案](PERSONA-DRAFT-register36.md)只供审阅，运行时仍加载现有人设。
 
 复验用 `REGISTER36_SETTINGS=/path/to/settings.json python -m pytest -s tests/test_register36.py`（会调用指定的 CLI 模型通道，可能计费）。三例各用独立内存库：两段取自 2026-11-25 流水的脱敏摘句，另有不在示例里的月食题。看实际出站及策划结果码，出站的语气和知识答案完整性仍需读原话判断。未设置通道时只测场景组装。2026-11-25 用现有人设和指定通道复验：交易段 `planner_silence`，没有出站；贤惠段答「是褒义词，通常是夸人善良、会照顾人」；月食题答出日地月近乎成一直线，以及月轨有倾角、满月通常错过地影。三例策划结果码均为 `ok`。这是隔离回放，不是线上效果统计。
@@ -626,7 +628,7 @@ def register(ctx):
 
 可用钩子：
 
-- `on_message(handler)`：`handler(ctx, event)`，返回 `False` 拦截消息
+- `on_message(handler)`：`handler(ctx, event)`，返回 `False` 拦截消息。被拦截的消息已按原文入库，但不进合批与裁定；core 会按 INFO 记日志，并在 `decision_log` 写一条 `reason = plugin_intercept:<插件名>`（`factors` 带插件名与流水 id），便于核对「入库了却没进裁定」的消息。
 - `on_before_reply(handler)`：`handler(ctx, event, messages)`，返回新的 messages 可改写上下文
 - `on_after_reply(handler)`：`handler(ctx, event, reply)`
 - `command(name, handler)`：`handler(ctx, event, args)`，返回字符串作为回复；可直接调用也可作装饰器

@@ -161,6 +161,50 @@ def test_delivery_failure_returns_ownership_to_core(setup, monkeypatch):
     assert s.generic == [BILI] and not s.adapter.sent
 
 
+def test_message_to_bot_with_single_link_reaches_verdict(setup, store):
+    """@bot 提问 + 单链接：插件不认领，整条交给 core 进裁定（第 38 项）。
+
+    线上事故：群 1059662053 里 @bot 让总结一条 X 链接，插件把整条消息当
+    「作品分享」回复详情并返回 False，消息从此不进合批与裁定。
+    """
+    s = setup
+    text = f'@Ruben 总结一下这个的内容\r\n{X}'
+    asyncio.run(s.bot.handle_event(message(text, mentions_bot=True)))
+    # 插件既没读详情也没发回执：这条消息不是一次分享，是一次提问
+    assert not s.reads
+    assert not any('抓不到' in text or '【X】' in text for text in s.adapter.texts)
+    # 链接交给 core 感知层读取，消息进了裁定并留下 decision_log
+    assert X in s.generic
+    logs = store.list_decision_logs(chat_id='g')
+    assert logs and logs[0]['chat_id'] == 'g'
+    assert not logs[0]['reason'].startswith('plugin_intercept')
+
+
+def test_reply_to_bot_with_single_link_reaches_verdict(setup, store):
+    """回复 bot 的消息同样是指向 bot 的提问，插件不认领。"""
+    s = setup
+    asyncio.run(s.bot.handle_event(message(BILI, reply_to_id='99', reply_sender_id='__bot__')))
+    assert not s.reads
+    assert not any('【B站】' in text for text in s.adapter.texts)
+    logs = store.list_decision_logs(chat_id='g')
+    assert logs and not logs[0]['reason'].startswith('plugin_intercept')
+
+
+def test_plain_share_still_expanded(setup, store):
+    """回归：不指向 bot 的普通分享链接照旧由插件展开，core 不重复读。
+
+    插件认领后仍会拦截这条消息（插件已回详情），但按第 38 项留下一条
+    ``plugin_intercept:link_detail`` 记录，不再是无痕的静默拦截。
+    """
+    s = setup
+    asyncio.run(s.bot.handle_event(message(BILI)))
+    assert s.reads == ['https://api.bilibili.com/x/web-interface/view?bvid=BV1xx411c7mD']
+    assert len(s.adapter.sent) == 1 and '实录' in s.adapter.texts[0]
+    assert not s.generic
+    log, = store.list_decision_logs(chat_id='g')
+    assert log['reason'] == 'plugin_intercept:link_detail'
+
+
 def test_manifest_schema_and_defaults(config):
     manifest = load_manifest(DIR)
     schema = {f.key: f for f in normalize_schema(manifest.config_schema)}

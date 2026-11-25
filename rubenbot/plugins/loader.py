@@ -1217,8 +1217,12 @@ class PluginManager:
             return None
         return result
 
-    async def run_message_hooks(self, ctx, event: MessageEvent) -> bool:
-        """返回 False 表示某插件拦截了这条消息。"""
+    async def run_message_hooks(self, ctx, event: MessageEvent) -> str | None:
+        """返回拦截这条消息的插件名；都放行时返回 ``None``。
+
+        只返回 bool 时入口不知道是谁吃掉了消息。被吞的消息在流水里是
+        静默空白，留下插件名才能在 ``decision_log`` 里写清来源。
+        """
         self._remember_runtime(ctx)
         for plugin in self.enabled_plugins:
             if not self._hooks_allowed(plugin):
@@ -1234,8 +1238,8 @@ class PluginManager:
                     logger.warning("插件 %s 的 on_message 异常：%s", plugin.name, exc)
                     continue
                 if result is False:
-                    return False
-        return True
+                    return plugin.name
+        return None
 
     async def run_before_reply(self, ctx, event: MessageEvent, messages: list[dict[str, str]]):
         for plugin in self.enabled_plugins:
