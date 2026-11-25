@@ -35,7 +35,7 @@ def _kuaishou(page, ident):
     for entry in obj(page.variable('INIT_STATE')).values():
         photo = obj(field(entry, 'photo'))
         photo_id = photo.get('photoId') or photo.get('id')
-        if not photo or (photo_id and text(photo_id) != ident) or obj(entry).get('result', 1) != 1:
+        if photo_id != ident or obj(entry).get('result', 1) != 1:
             continue
         covers = seq(photo.get('coverUrls'))
         return detail(photo.get('caption'), author=photo.get('userName'),
@@ -43,14 +43,19 @@ def _kuaishou(page, ident):
                       stats=stats(photo, 点赞='likeCount', 播放='viewCount'), published=photo.get('timestamp'))
     # 桌面页把 GraphQL 的短视频详情和用户分别存在 Apollo 归一化缓存里。
     cache = obj(field(page.variable('__APOLLO_STATE__'), 'defaultClient'))
-    photo = obj(cache.get(f'VisionVideoPhoto:{ident}'))
-    if text(photo.get('id')) == ident:
-        for item in cache.values():
-            if field(item, 'photo', '__ref') == f'VisionVideoPhoto:{ident}':
-                author = obj(cache.get(text(field(item, 'author', '__ref'))))
-                return detail(photo.get('caption'), author=author.get('name'), cover=photo.get('coverUrl'),
-                              duration=clock(photo.get('duration'), 1000), published=photo.get('timestamp'),
-                              stats=stats(photo, 点赞='likeCount', 播放='viewCount'))
+    for photo_ref in (f'VisionVideoDetailPhoto:{ident}', f'VisionVideoPhoto:{ident}'):
+        photo = obj(cache.get(photo_ref))
+        if photo.get('id') != ident:
+            continue
+        author_ref = field(photo, 'author', '__ref')
+        if not author_ref:
+            for item in cache.values():
+                if field(item, 'photo', '__ref') == photo_ref and (author_ref := field(item, 'author', '__ref')):
+                    break
+        author = obj(cache.get(text(author_ref)))
+        return detail(photo.get('caption'), author=author.get('name'), cover=photo.get('coverUrl'),
+                      duration=clock(photo.get('duration'), 1000), published=photo.get('timestamp'),
+                      stats=stats(photo, 点赞='likeCount', 播放='viewCount'))
     return None
 
 

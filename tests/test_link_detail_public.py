@@ -142,6 +142,43 @@ def test_kuaishou_desktop_photo_joins_own_author():
     assert (card.title, card.author) == ('黄昏', '作者')
 
 
+@pytest.mark.parametrize('direct_author', [True, False], ids=['photo', 'linked-detail'])
+def test_kuaishou_short_link_detail_photo(direct_author):
+    ident = '3xrxw85zqdjizmy'
+    photo_ref = f'VisionVideoDetailPhoto:{ident}'
+    author_ref = 'VisionVideoDetailAuthor:3xu9jn7pnvxwpug'
+    caption = '什么样的女生城府深？ #原创动画 #情感 #恋爱 #爱情'
+    cover = 'https://p23.a.yximgs.com/upic/2026/11/24/17/cover.jpg'
+    photo = {'id': ident, 'caption': caption, 'duration': 227720, 'likeCount': 2453,
+             'viewCount': '3.5万', 'coverUrl': cover, 'timestamp': 1795514845361}
+    cache = {'推荐详情': {'photo': {'__ref': 'VisionVideoDetailPhoto:other'}, 'author': {'__ref': 'User:other'}},
+             'User:other': {'name': '推荐作者'}, photo_ref: photo, author_ref: {'name': '动画作者'}}
+    if direct_author:
+        photo['author'] = {'__ref': author_ref}
+    else:
+        cache['作品详情'] = {'photo': {'__ref': photo_ref}, 'author': {'__ref': author_ref}}
+    short = 'https://v.kuaishou.com/JV8w9VwT'
+    card, seen = run('kuaishou', short, script('__APOLLO_STATE__', {'defaultClient': cache}, True),
+                     landing=f'https://www.kuaishou.com/short-video/{ident}')
+    assert seen == [short] and card is not None
+    assert (card.title, card.author, card.duration, card.cover) == (caption, '动画作者', '3:47', cover)
+    assert card.stats == {'点赞': 2453, '播放': '3.5万'}
+
+
+@pytest.mark.parametrize('entity_type', ['VisionVideoDetailPhoto', 'VisionVideoPhoto'])
+def test_kuaishou_apollo_rejects_mismatched_id(entity_type):
+    ref = f'{entity_type}:abcd'
+    cache = {ref: {'id': 'other', 'caption': '不是这条', 'likeCount': 1},
+             '推荐详情': {'photo': {'__ref': ref}, 'author': {'__ref': 'User:22'}}, 'User:22': {'name': '作者'}}
+    body = script('__APOLLO_STATE__', {'defaultClient': cache}, True)
+    assert run('kuaishou', 'https://www.kuaishou.com/short-video/abcd', body)[0] is None
+
+
+def test_kuaishou_mobile_rejects_missing_photo_id():
+    body = script('INIT_STATE', {'推荐详情': {'photo': {'caption': '不是这条', 'userName': '推荐作者'}}}, True)
+    assert run('kuaishou', CASES['kuaishou'][0], body)[0] is None
+
+
 def test_challenge_form_rejects_old_metadata():
     url, body, *_ = CASES['instagram']
     assert run('instagram', url, body + '<form id="challenge-form"></form>')[0] is None
