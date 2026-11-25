@@ -148,46 +148,20 @@ class WebState:
             except OSError as exc:  # noqa: BLE001 - 目录读不了不影响已有列表
                 logger.warning("扫描插件目录失败：%s", exc)
             return self.plugins.list_plugins()
-        from ..plugins.loader import discover_plugin_dirs
-        from ..plugins.manifest import read_manifest
-        from ..plugins.permissions import PluginPermissionStore, path_for_store
+        manager = self.offline_plugin_manager()
+        return manager.list_plugins()
 
-        # 独立 WebUI 读同一份授权文件（只读展示；写入需要运行中的管理器）
-        grants = PluginPermissionStore(path_for_store(self.store))
-        allow = set(self.config.plugins.enabled)
-        items = []
-        for name, path in discover_plugin_dirs(self.config.plugins.dir):
-            manifest, reason, core_too_old = read_manifest(path)
-            declared = manifest.permissions if manifest is not None else ()
-            items.append(
-                {
-                    "name": name,
-                    "enabled": name in allow,
-                    "loaded": False,
-                    "valid": manifest is not None,
-                    "invalid_reason": reason,
-                    "core_too_old": core_too_old,
-                    "manifest": manifest.as_dict() if manifest is not None else None,
-                    "permissions": grants.summary(name, declared),
-                    "commands": [],
-                    "hooks": {
-                        "on_message": 0,
-                        "on_before_reply": 0,
-                        "on_after_reply": 0,
-                        "on_start": 0,
-                        "on_stop": 0,
-                        "on_load": 0,
-                        "on_unload": 0,
-                        "on_config_change": 0,
-                    },
-                    "lifecycle": False,
-                    "hot_config": False,
-                    "path": str(path),
-                }
-            )
-        return items
+    def offline_plugin_manager(self) -> PluginManager:
+        """独立 WebUI 只读本地 manifest，不导入插件、不运行钩子。"""
+        manager = PluginManager(self.config, self.store)
+        if manager.permissions.path is None:
+            manager.permissions = self.extras.setdefault("offline_plugin_permissions", manager.permissions)
+        found = manager.discover()
+        for plugin in found:
+            plugin.enabled = plugin.name in self.config.plugins.enabled
+        return manager
 
-    def set_plugin_enabled(self, name: str, enabled: bool) -> bool:
+    def set_plugin_enabled(self, name: str, enabled: bool, *, trust: bool = True) -> bool:
         """运行时启用/停用插件，并把启用列表同步到内存里的配置。
 
         插件框架支持热卸载（停用触发 ``on_stop``），因此这里无需重启；
@@ -196,7 +170,7 @@ class WebState:
         manager = self.plugins
         if manager is None:
             return False
-        if not manager.set_enabled(name, enabled):
+        if not manager.set_enabled(name, enabled, trust=trust):
             return False
         names = self.enabled_plugin_names(manager)
         self.config.plugins.enabled = names
@@ -275,7 +249,7 @@ class WebState:
     # 配置热应用与重启
     # ------------------------------------------------------------------
 
-    def apply_config(self, new_config: Config) -> list[str]:
+    def apply_config(self, new_config: Config, *, trust_plugin_enables: bool = False) -> list[str]:
         """把新配置热应用到运行中的组件，返回只能重启生效的字段列表。
 
         热生效范围：llm / memory / chat / decision / plugins 的运行时参数、
@@ -318,7 +292,7 @@ class WebState:
         # 插件启停列表：显式启用制下，列表就是唯一来源；运行时同步（新增启用会现场加载）
         if self.plugins is not None and old.plugins.enabled != new_config.plugins.enabled:
             try:
-                self.plugins.apply_enabled(new_config.plugins.enabled)
+                self.plugins.apply_enabled(new_config.plugins.enabled, trust=trust_plugin_enables)
             except Exception as exc:  # noqa: BLE001 - 热应用失败不能让保存结果丢失
                 logger.warning("插件启用列表热应用失败：%s", exc)
 

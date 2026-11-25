@@ -683,11 +683,13 @@ def test_structured_save_without_manager_marks_plugins_restart(client, tmp_path)
     root = tmp_path / "plugins"
     (root / "alpha").mkdir(parents=True)
     (root / "alpha" / "plugin.py").write_text("def register(ctx):\n    pass\n", encoding="utf-8")
+    write_manifest(root / "alpha", "alpha", permissions=["read_messages"])
     state = client.app.state.web
     state.plugins = None
     state.config.plugins.dir = str(root)
     state.config.plugins.enabled = []
 
+    state.config_path.write_text(yaml.safe_dump({"plugins": {"dir": str(root)}}))
     result = client.put("/api/config", json={"config": {"plugins": {"enabled": ["alpha"]}}}).json()
     assert result["restart_required"] is True
     assert "plugins.enabled" in result["requires_restart"]
@@ -695,6 +697,8 @@ def test_structured_save_without_manager_marks_plugins_restart(client, tmp_path)
     assert "插件" in result["message"]
     data = yaml.safe_load(state.config_path.read_text(encoding="utf-8"))
     assert data["plugins"]["enabled"] == ["alpha"]
+
+    assert state.plugin_list()[0]["permissions"]["granted"] == ["read_messages"]
 
     # 换成运行中的 bot（有插件管理器）则同一改动是热生效
     from rubenbot.plugins.loader import PluginManager
@@ -712,6 +716,7 @@ def test_plugins_toggle_without_manager_persists_and_says_restart(client, tmp_pa
     root = tmp_path / "plugins"
     (root / "alpha").mkdir(parents=True)
     (root / "alpha" / "plugin.py").write_text("def register(ctx):\n    pass\n", encoding="utf-8")
+    write_manifest(root / "alpha", "alpha", permissions=["read_messages"])
     state = client.app.state.web
     state.plugins = None
     state.config.plugins.dir = str(root)

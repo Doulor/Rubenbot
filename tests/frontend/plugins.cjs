@@ -39,15 +39,6 @@ function setup() {
       if (path.endsWith('/reload')) return {message: '插件 local_dir 已热重载，授权与配置保持不变。'};
       return {message: '已启用'}; };
     api.put = async (path, body) => { calls.push([path, JSON.parse(JSON.stringify(body))]);
-      if (path.endsWith('/permissions')) {
-        const item = records['/api/plugins'].items.find(row => '/api/plugins/' + row.name + '/permissions' === path);
-        const declared = item.permissions.declared;
-        const granted = declared.filter(name => body.permissions.includes(name));
-        item.permissions = {...item.permissions, granted, all_granted: granted.length === declared.length,
-          permission_meta: item.permissions.permission_meta.map(meta => ({...meta, granted: granted.includes(meta.id)}))};
-        return {item: {name: item.name, permissions: item.permissions},
-          items: records['/api/plugins'].items, restart_required: false, message: '插件授权已更新，立即生效。'};
-      }
       if (fail) throw Error('校验失败');
       return {message: configHot ? '插件配置已保存并热生效，无需重启。' : '插件配置已保存，重启 bot 后生效。',
         hot: configHot, restart_required: !configHot, secrets: {api_key: true}}; };`);
@@ -148,39 +139,18 @@ test('没有本地插件、读取错误与迟到的响应都不破坏导航', as
   link('插件市场');
 });
 
-test('权限授权页逐项对照并即时写回，未授权的一项一眼可见', async () => {
-  const {root, run, route, node, link} = setup();
-  await route('#/plugins/grants/local-id');
-  assert.equal(link('权限授权').getAttribute('aria-current'), 'page');
-  assert.equal(link('本地插件').getAttribute('aria-current'), 'page');
-  // 声明了两项，只有「读消息」授权；「定时任务」标为未授且带高危标记
-  assert.match(root.textContent, /读消息/);
-  assert.match(root.textContent, /定时任务/);
-  assert.match(root.textContent, /未授权/);
-  node('SPAN', n => n.textContent === '高危');
-  const status = node('SPAN', n => n.getAttribute('role') === 'status');
-  assert.match(status.textContent, /声明了但未授权/);
-  const switches = root.walk().filter(n => n.tagName === 'BUTTON' && n.getAttribute('role') === 'switch');
-  assert.equal(switches.length, 2);
-  assert.equal(switches[0].getAttribute('aria-checked'), 'true');
-  assert.equal(switches[1].getAttribute('aria-checked'), 'false');
-  // 打开「定时任务」：立即 PUT 整表授权并刷新显示
-  await switches[1].fire('click');
-  const call = JSON.parse(run('JSON.stringify(calls.at(-1))'));
-  assert.deepEqual(call, ['/api/plugins/local_dir/permissions', {permissions: ['read_messages', 'scheduler']}]);
-  assert.equal(switches[1].getAttribute('aria-checked'), 'true');
-  assert.match(status.textContent, /已授权全部声明的权限/);
-  // 再撤掉「读消息」：同样立即写回
-  await switches[0].fire('click');
-  const revoked = JSON.parse(run('JSON.stringify(calls.at(-1))'));
-  assert.deepEqual(revoked, ['/api/plugins/local_dir/permissions', {permissions: ['scheduler']}]);
-  assert.match(root.textContent, /声明了但未授权/);
-});
-
-test('独立 WebUI 没有运行中的 bot 时授权页只读并说明原因', async () => {
-  const {root, run, route} = setup();
-  run("records['/api/plugins'].hot_reload = false");
-  await route('#/plugins/grants/local-id');
-  assert.match(root.textContent, /没有运行中的 bot/);
-  assert.equal(root.walk().filter(n => n.tagName === 'BUTTON' && n.getAttribute('role') === 'switch').length, 0);
+test('市场卡片没有单独的授权操作，详情列出每项声明和实际状态且不能修改', async () => {
+  const {root, run, route, node} = setup();
+  await route('#/plugins');
+  assert.ok(!root.walk().some(n => ['BUTTON', 'A'].includes(n.tagName) && /授权/.test(n.textContent)));
+  const detailLink = node('A', n => n.getAttribute('href') === '#/plugins/detail/local-id');
+  run(`const perms = records['/api/plugins'].items[0].permissions;
+    records['/api/plugins/local-id/detail'] = {plugin: {id: 'local-id', name: '本地插件',
+      installed: true, valid: true, permissions: {...perms, items: perms.permission_meta}}}`);
+  await route(detailLink.getAttribute('href'));
+  assert.match(root.textContent, /共声明 2 项，已授权 1 项/);
+  node('LI', n => /读消息.*已授权/.test(n.textContent));
+  node('LI', n => /定时任务.*高危.*未授权/.test(n.textContent));
+  assert.ok(!root.walk().some(n => n.getAttribute('role') === 'switch'));
+  assert.ok(run('calls.every(call => typeof call === "string")'));
 });

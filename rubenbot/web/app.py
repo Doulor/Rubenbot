@@ -80,7 +80,7 @@ from ..persona import (
     personafile_path,
 )
 from ..plugins.loader import PluginReloadError
-from ..plugins.manifest import PERMISSION_INFO
+from ..plugins.manifest import PERMISSION_INFO, ManifestError
 from ..stickers import KIND_PHOTO, KIND_STICKER
 from .about import check_update, project_info, runtime_info
 from .auth import COOKIE_NAME, BindSecurityError, check_bind_security, mask_secret
@@ -266,10 +266,19 @@ def _write_plugin_enabled(state) -> None:
 
 
 def _save_plugin_without_manager(state: WebState, name: str, enabled: bool) -> dict[str, Any]:
-    """独立 WebUI 模式：只把开关写进配置，并如实提示需要重启生效。"""
-    known = {item["name"] for item in state.plugin_list()}
-    if name not in known:
+    """独立 WebUI 模式：保存授权和开关，但不运行插件。"""
+    manager = state.offline_plugin_manager()
+    plugin = manager.find_plugin(name)
+    if plugin is None:
         raise ApiError(404, f"插件不存在：{name}")
+    name = plugin.name
+    if enabled and not plugin.enabled:
+        try:
+            manager.trust_for_enable(plugin)
+        except ManifestError as exc:
+            raise ApiError(409, f"插件 {name} 的 manifest 不合规：{exc}") from exc
+        except OSError as exc:
+            raise ApiError(500, str(exc)) from exc
     names = [item for item in state.config.plugins.enabled if item != name]
     if enabled:
         names.append(name)
@@ -476,6 +485,11 @@ def create_app(state: WebState):
     """
     # 必须先校验再起服务：非本地绑定缺口令时直接拒绝
     check_bind_security(state.config.webui)
+
+    if state.plugins is None:
+        # 首次以独立 WebUI 升级也要在市场换包之前按旧声明完成迁移。
+        manager = state.offline_plugin_manager()
+        manager.migrate_enabled_permissions(manager.plugins.values())
 
     app = FastAPI(
         title="RubenBot WebUI",
@@ -1128,63 +1142,33 @@ def create_app(state: WebState):
             "hot_reload": hot,
             "restart_required": not hot,
             "message": (
-                "插件默认全部关闭；开关与授权会立即生效，授权记录落在数据目录。"
+                "插件默认关闭。启用即授予当前声明的权限，立即生效。"
                 if hot
-                else "插件默认全部关闭；当前 WebUI 没有运行中的 bot，开关与授权会写入配置，重启后生效。"
+                else "插件默认全部关闭；当前 WebUI 没有运行中的 bot，授权记录与启用列表分别保存，重启后生效。"
             ),
-        }
-
-    @app.put("/api/plugins/{name}/permissions")
-    async def put_plugin_permissions(name: str, request: Request):
-        """逐项授权：整表替换某插件的授权，立即生效（不重启 bot）。
-
-        只接受 manifest 声明过的权限；未声明的 422 拒绝。独立 WebUI 模式
-        （没有插件管理器）不能改授权，如实返回 409。
-        """
-        require_session(request)
-        body = await _json_body(request)
-        values = body.get("permissions")
-        if not isinstance(values, list) or not all(isinstance(item, str) for item in values):
-            raise ApiError(422, "permissions 必须是权限名字符串数组")
-        manager = state.plugins
-        if manager is None:
-            raise ApiError(409, "当前 WebUI 没有运行中的 bot，无法修改插件授权")
-        plugin = manager.find_plugin(name)
-        if plugin is None:
-            raise ApiError(404, f"插件不存在：{name}")
-        try:
-            manager.set_permissions(plugin.name, values)
-        except KeyError:
-            raise ApiError(404, f"插件不存在：{name}") from None
-        except ValueError as exc:
-            raise ApiError(422, str(exc)) from exc
-        item = next(
-            (row for row in manager.list_plugins() if row["name"] == plugin.name), None
-        )
-        logger.info("WebUI 更新插件授权 %s：%s", plugin.name, "、".join(sorted(set(values))) or "（全部撤回）")
-        return {
-            "ok": True,
-            "item": item,
-            "items": state.plugin_list(),
-            "restart_required": False,
-            "message": "插件授权已更新，立即生效。",
         }
 
     @app.post("/api/plugins/{name}")
     async def toggle_plugin(name: str, request: Request):
         """启用/停用插件：热生效，并写回 config.yaml 的 plugins.enabled。
 
-        独立 WebUI 模式（没有插件管理器）没有运行中的 bot，只能写配置，
+        独立 WebUI 模式（没有插件管理器）没有运行中的 bot，只保存授权和开关，
         响应里会如实标注需要重启。
         """
         require_session(request)
         body = await _json_body(request)
-        enabled = bool(body.get("enabled"))
+        enabled = body.get("enabled")
+        if not isinstance(enabled, bool):
+            raise ApiError(422, "enabled 必须是布尔值")
         if state.plugins is None:
             return _save_plugin_without_manager(state, name, enabled)
         target = state.plugins.find_plugin(name)
         canonical = target.name if target is not None else name
-        if not state.set_plugin_enabled(canonical, enabled):
+        try:
+            applied = state.set_plugin_enabled(canonical, enabled)
+        except OSError as exc:
+            raise ApiError(500, str(exc)) from exc
+        if not applied:
             # manifest 不合规（含核心版本过低）时把原因带回去，别只说「不存在」
             plugin = state.plugins.plugins.get(canonical)
             if plugin is not None and not plugin.valid:
@@ -1756,6 +1740,26 @@ async def _save_structured_config(state: WebState, payload: Any) -> dict[str, An
             422, str(exc), fields=[{"field": "webui.password", "message": str(exc)}]
         ) from exc
 
+    explicit_enables = "enabled" in update.get("plugins", {})
+    added = set(new_config.plugins.enabled) - set(state.config.plugins.enabled)
+    if explicit_enables and added:
+        if new_config.plugins.dir != state.config.plugins.dir or (
+            state.plugins is not None and new_config.plugins.dir != state.plugins.config.plugins.dir
+        ):
+            raise ApiError(422, "请先保存插件目录并重启，再启用该目录中的插件")
+        if state.plugins is None:
+            manager = state.offline_plugin_manager()
+            for name in sorted(added):
+                plugin = manager.plugins.get(name)
+                if plugin is None:
+                    continue
+                try:
+                    manager.trust_for_enable(plugin)
+                except ManifestError as exc:
+                    raise ApiError(422, f"插件 {name} 的 manifest 不合规：{exc}") from exc
+                except OSError as exc:
+                    raise ApiError(500, str(exc)) from exc
+
     text = yaml.safe_dump(merged, allow_unicode=True, sort_keys=False)
     try:
         backup = save_config_text(path, text)
@@ -1764,7 +1768,7 @@ async def _save_structured_config(state: WebState, payload: Any) -> dict[str, An
 
     # 先把旧配置的快照留下（apply_config 会改 state.config）
     before = _config_snapshot(state.config)
-    requires_restart = state.apply_config(new_config)
+    requires_restart = state.apply_config(new_config, trust_plugin_enables=explicit_enables)
     after = _config_snapshot(new_config)
     # 独立 WebUI 模式没有运行中的插件管理器，插件开关只能写配置、重启后生效
     if (

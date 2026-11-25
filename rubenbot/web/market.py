@@ -491,7 +491,7 @@ class MarketService:
         # manifest 不合规（比如缺文件）时，展示信息退回索引条目，卡片才不至于全空
         fallback = entry
         permissions = manifest.get("permissions")
-        if not valid or not permissions:
+        if not valid:
             permissions = entry.permissions if fallback else []
         updatable = bool(
             entry is not None
@@ -508,7 +508,7 @@ class MarketService:
             "author": manifest.get("author") or (entry.author if entry else ""),
             "permissions": list(permissions),
             "permission_meta": _permission_meta(permissions),
-            # 已授权了哪几项（逐项对照由插件页的授权开关展示）
+            # 已授权了哪几项（详情页只读展示逐项对照）
             "granted_permissions": list(
                 (item.get("permissions") or {}).get("granted") or []
             ),
@@ -741,9 +741,7 @@ class MarketService:
                 raise MarketError(f"插件已安装：{plugin_id}", status=409)
             data = read_source(entry.download_url, self.fetcher)
             installed, manifest = self._install(root, plugin_id, data, entry=entry)
-            # 新装默认全未授权：先登记空记录，再扫描目录（扫描会做首次迁移，
-            # 已有的空记录不会被当成「已装插件」补成全授）。独立 WebUI 模式
-            # 没有管理器，直接写同一份授权文件，保证下次 bot 启动时也不全授。
+            # 安装不代表信任，只登记空记录。
             self._register_new_plugin(installed.name)
             logger.info("市场安装插件 %s %s 到 %s", plugin_id, manifest.version, installed)
             self._refresh()
@@ -752,7 +750,7 @@ class MarketService:
             "path": str(installed),
             "version": manifest.version,
             "message": (
-                f"插件 {entry.name} 已安装，尚未启用；在插件页逐项授权、再启用后才会加载。"
+                f"插件 {entry.name} 已安装，尚未启用；显式启用即授予当前声明的权限。"
             ),
         }
 
@@ -800,8 +798,7 @@ class MarketService:
             if manager is not None:
                 manager.plugins.pop(local["name"], None)
             # 更新保留已有授权；新版本新增声明的权限因为不在记录里，
-            # 自然保持未授权。已有记录不会被覆盖，缺记录时补一条空的，
-            # 避免扫描时被首次迁移误当成「已装插件」补成全授。
+            # 自然保持未授权。已有记录不会被覆盖。
             self._register_new_plugin(local["name"])
             self._refresh()
             enabled_now = False
@@ -949,34 +946,13 @@ class MarketService:
             raise MarketError("插件包缺少 plugin.py，已拒绝安装")
         return manifest
 
-    def _permission_store(self):
-        """市场装卸时用的授权记录：优先借管理器的，独立 WebUI 直接读同一份文件。"""
-        manager = getattr(self.state, "plugins", None)
-        if manager is not None:
-            return manager
-        from ..plugins.permissions import PluginPermissionStore, path_for_store
-
-        return PluginPermissionStore(path_for_store(self.state.store))
-
     def _register_new_plugin(self, name: str) -> None:
-        store = self._permission_store()
-        try:
-            if hasattr(store, "register_new_plugin"):
-                store.register_new_plugin(name)
-            else:
-                store.ensure_registered(name, ())
-        except Exception as exc:  # noqa: BLE001 - 写授权记录失败不影响装卸结果
-            logger.warning("登记插件 %s 的授权记录失败：%s", name, exc)
+        manager = self.state.plugins or self.state.offline_plugin_manager()
+        manager.register_new_plugin(name)
 
     def _forget_plugin(self, name: str) -> None:
-        store = self._permission_store()
-        try:
-            if hasattr(store, "forget_plugin"):
-                store.forget_plugin(name)
-            else:
-                store.forget(name)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("清理插件 %s 的授权记录失败：%s", name, exc)
+        manager = self.state.plugins or self.state.offline_plugin_manager()
+        manager.forget_plugin(name)
 
     def _refresh(self) -> None:
         manager = getattr(self.state, "plugins", None)
@@ -990,7 +966,7 @@ class MarketService:
     def _set_enabled(self, name: str, enabled: bool) -> bool:
         """启用/停用插件：有管理器走热生效，独立 WebUI 模式只改内存配置。"""
         if self.state.plugins is not None:
-            return self.state.set_plugin_enabled(name, enabled)
+            return self.state.set_plugin_enabled(name, enabled, trust=False)
         names = [item for item in self.state.config.plugins.enabled if item != name]
         if enabled:
             names.append(name)

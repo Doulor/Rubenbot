@@ -562,14 +562,15 @@ def test_update_keeps_plugin_config_and_enabled_state(tmp_path):
     alpha.mkdir(parents=True)
     (alpha / "plugin.py").write_text(PLUGIN_SOURCE, encoding="utf-8")
     (alpha / "config.yaml").write_text("option: keep-me\n", encoding="utf-8")
-    write_manifest(alpha, "alpha", version="1.0.0")
+    write_manifest(alpha, "alpha", version="1.0.0", permissions=["read_messages"])
 
     state = make_state(tmp_path)
     state.plugins.discover()
     state.plugins.set_enabled("alpha", True)
     state.config.plugins.enabled = ["alpha"]
 
-    archive = plugin_zip(tmp_path, "alpha", version="1.1.0", zip_name="alpha-1.1.zip")
+    archive = plugin_zip(tmp_path, "alpha", version="1.1.0", zip_name="alpha-1.1.zip",
+                         permissions=["read_messages", "network"])
     state.config.market.index_url = "https://example.test/plugins.json"
     state.extras["market_fetcher"] = lambda url, *, timeout: index_doc(
         [index_entry("alpha", version="1.1.0", download_url=str(archive))]
@@ -582,6 +583,9 @@ def test_update_keeps_plugin_config_and_enabled_state(tmp_path):
     # 代码与 manifest 换新，插件自己的配置保留
     assert load_manifest(alpha).version == "1.1.0"
     assert (alpha / "config.yaml").read_text(encoding="utf-8") == "option: keep-me\n"
+    # 自动恢复不是机主启用：新声明不授，network 准入仍拦截。
+    assert state.plugins.permissions.grants("alpha") == {"read_messages"}
+    assert not state.plugins._hooks_allowed(state.plugins.plugins["alpha"])
     # 启用状态保持
     assert state.plugins.plugins["alpha"].enabled is True
     assert result["enabled"] is True

@@ -3088,55 +3088,6 @@ button {
   background: transparent;
 }
 
-/* 装后授权：逐项开关，高危项和未授权状态都要一眼可见 */
-.perm-grants {
-  display: grid;
-  gap: 8px;
-}
-
-.perm-grant {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 14px;
-  padding: 10px 12px;
-  border-radius: 12px;
-  background: var(--surface-sunk);
-}
-
-.perm-grant.high-risk {
-  background: var(--bad-soft);
-}
-
-.perm-grant-text {
-  display: grid;
-  gap: 2px;
-  font-size: 12.5px;
-  line-height: 1.55;
-}
-
-.perm-grant-text strong {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-weight: 600;
-}
-
-.perm-grant-text span:not(.tag) {
-  color: var(--text-soft);
-}
-
-.perm-grant.high-risk .perm-grant-text span:not(.tag) {
-  color: var(--bad);
-}
-
-.perm-grant-side {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex: none;
-}
-
 /* ---------------- 插件详情 ---------------- */
 
 .plugin-detail-body {

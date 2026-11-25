@@ -448,8 +448,8 @@ function pluginDetailBody(data) {
               "p",
               { class: "field-hint", style: { margin: 0 } },
               data.installed
-                ? `共声明 ${data.permissions.declared.length} 项，已授权 ${(data.permissions.granted || []).length} 项。未授权的能力不会注入，也不能调用。`
-                : `共声明 ${data.permissions.declared.length} 项；安装后到「权限授权」页逐项批准。`
+                ? `共声明 ${data.permissions.declared.length} 项，已授权 ${(data.permissions.granted || []).length} 项。更新不会补授新权限；确认新声明后，可停用再启用。`
+                : `共声明 ${data.permissions.declared.length} 项；安装不会授权，显式启用即授予当前声明的权限。`
             )
           : null,
         pluginDetailPermissions(data.permissions || {}),

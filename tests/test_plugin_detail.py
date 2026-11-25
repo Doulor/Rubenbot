@@ -178,9 +178,8 @@ def test_detail_covers_every_section_for_installed_plugin(tmp_path):
     assert detail["status_text"] == "已安装 · 未启用"
     assert detail["readme"]["text"].startswith("# 演示插件")
     assert [item["id"] for item in detail["permissions"]["items"]]  # 声明齐全
-    # conftest 的测试 manifest 默认声明全部权限并视为已授权（一次性迁移口径）；
-    # 详情页如实照抄授权层的结果，不在这里另算
-    assert all(item["granted"] is True for item in detail["permissions"]["items"])
+    # 只发现、未启用：清单中的每一项均应显示为未授，查看详情不能授予权限。
+    assert all(item["granted"] is False for item in detail["permissions"]["items"])
     assert detail["triggers"] == ["说「演示」"]
     assert [doc["key"] for doc in detail["schema_docs"]] == ["mode", "count"]
     assert detail["schema_docs"][0]["options"][1]["label"] == "b"

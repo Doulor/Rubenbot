@@ -58,6 +58,8 @@ def _manager(root: Path, *, enabled=("demo",), permissions=None, source: str = L
     config.plugins.dir = str(root)
     config.plugins.enabled = list(enabled)
     store = MemoryStore(":memory:")
+    if permissions is not None:
+        store.set_meta("plugins:enable_trust:v1", "1")
     manager = PluginManager(
         config,
         store,
@@ -238,7 +240,7 @@ def test_unauthorized_network_plugin_gets_no_lifecycle_hooks(tmp_path, caplog):
         # 停用（此时没激活生命周期）与配置变更都不该把钩子发给未授权插件
         assert manager.set_enabled("demo", False) is True
         hot, message = manager.apply_config_change("demo", {"a": 1}, {"a": 2})
-        manager.set_enabled("demo", True)
+        manager.set_enabled("demo", True, trust=False)
     assert events == ["register"]
     assert hot is False and "授权" in message
     assert any("on_load" in record.message for record in caplog.records)

@@ -317,9 +317,6 @@ function settingsSkeleton(page, param) {
 function pluginSkeleton(param) {
   const tabs = skBox("segmented plugin-tabs", skeletonBar("80px", "32px"), skeletonBar("80px", "32px"));
   if (param.split("/")[0] === "config") return skBox("grid", tabs, settingsSkeleton("plugins", param));
-  if (param.split("/")[0] === "grants") {
-    return skBox("grid", tabs, settingsSkeleton("plugins", "config"));
-  }
   if (param.split("/")[0] === "detail") return skBox("grid", tabs, settingsSkeleton("plugins", "config"));
   return skBox("grid", tabs, skBox("grid sk-market",
     skBox("notice", skeletonBar("70%", "40px")),
@@ -2392,75 +2389,6 @@ function grantBadges(summary) {
   );
 }
 
-/** 授权开关列表：逐项对照 manifest，高危项醒目标红，改动即时生效。 */
-function permissionGrants(item, onSaved) {
-  const summary = item.permissions || {};
-  const meta = summary.permission_meta || [];
-  if (!meta.length) {
-    return h("p", { class: "field-hint" }, item.invalid_reason || "该插件没有声明任何权限。");
-  }
-  const granted = new Set(summary.granted || []);
-  const status = h(
-    "span",
-    { class: "field-hint", role: "status" },
-    summary.all_granted ? "已授权全部声明的权限" : "声明了但未授权的权限不会注入，也不能调用"
-  );
-  const rows = h(
-    "div",
-    { class: "perm-grants" },
-    ...meta.map((info) => {
-      const state = h("span", { class: "field-hint" }, granted.has(info.id) ? "已授权" : "未授权");
-      const toggle = switchField(granted.has(info.id), async (next) => {
-        const wanted = new Set(granted);
-        if (next) wanted.add(info.id); else wanted.delete(info.id);
-        toggle.disabled = true;
-        try {
-          const result = await api.put(
-            `/api/plugins/${encodeURIComponent(item.name)}/permissions`,
-            { permissions: [...wanted] }
-          );
-          granted.clear();
-          (result.item?.permissions?.granted || []).forEach((name) => granted.add(name));
-          state.textContent = next ? "已授权" : "未授权";
-          status.textContent = result.item?.permissions?.all_granted
-            ? "已授权全部声明的权限"
-            : "声明了但未授权的权限不会注入，也不能调用";
-          const fresh = (result.items || []).find((row) => row.name === item.name);
-          if (fresh) item.permissions = fresh.permissions;
-          onSaved?.(result);
-        } catch (err) {
-          toggle.setAttribute("aria-checked", next ? "false" : "true");
-          Motion.switchThumb(toggle.querySelector(".switch-thumb"), !next);
-          if (!(err instanceof Unauthorized)) toast(err.message || "授权失败", "error");
-        } finally {
-          toggle.disabled = false;
-        }
-      }, { label: `授权 ${item.manifest?.name || item.name} ${info.label || info.id}` });
-      return h(
-        "div",
-        { class: `perm-grant ${info.high_risk ? "high-risk" : ""}` },
-        h(
-          "div",
-          { class: "perm-grant-text" },
-          h("strong", {}, info.label || info.id),
-          info.high_risk ? h("span", { class: "tag bad" }, "高危") : null,
-          h("span", {}, info.description || "")
-        ),
-        h("div", { class: "perm-grant-side" }, state, toggle)
-      );
-    })
-  );
-  return h(
-    "div",
-    { style: { display: "grid", gap: "10px" } },
-    status,
-    rows,
-    granted.size === 0
-      ? h("p", { class: "field-hint" }, "当前一项都没授权：新装插件默认全部未授权，请按需逐项打开。")
-      : null
-  );
-}
-
 /** 市场卡片的状态标签（含可更新 / 不合规 / 核心版本过低 / 仅展示）。 */
 function marketTags(item) {
   const tags = [];
@@ -2527,8 +2455,8 @@ function installDialog(item) {
       h(
         "p",
         { class: "soft", style: { marginTop: 0 } },
-        `版本 ${item.version || "未知"} · ${item.author || "未知作者"}。插件是任意 Python 代码，安装即完全信任；` +
-          "安装后默认不启用，需要你在卡片上手动开启。"
+        `版本 ${item.version || "未知"} · ${item.author || "未知作者"}。插件是任意 Python 代码，请先确认来源可信；` +
+          "安装不会启用插件或授权；点击启用即授予本地声明的权限。"
       ),
       h("div", { class: "field-label" }, "它需要这些权限"),
       rows,
@@ -2614,11 +2542,11 @@ function detailDrawer(item) {
             "div",
             {},
             h("div", { class: "field-label" }, "授权状态"),
-            grantBadges(item.permissions),
+            localPermissionBadges(item),
             h(
               "p",
               { class: "field-hint" },
-              "逐项开关在插件的「权限授权」页；未授权的能力不会注入，也不能调用。"
+              "显式启用即授予声明权限；未授权的能力不会注入，也不能调用。"
             )
           )
         : null,
@@ -2638,84 +2566,13 @@ function detailDrawer(item) {
   Motion.dialogMotion(dialog, true);
 }
 
-/** 授权页：每个已装插件逐项授权，声明了但未授权的项一眼可见，改动即时生效。 */
-async function renderPluginGrants(panel, selected) {
-  const data = await api.get("/api/plugins");
-  const items = data.items || [];
-  if (!items.length) {
-    panel.replaceChildren(
-      card("", { body: emptyState("plugins", "还没有已安装的插件", "到插件市场安装后，即可在这里逐项授权。") })
-    );
-    return;
-  }
-  const idOf = item => encodeURIComponent(item.manifest?.id || item.name);
-  const nameOf = item => item.manifest?.name || item.name;
-  const current = items.find(item => idOf(item) === selected) || items[0];
-  const menu = h(
-    "nav",
-    { class: "settings-menu", "aria-label": "已安装插件" },
-    h("div", { class: "settings-menu-group" }, "已安装插件"),
-    ...items.map(item =>
-      h(
-        "a",
-        {
-          class: `settings-menu-item${item === current ? " active" : ""}`,
-          href: `#/plugins/grants/${idOf(item)}`,
-          "aria-current": item === current ? "page" : null,
-        },
-        nameOf(item)
-      )
-    )
-  );
-  const editor = h("div", { class: "settings-content" });
-  panel.replaceChildren(h("div", { class: "settings-layout" }, menu, editor));
-
-  const hot = Boolean(data.hot_reload);
-  const summary = current.permissions || {};
-  const missing = (summary.declared || []).filter(name => !(summary.granted || []).includes(name));
-  const body = h("div", { style: { display: "grid", gap: "12px" } });
-  if (!current.valid) {
-    body.append(h("p", { class: "field-hint" }, current.invalid_reason || "该插件的 manifest 不合规，不能授权。"));
-  } else if (!hot) {
-    body.append(
-      h(
-        "div",
-        { class: "notice" },
-        icon("warning"),
-        h("span", {}, "当前 WebUI 没有运行中的 bot：这里只能查看已存授权，改动需在 bot 运行时的 WebUI 里进行。")
-      )
-    );
-    body.append(grantBadges(summary));
-  } else {
-    body.append(
-      h(
-        "p",
-        { class: "field-hint", style: { margin: 0 } },
-        missing.length
-          ? `声明了 ${(summary.declared || []).length} 项，已授权 ${(summary.granted || []).length} 项；未授权项不会注入，也不能调用。`
-          : `声明了 ${(summary.declared || []).length} 项，已全部授权。`
-      )
-    );
-    body.append(
-      permissionGrants(current, (result) => {
-        const fresh = (result.items || []).find(row => row.name === current.name);
-        if (fresh) {
-          current.permissions = fresh.permissions;
-          toast("授权已更新，立即生效");
-        }
-      })
-    );
-  }
-  editor.replaceChildren(card(nameOf(current), { body }));
-}
-
 /** 已装插件的授权摘要（配置页顶部一行）：已授 / 未授一眼可见。 */
 function grantSummaryBlock(item) {
   const meta = item.permissions?.permission_meta || [];
   return h(
     "div",
     { style: { display: "grid", gap: "8px" } },
-    h("div", { class: "field-label" }, "权限授权"),
+    h("div", { class: "field-label" }, "授权状态"),
     grantBadges(item.permissions),
     h(
       "span",
@@ -2725,7 +2582,7 @@ function grantSummaryBlock(item) {
         : (item.permissions?.all_granted
             ? "已授权全部声明的权限。"
             : "有声明了但未授权的权限：它们不会注入，也不能调用。") +
-            " 可在「权限授权」页逐项开关，改动立即生效。"
+            " 更新不会补授；确认新声明后，可停用再启用。"
     )
   );
 }
@@ -2866,18 +2723,6 @@ function marketActions(item, refresh) {
       )
     );
   } else {
-    buttons.push(
-      h(
-        "a",
-        {
-          class: "btn btn-sm",
-          href: `#/plugins/grants/${encodeURIComponent(item.plugin_name)}`,
-          title: "逐项授权该插件声明的权限；没授权的能力不能调用",
-        },
-        icon("check"),
-        "授权"
-      )
-    );
     if (item.updatable && item.download_available) {
       buttons.push(
         h(
@@ -2917,7 +2762,7 @@ function marketActions(item, refresh) {
             class: "btn btn-sm btn-primary",
             type: "button",
             disabled: item.invalid || item.core_too_old,
-            title: item.invalid_reason || (item.core_too_old ? "当前框架版本过低" : ""),
+            title: item.invalid_reason || (item.core_too_old ? "当前框架版本过低" : "启用即授予当前声明的权限"),
             onclick: run(
               `/api/plugins/${encodeURIComponent(item.plugin_name)}`,
               { enabled: true },
@@ -3049,12 +2894,10 @@ function marketCard(item, refresh) {
 async function renderPlugins(view, sub = "") {
   const [tab, selected] = sub.split("/");
   const detail = tab === "detail";
-  const grants = tab === "grants";
   const config = tab === "config";
   const modes = [
-    { href: "#/plugins", label: "插件市场", active: !config && !grants && !detail },
+    { href: "#/plugins", label: "插件市场", active: !config && !detail },
     { href: "#/plugins/config", label: "插件配置", active: config },
-    { href: "#/plugins/grants", label: "权限授权", active: grants },
     { href: "#/plugins/detail", label: "插件详情", active: detail },
   ];
   const tabs = h("nav", { class: "segmented plugin-tabs", "aria-label": "插件页面" },
@@ -3066,7 +2909,6 @@ async function renderPlugins(view, sub = "") {
   view.replaceChildren(h("div", { class: "grid" }, tabs, panel));
   try {
     if (detail) return await renderPluginDetail(panel, selected);
-    if (grants) return await renderPluginGrants(panel, selected);
     if (config) return await renderPluginConfigs(panel, selected);
     else await renderPluginMarket(panel);
   } catch (err) {
@@ -3186,7 +3028,7 @@ async function renderPluginMarket(view) {
       h(
         "p",
         { class: "field-hint" },
-        "插件默认全部关闭：安装后状态是「已安装」，在卡片上点「启用」才会加载。"
+        "插件默认全部关闭：安装后状态是「已安装」，在卡片上点「启用」即授予本地声明的权限并加载插件。"
       )
     )
   );

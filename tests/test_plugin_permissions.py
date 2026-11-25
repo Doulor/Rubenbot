@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -92,7 +93,9 @@ def _manager(
     config.reply.segment_delay_enabled = False
     config.decision.merge_window_seconds = 0
     config.decision.hard_merge_window_seconds = 0
-    store = MemoryStore(":memory:")
+    store = MemoryStore(path.with_name("bot.sqlite") if path else ":memory:")
+    if permissions is not None:
+        store.set_meta("plugins:enable_trust:v1", "1")
     if permissions is None and path is not None:
         permissions = PluginPermissionStore(path)
     manager = PluginManager(config, store, permissions=permissions)
@@ -162,8 +165,8 @@ def test_new_install_defaults_to_no_grants(tmp_path):
     path = tmp_path / "plugin_permissions.json"
     root = tmp_path / "plugins"
     _make_plugin(root, "existing")
-    manager = _manager(root, path=path)
-    # 首次升级：此刻已在目录里的插件全授
+    manager = _manager(root, path=path, enabled=["existing"])
+    # 首次升级只补启用名单
     assert manager.permissions.grants("existing")
 
     # 授权文件已经有了，再放一个新插件：一项都不授
@@ -172,42 +175,31 @@ def test_new_install_defaults_to_no_grants(tmp_path):
     assert manager.permissions.grants("later") == frozenset()
 
 
-def test_first_upgrade_grants_every_installed_plugin_by_manifest(tmp_path):
-    """已装插件第一次升级到授权层：按当前 manifest 全授，线上插件不断线。"""
-    _make_plugin(tmp_path / "plugins", "demo", permissions=["read_messages", "capabilities"])
-    _make_plugin(tmp_path / "plugins", "other", permissions=["send_messages"])
+@pytest.mark.parametrize("existing", [[], ["read_messages"]])
+def test_upgrade_fills_only_enabled_before_first_hook(tmp_path, caplog, existing):
+    root = tmp_path / "plugins"
+    declared = ["read_messages", "network", "scheduler"]
+    _make_plugin(root, "demo", permissions=declared)
+    _make_plugin(root, "off", permissions=declared)
+    _make_plugin(root, "untouched", permissions=declared)
     path = tmp_path / "plugin_permissions.json"
-    manager = _manager(tmp_path / "plugins", path=path)
-    assert manager.permissions.migrated is True
-    assert manager.permissions.grants("demo") == {"read_messages", "capabilities"}
-    assert manager.permissions.grants("other") == {"send_messages"}
-    assert path.exists()
+    # 线上旧版即使 migrated=true，也可能有空记录或只授了一部分。
+    path.write_text(json.dumps({"version": 1, "migrated": True, "plugins": {
+        "demo": existing, "off": ["read_messages"],
+    }}))
+    with caplog.at_level("INFO", logger="rubenbot.plugins.permissions"):
+        manager = _manager(root, path=path)
+    assert manager.extras["perm"]["events"] == ["register", "start"]
+    assert manager.permissions.grants("demo") == set(declared)
+    assert json.loads(path.read_text())["plugins"] == {"demo": sorted(declared), "off": ["read_messages"]}
+    assert sum("插件授权变更：授予 demo" in r.message for r in caplog.records) == len(declared) - len(existing)
 
-
-def test_migration_is_one_shot_and_survives_restart(tmp_path, caplog):
-    """迁移只发生一次；授权记录落盘，重启后不丢。"""
-    _make_plugin(tmp_path / "plugins", "demo")
-    path = tmp_path / "plugin_permissions.json"
-    manager = _manager(tmp_path / "plugins", path=path)
-    manager.permissions.revoke("demo", "llm")
-
-    again = PluginPermissionStore(path)
-    assert again.migrated is True
-    # 撤回的 llm 不会因为重启又回来
-    assert again.allows("demo", "llm") is False
-    assert again.grants("demo") == set(_DEFAULT_PERMISSIONS) - {"llm"}
-
-
-def test_registered_new_plugin_is_not_swept_into_migration(tmp_path):
-    """市场新装（登记空授权）的插件即使赶上迁移也保持全未授。"""
-    _make_plugin(tmp_path / "plugins", "fresh")
-    path = tmp_path / "plugin_permissions.json"
-    store = PluginPermissionStore(path)
-    store.ensure_registered("fresh", ["read_messages"])
-    manager = _manager(tmp_path / "plugins", path=path)
-    manager.permissions = store
-    manager.discover()
-    assert store.grants("fresh") == frozenset()
+    manager.permissions.revoke("demo", "network")
+    manager.reload_plugin("demo")
+    assert not manager.permissions.allows("demo", "network")
+    again = _manager(root, path=path)
+    assert not again.permissions.allows("demo", "network")
+    assert again.extras["perm"]["events"] == ["register"]
 
 
 def test_forget_clears_grants_for_reinstall(tmp_path):
@@ -449,42 +441,73 @@ def client(tmp_path):
     return TestClient(create_app(state)), state
 
 
-def test_webui_reads_and_writes_grants(client):
+@pytest.mark.parametrize("hot", [True, False])
+def test_webui_enable_trusts_only_local_declarations_before_load(client, tmp_path, hot, caplog):
     client_obj, state = client
     root = Path(state.config.plugins.dir)
-    _make_plugin(root, "demo", permissions=["read_messages", "scheduler"])
-    recorded = PluginPermissionStore(None)
-    recorded.migrate({"demo": ["read_messages", "scheduler"]})
-    state.plugins = _manager(root, permissions=recorded)
-
-    listing = client_obj.get("/api/plugins").json()
-    item = next(row for row in listing["items"] if row["name"] == "demo")
-    assert item["permissions"]["granted"] == ["read_messages", "scheduler"]
-    assert {meta["id"] for meta in item["permissions"]["permission_meta"]} == {"read_messages", "scheduler"}
-    assert {meta["id"]: meta["high_risk"] for meta in listing["permissions"]}["scheduler"] is True
-
-    response = client_obj.put("/api/plugins/demo/permissions", json={"permissions": ["read_messages"]})
+    declared = ["read_messages", "send_messages", "network"]
+    directory = _make_plugin(root, "link_detail", permissions=declared)
+    state.store.path = str(tmp_path / "bot.sqlite")
+    # 钩子内实际使用按权限收口的入口；不接触真实网络。
+    (directory / "plugin.py").write_text(
+        'def register(ctx):\n'
+        '    ctx.store.count_memories()\n'
+        '    @ctx.on_load\n'
+        '    def check(context, manifest):\n'
+        '        context.extras["loaded"] = True\n'
+    )
+    if hot:
+        state.plugins = PluginManager(state.config, state.store)
+        state.plugins.load_all()
+    assert client_obj.get("/api/plugins").json()["items"][0]["permissions"]["granted"] == []
+    with caplog.at_level("INFO", logger="rubenbot.plugins.permissions"):
+        response = client_obj.post("/api/plugins/link_detail", json={"enabled": True, "permissions": ["llm"]})
     assert response.status_code == 200
-    payload = response.json()
-    assert payload["restart_required"] is False
-    fresh = next(row for row in payload["items"] if row["name"] == "demo")
-    assert fresh["permissions"]["granted"] == ["read_messages"]
-    assert state.plugins.permissions.allows("demo", "scheduler") is False
-
-    # 未声明的权限不许授出
-    bad = client_obj.put("/api/plugins/demo/permissions", json={"permissions": ["llm"]})
-    assert bad.status_code == 422
-    assert state.plugins.permissions.grants("demo") == {"read_messages"}
-    # 插件不存在 / 参数不合法
-    assert client_obj.put("/api/plugins/nope/permissions", json={"permissions": []}).status_code == 404
-    assert client_obj.put("/api/plugins/demo/permissions", json={"permissions": "llm"}).status_code == 422
+    assert response.json()["restart_required"] is not hot
+    path = tmp_path / "plugin_permissions.json"
+    assert json.loads(path.read_text())["plugins"]["link_detail"] == sorted(declared)
+    assert any("授予 link_detail" in r.message and "network" in r.message for r in caplog.records)
+    assert not any("已拦截" in r.message for r in caplog.records)
+    if hot:
+        assert state.plugins.extras["loaded"] is True
+    detail = client_obj.get("/api/plugins/link_detail/detail").json()["plugin"]["permissions"]
+    assert set(detail["declared"]) == set(detail["granted"]) == set(declared)
+    assert all(row["granted"] for row in detail["items"])
+    assert client_obj.put("/api/plugins/link_detail/permissions", json={"permissions": []}).status_code in (404, 405)
 
 
-def test_webui_grants_unavailable_without_manager(client):
-    client_obj, state = client
-    state.plugins = None
-    response = client_obj.put("/api/plugins/demo/permissions", json={"permissions": []})
-    assert response.status_code == 409
+def test_unrelated_webui_save_is_not_an_enable_gesture(client):
+    web, state = client
+    root = Path(state.config.plugins.dir)
+    _make_plugin(root, "demo", permissions=["network"])
+    state.plugins = PluginManager(state.config, state.store)
+    state.plugins.load_all()
+    # 磁盘名单由别处更改。保存不相关设置可能同步运行状态，但不是显式授权。
+    state.config_path.write_text(f'plugins:\n  dir: {root}\n  enabled: [demo]\n')
+    response = web.put("/api/config", json={"config": {"chat": {"bot_name": "测试"}}})
+    assert response.status_code == 200
+    assert state.plugins.plugins["demo"].enabled
+    assert not state.plugins.permissions.allows("demo", "network")
+
+
+def test_enable_real_link_detail_allows_checked_fetch(client, tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from rubenbot.plugins.loader import PluginContext
+
+    web, state = client
+    state.config.plugins.dir = str(Path(__file__).resolve().parents[1] / "plugins")
+    state.store.path = str(tmp_path / "bot.sqlite")
+    manager = state.plugins = PluginManager(state.config, state.store)
+    manager.load_all()
+    result = web.post("/api/plugins/link_detail", json={"enabled": True})
+    assert result.status_code == 200
+    assert manager.permissions.grants("link_detail") == {"read_messages", "send_messages", "network"}
+    fetch = AsyncMock()
+    monkeypatch.setattr("rubenbot.plugins.loader.public_web.fetch", fetch)
+    ctx = PluginContext(manager.plugins["link_detail"], manager)
+    asyncio.run(ctx.fetch_public_page("https://example.test/", allow_url=lambda url: True))
+    fetch.assert_awaited_once()
 
 
 def test_corrupt_grants_file_fails_closed(tmp_path):

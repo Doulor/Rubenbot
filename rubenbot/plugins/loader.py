@@ -29,7 +29,7 @@ ctx 提供：
 - ``fetch_public_page`` / ``fetch_public_cover``：需 ``network`` 授权，受检读取公网链接或封面
 - ``bot`` / ``runtime``：宿主 bot 与最近一次分发时的运行时上下文
 
-**装后授权**：manifest 只声明权限，机主在 WebUI 里逐项授权后插件才能真正使用。
+**启用即信任**：机主显式启用时按本地 manifest 授权，自动恢复和重载不授新权限。
 ``call_capability`` 按 ``capabilities``（``qzone.*`` 按 ``qzone_write``）检查，
 ``llm`` / ``store`` / ``fetch`` / ``bot`` 与钩子拿到的适配器 ``send`` 分别检查
 ``llm`` / ``read_messages`` / ``network`` / ``send_messages``；插件通过
@@ -797,7 +797,8 @@ class PluginManager:
         # 最近一次分发时的运行时上下文（BotContext）：插件可从它拿 bot、persona 等
         self.current_runtime: Any = None
         self.on_music_delivery: Callable[[str, str, str, str], None] | None = None
-        # 装后授权：构造时没给就按数据库同目录的独立文件读；内存库只驻内存
+        self._trust_migrated = False
+        # 实授记录：构造时没给就按数据库同目录的独立文件读；内存库只驻内存
         self.permissions = permissions or PluginPermissionStore(path_for_store(store))
         # 适配器收口代理缓存：(插件名, id(真实适配器)) -> 代理，保证同一真实
         # 适配器每次拿到的是同一个代理对象（插件用它判断同一条线路）。
@@ -814,41 +815,51 @@ class PluginManager:
             self._adapter_proxies[key] = proxy
         return proxy
 
-    def _migrate_permissions(self, plugins: Iterable[Plugin]) -> None:
-        """首次升级：已装插件按当前 manifest 视为已授权，新装的从空授权开始。
+    def _write_grants(self, name: str, grants: Iterable[str]) -> None:
+        """授权落盘后才允许加载；写入失败时恢复旧实授，沿用原有变更审计。"""
+        previous = self.permissions.grants(name)
+        self.permissions.set_permissions(name, grants)
+        if error := self.permissions.last_error:
+            self.permissions.set_permissions(name, previous)
+            raise OSError(f"插件 {name} 授权写入失败：{error}")
 
-        只在授权层从未初始化过时真正写入；之后放进插件目录或从市场新装的
-        插件一律保持空授权（默认拒绝）。
-        """
-        installed = {
-            plugin.name: plugin.manifest.permissions
-            for plugin in plugins
-            if plugin.valid and plugin.manifest is not None
-        }
-        try:
-            self.permissions.migrate(installed)
-        except Exception as exc:  # noqa: BLE001 - 授权迁移失败不阻断启动
-            logger.warning("插件授权迁移失败：%s", exc)
+    def trust_for_enable(self, plugin: Plugin) -> None:
+        """仅显式启用用：校验本地声明，不从索引或客户端取权限，不执行插件代码。"""
+        self._refresh_manifest(plugin)
+        if plugin.manifest is None:
+            raise ManifestError(plugin.invalid_reason or "manifest 不合规")
+        self._write_grants(plugin.name, plugin.manifest.permissions)
+
+    def migrate_enabled_permissions(self, plugins: Iterable[Plugin]) -> None:
+        """首次升级只补启用名单的缺项；用独立版本标记兼容已有的旧授权文件。"""
+        key = "plugins:enable_trust:v1"
+        if self._trust_migrated or (self.store is not None and self.store.get_meta(key)):
+            return
+        # 损坏的授权文件仍默认拒绝，不当作待迁移的空记录。
+        if not self.permissions.last_error:
+            enabled = set(self.config.plugins.enabled)
+            for plugin in plugins:
+                if plugin.name not in enabled or plugin.manifest is None:
+                    continue
+                old = self.permissions.grants(plugin.name)
+                missing = set(plugin.manifest.permissions) - old
+                if missing:
+                    try:
+                        self._write_grants(plugin.name, old | missing)
+                    except OSError as exc:
+                        # 保持原授权，不因单个失败阻断其余插件或在后续启动补授新声明。
+                        logger.warning("%s；修复写入问题后请手动停用再启用", exc)
+        if self.store is not None:
+            self.store.set_meta(key, "1")
+        self._trust_migrated = True
 
     def _remember_runtime(self, ctx) -> None:
         if ctx is not None:
             self.current_runtime = ctx
 
     def register_new_plugin(self, name: str) -> frozenset[str]:
-        """市场装好一个插件后调用：登记空授权（新装默认全未授）。
-
-        必须在 ``discover()`` 之前调用，否则首次迁移可能把它当成已装插件全授。
-        """
-        plugin = self.plugins.get(name)
-        declared = plugin.manifest.permissions if plugin is not None and plugin.manifest else ()
-        if not declared:
-            # 市场装完时管理器还没扫目录：直接读落盘的 manifest 拿声明，
-            # 保证空授权记录按真实声明写盘（记录本身不存权限，只写空表）
-            try:
-                declared = load_manifest(Path(self.config.plugins.dir) / name).permissions
-            except ManifestError:
-                declared = ()
-        self.permissions.ensure_registered(name, declared)
+        """市场装好一个插件后登记空授权；仅安装不代表信任。"""
+        self.permissions.ensure_registered(name, ())
         return self.permissions.grants(name)
 
     def forget_plugin(self, name: str) -> None:
@@ -892,9 +903,6 @@ class PluginManager:
                 plugin.path = entry
             self._refresh_manifest(plugin)
             found.append(plugin)
-        # 首次升级：授权记录还没初始化时，把此刻扫到的已装插件按 manifest 全授；
-        # 之后才放进目录的插件（或市场新装的）一律从空授权开始。
-        self._migrate_permissions(found)
         return found
 
     @staticmethod
@@ -932,6 +940,7 @@ class PluginManager:
         ``plugins.enabled`` 未配置或为空时不会加载任何插件（默认全关）。
         """
         found = self._discover(directory)
+        self.migrate_enabled_permissions(found)
         allow = set(self.config.plugins.enabled)
         loaded: list[Plugin] = []
         for plugin in found:
@@ -973,7 +982,7 @@ class PluginManager:
             logger.warning("插件 %s 已写入 plugins.enabled，但目录里没有找到", name)
         return loaded
 
-    def apply_enabled(self, names: list[str] | None) -> list[str]:
+    def apply_enabled(self, names: list[str] | None, *, trust: bool = True) -> list[str]:
         """把新的启用列表写进配置并热应用，返回启用失败的插件名。
 
         会重新扫描插件目录（发现新增的插件目录），然后逐个同步启停：
@@ -985,6 +994,7 @@ class PluginManager:
             name = str(item).strip()
             if name and name not in cleaned:
                 cleaned.append(name)
+        newly_enabled = set(cleaned) - set(self.config.plugins.enabled)
         self.config.plugins.enabled = cleaned
         allow = set(cleaned)
         self._discover()
@@ -1002,7 +1012,7 @@ class PluginManager:
                 self._reject(plugin, plugin.invalid_reason or "manifest 不合规")
                 failures.append(name)
                 continue
-            if not self.set_enabled(name, True):
+            if not self.set_enabled(name, True, trust=trust and name in newly_enabled):
                 plugin.enabled = False
                 failures.append(name)
                 if plugin.invalid_reason:
@@ -1346,7 +1356,7 @@ class PluginManager:
             # 值没变：不管插件声不声明钩子都不用重启
             return True, False, "配置没有变化"
         if not self._hooks_allowed(plugin):
-            return False, True, "插件未获网络授权，配置未热应用，请授权后重载或重启"
+            return False, True, "插件未获网络授权，配置未热应用，请确认声明后停用再启用"
         if not plugin.config_change_hooks:
             return False, True, "该插件不支持热更新配置，已写入磁盘，重启 bot 后生效"
         if not plugin.enabled or not plugin.loaded:
@@ -1549,7 +1559,7 @@ class PluginManager:
                 "invalid_reason": p.invalid_reason,
                 "core_too_old": p.core_too_old,
                 "manifest": p.manifest.as_dict() if p.manifest is not None else None,
-                # 声明与授权的逐项对照，供 WebUI 渲染授权开关
+                # 声明与授权的逐项对照，供 WebUI 只读展示
                 "permissions": self.permissions.summary(
                     p.name, p.manifest.permissions if p.manifest is not None else ()
                 ),
@@ -1573,7 +1583,7 @@ class PluginManager:
         ]
 
     def set_permissions(self, name: str, permissions: Iterable[str]) -> frozenset[str]:
-        """整表替换某插件的授权（WebUI 开关用），返回最新授权集合。
+        """整表替换某插件的授权，返回最新授权集合。
 
         只能授出 manifest 声明过的权限；未声明的一律拒绝。授权变化立即生效：
         撤掉 ``scheduler`` / ``network`` / ``llm`` 导致后台任务不再满足启动
@@ -1648,7 +1658,7 @@ class PluginManager:
         plugin.loaded = False
         return True
 
-    def set_enabled(self, name: str, enabled: bool) -> bool:
+    def set_enabled(self, name: str, enabled: bool, *, trust: bool = True) -> bool:
         """运行时启用/禁用插件，返回是否找到该插件。
 
         禁用只是让分发时跳过它（已注册的钩子留着，再次启用立即生效）；
@@ -1656,12 +1666,19 @@ class PluginManager:
         禁用/启用时会同步调用插件的 ``on_stop`` / ``on_unload`` 与
         ``on_start``，后台任务据此启动和干净退出。manifest 不合规的插件不能启用。
 
+        显式启用先授予本地声明；市场恢复状态时传 ``trust=False`` 保留原实授。
         这个开关会同步更新内存里 ``config.plugins.enabled``；WebUI 调用它
         之后负责把列表写回 config.yaml。
         """
         plugin = self.plugins.get(name)
         if plugin is None:
             return False
+        if enabled and trust and not plugin.enabled:
+            try:
+                self.trust_for_enable(plugin)
+            except ManifestError as exc:
+                self._reject(plugin, exc.reason)
+                return False
         if enabled and not plugin.valid:
             # 目录里的 manifest 可能刚被改好/改坏：再校验一次
             self._refresh_manifest(plugin)
