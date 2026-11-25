@@ -1152,7 +1152,7 @@ function aboutLayout(data) {
   const strategy = name => MODEL_POOL_STRATEGY_LABELS[name] || name;
   const states = { connected: "已连接", disconnected: "未连接", disabled: "未启用", not_running: "未运行" };
   const roleNames = { chat: "对话", extract: "事实抽取", consolidate: "记忆归纳", gate: "分寸审查",
-    fast: "快速任务", summary: "滚动摘要", vision: "看图", distill: "画像提炼" };
+    fast: "快速任务", reply_gate: "回复门分类", summary: "滚动摘要", vision: "看图", distill: "画像提炼" };
   const source = p?.commit_source === "deploy" ? "部署盖戳" : "Git HEAD";
   const commit = !p ? bar() : p.commit ? aboutLink(p.commit_url, p.commit.slice(0, 7), `${source} · ${p.commit}`)
     : `未知（${p.commit_reason}）`;
@@ -3392,6 +3392,7 @@ function modelsEditor(draft, observations = {}, historyWarning = "") {
   const labels = new Map(Object.entries({
     chat: "对话", vision: "看图", fast: "快速任务", summary: "滚动摘要",
     extract: "记忆抽取", consolidate: "记忆归纳", gate: "分寸审查", distill: "画像提炼",
+    reply_gate: "回复门分类",
   }));
   const roles = new Set([...labels.keys(), ...Object.keys(pools), ...Object.keys(strategies)]);
   const initial = JSON.stringify(llm);

@@ -24,9 +24,21 @@ class ScriptedLLM:
         self.responses = {k: list(v) for k, v in (responses or {}).items()}
         self.default = default
         self.calls: list[dict[str, Any]] = []
+        # 回复门调用单独一列：多数用例按 calls 的下标断言行文流程，分类调用
+        # 混进去会把每个下标都挪一位。要断言分类本身的用例读 gate_calls。
+        self.gate_calls: list[dict[str, Any]] = []
 
     async def complete(self, messages, *, role="chat", task=None, temperature=None, json_mode=False):
-        self.calls.append({"role": role, "task": task, "messages": messages, "json_mode": json_mode})
+        call = {"role": role, "task": task, "messages": messages, "json_mode": json_mode}
+        if task == "reply_gate":
+            self.gate_calls.append(call)
+            # 回复门默认「真问题」：与旧流程一样照常规划、生成，不把沉默塞进
+            # 无关用例；要测某一类的用例在 responses 里放 "reply_gate": [...] 覆盖。
+            queue = self.responses.get("reply_gate")
+            if queue:
+                return queue.pop(0)
+            return json.dumps({"category": "真问题", "reason": "默认"}, ensure_ascii=False)
+        self.calls.append(call)
         queue = self.responses.get(role)
         if queue:
             return queue.pop(0)

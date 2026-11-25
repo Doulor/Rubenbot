@@ -114,6 +114,7 @@ STATIC_DIR = Path(__file__).parent / "static"
 MODEL_ROLE_LABELS = {
     "chat": "对话",
     "fast": "快速档（小任务）",
+    "reply_gate": "回复门（生成前分类）",
     "summary": "滚动摘要",
     "vision": "看图",
     "gate": "分寸审查",

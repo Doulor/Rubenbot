@@ -19,6 +19,7 @@ llm:
       - {provider: deepseek, model: deepseek-chat}
       # - {provider: backup, model: chat-model}
     # vision: [{provider: backup, model: vision-model}]
+    # reply_gate: [{provider: deepseek, model: deepseek-chat}]  # 生成前分类；不写就跟随 fast
   # 未指定的角色仍按原回退链取整个池，如 distill → consolidate → chat。
   # 模型池策略：failover（按顺序故障转移）/ round_robin（轮询）/ random（随机）
   # 单模型列表时三种策略行为一致；配了多个模型时按策略最多走一遍、不额外退避。
@@ -38,7 +39,7 @@ llm:
     default_daily_calls: 500        # 未单列任务类型的每日调用上限；null 表示不限
     default_daily_cost_usd: null    # 未单列任务类型的每日费用上限；null 表示不限
     # 按任务类型覆盖（任务标签就是 llm_usage.task：chat / extract / gen_stage1 …）。
-    # 不写这一项时用内置默认：gen_stage1 1500、gen_stage2 1200、extract 600、
+    # 不写这一项时用内置默认：gen_stage1 1500、gen_stage2 1200、reply_gate 1200、extract 600、
     # image_description 400、sticker_* 300、conversation_state 300、chat 300、
     # rolling_summary 200、group_profile 150、consolidate 150、distill 100、
     # gate 100、event_judge 50；未列出的任务用 default_daily_calls。

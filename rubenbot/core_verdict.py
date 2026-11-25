@@ -8,7 +8,7 @@ import re
 from dataclasses import replace
 from typing import Any
 
-from . import computer
+from . import computer, reply_gate
 from .adapters.base import SEND_STICKER, MessageEvent, Segment
 from .agreement import is_repetitive_agreement
 from .core_delivery import ReplyFlight
@@ -429,6 +429,7 @@ class VerdictMixin:
             # 多人批次没有可代表全体的授权账号，不能以主要发言人的权限执行工具。
             # 操作委托只执行一次：交付已送达就静默，没办成才有一句说明，均不重写。
             raw = await self.generate(messages, event=event if tools_allowed and not attempt else None,
+                                      gate_event=event,
                                       task="gen_agreement_retry" if attempt else "gen_stage2",
                                       computer_task=operation, deliver_file=expression.deliver_file)
             if flight.updates:
@@ -624,6 +625,13 @@ class VerdictMixin:
         # 改写复述复核：被压下的那一轮留下触发消息 id 与判定结果，不无痕丢弃。
         if paraphrase:
             factor_data["paraphrase"] = paraphrase
+        # 回复门：本轮生成前那次便宜分类的类别、模型、耗时与 token。
+        gate = reply_gate.factor_for(event)
+        if gate:
+            factor_data["reply_gate"] = gate
+        # 按分类「不理」没进生成：审计里把沉默来源和分类分开写清楚。
+        if decision.reason == "veto_marker" and gate and gate.get("category") == "不理":
+            factor_data["reply_gate"]["silenced"] = True
         try:
             self.store.add_decision_log(
                 platform=event.platform,

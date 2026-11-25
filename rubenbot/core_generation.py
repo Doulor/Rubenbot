@@ -6,7 +6,7 @@ import inspect
 from pathlib import Path
 from typing import Any
 
-from . import computer
+from . import computer, reply_gate
 from .adapters.base import MessageEvent
 from .core_shared import (
     _log_identity,
@@ -140,13 +140,28 @@ class GenerationMixin:
         task: str = "chat",
         computer_task: bool = False,
         deliver_file: bool = False,
+        gate_event: MessageEvent | None = None,
     ) -> str:
         """生成回复；模型支持工具调用时先走有限轮次的工具循环。
 
         工具不可用、模型不用工具、或任何一步出问题，都退化为普通单次生成。
         ``task`` 只用于用量打标：单段直出是 ``chat``，两段式的第二段是
         ``gen_stage2``。
+
+        群聊进生成前先过一次便宜的回复门（见 ``reply_gate``）：先判这批是灌水、
+        调侃、真问题还是不用理，再决定给主生成加哪种口吻指导，或这一轮不出声。
+        分类失败、超时或输出不可解析都照原样生成，只是一条审计。
+
+        ``gate_event`` 是本轮触发事件：多人合批时调用方出于授权给不出
+        ``event``（工具不开放），但回复门仍要按这批的原话分类，所以单独传。
         """
+        gate_subject = event if event is not None else gate_event
+        if gate_subject is not None and not computer_task:
+            messages, silence = await reply_gate.apply(
+                self, gate_subject, messages, marker=self.config.decision.veto_marker,
+            )
+            if silence:
+                return silence
         if event is not None and self.tool_definitions(event):
             try:
                 reply = await self._generate_with_tools(messages, event, task=task, operation=computer_task,

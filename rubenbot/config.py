@@ -56,6 +56,8 @@ ROLE_FALLBACKS: dict[str, tuple[str, ...]] = {
     "extract": ("chat",),
     "consolidate": ("chat",),
     "fast": ("chat",),
+    # 回复门：生成前那一次便宜分类；没单独配就跟随 fast，再沿链落到 chat
+    "reply_gate": ("fast", "chat"),
     "summary": ("chat",),
     "vision": ("chat",),
     # 记忆 v2：分寸审查没配就跟随 chat；画像提炼沿用归纳模型

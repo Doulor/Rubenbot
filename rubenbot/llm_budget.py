@@ -44,6 +44,8 @@ META_KEY = "llm_budget:ledger"
 DEFAULT_TASK_CALL_LIMITS: dict[str, int] = {
     "gen_stage1": 1500,
     "gen_stage2": 1200,
+    # 回复门：每次群聊生成前一次便宜分类，次数跟 gen_stage2 同量级
+    "reply_gate": 1200,
     "extract": 600,
     "image_description": 400,
     "sticker_description": 300,
