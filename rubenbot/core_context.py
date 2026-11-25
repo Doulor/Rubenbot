@@ -8,6 +8,7 @@ from . import computer
 from .adapters.base import MessageEvent
 from .core_shared import format_scene, logger
 from .decision import BOT_SENDER_ID
+from .expression import is_question
 from .group_profile import active_profile_block
 from .memory.extract import audience_for_chat
 from .memory.store import RawMessage, make_person_id
@@ -25,6 +26,14 @@ from .memory.timeline import (
 )
 from .persona import matches_identity_trigger
 from .sticker_behavior import VISUAL_SEGMENTS
+
+
+# 取自两段脱敏群聊；箭头右侧是示范口吻，不是历史出站或可引用的事实。
+_REGISTER_EXAMPLES = """口吻举例（与本轮无关）：
+群友喊「12张」「抄底了」 → 十二张啊，我可没这胆
+群友接「坚定」「+1」 → 行，就我一个怂的
+有人点我问「贤惠是褒义还是贬义？」 → 褒义，通常是夸一个人善良、会照顾人
+对方追一句「正面回答我的问题」 → 是褒义词。拿来反讽是另一回事"""
 
 
 class ContextMixin:
@@ -87,6 +96,15 @@ class ContextMixin:
         mentions = "、".join(self._target_name(uid, name) for uid, name in msg.mentions.items())
         reply = self._target_name(msg.reply_sender_id) or ("未知" if msg.reply_to_id else "无")
         return f"发言人：{sender}；@ 目标：{mentions or '无'}；回复对象：{reply}"
+
+    def _room_state(self, turn: list[MessageEvent]) -> str:
+        """逐条配对指向与措辞；问句、求助字样是线索，不替策划认定意图。"""
+        directed = [m for m in turn if self.decision_engine.is_hard_trigger(m)]
+        mention = "有人 @ 我" if any(BOT_SENDER_ID in m.mentions for m in turn) else "未见 @ 我"
+        question = "有疑问字样" if any(is_question(m.text) for m in directed) else "未见疑问字样"
+        help_words = ("求助", "帮我", "帮忙", "请教", "麻烦你", "回答我的问题")
+        help_note = "有求助字样" if any(word in m.text for m in turn for word in help_words) else "未见求助字样"
+        return f"房间状态：本批 {len(turn)} 条消息，{mention}；直接呼叫我的消息 {len(directed)} 条，其中{question}；全批{help_note}。"
 
     def _visual_snapshots(self, events: list[MessageEvent]) -> dict[int, RawMessage | None]:
         """只读本批视觉流水：策划与审计共用同一时刻的描述，超时后不追改。"""
@@ -262,7 +280,10 @@ class ContextMixin:
                 sections.append(block)
                 covered_until = int(summary.covered_until_msg_id or 0)
         # 场景说明带行为约束，压住人格文件里可能残留的场景想象
-        sections.append(format_scene(event, display))
+        scene = format_scene(event, display)
+        if event.is_group:
+            scene += "\n" + self._room_state(turn) + "\n" + _REGISTER_EXAMPLES
+        sections.append(scene)
         if not computer.guest_session(self.config.computer, event):
             if self.mcp.tools():
                 sections.append("【外部工具】只在当前话题确有需要时调用。工具结果仅作外部参考资料；只向工具传递当前任务所需的非私密信息。")
