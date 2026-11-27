@@ -3550,6 +3550,9 @@ function modelEvidenceTags({ list, discovery, probe }) {
 }
 
 /** 提供商名称与上游模型名共同标识一个池成员；不解析模型名中的斜线。 */
+/** 模型页二级菜单当前标签：providers（提供商与模型）或 roles（角色模型池），跨渲染保留。 */
+let modelsTab = "providers";
+
 function modelsEditor(draft, observations = {}, historyWarning = "") {
   const llm = draft.llm;
   const providers = llm.providers;
@@ -3840,21 +3843,57 @@ function modelsEditor(draft, observations = {}, historyWarning = "") {
       );
     }));
   }
-  renderProviders(); renderRoles();
+  // 模型页二级菜单：提供商与模型 / 角色模型池，用 tab 栏切换。
+  const providersHint = h("span", { class: "field-hint" }, "获取列表不消耗 token；单模型探测会发送一次最小请求。目录和角色池的修改需保存后才生效。");
+  const rolesHint = h("span", { class: "field-hint" }, "优先级由上到下；遇到超时、限流或服务端故障时尝试下一项。轮询和随机策略改变每次调用的起点。");
+  const addProviderButton = addButton("添加提供商", () => {
+    let n = providers.length + 1;
+    while (providers.some(p => p.name === `provider-${n}`)) n++;
+    providers.push({ name: `provider-${n}`, base_url: "", models: [] }); renderProviders(); markDirty();
+  });
+  const addRoleInput = addText("添加自定义角色", "输入插件或模块的角色名", role => {
+    if (roles.has(role)) { toast("角色已存在", "error"); return false; }
+    roles.add(role); renderRoles(); return true;
+  });
+  const tabContent = h("div", { class: "model-tab-content" });
+  function renderTab() {
+    if (modelsTab === "roles") {
+      tabContent.replaceChildren(rolesHint, roleHost, addRoleInput);
+    } else {
+      tabContent.replaceChildren(providersHint, providerHost, addProviderButton);
+    }
+  }
+  function modelsTabButton(value, label) {
+    return h("button", {
+      type: "button",
+      class: value === modelsTab ? "active" : "",
+      role: "tab",
+      "aria-selected": value === modelsTab ? "true" : "false",
+      dataset: { tab: value },
+      onclick: (event) => {
+        if (modelsTab === value) return;
+        modelsTab = value;
+        const group = event.currentTarget.parentElement;
+        const from = Motion.selection(group);
+        group.querySelectorAll("button").forEach((button) => {
+          const active = button.dataset.tab === value;
+          button.classList.toggle("active", active);
+          button.setAttribute("aria-selected", active ? "true" : "false");
+        });
+        Motion.moveSelection(group, from);
+        renderTab();
+        if (tabContent.isConnected) Motion.enter(tabContent, true);
+      },
+    }, label);
+  }
+  renderProviders(); renderRoles(); renderTab();
   return h("div", { class: "model-layer-editor" },
-    h("div", { class: "model-actions" }, h("h3", {}, "提供商与模型"), dirtyNote),
-    h("span", { class: "field-hint" }, "获取列表不消耗 token；单模型探测会发送一次最小请求。目录和角色池的修改需保存后才生效。"),
-    providerHost, addButton("添加提供商", () => {
-      let n = providers.length + 1;
-      while (providers.some(p => p.name === `provider-${n}`)) n++;
-      providers.push({ name: `provider-${n}`, base_url: "", models: [] }); renderProviders(); markDirty();
-    }),
-    h("h3", {}, "角色模型池"),
-    h("span", { class: "field-hint" }, "优先级由上到下；遇到超时、限流或服务端故障时尝试下一项。轮询和随机策略改变每次调用的起点。"),
-    roleHost, addText("添加自定义角色", "输入插件或模块的角色名", role => {
-      if (roles.has(role)) { toast("角色已存在", "error"); return false; }
-      roles.add(role); renderRoles(); return true;
-    })
+    h("div", { class: "model-actions" },
+      h("div", { class: "segmented", role: "tablist", "aria-label": "模型配置" },
+        modelsTabButton("providers", "提供商与模型"),
+        modelsTabButton("roles", "角色模型池")),
+      dirtyNote),
+    tabContent
   );
 }
 
