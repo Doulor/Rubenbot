@@ -1162,7 +1162,7 @@ function aboutLayout(data) {
       h("small", { class: "mono" }, p ? `v${p.version}` : bar())),
     h("div", { class: "about-release" }, h("span", {}, "当前提交 · ", commit), data ? updateCheck() : skeletonBar("96px", "32px")));
   const roles = runtime ? Object.entries(runtime.roles) : Object.keys(roleNames).map(role => [role, null]);
-  const pools = card("角色模型池", { hint: "首选模型 / 池内数量与策略", body: roles.map(([role, pool]) =>
+  const pools = card("模块模型", { hint: "首选模型 / 池内数量与策略", body: roles.map(([role, pool]) =>
     kvRow(Object.hasOwn(roleNames, role) ? roleNames[role] : role, pool ? [pool.model || "未配置",
       h("small", { class: "about-pool" }, `${pool.count} 个 · ${strategy(pool.strategy)}`)] : [bar(), h("small", { class: "about-pool" }, bar())])) });
   const info = card("运行信息", { body: [
@@ -3550,7 +3550,7 @@ function modelEvidenceTags({ list, discovery, probe }) {
 }
 
 /** 提供商名称与上游模型名共同标识一个池成员；不解析模型名中的斜线。 */
-/** 模型页二级菜单当前标签：providers（提供商与模型）或 roles（角色模型池），跨渲染保留。 */
+/** 模型页二级菜单当前标签：providers（提供商）或 roles（模块模型），跨渲染保留。 */
 let modelsTab = "providers";
 
 function modelsEditor(draft, observations = {}, historyWarning = "") {
@@ -3575,7 +3575,9 @@ function modelsEditor(draft, observations = {}, historyWarning = "") {
     const old = saved && Object.hasOwn(observations, p.name) ? observations[p.name] : {};
     const s = { saved: saved ? { name: p.name, url: p.base_url, models: new Set(p.models), key: p.has_api_key } : null,
       discovery: old.discovery, listed: new Set(old.discovery?.models), probes: new Map(Object.entries(old.probes || {})),
-      pending: new Set(), query: "", limit: 100, editingName: false, message: "" };
+      pending: new Set(), query: "", limit: 100, editingName: false, message: "",
+      // 上游挑选器状态：只在本轮草稿里，保存时不提交。
+      pickerOpen: false, picked: new Set(), pickerQuery: "", pickerLimit: 100 };
     states.set(p, s);
     return s;
   }
@@ -3616,7 +3618,7 @@ function modelsEditor(draft, observations = {}, historyWarning = "") {
   }
   function canRemove(name, model) {
     const used = references(name, model);
-    if (used.length) toast(`请先从角色池移除引用：${[...new Set(used.map(r => r.role))].join("、")}`, "error");
+    if (used.length) toast(`请先从模块移除引用：${[...new Set(used.map(r => r.role))].join("、")}`, "error");
     return !used.length;
   }
 
@@ -3630,11 +3632,23 @@ function modelsEditor(draft, observations = {}, historyWarning = "") {
     const controls = h("div", { class: "model-actions" });
     const count = h("span", { class: "field-hint", role: "status" });
     const modelRows = h("div", { class: "model-catalog-list" });
-    const search = h("input", { type: "search", class: "input", placeholder: "搜索此提供商的模型", "aria-label": "搜索模型",
+    const search = h("input", { type: "search", class: "input", placeholder: "搜索待选模型", "aria-label": "搜索模型",
       oninput: event => { s.query = event.target.value.trim().toLowerCase(); s.limit = 100; renderModels(); },
     });
+    // 上游挑选器面板：整块只建一次，切 tab / 刷新都不重建，搜索框不丢焦点。
+    const pickerStatus = h("div", { class: "model-discovery-status", role: "status" });
+    const pickerSearch = h("input", { type: "search", class: "input", placeholder: "搜索上游模型", "aria-label": "搜索上游模型",
+      oninput: event => { s.pickerQuery = event.target.value.trim().toLowerCase(); s.pickerLimit = 100; renderPickerList(); },
+    });
+    const pickerList = h("div", { class: "model-picker-list" });
+    const pickerConfirm = btn("确认添加", () => {
+      const added = [...s.picked].filter(m => !provider.models.includes(m));
+      if (added.length) provider.models.push(...added);
+      closePicker(); renderModels(); renderRoles();
+    }, { "aria-label": "确认添加", class: "btn btn-sm btn-primary" });
+    const pickerPanel = h("div", { class: "model-picker", hidden: true });
     function identityChanged() {
-      s.roleModel = null; s.message = "";
+      s.message = "";
       renderPanel(); renderRoles();
     }
     const keyInput = h("input", { class: "input", type: "password", autocomplete: "new-password",
@@ -3680,6 +3694,15 @@ function modelsEditor(draft, observations = {}, historyWarning = "") {
     }
     const field = (label, control) => h("label", { class: "settings-field" },
       h("span", { class: "field-label" }, label), control);
+    pickerPanel.replaceChildren(
+      h("div", { class: "model-picker-head" },
+        h("strong", {}, "从上游选择模型"),
+        h("span", { class: "field-hint" }, "只勾想要的，点确认后才会加进待选模型；不会把上游列表全部加进来。")),
+      pickerStatus,
+      h("div", { class: "model-searchbar" }, field("搜索上游模型", pickerSearch)),
+      pickerList,
+      h("div", { class: "model-actions" }, pickerConfirm,
+        btn("取消", closePicker, { "aria-label": "取消上游选择" })));
     // 请求只引用已保存名称，绝不把表单中的地址或密钥交给诊断接口。
     async function diagnose(model = null, refresh = false) {
       if (!sameIdentity(provider) || s.pending.has(model) || (model !== null && !s.saved.models.has(model))) return;
@@ -3702,36 +3725,40 @@ function modelsEditor(draft, observations = {}, historyWarning = "") {
     }
     function renderPanel() {
       const ready = sameIdentity(provider), d = ready ? s.discovery : null, busy = ready && s.pending.has(null);
-      const label = !ready ? "待保存" : d?.status === "available" ? "拉取成功" : d?.status === "error" ? "拉取失败" : "未拉取";
+      const label = !ready ? "待保存" : d?.status === "available" ? "连通正常" : d?.status === "error" ? "连通失败" : "未测试";
       header.replaceChildren(h("div", { class: "model-provider-id" }, h("strong", {}, provider.name),
         h("span", { class: "mono", title: provider.base_url }, provider.base_url || "未填写接口地址")),
         h("span", { class: `model-health ${d?.status || "unknown"}` }, label));
-      status.replaceChildren(...[h("span", {}, !ready ? "请先保存提供商，再获取模型或探测。" : d ?
-        `最近拉取 ${fmtDateTime(Date.parse(d.checked_at) / 1000)}${d.error ? `，${modelErrorLabel(d.error)}` : ""}` : historyWarning || "还没拉取过，点获取模型"),
+      status.replaceChildren(...[h("span", {}, !ready ? "请先保存提供商，再测试连通性或从上游获取模型。" : d ?
+        `最近拉取 ${fmtDateTime(Date.parse(d.checked_at) / 1000)}${d.error ? `，${modelErrorLabel(d.error)}` : ""}` : historyWarning || "还没拉取过，点「测试连通性」或「从上游获取」。"),
         d?.cached_at ? h("span", {}, `来自缓存（${fmtDateTime(Date.parse(d.cached_at) / 1000)}）`) : null,
         s.message && ready ? h("span", { class: "tag bad" }, s.message) : null].filter(Boolean));
-      controls.replaceChildren(...[btn(busy ? "拉取中…" : "获取模型", () => diagnose(), { disabled: !ready || busy }),
-        btn("测连通性", () => diagnose(null, true), { disabled: !ready || busy, title: "强制刷新上游模型列表，不调用模型" }),
-        (d?.status === "error" || s.message) && ready ? btn("重试拉取", () => diagnose(null, true), { disabled: busy }) : null].filter(Boolean));
+      controls.replaceChildren(
+        btn(busy ? "测试中…" : "测试连通性", () => diagnose(null, true),
+          { disabled: !ready || busy, title: "强制刷新上游模型列表，验证提供商是否连通", class: "btn btn-sm btn-primary" }),
+        btn("从上游获取", openPicker, { disabled: !ready || busy, title: "拉取上游模型列表，勾选后加入待选" }));
       renderModels();
     }
-    function changeCatalog(add, model, focus = false) {
-      if (!add && !canRemove(provider.name, model)) return false;
-      if (add) { if (!provider.models.includes(model)) provider.models.push(model); }
-      else provider.models = provider.models.filter(name => name !== model);
-      s.roleModel = null; renderModels(focus ? model : null); renderRoles();
+    // 待选模型就是 provider.models：在列表里就是候选，不在就是没有，不用勾选表达。
+    function addCandidate(model) {
+      if (provider.models.includes(model)) { toast("此提供商已有这个模型", "error"); return false; }
+      provider.models.push(model);
+      renderModels(); renderRoles();
       return true;
     }
-    function modelRow(model, joined, focus) {
-      const check = h("input", { type: "checkbox", checked: joined, "aria-label": `勾选 ${model}`,
-        onchange: event => { if (!changeCatalog(event.target.checked, model, true)) event.target.checked = joined; } });
-      if (focus) Promise.resolve().then(() => check.focus?.({ preventScroll: true }));
+    function removeCandidate(model) {
+      if (!canRemove(provider.name, model)) return false;
+      provider.models = provider.models.filter(name => name !== model);
+      renderModels(); renderRoles();
+      return true;
+    }
+    function modelRow(model) {
       const saved = sameIdentity(provider) && s.saved.models.has(model);
       const proof = modelEvidenceTags(evidence(provider, model));
       const probeButton = btn(s.pending.has(model) && saved ? "探测中…" : "测一下", () => diagnose(model), {
         disabled: !saved || s.pending.has(model), title: saved ? "发送一次最小调用，可能产生费用" : "请先保存提供商与模型",
         "aria-label": `探测 ${model}` });
-      const name = joined ? h("input", { class: "input mono", value: model, "aria-label": "上游模型名",
+      const name = h("input", { class: "input mono", value: model, "aria-label": "上游模型名",
         oninput: event => { proof.hidden = event.target.value.trim() !== model; probeButton.disabled = proof.hidden || !saved || s.pending.has(model); },
         onchange: event => {
           const next = event.target.value.trim();
@@ -3742,36 +3769,69 @@ function modelsEditor(draft, observations = {}, historyWarning = "") {
           }
           renderModels(); renderRoles();
         },
-      }) : h("span", { class: "model-id mono" }, model);
-      const rolePicker = s.roleModel === model && joined ? selectField("", [{ value: "", label: "选择要加入的角色" },
-        ...[...roles].filter(role => !(pools[role] || []).some(ref => ref.provider === provider.name && ref.model === model))
-          .map(role => ({ value: role, label: labels.get(role) || role }))], role => {
-        if (role && roles.has(role) && !(pools[role] || []).some(ref => ref.provider === provider.name && ref.model === model)) {
-          pools[role] = [...(pools[role] || []), { provider: provider.name, model }];
-        }
-        s.roleModel = null; renderModels(); renderRoles();
-      }) : null;
-      rolePicker?.setAttribute("aria-label", `${model} 加入角色`);
+      });
       return h("div", { class: "model-catalog-row", dataset: { model } },
-        h("div", { class: "model-catalog-name" }, check, name, h("span", { class: "field-hint" }, joined ? "已在目录" : "未加入")),
+        h("div", { class: "model-catalog-name" }, name),
         proof,
-        h("div", { class: "model-actions" }, joined ? probeButton : null,
-          joined ? btn("加入角色池", () => { s.roleModel = s.roleModel === model ? null : model; renderModels(); }) : null,
-          joined ? btn("移除目录", () => changeCatalog(false, model), { "aria-label": "删除此上游模型" }) : btn("加入目录", () => changeCatalog(true, model)),
-          rolePicker));
+        h("div", { class: "model-actions" }, probeButton,
+          action("删除此上游模型", "trash", () => removeCandidate(model))));
     }
-    function renderModels(focusModel = null) {
-      const catalog = new Set(provider.models), listed = sameIdentity(provider) ? s.listed : null;
-      // 固定本轮已保存目录及上游列表顺序，勾选发现项不会跳到页首。
-      const names = new Set([...(s.saved?.models || []), ...(listed || []), ...catalog]);
-      const filtered = [...names].filter(m => (catalog.has(m) || listed?.has(m)) && m.toLowerCase().includes(s.query));
-      modelRows.replaceChildren(...filtered.slice(0, s.limit).map(m => modelRow(m, catalog.has(m), m === focusModel)), ...[
-        filtered.length === 0 ? h("span", { class: "field-hint" }, s.query ? "没有匹配的模型，试试其他关键词。" : "目录为空，可获取上游列表或手动添加模型。") : null,
+    function renderModels() {
+      const filtered = provider.models.filter(m => m.toLowerCase().includes(s.query));
+      modelRows.replaceChildren(...filtered.slice(0, s.limit).map(m => modelRow(m)), ...[
+        filtered.length === 0 ? h("span", { class: "field-hint" }, s.query ? "没有匹配的模型，试试其他关键词。" : "还没有待选模型，手动添加或点「从上游获取」。") : null,
         filtered.length > s.limit ? btn(`加载更多（已显示 ${s.limit} / ${filtered.length}）`, () => { s.limit += 100; renderModels(); }) : null].filter(Boolean));
-      count.textContent = `已加入 ${catalog.size} 个模型`;
+      count.textContent = `待选模型 ${provider.models.length} 个`;
+      renderPicker();
+    }
+    // 上游挑选器：拉回列表只用来挑，确认后才把勾中的加进待选，绝不整批自动加入。
+    async function openPicker() {
+      if (!sameIdentity(provider)) { toast("请先保存提供商，再从上游获取模型。", "error"); return; }
+      if (s.pending.has(null)) return;
+      if (!s.discovery || s.discovery.status === "error") {
+        await diagnose();
+        if (!s.discovery || s.discovery.status === "error") return;
+      }
+      s.pickerOpen = true; s.picked = new Set(); s.pickerQuery = ""; s.pickerLimit = 100;
+      renderPicker();
+    }
+    function closePicker() {
+      s.pickerOpen = false; s.picked = new Set();
+      renderPicker();
+    }
+    function renderPicker() {
+      pickerPanel.hidden = !s.pickerOpen;
+      if (!s.pickerOpen) return;
+      pickerSearch.value = s.pickerQuery;
+      pickerStatus.replaceChildren(h("span", {}, s.discovery?.status === "available"
+        ? `上游共 ${s.listed.size} 个模型，最近拉取 ${fmtDateTime(Date.parse(s.discovery.checked_at) / 1000)}`
+        : "上游列表未拉取"));
+      renderPickerList();
+      updatePickerConfirm();
+    }
+    function renderPickerList() {
+      const catalog = new Set(provider.models);
+      const upstream = [...(s.listed || [])].filter(m => !catalog.has(m));
+      const filtered = upstream.filter(m => m.toLowerCase().includes(s.pickerQuery));
+      pickerList.replaceChildren(...filtered.slice(0, s.pickerLimit).map(model => {
+        const check = h("input", { type: "checkbox", checked: s.picked.has(model), "aria-label": `挑选 ${model}`,
+          onchange: event => {
+            if (event.target.checked) s.picked.add(model); else s.picked.delete(model);
+            updatePickerConfirm();
+          } });
+        return h("div", { class: "model-picker-row", dataset: { pick: model } },
+          check, h("span", { class: "mono" }, model));
+      }), ...[
+        filtered.length === 0 ? h("span", { class: "field-hint" }, s.pickerQuery ? "没有匹配的上游模型。" : "上游没有可添加的模型（已在待选的不在此列）。") : null,
+        filtered.length > s.pickerLimit ? btn(`加载更多（已显示 ${s.pickerLimit} / ${filtered.length}）`, () => { s.pickerLimit += 100; renderPickerList(); }) : null].filter(Boolean));
+    }
+    function updatePickerConfirm() {
+      pickerConfirm.textContent = `确认添加（已选 ${s.picked.size} 个）`;
+      pickerConfirm.disabled = s.picked.size === 0;
     }
     s.repaint = renderPanel;
     search.value = s.query;
+    pickerSearch.value = s.pickerQuery;
     renderPanel();
     return h("article", { class: "model-pool-item model-provider-card", dataset: { provider: provider.name } },
       header,
@@ -3786,11 +3846,12 @@ function modelsEditor(draft, observations = {}, historyWarning = "") {
           providers.splice(providers.indexOf(provider), 1); states.delete(provider); renderProviders(); renderRoles();
         }, { "aria-label": "删除此提供商" })),
       h("div", { class: "model-discovery-tools" }, controls, status),
-      h("div", { class: "model-searchbar" }, field("搜索模型", search), count), modelRows,
-      addText("添加模型", "手动输入上游模型名", name => {
-        if (provider.models.includes(name)) { toast("此提供商已有这个模型", "error"); return false; }
-        return changeCatalog(true, name);
-      })
+      pickerPanel,
+      h("div", { class: "model-actions" }, h("h3", {}, "待选模型"), count),
+      h("span", { class: "field-hint" }, "这里的模型是你挑出来的候选；模块在「模块模型」里从候选里选。"),
+      h("div", { class: "model-searchbar" }, field("搜索模型", search)),
+      modelRows,
+      addText("添加模型", "手动输入上游模型名", name => addCandidate(name))
     );
   }
   function renderProviders() { providerHost.replaceChildren(...providers.map(providerRow)); }
@@ -3817,11 +3878,14 @@ function modelsEditor(draft, observations = {}, historyWarning = "") {
       const move = (i, j) => { [refs[i], refs[j]] = [refs[j], refs[i]]; renderRoles(); };
       const asRef = value => { const [provider, model] = JSON.parse(value); return { provider, model }; };
       const add = value => { if (value) { pools[role] = [...refs, asRef(value)]; renderRoles(); } };
-      const verified = available.filter(opt => opt.evidence.effective === "available");
+      const label = labels.get(role) || role;
       return h("article", { class: "model-pool-item", dataset: { role } },
-        h("div", { class: "model-pool-head" }, h("strong", { class: "field-label" },
-          labels.has(role) ? `${labels.get(role)}（${role}）` : role), strategy,
-          labels.has(role) ? null : action(`删除自定义角色 ${role}`, "trash", () => {
+        h("div", { class: "model-pool-head" },
+          h("div", { class: "model-module-title" },
+            h("strong", { class: "field-label" }, label),
+            h("span", { class: "field-hint" }, role)),
+          strategy,
+          labels.has(role) ? null : action(`删除自定义模块 ${role}`, "trash", () => {
             roles.delete(role); delete pools[role]; delete strategies[role]; renderRoles();
           })),
         refs.length ? refs.map((ref, i) => {
@@ -3837,24 +3901,25 @@ function modelsEditor(draft, observations = {}, historyWarning = "") {
           }, role === "chat" && refs.length === 1)),
           h("div", { class: "model-actions" }, i === 0 ? h("span", { class: "tag accent" }, "首选") : null, modelEvidenceTags(proof)));
         }) : h("span", { class: "field-hint" }, role === "chat" ? "请至少选择一个对话模型。" :
-          role === "distill" ? "跟随记忆归纳模型池，未配置时跟随对话。" : "未单独配置，跟随对话模型池。"),
-        h("div", { class: "model-actions" }, verified.length ? picker("", [{ value: "", label: "加入可用模型" }, ...verified], `${role} 加入可用模型`, add) : null,
-          available.length ? picker("", [{ value: "", label: "从全部目录选择" }, ...available], `${role} 新增模型`, add) : h("span", { class: "field-hint" }, "暂无其他可选模型。"))
+          role === "distill" ? "跟随记忆归纳模块，未配置时跟随对话。" : "未单独配置，跟随对话模块。"),
+        h("div", { class: "model-actions" },
+          available.length ? picker("", [{ value: "", label: "添加模型" }, ...available], `${role} 新增模型`, add)
+            : h("span", { class: "field-hint" }, "暂无其他可选模型，先去「提供商」添加待选模型。"))
       );
     }));
   }
-  // 模型页二级菜单：提供商与模型 / 角色模型池，用 tab 栏切换。
+  // 模型页二级菜单：提供商 / 模块模型，用 tab 栏切换。
   // 两个面板常驻 DOM（切 tab 只改 hidden），不挂载/卸载，
-  // 这样角色池里的控件始终能被找到，保存逻辑也不受 tab 影响。
-  const providersHint = h("span", { class: "field-hint" }, "获取列表不消耗 token；单模型探测会发送一次最小请求。目录和角色池的修改需保存后才生效。");
-  const rolesHint = h("span", { class: "field-hint" }, "优先级由上到下；遇到超时、限流或服务端故障时尝试下一项。轮询和随机策略改变每次调用的起点。");
+  // 这样模块里的控件始终能被找到，保存逻辑也不受 tab 影响。
+  const providersHint = h("span", { class: "field-hint" }, "提供商只管连接；下面的「待选模型」是你挑出来的候选，模块在「模块模型」里从候选里选。");
+  const rolesHint = h("span", { class: "field-hint" }, "每个模块单独选模型；顺序即优先级，排在最前的是首选。遇到超时、限流或服务端故障时尝试下一项。轮询和随机策略改变每次调用的起点。");
   const addProviderButton = addButton("添加提供商", () => {
     let n = providers.length + 1;
     while (providers.some(p => p.name === `provider-${n}`)) n++;
     providers.push({ name: `provider-${n}`, base_url: "", models: [] }); renderProviders(); markDirty();
   });
-  const addRoleInput = addText("添加自定义角色", "输入插件或模块的角色名", role => {
-    if (roles.has(role)) { toast("角色已存在", "error"); return false; }
+  const addRoleInput = addText("添加自定义模块", "输入插件或模块名", role => {
+    if (roles.has(role)) { toast("模块已存在", "error"); return false; }
     roles.add(role); renderRoles(); return true;
   });
   const providersSection = h("div", { class: "model-tab-panel", hidden: modelsTab !== "providers" },
@@ -3893,8 +3958,8 @@ function modelsEditor(draft, observations = {}, historyWarning = "") {
   return h("div", { class: "model-layer-editor" },
     h("div", { class: "model-actions" },
       h("div", { class: "segmented", role: "tablist", "aria-label": "模型配置" },
-        modelsTabButton("providers", "提供商与模型"),
-        modelsTabButton("roles", "角色模型池")),
+        modelsTabButton("providers", "提供商"),
+        modelsTabButton("roles", "模块模型")),
       dirtyNote),
     providersSection, rolesSection
   );
@@ -4384,7 +4449,7 @@ function settingsCardSpecs(draft, secrets, pluginsAvailable, observations, histo
     {
       path: "llm.providers",
       node: card("模型配置", {
-        hint: "从提供商目录组装跨接口的角色池",
+        hint: "从提供商的待选模型里为各模块组装模型",
         body: modelsEditor(draft, observations, historyWarning),
       }),
     },

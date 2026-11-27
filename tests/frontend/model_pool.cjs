@@ -69,7 +69,7 @@ test('改提供商名与上游模型名同步所有引用，防止删除引用�
   assert.equal(payload().llm.providers[0].name, 'main');
 });
 
-test('提供商、模型及自定义角色增删，密钥只提交用户填写的新值', async () => {
+test('提供商、模型及自定义模块增删，密钥只提交用户填写的新值', async () => {
   const {root, payload} = render();
   await named(root, '添加提供商').fire('click');
   const p = providers(root)[2];
@@ -78,10 +78,10 @@ test('提供商、模型及自定义角色增删，密钥只提交用户填写�
   await change(field(p, 'API Key'), '${NEW_TOKEN}', 'input');
   let add = named(p, '添加模型'); add.value = 'org/m'; await add.fire('keydown', {key: 'Enter'});
   assert.deepEqual(payload().llm.providers[2], {name: 'third', base_url: 'https://third.example/v1', models: ['org/m'], api_key: '${NEW_TOKEN}'});
-  add = named(root, '添加自定义角色'); add.value = 'plugin-x'; await add.fire('keydown', {key: 'Enter'});
+  add = named(root, '添加自定义模块'); add.value = 'plugin-x'; await add.fire('keydown', {key: 'Enter'});
   await change(named(root, 'plugin-x 新增模型'), key('third', 'org/m'));
   assert.deepEqual(payload().llm.role_pools['plugin-x'], [ref('third', 'org/m')]);
-  await named(root, '删除自定义角色 plugin-x').fire('click');
+  await named(root, '删除自定义模块 plugin-x').fire('click');
   await named(p, '删除此上游模型').fire('click');
   assert.deepEqual(payload().llm.providers[2].models, []);
   await named(p, '删除此提供商').fire('click');
@@ -114,7 +114,7 @@ test('非模型页保存不迁移模型配置，模型页保存不混入旧字�
   assert.throws(payload, /至少要选一个模型/);
 });
 
-test('目录预览分段并可搜索，勾选只改草稿；单模型调用失败不改变列表证据', async () => {
+test('从上游挑选只加勾中的，拉取不自动加进待选；单模型调用失败不改变列表证据', async () => {
   const {ui, root, payload} = render(), card = providers(root)[0];
   ui.run(`const diagnostics = [];
     api.post = async (path, body) => {
@@ -124,11 +124,13 @@ test('目录预览分段并可搜索，勾选只改草稿；单模型调用失�
         models:['shared', ...Array.from({length: 220}, (_, i) => 'test-' + i)]};
     }`);
   const rows = () => card.walk().filter(node => node.dataset.model);
+  const picks = () => card.walk().filter(node => node.dataset.pick);
   const shared = () => rows().find(node => node.dataset.model === 'shared');
   assert.equal(rows().length, 2);
   assert.match(card.textContent, /还没拉取过/);
-  await named(card, '获取模型').fire('click');
-  assert.equal(rows().length, 100);
+  await named(card, '从上游获取').fire('click');
+  // 挑选器打开：上游 221 个里已在待选的 shared 不再列出，分页只显示 100 个。
+  assert.equal(picks().length, 100);
   assert.deepEqual(payload().llm.providers[0].models, ['shared', 'org/vision']);
   assert.doesNotMatch(card.textContent, /null|undefined/);
   assert.match(rows()[1].textContent, /未在上游列表/);
@@ -136,15 +138,18 @@ test('目录预览分段并可搜索，勾选只改草稿；单模型调用失�
   assert.match(shared().textContent, /可用（上游列表）/);
   assert.match(shared().textContent, /HTTP 401/);
   assert.equal(shared().walk().filter(node => node.tagName === 'TIME').length, 2);
-  const search = named(card, '搜索模型');
+  const search = named(card, '搜索上游模型');
   await change(search, 'test-219', 'input');
-  assert.equal(rows().length, 1);
-  const check = named(card, '勾选 test-219');
+  assert.equal(picks().length, 1);
+  const check = named(card, '挑选 test-219');
   check.checked = true; await check.fire('change');
+  // 只勾不确认：待选还没变。
+  assert.ok(!payload().llm.providers[0].models.includes('test-219'));
+  await named(card, '确认添加').fire('click');
   assert.ok(payload().llm.providers[0].models.includes('test-219'));
+  assert.equal(rows().length, 3);
   assert.equal(named(card, '探测 test-219').getAttribute('disabled'), '');
-  await named(rows()[0], '加入角色池').fire('click');
-  await change(named(card, 'test-219 加入角色'), 'fast');
+  await change(named(root, 'fast 新增模型'), key('a', 'test-219'));
   assert.deepEqual(payload().llm.role_pools.fast, [ref('a', 'test-219')]);
   assert.deepEqual(JSON.parse(ui.run('JSON.stringify(diagnostics)')), [
     {path:'/api/models/discover',body:{provider:'a',refresh:false}},
