@@ -2295,7 +2295,7 @@ button {
   gap: 12px;
 }
 
-.model-tab-content {
+.model-tab-panel {
   display: grid;
   gap: 12px;
 }

@@ -3844,6 +3844,8 @@ function modelsEditor(draft, observations = {}, historyWarning = "") {
     }));
   }
   // 模型页二级菜单：提供商与模型 / 角色模型池，用 tab 栏切换。
+  // 两个面板常驻 DOM（切 tab 只改 hidden），不挂载/卸载，
+  // 这样角色池里的控件始终能被找到，保存逻辑也不受 tab 影响。
   const providersHint = h("span", { class: "field-hint" }, "获取列表不消耗 token；单模型探测会发送一次最小请求。目录和角色池的修改需保存后才生效。");
   const rolesHint = h("span", { class: "field-hint" }, "优先级由上到下；遇到超时、限流或服务端故障时尝试下一项。轮询和随机策略改变每次调用的起点。");
   const addProviderButton = addButton("添加提供商", () => {
@@ -3855,13 +3857,13 @@ function modelsEditor(draft, observations = {}, historyWarning = "") {
     if (roles.has(role)) { toast("角色已存在", "error"); return false; }
     roles.add(role); renderRoles(); return true;
   });
-  const tabContent = h("div", { class: "model-tab-content" });
+  const providersSection = h("div", { class: "model-tab-panel", hidden: modelsTab !== "providers" },
+    providersHint, providerHost, addProviderButton);
+  const rolesSection = h("div", { class: "model-tab-panel", hidden: modelsTab !== "roles" },
+    rolesHint, roleHost, addRoleInput);
   function renderTab() {
-    if (modelsTab === "roles") {
-      tabContent.replaceChildren(rolesHint, roleHost, addRoleInput);
-    } else {
-      tabContent.replaceChildren(providersHint, providerHost, addProviderButton);
-    }
+    providersSection.hidden = modelsTab !== "providers";
+    rolesSection.hidden = modelsTab !== "roles";
   }
   function modelsTabButton(value, label) {
     return h("button", {
@@ -3882,7 +3884,8 @@ function modelsEditor(draft, observations = {}, historyWarning = "") {
         });
         Motion.moveSelection(group, from);
         renderTab();
-        if (tabContent.isConnected) Motion.enter(tabContent, true);
+        const panel = modelsTab === "roles" ? rolesSection : providersSection;
+        if (panel.isConnected) Motion.enter(panel, true);
       },
     }, label);
   }
@@ -3893,7 +3896,7 @@ function modelsEditor(draft, observations = {}, historyWarning = "") {
         modelsTabButton("providers", "提供商与模型"),
         modelsTabButton("roles", "角色模型池")),
       dirtyNote),
-    tabContent
+    providersSection, rolesSection
   );
 }
 
