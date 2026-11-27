@@ -52,7 +52,9 @@ from __future__ import annotations
 import asyncio
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
+import json
 import logging
+import os
 import sqlite3
 import time
 from functools import lru_cache
@@ -77,6 +79,7 @@ from ..persona import (
     Persona,
     load_persona,
     load_persona_parts,
+    load_reply_examples,
     personafile_path,
 )
 from ..plugins.loader import PluginReloadError
@@ -475,6 +478,71 @@ def _apply_persona(state: WebState, text: str, *, name: str = "persona") -> dict
             if applied
             else "人格文件已保存。当前没有运行中的 bot，下次启动生效。"
         ),
+    }
+
+
+# ----------------------------------------------------------------------
+# 说话例子（reply_examples.json）：分条管理
+# ----------------------------------------------------------------------
+# 例子是 JSON 字符串数组；bot 每次拼系统提示词时都现读文件，所以改完
+# 下一条回复就生效，无需重启、不用热加载人格。
+_EXAMPLE_MAX_LEN = 2000
+_EXAMPLES_READ_LIMIT = 10000
+
+
+def _examples_path(state: WebState) -> Path:
+    return Path(state.config.persona_examples_path)
+
+
+def _normalize_example(value: Any) -> str:
+    """与 load_reply_examples 的归一化一致：压空白。"""
+    return " ".join(str(value or "").split())
+
+
+def _read_examples(state: WebState) -> list[str]:
+    """读出全部例子；文件缺失/损坏返回空列表。"""
+    return load_reply_examples(_examples_path(state), limit=_EXAMPLES_READ_LIMIT)
+
+
+def _save_examples(state: WebState, examples: list[str]) -> None:
+    """原子写回例子文件：先写临时文件再 rename，避免半截 JSON。"""
+    path = _examples_path(state)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    tmp.write_text(
+        json.dumps(examples, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    os.replace(tmp, path)
+
+
+def _require_example_text(value: Any) -> str:
+    text = _normalize_example(value)
+    if not text:
+        raise ApiError(422, "例子内容不能为空")
+    if len(text) > _EXAMPLE_MAX_LEN:
+        raise ApiError(422, f"例子太长（最多 {_EXAMPLE_MAX_LEN} 字）")
+    return text
+
+
+def _check_example_index(examples: list[str], index: int) -> None:
+    if index < 0 or index >= len(examples):
+        raise ApiError(404, f"没有第 {index + 1} 条例子")
+
+
+def _examples_payload(state: WebState) -> dict[str, Any]:
+    """例子列表 + 生效配置；每次改动后返回，供前端直接刷新。"""
+    examples = _read_examples(state)
+    count = state.config.persona_examples_count
+    enabled = state.config.persona_examples_enabled
+    return {
+        "ok": True,
+        "path": str(_examples_path(state)),
+        "enabled": enabled,
+        "count": count,
+        "position": state.config.persona_examples_position,
+        "total": len(examples),
+        "active": min(count, len(examples)) if enabled else 0,
+        "examples": examples,
     }
 
 
@@ -1627,6 +1695,78 @@ def create_app(state: WebState):
             "stage": stage,
             "source": "bot" if state.bot_persona() is not None else "file",
         }
+
+    # ------------------------------------------------------------------
+    # 说话例子：分条增删改 + 生效数开关
+    # ------------------------------------------------------------------
+    # 例子文件每次拼提示词时现读，改完下一条 bot 回复就生效，无需重启。
+    # 生效数 / 启用开关走结构化配置保存，同样热生效（见 restart_fields）。
+
+    @app.get("/api/persona/examples")
+    async def get_persona_examples(request: Request):
+        require_session(request)
+        return _examples_payload(state)
+
+    @app.post("/api/persona/examples")
+    async def add_persona_example(request: Request):
+        require_session(request)
+        body = await _json_body(request)
+        text = _require_example_text(body.get("text"))
+        examples = _read_examples(state)
+        if text in examples:
+            raise ApiError(422, "这条例子已经存在")
+        examples.append(text)
+        _save_examples(state, examples)
+        logger.info("WebUI 新增说话例子（共 %d 条）", len(examples))
+        return _examples_payload(state)
+
+    @app.put("/api/persona/examples/settings")
+    async def update_persona_examples_settings(request: Request):
+        require_session(request)
+        body = await _json_body(request)
+        update: dict[str, Any] = {}
+        for key in body:
+            if key not in ("count", "enabled"):
+                raise ApiError(422, f"未知的设置字段：{key}")
+        if "count" in body:
+            count = body.get("count")
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise ApiError(422, "生效条数应为不小于 0 的整数")
+            update["examples_count"] = count
+        if "enabled" in body:
+            enabled = body.get("enabled")
+            if not isinstance(enabled, bool):
+                raise ApiError(422, "启用开关应为 true 或 false")
+            update["examples_enabled"] = enabled
+        if not update:
+            raise ApiError(422, "请提供 count 或 enabled")
+        result = await _save_structured_config(state, {"persona": update})
+        logger.info("WebUI 修改说话例子设置：%s", update)
+        return {**result, "examples": _examples_payload(state)}
+
+    @app.put("/api/persona/examples/{index}")
+    async def update_persona_example(index: int, request: Request):
+        require_session(request)
+        body = await _json_body(request)
+        text = _require_example_text(body.get("text"))
+        examples = _read_examples(state)
+        _check_example_index(examples, index)
+        if text in examples and examples[index] != text:
+            raise ApiError(422, "这条例子已经存在")
+        examples[index] = text
+        _save_examples(state, examples)
+        logger.info("WebUI 修改第 %d 条说话例子", index + 1)
+        return _examples_payload(state)
+
+    @app.delete("/api/persona/examples/{index}")
+    async def delete_persona_example(index: int, request: Request):
+        require_session(request)
+        examples = _read_examples(state)
+        _check_example_index(examples, index)
+        del examples[index]
+        _save_examples(state, examples)
+        logger.info("WebUI 删除第 %d 条说话例子（剩余 %d 条）", index + 1, len(examples))
+        return _examples_payload(state)
 
     # ------------------------------------------------------------------
     # 静态页

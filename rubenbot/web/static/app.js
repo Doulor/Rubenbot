@@ -1217,6 +1217,173 @@ async function renderLegacyPersona(view, param, entry) {
 }
 
 /**
+ * 说话例子：分条增删改 + 生效设置。例子文件每次拼提示词时现读，
+ * 改完下一条 bot 回复就生效，无需重启。
+ */
+async function examplesNodes() {
+  const body = h("div", { class: "examples-body" });
+  const refreshButton = h("button", { class: "btn btn-sm", type: "button" }, icon("refresh"), "刷新");
+  const examplesCard = card("说话例子", {
+    hint: "改完下一条回复就生效，无需重启",
+    actions: [refreshButton],
+    body,
+  });
+
+  const render = (data) => {
+    const enabledBox = h("input", {
+      type: "checkbox",
+      checked: data.enabled,
+      "aria-label": "启用说话例子",
+    });
+    const countInput = h("input", {
+      type: "number",
+      class: "input examples-count",
+      min: "0",
+      step: "1",
+      value: String(data.count),
+      "aria-label": "生效条数",
+    });
+    const saveSettings = h("button", { class: "btn btn-sm", type: "button" }, "保存设置");
+    saveSettings.addEventListener("click", async () => {
+      const count = Number(countInput.value);
+      if (!Number.isInteger(count) || count < 0) {
+        toast("生效条数应为不小于 0 的整数", "error");
+        countInput.focus();
+        return;
+      }
+      saveSettings.disabled = true;
+      try {
+        const result = await api.put("/api/persona/examples/settings", {
+          count,
+          enabled: enabledBox.checked,
+        });
+        render(result.examples);
+        toast("设置已保存，下一条回复就生效");
+      } catch (err) {
+        if (err instanceof Unauthorized) return;
+        toast(err.message || "保存设置失败", "error");
+      } finally {
+        saveSettings.disabled = false;
+      }
+    });
+    const settings = h(
+      "div",
+      { class: "examples-settings" },
+      h("span", { class: "muted", style: { fontSize: "12.5px" } },
+        `共 ${data.total} 条，前 ${data.active} 条生效${data.enabled ? "" : "（已停用）"}`),
+      h("label", {}, enabledBox, "启用"),
+      h("label", {}, "生效条数", countInput),
+      saveSettings
+    );
+
+    const rows = data.examples.map((text, index) => {
+      const input = h("textarea", {
+        class: "textarea example-text",
+        rows: "2",
+        value: text,
+        "aria-label": `第 ${index + 1} 条例子`,
+        spellcheck: "false",
+      });
+      const save = h("button", { class: "btn btn-sm", type: "button", disabled: true }, "保存");
+      const del = h("button", { class: "btn btn-sm btn-danger", type: "button" }, icon("trash"), "删除");
+      input.addEventListener("input", () => {
+        save.disabled = input.value === text;
+      });
+      save.addEventListener("click", async () => {
+        if (!input.value.trim()) {
+          toast("例子内容不能为空", "error");
+          input.focus();
+          return;
+        }
+        save.disabled = true;
+        try {
+          render(await api.put(`/api/persona/examples/${index}`, { text: input.value }));
+          toast(`第 ${index + 1} 条例子已保存`);
+        } catch (err) {
+          if (err instanceof Unauthorized) return;
+          toast(err.message || "保存失败", "error");
+          save.disabled = false;
+        }
+      });
+      del.addEventListener("click", () => {
+        confirmDialog({
+          title: "删除这条例子？",
+          message: `第 ${index + 1} 条例子删掉后就不再放进提示词，之后可以重新新增。`,
+          confirmText: "删除",
+          danger: true,
+          onConfirm: async () => {
+            try {
+              render(await api.del(`/api/persona/examples/${index}`));
+              toast("已删除");
+            } catch (err) {
+              if (err instanceof Unauthorized) return;
+              toast(err.message || "删除失败", "error");
+            }
+          },
+        });
+      });
+      return h(
+        "div",
+        { class: "example-row" },
+        h("span", { class: "example-num" }, String(index + 1)),
+        input,
+        h("div", { class: "example-actions" }, save, del)
+      );
+    });
+
+    const newInput = h("textarea", {
+      class: "textarea",
+      rows: "2",
+      placeholder: "新增一条例子，例如：情境：…… Ruben：……",
+      "aria-label": "新增例子",
+      spellcheck: "false",
+    });
+    const addButton = h("button", { class: "btn btn-primary", type: "button" }, icon("plus"), "新增例子");
+    addButton.addEventListener("click", async () => {
+      if (!newInput.value.trim()) {
+        toast("先写一条例子内容", "error");
+        newInput.focus();
+        return;
+      }
+      addButton.disabled = true;
+      try {
+        render(await api.post("/api/persona/examples", { text: newInput.value }));
+        toast("已新增例子，下一条回复就生效");
+      } catch (err) {
+        if (err instanceof Unauthorized) return;
+        toast(err.message || "新增失败", "error");
+      } finally {
+        addButton.disabled = false;
+      }
+    });
+
+    body.replaceChildren(
+      settings,
+      data.total === 0
+        ? h("p", { class: "muted", style: { margin: "0 0 12px", fontSize: "12.5px" } }, "还没有例子，在下面新增一条。")
+        : null,
+      ...rows,
+      h("div", { class: "example-add" }, newInput, addButton)
+    );
+  };
+
+  const reload = async () => {
+    try {
+      render(await api.get("/api/persona/examples"));
+    } catch (err) {
+      if (err instanceof Unauthorized) return;
+      body.replaceChildren(
+        h("p", { class: "muted", style: { margin: 0, fontSize: "12.5px" } }, "例子列表读取失败，点右上角刷新重试。")
+      );
+      toast(err.message || "读取例子失败", "error");
+    }
+  };
+  refreshButton.addEventListener("click", reload);
+  await reload();
+  return examplesCard;
+}
+
+/**
  * 人设编辑器的全部节点。人设页已搬进「机器人」选项卡做人设二级页，
  * 但编辑器本身（保存、.bak 备份、热重载、只读预览）保持原样。
  */
@@ -1485,9 +1652,10 @@ async function personaNodes() {
     }
   };
   renderEffective(data, initialPreview);
+  const examplesCard = await examplesNodes();
 
   // 切到别的页时由 renderRoute / 二级菜单统一清掉脏标记与 beforeunload 提醒
-  return [editCard, h("div", { class: "grid grid-2" }, effectiveCard, previewCard)];
+  return [editCard, examplesCard, h("div", { class: "grid grid-2" }, effectiveCard, previewCard)];
 }
 
 /* ------------------------------------------------------------------ */

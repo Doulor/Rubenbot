@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
@@ -1006,6 +1007,91 @@ def test_persona_examples_startup_and_hot_reload(tmp_path):
     finally:
         asyncio.run(llm.close())
         store.close()
+
+
+def test_persona_examples_crud(client, config, tmp_path):
+    examples_path = tmp_path / "reply_examples.json"
+    config.persona_examples_path = str(examples_path)
+
+    # 文件还不存在时返回空列表，不报错也不建文件
+    data = client.get("/api/persona/examples").json()
+    assert data["total"] == 0
+    assert data["active"] == 0
+    assert data["examples"] == []
+    assert data["enabled"] is True
+    assert data["count"] == 5
+    assert not examples_path.exists()
+
+    # 新增：去首尾空白后落盘，加载器按 limit 5 和 10 都能读
+    added = client.post("/api/persona/examples", json={"text": "  情境：A Ruben：你好  "}).json()
+    assert added["total"] == 1
+    assert added["active"] == 1
+    assert added["examples"] == ["情境：A Ruben：你好"]
+    assert json.loads(examples_path.read_text(encoding="utf-8")) == ["情境：A Ruben：你好"]
+    from rubenbot.persona import load_reply_examples
+
+    assert load_reply_examples(examples_path, limit=5) == ["情境：A Ruben：你好"]
+    assert load_reply_examples(examples_path, limit=10) == ["情境：A Ruben：你好"]
+
+    # 重复与空内容被拒，文件不动
+    assert client.post("/api/persona/examples", json={"text": "情境：A Ruben：你好"}).status_code == 422
+    for bad in ({"text": ""}, {"text": "   "}, {}):
+        assert client.post("/api/persona/examples", json=bad).status_code == 422
+    assert json.loads(examples_path.read_text(encoding="utf-8")) == ["情境：A Ruben：你好"]
+
+    # 再加两条：改第二条、删第一条
+    client.post("/api/persona/examples", json={"text": "第二条"}).raise_for_status()
+    client.post("/api/persona/examples", json={"text": "第三条"}).raise_for_status()
+    updated = client.put("/api/persona/examples/1", json={"text": "第二条·改"}).json()
+    assert updated["examples"] == ["情境：A Ruben：你好", "第二条·改", "第三条"]
+    assert client.put("/api/persona/examples/1", json={"text": "第三条"}).status_code == 422
+    assert client.put("/api/persona/examples/3", json={"text": "x"}).status_code == 404
+    assert client.put("/api/persona/examples/-1", json={"text": "x"}).status_code == 404
+    deleted = client.delete("/api/persona/examples/0").json()
+    assert deleted["examples"] == ["第二条·改", "第三条"]
+    assert client.delete("/api/persona/examples/2").status_code == 404
+    assert load_reply_examples(examples_path, limit=10) == ["第二条·改", "第三条"]
+
+
+def test_persona_examples_settings(client, config, tmp_path, config_path):
+    examples_path = tmp_path / "reply_examples.json"
+    examples_path.write_text('["一条", "两条", "三条"]', encoding="utf-8")
+    config.persona_examples_path = str(examples_path)
+    # 配置原文里也要有同样的路径，否则结构化保存合并后会回到默认路径
+    config_path.write_text(
+        f"persona:\n  path: {config.persona_path}\n  examples_path: {examples_path}\n",
+        encoding="utf-8",
+    )
+
+    data = client.get("/api/persona/examples").json()
+    assert data["total"] == 3
+    assert data["active"] == 3  # count 默认 5，大于总数
+
+    # 生效数改成 1：热生效，不用重启
+    result = client.put("/api/persona/examples/settings", json={"count": 1}).json()
+    assert result["requires_restart"] == []
+    assert result["examples"]["count"] == 1
+    assert result["examples"]["active"] == 1
+    assert result["examples"]["total"] == 3
+    assert Config.load(config_path).persona_examples_count == 1
+
+    # 停用：active 归零，列表本身不动
+    result = client.put("/api/persona/examples/settings", json={"enabled": False}).json()
+    assert result["examples"]["enabled"] is False
+    assert result["examples"]["active"] == 0
+    assert result["examples"]["total"] == 3
+
+    # 非法输入
+    for bad in ({"count": -1}, {"count": "3"}, {"count": 1.5}, {"enabled": "yes"}, {"foo": 1}, {}):
+        assert client.put("/api/persona/examples/settings", json=bad).status_code == 422, bad
+
+
+def test_persona_examples_require_login(locked_client):
+    assert locked_client.get("/api/persona/examples").status_code == 401
+    assert locked_client.post("/api/persona/examples", json={"text": "x"}).status_code == 401
+    assert locked_client.put("/api/persona/examples/0", json={"text": "x"}).status_code == 401
+    assert locked_client.delete("/api/persona/examples/0").status_code == 401
+    assert locked_client.put("/api/persona/examples/settings", json={"count": 1}).status_code == 401
 
 
 def test_persona_hot_reload_into_running_bot(config, store):

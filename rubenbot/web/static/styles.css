@@ -2627,6 +2627,69 @@ button {
   overflow-wrap: anywhere;
 }
 
+/* 说话例子：分条编辑 */
+.examples-settings {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 14px;
+  margin-bottom: 12px;
+}
+
+.examples-settings label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.examples-count {
+  width: 76px;
+}
+
+.example-row {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  margin-bottom: 8px;
+}
+
+.example-num {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  margin-top: 9px;
+  border-radius: 999px;
+  background: var(--surface-sunk);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 22px;
+  text-align: center;
+}
+
+.example-text {
+  flex: 1;
+  min-height: 54px;
+}
+
+.example-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.example-add {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  margin-top: 12px;
+}
+
+.example-add .textarea {
+  flex: 1;
+  min-height: 54px;
+}
+
 /* ---------------- 登录 ---------------- */
 
 .login {
