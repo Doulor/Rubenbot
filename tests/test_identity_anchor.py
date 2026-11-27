@@ -32,7 +32,7 @@ def test_model_discussion_and_owner_mention(config, store):
     stage1 = llm.calls[0]["messages"]
     assert cfg_persona.file_text("identity").strip() not in stage1[0]["content"]
     state = stage1[-1]["content"].split("【自身状态】")[1]
-    assert all(s in state for s in ("我叫 Ruben", "赛博生命", "多萝把我部署", "本群的一名群友", "offline-backend"))
+    assert all(s in state for s in ("我叫 Ruben", "赛博生命", "多萝把你部署起来", "本群的一名群友", "offline-backend"))
     assert "Argon" not in state and "Claude" not in state and config.llm.api_key not in state
     receive("小猪，这回听懂了没", mentioned=True)
     assert adapter.texts == ["你又逗我"]

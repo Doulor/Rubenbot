@@ -13,9 +13,9 @@ def test_shipped_draft_keeps_help_and_evidence_in_both_stages():
     assert persona.multi_file and persona.name == "Ruben"
     for stage in ("planner", "generator"):
         prompt = persona.system_prompt(stage=stage)
-        assert "慢热" in prompt and "朋友" in prompt
-        assert "拿不准就去查" in prompt and "还不知道" in prompt
-        assert "我的看法要是不同" in prompt
+        assert "慢热" in prompt and "群友" in prompt
+        assert "拿不准的公开事实去找原文" in prompt and "还没查到" in prompt
         assert "多萝本人在私聊" not in prompt
     assert "群友亲口讲" in persona.system_prompt(stage="planner")
-    assert "原文里有用的地方" in persona.system_prompt(stage="generator")
+    assert "查到的能说出根据" in persona.system_prompt(stage="generator")
+    assert "观点不同" in persona.system_prompt(stage="generator")
