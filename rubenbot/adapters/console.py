@@ -11,6 +11,7 @@ bot 的回复打印到 stdout，以 ``Ruben:`` 开头。
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import sys
 from typing import Any, TextIO
@@ -29,6 +30,8 @@ from .base import (
 
 _LINE_RE = re.compile(r"^\[(?P<chat>[^\]]+)\]\s*(?P<text>.*)$")
 _GROUP_USER_RE = re.compile(r"^(?P<chat>[^|\]]+)\|(?P<name>[^|\]]+)$")
+
+logger = logging.getLogger(__name__)
 
 
 class ConsoleAdapter(BaseAdapter):
@@ -73,7 +76,12 @@ class ConsoleAdapter(BaseAdapter):
         while not self._stop.is_set():
             line = await loop.run_in_executor(None, self.stdin.readline)
             if not line:
-                break
+                # stdin 已关闭（nohup/systemd/docker 下从一开始就关着）：
+                # 不能直接返回，否则 core 的 gather 会认为适配器全部结束而
+                # 关停整个 bot。挂起等待 stop()，WebUI 与其他适配器继续工作。
+                logger.info("console stdin 已关闭，适配器进入待命（不再接收输入，bot 继续运行）")
+                await self._stop.wait()
+                return
             await self.feed_line(line.rstrip("\n"))
             if self._stop.is_set():
                 break
