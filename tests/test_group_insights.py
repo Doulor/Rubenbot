@@ -409,9 +409,9 @@ def test_cache_survives_corrupt_file(tmp_path):
 # ----------------------------------------------------------------------
 
 
-def make_store() -> MemoryStore:
+def make_store(now: float | None = None) -> MemoryStore:
     store = MemoryStore(":memory:")
-    now = time.time()
+    now = time.time() if now is None else now
     store.add_raw_message(
         platform="recording", chat_id="g1", sender_id="u1", text="今天吃什么", sender_name="阿花", ts=now - 300
     )
@@ -435,10 +435,14 @@ def run(coro):
 
 
 def test_stats_reply_aggregates_today(tmp_path):
-    store = make_store()
+    # 用固定正午时钟：消息在 now-300，若用真实时间、测试恰在 00:00–00:05 跑，
+    # 消息会落到昨天午夜前，今日窗口为空（午夜边界抖动）。
+    local = time.localtime()
+    noon = time.mktime((local.tm_year, local.tm_mon, local.tm_mday, 12, 0, 0, 0, 0, -1))
+    store = make_store(now=noon)
     store.add_raw_message(platform='recording', chat_type='private', chat_id='g1',
                           sender_id='u3', sender_name='私聊访客', text='不计入群发言榜')
-    insights = make_insights(tmp_path, store=store)
+    insights = make_insights(tmp_path, store=store, clock=lambda: noon)
     text = insights.stats_reply(group_event(), window_days=1)
     assert "今日发言榜" in text
     assert "共 4 条" in text  # bot 自己的不计
