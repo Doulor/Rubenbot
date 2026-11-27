@@ -298,7 +298,7 @@ llm:
 
 旧 `llm.base_url`、`api_key`、`chat_model` 等字段及 `models: {角色: 名称或列表}` 无需手动修改；加载不会改写文件。WebUI 把旧端点展示为 `default`，保存三层配置时再写入新格式。提供商地址和密钥支持 `${ENV_VAR}`；目录名称、上游模型名和池引用按字面读取。同名同地址时，密钥框留空保留原值，点「清除密钥」才会清空；改名或换端点不会继承旧密钥。
 
-只想本地试玩时，把 `adapters.snowluma` 整段注释掉，只保留：
+只想本地试玩时，把 `config.yaml` 里的 `adapters:` 整段删掉，换成下面这段（直接复制粘贴，不用逐行注释 `config.example.yaml` 里 snowluma 那 60 行，含 `capabilities:` 子项，注漏一行就会 YAML 报错）：
 
 ```yaml
 adapters:
