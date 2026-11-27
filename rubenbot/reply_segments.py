@@ -1,4 +1,4 @@
-"""回复分段：换行优先，长解释只在完整句界拆开，不在半句话里随机断开。"""
+"""回复分段：换行优先，长解释只在完整句界拆开，不在半句话里随机断开；两个汉字之间的空格也算一个切点。"""
 
 from __future__ import annotations
 
@@ -8,8 +8,18 @@ from collections.abc import Iterator
 
 # 成对符号：开 -> 关（ASCII 引号开闭同型）
 _BRACKET_PAIRS = {
-    "（": "）", "(": ")", "「": "」", "『": "』", "【": "】", "《": "》", "〈": "〉",
-    "[": "]", "{": "}", "“": "”", "‘": "’", '"': '"',
+    "（": "）",
+    "(": ")",
+    "「": "」",
+    "『": "』",
+    "【": "】",
+    "《": "》",
+    "〈": "〉",
+    "[": "]",
+    "{": "}",
+    "“": "”",
+    "‘": "’",
+    '"': '"',
 }
 _URL_RE = re.compile(r"https?://[^\s<>\"'（）()【】「」『』，。！？；：、]+", re.IGNORECASE)
 _SENTENCE_ENDS = frozenset("。！？!?…~～")
@@ -17,6 +27,11 @@ _CONTINUATIONS = "，,；;、"
 _DROP_ONLY = frozenset("，,。；;、：:！？!?…~～.．-—()（）[]【】「」『』\"'“”‘’ \t\n\r　")
 _SEPARATOR_ONLY = "，,。；;、：:.． \t\n\r　"
 _SHORT_REPLY_CHARS = 35
+
+
+def _is_cjk(char: str) -> bool:
+    """常用汉字（CJK 统一表意文字主区）。"""
+    return "\u4e00" <= char <= "\u9fff"
 
 
 def _find_closing(text: str, start: int, open_char: str, close_char: str) -> int:
@@ -55,6 +70,12 @@ def _boundaries(text: str, *, sentences: bool) -> Iterator[int]:
             while index < len(text) and text[index] in _SENTENCE_ENDS:
                 index += 1
             yield index
+        elif char in " 　":
+            # 只有夹在两个汉字之间的空格才切：英文、数字、标点旁边的空格不动。
+            prev = text[index - 2] if index >= 2 else ""
+            nxt = text[index] if index < len(text) else ""
+            if prev and _is_cjk(prev) and nxt and _is_cjk(nxt):
+                yield index
 
 
 def _cut(text: str, *, sentences: bool) -> Iterator[str]:
@@ -81,7 +102,7 @@ def _finish(text: str) -> str:
         end -= 1
     for match in _URL_RE.finditer(text):
         if match.end() > end:
-            return text[:match.end()] + "。"
+            return text[: match.end()] + "。"
     return text[:end]
 
 
@@ -107,9 +128,15 @@ def split_segments(
             continue
         if parts and parts[-1][-1] in _CONTINUATIONS:
             # URL 可以合法地以 ASCII 逗号/分号结尾，不把下一行粘进地址。
-            joiner = " " if parts[-1][-1].isascii() and (
-                line[0].isascii() or any(m.end() == len(parts[-1]) for m in _URL_RE.finditer(parts[-1]))
-            ) else ""
+            joiner = (
+                " "
+                if parts[-1][-1].isascii()
+                and (
+                    line[0].isascii()
+                    or any(m.end() == len(parts[-1]) for m in _URL_RE.finditer(parts[-1]))
+                )
+                else ""
+            )
             parts[-1] += joiner + line
         else:
             parts.append(line)

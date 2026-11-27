@@ -81,10 +81,26 @@ def test_short_reply_stays_one_segment():
 
 @pytest.mark.parametrize("mark", list("，,；;、"))
 def test_clause_boundaries_are_not_message_boundaries(mark):
-    sentence = f"还在调呢{mark}等把最后 两项设置核对完{mark}就可以请大家再试一次了。"
+    sentence = f"还在调呢{mark}等把最后两项设置核对完{mark}就可以请大家再试一次了。"
     assert split_segments(sentence, rng=random.Random(1)) == [sentence]
     wrapped = sentence.replace(mark, mark + "\n")
     assert split_segments(wrapped + "\n辛苦了！") == [sentence, "辛苦了！"]
+
+
+def test_space_between_two_cjk_chars_is_a_boundary():
+    assert split_segments("今天天气很好 我们去跑步吧", rng=random.Random(0)) == [
+        "今天天气很好",
+        "我们去跑步吧",
+    ]
+    assert split_segments("你好 世界", rng=random.Random(0)) == ["你好", "世界"]
+    # 全角空格也一样
+    assert split_segments("今天天气很好　我们去跑步吧", rng=random.Random(0)) == [
+        "今天天气很好",
+        "我们去跑步吧",
+    ]
+    # 数字、标点旁边的空格不动
+    assert split_segments("第 1 名是你", rng=random.Random(0)) == ["第 1 名是你"]
+    assert split_segments("你好， 世界", rng=random.Random(0)) == ["你好， 世界"]
 
 
 @pytest.mark.parametrize("limit", [1, 2, 3])
@@ -95,7 +111,11 @@ def test_dangling_final_separator_without_continuation(limit):
 
 def test_store_region_explanation_groups_sentences(config, store):
     conclusion = "先看商店地区，不用急着换账号。"
-    facts = ["开发者可以选择上架地区。", "商店按账号地区展示应用。", "改系统语言，不会改变商店地区。"]
+    facts = [
+        "开发者可以选择上架地区。",
+        "商店按账号地区展示应用。",
+        "改系统语言，不会改变商店地区。",
+    ]
     draft = conclusion + "".join(facts)
     bot, adapter = make_bot(config, store, ScriptedLLM({"chat": [draft]}))
     asyncio.run(bot.handle_event(private_event("为什么搜不到外区的 App？")))
@@ -218,8 +238,14 @@ def test_reply_config_defaults():
 
 def test_reply_config_from_raw():
     reply = Config.from_raw(
-        {"reply": {"max_segments": 4, "segment_delay_enabled": False,
-                   "segment_delay_per_char_ms": 40, "segment_delay_max_ms": 900}}
+        {
+            "reply": {
+                "max_segments": 4,
+                "segment_delay_enabled": False,
+                "segment_delay_per_char_ms": 40,
+                "segment_delay_max_ms": 900,
+            }
+        }
     ).reply
     assert reply.max_segments == 4
     assert reply.segment_delay_enabled is False
@@ -243,7 +269,9 @@ def test_shipped_config_example_matches_defaults():
 def test_webui_validate_reply():
     from rubenbot.web.config_schema import ConfigValidationError, validate_structured
 
-    update = validate_structured({"reply": {"max_segments": "2", "segment_delay_per_char_ms": "50"}})
+    update = validate_structured(
+        {"reply": {"max_segments": "2", "segment_delay_per_char_ms": "50"}}
+    )
     assert update["reply"]["max_segments"] == 2
     assert update["reply"]["segment_delay_per_char_ms"] == 50.0
     with pytest.raises(ConfigValidationError) as info:
