@@ -1,4 +1,4 @@
-/* 插件详情页：介绍 / 版本 / 作者 / 权限 / 触发方式 / 配置说明 / 启用状态。
+/* 插件详情页：介绍 / 版本 / 作者 / 权限 / 触发方式 / 启用状态。
  *
  * 单独成文件，不改 app.js 里的既有函数；app.js 的统一插件页（#/plugins/<id>/detail）
  * 把详情内容交给这里的 renderPluginDetailContent，左侧插件列表与「配置 | 详情」
@@ -115,38 +115,7 @@ function pluginDetailTriggers(data) {
     : h("p", { class: "field-hint" }, "该插件没有声明触发方式（以 plugin.py 实际注册为准）。");
 }
 
-/** 配置说明：字段、类型、默认值、范围 / 可选值与用途。 */
-function pluginDetailSchemaDocs(docs) {
-  if (!docs || !docs.length) {
-    return h("p", { class: "field-hint" }, "该插件没有声明配置项。");
-  }
-  return h(
-    "ul",
-    { class: "perm-list schema-docs" },
-    ...docs.map((doc) => {
-      const meta = [
-        doc.type_label,
-        doc.range ? `范围 ${doc.range}` : null,
-        doc.options && doc.options.length
-          ? `可选：${doc.options.map((option) => option.label || option.value).join(" / ")}`
-          : null,
-      ].filter(Boolean);
-      return h(
-        "li",
-        {},
-        h("strong", {}, doc.label || doc.key),
-        h(
-          "span",
-          {},
-          h("span", {}, doc.description || "（没有写说明）"),
-          h("span", { class: "field-hint" }, `${meta.join(" · ")} · 默认 ${doc.secret ? "已设置" : detailValueText(doc.default)}`)
-        )
-      );
-    })
-  );
-}
-
-/** 详情页主体：标题、元信息、介绍、触发、权限与配置说明。配置表单不在这里，改配置去上方的「配置」子 tab。 */
+/** 详情页主体：标题、元信息、介绍、触发与权限。配置相关的东西都不在这里，改配置去上方的「配置」子 tab。 */
 function pluginDetailBody(data) {
   const idOf = encodeURIComponent(data.id || data.plugin_name || "");
   const chips = pluginDetailTags(data);
@@ -252,11 +221,10 @@ function pluginDetailBody(data) {
       ),
     }
   );
-  const docs = card("配置说明", { body: pluginDetailSchemaDocs(data.schema_docs) });
-
-  // 详情页只做详情：介绍、触发、权限、配置说明，外加插件自己的动态管理区
-  //（比如 RSS 的订阅列表）。配置表单不在这里放，改配置去上方的「配置」子 tab。
-  return [overview, h("div", { class: "grid grid-2" }, intro, triggers), h("div", { class: "grid grid-2" }, permissions, docs)];
+  // 详情页只做详情：介绍、触发、权限，外加插件自己的动态管理区
+  //（比如 RSS 的订阅列表）。配置相关的东西（表单和配置说明）都不在这里，
+  //改配置、看字段说明都去上方的「配置」子 tab。
+  return [overview, h("div", { class: "grid grid-2" }, intro, triggers), permissions];
 }
 
 /** RSS 插件专属：按订阅源分组的订阅管理（新增表单 + 提醒前缀 + 删除）。 */

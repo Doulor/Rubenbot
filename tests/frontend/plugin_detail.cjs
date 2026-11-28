@@ -105,10 +105,10 @@ function setup({ detail = detailPayload(), market } = {}) {
   return { root, run, route, node };
 }
 
-test('详情页渲染介绍、版本、作者、权限、触发方式、配置说明与启用状态', async () => {
+test('详情页渲染介绍、版本、作者、权限、触发方式与启用状态', async () => {
   const { root, route, node } = setup();
   await route('#/plugins/music/detail');
-  for (const fact of ['点歌', 'v1.1.0', 'RubenBot', '已安装 · 未启用', '读消息', '定时任务', '高危', '「点歌 <歌名>」', '冷却（秒）', '触发词']) {
+  for (const fact of ['点歌', 'v1.1.0', 'RubenBot', '已安装 · 未启用', '读消息', '定时任务', '高危', '「点歌 <歌名>」']) {
     assert.match(root.textContent, new RegExp(fact.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')),
       `缺少：${fact}。实际：${root.textContent.slice(0, 800)}`);
   }
@@ -119,9 +119,9 @@ test('详情页渲染介绍、版本、作者、权限、触发方式、配置�
   // 详情菜单列出其它插件，可切换
   const link = node('A', (n) => n.textContent === '朴素插件');
   assert.equal(link.getAttribute('href'), '#/plugins/plain/detail');
-  // 配置说明给出类型、范围、默认值
-  assert.match(root.textContent, /字符串列表/);
-  assert.match(root.textContent, /范围 0 – 86400/);
+  // 详情页里没有任何配置内容：没有配置表单，也没有「配置说明」卡片
+  assert.equal(root.textContent.includes('配置说明'), false);
+  assert.equal(root.walk().some((n) => n.tagName === 'FORM'), false);
 });
 
 test('缺 schema 的插件不崩：详情照常渲染，详情页里没有配置表单', async () => {
