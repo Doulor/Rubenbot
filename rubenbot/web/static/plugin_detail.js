@@ -168,7 +168,189 @@ function pluginDetailSchemaDocs(docs) {
   );
 }
 
-/** 详情页主体：标题、元信息、介绍、触发、权限与配置说明。静态配置不在这里改，去「插件配置」页。 */
+/** 单个 schema 控件的包装：kind 决定事件与回读时怎么写值。 */
+function schemaFieldControl(spec, value, onChange, secretSet) {
+  const kind = String(spec.type || "string");
+  const label = spec.label || spec.description || spec.key;
+  const options = Array.isArray(spec.options) ? spec.options : [];
+  if (kind === "bool") {
+    return { kind: "switch", node: switchField(Boolean(value), onChange, { label }) };
+  }
+  if (kind === "int" || kind === "number") {
+    return {
+      kind: "input",
+      node: numberField(value, (next) => onChange(next === "" ? "" : Number(next)), {
+        step: spec.step === undefined || spec.step === null ? (kind === "int" ? 1 : "any") : spec.step,
+        min: spec.min,
+        max: spec.max,
+      }),
+    };
+  }
+  if (kind === "list") {
+    // 标签组的增删状态在闭包里：保存后若服务端归一了列表（去空项、去重），
+    // 需要整组重建才能和回读值一致
+    const holder = h("div", {});
+    let build = (values) =>
+      listEditor(Array.isArray(values) ? values : [], onChange, {
+        placeholder: spec.placeholder || `添加${label}`,
+      });
+    holder.append(build(value));
+    const refresh = (next) => holder.replaceChildren(build(next));
+    return { kind: "list", node: holder, refresh };
+  }
+  if (options.length) {
+    const control = selectField(
+      value,
+      options.map((option) => ({ value: option.value, label: option.label || option.value })),
+      onChange
+    );
+    return { kind: "select", node: control };
+  }
+  if (spec.secret) {
+    const input = h("input", {
+      class: "input",
+      type: "password",
+      autocomplete: "new-password",
+      placeholder: (secretSet || {})[spec.key] ? "已设置，留空保留原值" : "尚未设置",
+      oninput: (event) => onChange(event.target.value),
+    });
+    return { kind: "secret", node: input };
+  }
+  if (kind === "text") {
+    const area = h("textarea", {
+      class: "input",
+      rows: 4,
+      placeholder: spec.placeholder || "",
+      value: value === undefined || value === null ? "" : String(value),
+      oninput: (event) => onChange(event.target.value),
+    });
+    return { kind: "textarea", node: area };
+  }
+  return {
+    kind: "input",
+    node: textField(value, onChange, { placeholder: spec.placeholder || "" }),
+  };
+}
+
+/** 把回读值写回已渲染的控件（保存后与服务端结果对齐）。 */
+function applySchemaValue(entry, value) {
+  const node = entry.node;
+  if (entry.kind === "switch") {
+    const next = Boolean(value);
+    node.setAttribute("aria-checked", next ? "true" : "false");
+    Motion.switchThumb(node.querySelector(".switch-thumb"), next);
+  } else if (entry.kind === "list") {
+    entry.refresh(value);
+  } else {
+    node.value = value === null || value === undefined ? "" : String(value);
+  }
+}
+
+/**
+ * schema 驱动的配置表单。
+ *  - 控件类型按 schema 的 type 选：开关 / 数字 / 列表 / 下拉 / 文本 / 密钥
+ *  - options 渲染成下拉，min / max / step 传给数字输入
+ *  - 保存后以服务端回读值为准回填，错误按字段显示在控件下方
+ */
+function schemaConfigForm(data, path, options = {}) {
+  const draft = { ...(data.values || {}) };
+  const secrets = { ...(data.secrets || {}) };
+  const controls = new Map();
+  const fields = h("fieldset", { class: "plugin-config-fields", "aria-label": "插件配置" });
+  const errorBoxes = new Map();
+
+  const renderField = (spec) => {
+    const key = String(spec.key || "").trim();
+    if (!key) return;
+    const label = spec.label || spec.description || key;
+    const onChange = (value) => { draft[key] = value; };
+    const entry = schemaFieldControl(spec, draft[key], onChange, secrets);
+    controls.set(key, entry);
+    entry.node.setAttribute("aria-label", label);
+    const error = h("span", { class: "field-error", role: "alert" });
+    errorBoxes.set(key, error);
+    const hint = [];
+    if (spec.description) hint.push(spec.description);
+    if (spec.min !== undefined || spec.max !== undefined) {
+      const low = spec.min === undefined ? "" : spec.min;
+      const high = spec.max === undefined ? "" : spec.max;
+      hint.push(`范围 ${low} – ${high}`);
+    }
+    if (spec.secret) hint.push("密钥不会回显，留空表示保留原值。");
+    if (Array.isArray(spec.options) && spec.options.length) {
+      hint.push(`可选：${spec.options.map((option) => option.label || option.value).join(" / ")}`);
+    }
+    fields.append(
+      h(
+        "div",
+        { class: "field" },
+        h("span", { class: "field-label" }, label),
+        entry.node,
+        hint.length ? h("span", { class: "field-hint" }, hint.join(" ")) : null,
+        error
+      )
+    );
+  };
+
+  (data.schema || []).forEach(renderField);
+  const save = h("button", { type: "submit", class: "btn btn-primary" }, icon("check"), "保存配置");
+  const hot = Boolean(options.hot);
+  const result = h(
+    "div",
+    { role: "status", class: "field-hint" },
+    hot ? "保存后立即生效，无需重启。" : "保存后重启 bot 生效。"
+  );
+  const setErrors = (errors) => {
+    for (const box of errorBoxes.values()) box.textContent = "";
+    for (const item of errors || []) {
+      const box = errorBoxes.get(item.field);
+      if (box) box.textContent = item.message || "不合规";
+    }
+  };
+  const form = h(
+    "form",
+    { class: "grid" },
+    fields,
+    h("div", { class: "market-actions" }, save, result)
+  );
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (save.disabled) return;
+    save.disabled = fields.disabled = true;
+    setErrors([]);
+    try {
+      const payload = await api.put(path, { values: draft });
+      result.textContent = payload.message || "插件配置已保存。";
+      // 服务端会归一化（去空项、转数字）并隐藏密钥；以回读值为准回填。
+      // 只回填服务端确实返回的键：缺失的键保留原控件内容，不能凭空清空
+      const fresh = payload.values || {};
+      for (const [key, entry] of controls) {
+        if (!Object.hasOwn(fresh, key)) continue;
+        draft[key] = fresh[key];
+        applySchemaValue(entry, fresh[key]);
+      }
+      if (payload.secrets) {
+        Object.assign(secrets, payload.secrets);
+        for (const [key, entry] of controls) {
+          if (entry.kind === "secret" && entry.node) {
+            entry.node.value = "";
+            entry.node.placeholder = payload.secrets[key] ? "已设置，留空保留原值" : "尚未设置";
+          }
+        }
+      }
+    } catch (err) {
+      if (!(err instanceof Unauthorized)) {
+        result.textContent = err.message || "保存失败，请重试。";
+        setErrors(err.fields || []);
+      }
+    } finally {
+      save.disabled = fields.disabled = false;
+    }
+  });
+  return form;
+}
+
+/** 详情页主体：标题、元信息、介绍、触发、权限、配置说明与配置表单。 */
 function pluginDetailBody(data) {
   const idOf = encodeURIComponent(data.id || data.plugin_name || "");
   const chips = pluginDetailTags(data);
@@ -276,10 +458,28 @@ function pluginDetailBody(data) {
   );
   const docs = card("配置说明", { body: pluginDetailSchemaDocs(data.schema_docs) });
 
-  // 注意：静态配置（manifest 的 config_schema）只在「插件配置」页改，
-  // 详情页不再重复放一份配置表单，避免两处看起来不一样还容易改岔。
-  // 详情页只留介绍/触发/权限/说明，外加插件自己的动态管理区（比如 RSS 的订阅列表）。
-  return [overview, h("div", { class: "grid grid-2" }, intro, triggers), h("div", { class: "grid grid-2" }, permissions, docs)];
+  const configCard = data.can_configure
+    ? card("配置", {
+        hint: data.hot_config ? "插件声明了 on_config_change，保存后热生效" : "保存后需重启 bot 生效",
+        body: schemaConfigForm(
+          { schema: data.schema, values: data.config.values || {}, secrets: data.config.secrets || {} },
+          `/api/plugins/${idOf}/config`,
+          { hot: data.hot_config }
+        ),
+      })
+    : data.installed && data.valid
+    ? card("配置", { body: h("p", { class: "field-hint" }, "该插件没有声明配置项。") })
+    : card("配置", {
+        body: h(
+          "p",
+          { class: "field-hint" },
+          data.installed
+            ? data.invalid_reason || "该插件的 manifest 不合规，不能配置。"
+            : "插件还没安装：安装后即可在这里配置。"
+        ),
+      });
+
+  return [overview, h("div", { class: "grid grid-2" }, intro, triggers), h("div", { class: "grid grid-2" }, permissions, docs), configCard];
 }
 
 /** RSS 插件专属：按订阅源分组的订阅管理（新增表单 + 提醒前缀 + 删除）。 */
