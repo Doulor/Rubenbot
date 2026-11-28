@@ -26,6 +26,28 @@
       "required": ["group_id", "message"]
     },
     {
+      "name": "send_group_forward_msg",
+      "summary": "往群里发一条合并转发消息（多个 node 节点）",
+      "risk": "safe",
+      "cooldown_seconds": 0,
+      "params": {
+        "group_id": {"type": "integer", "description": "群号"},
+        "messages": {"type": "array", "description": "转发节点数组，每个节点 {type: 'node', data: {name, uin, content}}"}
+      },
+      "required": ["group_id", "messages"]
+    },
+    {
+      "name": "send_private_forward_msg",
+      "summary": "给某人发一条合并转发消息（多个 node 节点）",
+      "risk": "safe",
+      "cooldown_seconds": 0,
+      "params": {
+        "user_id": {"type": "integer", "description": "对方 QQ 号"},
+        "messages": {"type": "array", "description": "转发节点数组，每个节点 {type: 'node', data: {name, uin, content}}"}
+      },
+      "required": ["user_id", "messages"]
+    },
+    {
       "name": "send_msg",
       "summary": "按 message_type 自动选私聊或群聊发送",
       "risk": "safe",

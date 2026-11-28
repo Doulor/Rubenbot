@@ -482,6 +482,93 @@ function pluginDetailBody(data) {
   return [overview, h("div", { class: "grid grid-2" }, intro, triggers), h("div", { class: "grid grid-2" }, permissions, docs), configCard];
 }
 
+/** RSS 插件专属：订阅列表（读插件订阅表）+ 页面上删除。 */
+async function renderRssSubscriptions(editor) {
+  const mount = h("div", {}, skeleton(2));
+  editor.appendChild(mount);
+  const load = async () => {
+    let payload;
+    try {
+      payload = await api.get("/api/plugins/rss/subscriptions");
+    } catch (err) {
+      if (err instanceof Unauthorized) return;
+      mount.replaceChildren(
+        card("订阅列表", {
+          body: h("p", { class: "field-hint" }, `订阅列表读不到：${err.message}`),
+        })
+      );
+      return;
+    }
+    const items = payload.items || [];
+    if (!items.length) {
+      mount.replaceChildren(
+        card("订阅列表", {
+          body: h("p", { class: "field-hint" }, "还没有订阅。私聊或群里发 /rss 订阅 <地址> 添加。"),
+        })
+      );
+      return;
+    }
+    mount.replaceChildren(
+      card("订阅列表", {
+        hint: `${items.length} 条`,
+        body: h(
+          "div",
+          { style: { display: "grid", gap: "8px" } },
+          ...items.map((sub) => {
+            const target = sub.target_type === "group" ? `群 ${sub.target_id}` : `私聊 ${sub.target_id}`;
+            const failed = (sub.fail_count || 0) >= 5;
+            return h(
+              "div",
+              { style: { display: "flex", gap: "10px", alignItems: "center" } },
+              h(
+                "div",
+                { style: { flex: "1", minWidth: 0 } },
+                h("div", { style: { fontWeight: 600 } }, sub.feed_title || sub.feed_url),
+                h(
+                  "div",
+                  { class: "field-hint", style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } },
+                  sub.feed_url
+                ),
+                h(
+                  "div",
+                  { class: "field-hint" },
+                  `推到 ${target} · 上次抓取 ${fmtRelative(sub.last_checked_at)}${failed ? " · 连续失败，已停推" : ""}`
+                )
+              ),
+              h(
+                "button",
+                {
+                  class: "btn btn-sm btn-danger",
+                  type: "button",
+                  onclick: async (ev) => {
+                    const btn = ev.currentTarget;
+                    btn.disabled = true;
+                    try {
+                      const qs = new URLSearchParams({
+                        feed_url: sub.feed_url,
+                        target_type: sub.target_type,
+                        target_id: String(sub.target_id),
+                      });
+                      await api.del(`/api/plugins/rss/subscriptions?${qs}`);
+                      await load();
+                    } catch (err) {
+                      if (err instanceof Unauthorized) return;
+                      toast(`删除失败：${err.message}`, "error");
+                      btn.disabled = false;
+                    }
+                  },
+                },
+                "删除"
+              )
+            );
+          })
+        ),
+      })
+    );
+  };
+  await load();
+}
+
 /** 详情路由：#/plugins/detail/<id>；左侧菜单可切换其它插件。 */
 async function renderPluginDetail(panel, selected) {
   let items = [];
@@ -531,6 +618,7 @@ async function renderPluginDetail(panel, selected) {
   try {
     const payload = await api.get(`/api/plugins/${encodeURIComponent(currentId)}/detail`);
     editor.replaceChildren(...pluginDetailBody(payload.plugin || {}));
+    if (currentId === "rss") await renderRssSubscriptions(editor);
   } catch (err) {
     if (err instanceof Unauthorized) return false;
     editor.replaceChildren(

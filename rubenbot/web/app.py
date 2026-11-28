@@ -1350,6 +1350,38 @@ def create_app(state: WebState):
             "message": f"插件 {target} 已热重载，授权与配置保持不变。",
         }
 
+    def _rss_service():
+        """取 RSS 插件的 service（插件未加载时 None）。"""
+        manager = state.plugins
+        if manager is None:
+            return None
+        return manager.extras.get("rss")
+
+    @app.get("/api/plugins/rss/subscriptions")
+    def rss_subscriptions_list(request: Request):
+        """RSS 插件订阅列表：读插件自己的订阅表。"""
+        require_session(request)
+        service = _rss_service()
+        if service is None:
+            raise ApiError(409, "RSS 插件未启用，订阅列表不可用")
+        return {"ok": True, "items": service.store.list()}
+
+    @app.delete("/api/plugins/rss/subscriptions")
+    def rss_subscriptions_delete(request: Request):
+        """RSS 插件删除一条订阅：按 feed_url + 目标定位（query 参数）。"""
+        require_session(request)
+        service = _rss_service()
+        if service is None:
+            raise ApiError(409, "RSS 插件未启用，无法删除订阅")
+        feed_url = request.query_params.get("feed_url", "").strip()
+        target_type = request.query_params.get("target_type", "").strip()
+        target_id = request.query_params.get("target_id", "").strip()
+        if not feed_url or target_type not in ("group", "private") or not target_id:
+            raise ApiError(400, "缺少 feed_url / target_type / target_id")
+        if not service.store.remove(feed_url, target_type, target_id):
+            raise ApiError(404, "订阅不存在")
+        return {"ok": True, "message": "订阅已删除"}
+
     @app.get("/api/market")
     def market_snapshot(request: Request):
         """市场页数据：来源标注 + 本地/索引合并后的卡片列表。"""
