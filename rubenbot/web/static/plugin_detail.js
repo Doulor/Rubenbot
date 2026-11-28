@@ -1,7 +1,8 @@
 /* 插件详情页：介绍 / 版本 / 作者 / 权限 / 触发方式 / 配置说明 / 启用状态。
  *
- * 单独成文件，不改 app.js 里的既有函数；app.js 的路由只把
- * #/plugins/detail/<id> 交给这里的 renderPluginDetail。
+ * 单独成文件，不改 app.js 里的既有函数；app.js 的统一插件页（#/plugins/<id>/detail）
+ * 把详情内容交给这里的 renderPluginDetailContent，左侧插件列表与「配置 | 详情」
+ * 子 tab 都由 app.js 管，本文件只负责详情区本身。
  * 只读展示 + schema 驱动的配置表单；所有文本仍走 textContent。
  *
  * 本文件与 app.js 共用全局作用域：两边都只用顶层函数声明与 const 常量，
@@ -43,29 +44,6 @@ function pluginDetailTags(data) {
   if (data.updatable) tags.push(h("span", { class: "tag warn" }, "可更新"));
   if (data.loaded) tags.push(h("span", { class: "tag outline" }, "已加载"));
   return tags;
-}
-
-/** 详情页左侧菜单：已装与可装插件都列出来，当前选中的高亮。 */
-function pluginDetailMenu(items, currentId) {
-  const rows = items.length
-    ? items.map((item) =>
-        h(
-          "a",
-          {
-            class: `settings-menu-item${item.id === currentId ? " active" : ""}`,
-            href: `#/plugins/detail/${encodeURIComponent(item.id || item.plugin_name)}`,
-            "aria-current": item.id === currentId ? "page" : null,
-          },
-          item.name || item.id
-        )
-      )
-    : [h("span", { class: "field-hint" }, "还没有可查看的插件")];
-  return h(
-    "nav",
-    { class: "settings-menu", "aria-label": "插件详情" },
-    h("div", { class: "settings-menu-group" }, "插件"),
-    ...rows
-  );
 }
 
 /** 权限清单：高危项标红；已装插件同时标出是否已授权。 */
@@ -700,52 +678,10 @@ async function renderRssSubscriptions(editor) {
   await load();
 }
 
-/** 详情路由：#/plugins/detail/<id>；左侧菜单可切换其它插件。 */
-async function renderPluginDetail(panel, selected) {
-  let items = [];
-  try {
-    const market = await api.get("/api/market");
-    items = (market.items || []).map((item) => ({ id: item.id, name: item.name || item.id }));
-  } catch (err) {
-    if (err instanceof Unauthorized) return;
-    try {
-      const local = await api.get("/api/plugins");
-      items = (local.items || []).map((item) => ({
-        id: item.manifest?.id || item.name,
-        name: item.manifest?.name || item.name,
-      }));
-    } catch (inner) {
-      if (inner instanceof Unauthorized) return;
-    }
-  }
-  let picked = "";
-  try {
-    picked = selected ? decodeURIComponent(selected) : "";
-  } catch (_err) {
-    // 地址栏里可能有手改坏的转义：当作没选中，退回第一个插件
-    picked = "";
-  }
-  const currentId = picked || items[0]?.id;
-  if (!currentId) {
-    panel.replaceChildren(
-      card("", { body: emptyState("plugins", "还没有可查看的插件", "到插件市场安装后，即可在这里查看详情。") })
-    );
-    return;
-  }
-  const editor = h("div", { class: "settings-content" }, skeleton(3));
-  panel.replaceChildren(
-    h(
-      "div",
-      { class: "grid" },
-      h(
-        "div",
-        { class: "toolbar" },
-        h("a", { class: "btn btn-sm btn-ghost", href: "#/plugins" }, icon("caret"), "返回插件市场"),
-        h("span", { class: "field-hint" }, "详情只读；配置请在下方的表单里修改。")
-      ),
-      h("div", { class: "settings-layout" }, pluginDetailMenu(items, currentId), editor)
-    )
-  );
+/** 详情子 tab 的内容：只取该插件的详情并渲染，列表与子 tab 由 app.js 的统一插件页管。
+ *  不再自己拉市场索引取菜单——菜单是已安装列表，和配置 tab 共用一份。
+ */
+async function renderPluginDetailContent(editor, currentId) {
   try {
     const payload = await api.get(`/api/plugins/${encodeURIComponent(currentId)}/detail`);
     editor.replaceChildren(...pluginDetailBody(payload.plugin || {}));

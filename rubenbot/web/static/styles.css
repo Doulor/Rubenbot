@@ -1065,7 +1065,8 @@ button {
 }
 
 .segmented button,
-.plugin-tabs a {
+.plugin-tabs a,
+.plugin-subtabs a {
   height: 32px;
   padding: 0 15px;
   border: 0;
@@ -1078,12 +1079,14 @@ button {
 }
 
 .segmented button:hover,
-.plugin-tabs a:hover {
+.plugin-tabs a:hover,
+.plugin-subtabs a:hover {
   color: var(--text);
 }
 
 .segmented button.active,
-.plugin-tabs a.active {
+.plugin-tabs a.active,
+.plugin-subtabs a.active {
   background: var(--accent-container);
   color: var(--on-accent-container);
   box-shadow: none;
@@ -1695,6 +1698,8 @@ button {
 
 .plugin-tabs { justify-self: start; }
 .plugin-tabs a { display: inline-flex; align-items: center; }
+.plugin-subtabs { justify-self: start; }
+.plugin-subtabs a { display: inline-flex; align-items: center; }
 .plugin-config-fields {
   display: grid;
   gap: 16px;

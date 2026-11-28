@@ -52,14 +52,16 @@ function setup() {
   return {root, run, route, node, link};
 }
 
-test('从旧市场入口切到配置，按已安装插件选项切换，再返回市场', async () => {
+test('从市场切到插件列表，默认进配置，按已安装插件切换，再返回市场', async () => {
   const {root, run, route, node, link} = setup();
   await route('#/plugins');
   assert.equal(link('插件市场').getAttribute('aria-current'), 'page');
   for (const label of ['安装', '停用', '卸载']) node('BUTTON', n => n.textContent === label);
   assert.ok(!root.walk().some(n => n.tagName === 'BUTTON' && n.textContent === '配置'));
-  await route(link('插件配置').getAttribute('href'));
-  assert.equal(link('插件配置').getAttribute('aria-current'), 'page');
+  await route(link('插件').getAttribute('href'));
+  assert.equal(link('插件').getAttribute('aria-current'), 'page');
+  // 插件列表默认进配置子 tab，首个插件的表单直接可见
+  assert.equal(link('配置').getAttribute('aria-current'), 'page');
   assert.equal(link('本地插件').getAttribute('aria-current'), 'page');
   assert.doesNotMatch(root.textContent, /远程插件/);
   node('FORM');
@@ -74,7 +76,8 @@ test('从旧市场入口切到配置，按已安装插件选项切换，再返�
 
 test('修改 schema 控件，保存失败保留草稿，重试提交至 manifest ID 对应端点', async () => {
   const {root, run, route, node} = setup();
-  await route('#/plugins/config/local-id');
+  await route('#/plugins/local-id/config');
+  assert.equal(node('A', n => n.textContent === '配置').getAttribute('aria-current'), 'page');
   const field = label => node('INPUT', n => n.getAttribute('aria-label') === label);
   const model = field('模型');
   assert.equal(model.value, '默认');
@@ -123,18 +126,18 @@ test('没有本地插件、读取错误与迟到的响应都不破坏导航', as
   const {root, run, route, link} = setup();
   run(`let resolveConfig; const get = api.get; api.get = path => path.endsWith('/config')
     ? new Promise(resolve => {resolveConfig = resolve}) : get(path)`);
-  const first = route('#/plugins/config/local-id');
+  const first = route('#/plugins/local-id/config');
   await new Promise(resolve => setImmediate(resolve));
   await route(link('简单插件').getAttribute('href'));
   run(`resolveConfig(records['/api/plugins/local-id/config'])`); await first;
   assert.match(root.textContent, /无可配置项/);
   assert.doesNotMatch(root.textContent, /保存配置/);
   run(`api.get = get; delete records['/api/plugins/local-id/config']`);
-  await route('#/plugins/config/local-id');
+  await route('#/plugins/local-id/config');
   assert.match(root.textContent, /读取配置失败/);
   link('简单插件');
   run(`records['/api/plugins'].items = []`);
-  await route('#/plugins/config');
+  await route('#/plugins/installed');
   assert.match(root.textContent, /还没有已安装的插件/);
   link('插件市场');
 });
@@ -143,7 +146,7 @@ test('市场卡片没有单独的授权操作，详情列出每项声明和实�
   const {root, run, route, node} = setup();
   await route('#/plugins');
   assert.ok(!root.walk().some(n => ['BUTTON', 'A'].includes(n.tagName) && /授权/.test(n.textContent)));
-  const detailLink = node('A', n => n.getAttribute('href') === '#/plugins/detail/local-id');
+  const detailLink = node('A', n => n.getAttribute('href') === '#/plugins/local-id/detail');
   run(`const perms = records['/api/plugins'].items[0].permissions;
     records['/api/plugins/local-id/detail'] = {plugin: {id: 'local-id', name: '本地插件',
       installed: true, valid: true, permissions: {...perms, items: perms.permission_meta}}}`);

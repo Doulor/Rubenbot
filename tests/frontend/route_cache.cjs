@@ -131,7 +131,7 @@ test('更新仅由按钮触发，可重试；最新、可更新和失败都不�
 
 test('缓存中开始编辑的表单不被后台结果覆盖；下次访问不带回草稿', async () => {
   const {route, run, view} = setup();
-  const edit = () => route('#/plugins/config/demo');
+  const edit = () => route('#/plugins/demo/config');
   const complete = async (load, name) => {
     await new Promise(resolve => setImmediate(resolve));
     run(`pending['/api/plugins/demo/config'].resolve({schema, values: {name: ${JSON.stringify(name)}}})`);
@@ -153,6 +153,24 @@ test('缓存中开始编辑的表单不被后台结果覆盖；下次访问不�
   const again = edit();
   assert.equal(view.querySelector('input').value, '服务器新名');
   await complete(again, '服务器新名');
+});
+
+test('旧插件路由重定向到新路由，地址栏更新为新地址', async () => {
+  const {route, run, view} = setup();
+  const load = route('#/plugins/config/demo');
+  // renderRoute 归一化后地址栏已是新路由，内容按新路由渲染
+  assert.equal(run('location.hash'), '#/plugins/demo/config');
+  await new Promise(resolve => setImmediate(resolve));
+  run(`pending['/api/plugins/demo/config'].resolve({schema, values: {name: '演示'}})`);
+  await load;
+  assert.equal(view.querySelector('input').value, '演示');
+  // 旧详情路由同样重定向
+  const detail = route('#/plugins/detail/demo');
+  assert.equal(run('location.hash'), '#/plugins/demo/detail');
+  await new Promise(resolve => setImmediate(resolve));
+  run(`pending['/api/plugins/demo/detail'].reject(Error('详情读取失败'))`);
+  await detail;
+  assert.match(view.textContent, /读取详情失败/);
 });
 
 test('切回概览恢复唯一轮询；离开后迟到的概览请求不能重启它', async () => {

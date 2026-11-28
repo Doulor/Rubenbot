@@ -316,8 +316,8 @@ function settingsSkeleton(page, param) {
 
 function pluginSkeleton(param) {
   const tabs = skBox("segmented plugin-tabs", skeletonBar("80px", "32px"), skeletonBar("80px", "32px"));
-  if (param.split("/")[0] === "config") return skBox("grid", tabs, settingsSkeleton("plugins", param));
-  if (param.split("/")[0] === "detail") return skBox("grid", tabs, settingsSkeleton("plugins", "config"));
+  // 插件页只有两档：空参数是市场，有参数是已安装插件（列表 + 配置/详情子 tab）
+  if (param) return skBox("grid", tabs, settingsSkeleton("plugins", param));
   return skBox("grid", tabs, skBox("grid sk-market",
     skBox("notice", skeletonBar("70%", "40px")),
     skBox("market-toolbar", skeletonBar("min(100%, 420px)", "40px"),
@@ -610,6 +610,17 @@ function currentRoute() {
   return { page: PAGES[page] ? page : "overview", param: rest.join("/") };
 }
 
+// 旧插件路由平滑过渡：#/plugins/config/<id> → #/plugins/<id>/config，
+// #/plugins/detail/<id> → #/plugins/<id>/detail；不带 id 的旧路由回到插件列表。
+// renderRoute 与 renderPlugins 两边都调它：直接渲染旧地址也不会 404。
+function normalizePluginParam(param) {
+  const parts = String(param || "").split("/").filter(Boolean);
+  if (parts[0] === "config" || parts[0] === "detail") {
+    return parts[1] ? `${parts[1]}/${parts[0]}` : "installed";
+  }
+  return param;
+}
+
 function navigate(page, param = "") {
   location.hash = param ? `#/${page}/${param}` : `#/${page}`;
 }
@@ -623,12 +634,22 @@ function setHeader(title, sub, actions = []) {
 
 async function renderRoute() {
   const route = currentRoute();
+  // 旧插件路由重定向到新路由：地址栏也改成新地址，深链与刷新都走新路由。
+  if (route.page === "plugins") {
+    const normalized = normalizePluginParam(route.param);
+    if (normalized !== route.param) {
+      route.param = normalized;
+      const canonical = `#/plugins/${normalized}`;
+      if (location.hash !== canonical) location.hash = canonical;
+    }
+  }
   const view = $("#view");
   const routeChanged = route.page !== state.page || route.param !== state.param;
   const subpage = routeChanged && route.page === state.page && ["bot", "settings", "plugins"].includes(route.page);
   const previous = subpage ? {
     menu: Motion.selection(view.querySelector(".settings-menu")),
     tab: Motion.selection(view.querySelector(".plugin-tabs")),
+    subtab: Motion.selection(view.querySelector(".plugin-subtabs")),
   } : {};
   markRouteChange(view, routeChanged);
   state.page = route.page;
@@ -666,6 +687,7 @@ async function renderRoute() {
     const tabs = view.querySelector(".plugin-tabs");
     Motion.moveSelection(menu, previous.menu);
     Motion.moveSelection(tabs, previous.tab);
+    Motion.moveSelection(view.querySelector(".plugin-subtabs"), previous.subtab);
     if (enter) Motion.enter((subpage && (view.querySelector(".settings-content") || tabs?.nextElementSibling)) || view, subpage);
   };
   const generation = cacheGeneration;
@@ -2756,8 +2778,11 @@ function grantSummaryBlock(item) {
   );
 }
 
-/** 配置页只读本地清单，不必等市场索引；没有 schema 的插件同样列出。 */
-async function renderPluginConfigs(panel, selected) {
+/** 已安装插件页：左侧只有一份插件列表，右侧内容区顶部是「配置 | 详情」子 tab，默认配置。
+ *  列表与子 tab 共用一份插件数据；切插件时留在当前子 tab，切子 tab 时留在当前插件。
+ *  selected 为空或不在已装列表里时退回第一个插件（和旧配置页的兜底一致）。
+ */
+async function renderInstalledPlugin(panel, selected, tab) {
   const { items } = await api.get("/api/plugins");
   if (!items.length) {
     panel.replaceChildren(card("", { body: emptyState("plugins", "还没有已安装的插件", "到插件市场安装后，即可在这里配置。") }));
@@ -2765,16 +2790,47 @@ async function renderPluginConfigs(panel, selected) {
   }
   const idOf = item => encodeURIComponent(item.manifest?.id || item.name);
   const nameOf = item => item.manifest?.name || item.name;
-  const current = items.find(item => idOf(item) === selected) || items[0];
+  let picked = "";
+  try {
+    picked = selected ? decodeURIComponent(selected) : "";
+  } catch (_err) {
+    // 地址栏里可能有手改坏的转义：当作没选中，退回第一个插件
+    picked = "";
+  }
+  const current = items.find(item => idOf(item) === picked) || items[0];
+  const currentId = idOf(current);
+  const activeTab = tab === "detail" ? "detail" : "config";
   const menu = h("nav", { class: "settings-menu", "aria-label": "已安装插件" },
     h("div", { class: "settings-menu-group" }, "已安装插件"),
     ...items.map(item => h("a", {
       class: `settings-menu-item${item === current ? " active" : ""}`,
-      href: `#/plugins/config/${idOf(item)}`,
+      href: `#/plugins/${idOf(item)}/${activeTab}`,
       "aria-current": item === current ? "page" : null,
     }, nameOf(item))));
-  const editor = h("div", { class: "settings-content" });
-  panel.replaceChildren(h("div", { class: "settings-layout" }, menu, editor));
+  const subtabs = h("nav", { class: "segmented plugin-subtabs", "aria-label": "插件操作" },
+    h("a", {
+      href: `#/plugins/${currentId}/config`,
+      class: activeTab === "config" ? "active" : "",
+      "aria-current": activeTab === "config" ? "page" : null,
+    }, "配置"),
+    h("a", {
+      href: `#/plugins/${currentId}/detail`,
+      class: activeTab === "detail" ? "active" : "",
+      "aria-current": activeTab === "detail" ? "page" : null,
+    }, "详情"));
+  const editor = h("div", { class: "settings-content" }, skeleton(3));
+  panel.replaceChildren(
+    h("div", { class: "settings-layout" }, menu,
+      h("div", { class: "grid" }, subtabs, editor))
+  );
+  if (activeTab === "detail") return await renderPluginDetailContent(editor, currentId);
+  return await renderPluginConfigEditor(editor, current);
+}
+
+/** 配置子 tab 的内容：沿用旧配置页的表单（pluginConfigForm），只去掉左侧菜单那层。 */
+async function renderPluginConfigEditor(editor, current) {
+  const idOf = item => encodeURIComponent(item.manifest?.id || item.name);
+  const nameOf = item => item.manifest?.name || item.name;
   const title = nameOf(current);
   const grantBlock = current.valid ? grantSummaryBlock(current) : null;
   if (!current.valid || !current.manifest?.config_schema?.length) {
@@ -3043,7 +3099,7 @@ function marketCard(item, refresh) {
         "a",
         {
           class: "btn btn-sm btn-ghost",
-          href: `#/plugins/detail/${encodeURIComponent(item.id || item.plugin_name)}`,
+          href: `#/plugins/${encodeURIComponent(item.id || item.plugin_name)}/detail`,
           title: "打开完整详情页：介绍、权限、触发方式与配置",
         },
         "详情"
@@ -3061,13 +3117,14 @@ function marketCard(item, refresh) {
 }
 
 async function renderPlugins(view, sub = "") {
-  const [tab, selected] = sub.split("/");
-  const detail = tab === "detail";
-  const config = tab === "config";
+  // 顶栏只有两档：插件市场、插件（已安装列表）。选了插件后，内容区上方再分
+  // 「配置 | 详情」子 tab，默认配置。旧路由在 renderRoute 里已归一化，这里再
+  // 归一一次，直接渲染旧地址也不会 404。
+  const parts = normalizePluginParam(sub).split("/").filter(Boolean);
+  const installed = parts.length > 0;
   const modes = [
-    { href: "#/plugins", label: "插件市场", active: !config && !detail },
-    { href: "#/plugins/config", label: "插件配置", active: config },
-    { href: "#/plugins/detail", label: "插件详情", active: detail },
+    { href: "#/plugins", label: "插件市场", active: !installed },
+    { href: "#/plugins/installed", label: "插件", active: installed },
   ];
   const tabs = h("nav", { class: "segmented plugin-tabs", "aria-label": "插件页面" },
     ...modes.map(({ href, label, active }) =>
@@ -3077,9 +3134,10 @@ async function renderPlugins(view, sub = "") {
   const panel = h("div", {}, skeleton(3));
   view.replaceChildren(h("div", { class: "grid" }, tabs, panel));
   try {
-    if (detail) return await renderPluginDetail(panel, selected);
-    if (config) return await renderPluginConfigs(panel, selected);
-    else await renderPluginMarket(panel);
+    if (!installed) return await renderPluginMarket(panel);
+    const selected = parts[0] === "installed" ? "" : parts[0];
+    const tab = parts[1] === "detail" ? "detail" : "config";
+    return await renderInstalledPlugin(panel, selected, tab);
   } catch (err) {
     if (!(err instanceof Unauthorized)) panel.replaceChildren(card("", { body: [
       emptyState("warning", "加载失败", err.message),

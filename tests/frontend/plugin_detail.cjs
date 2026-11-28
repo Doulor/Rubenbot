@@ -75,6 +75,11 @@ function setup({ detail = detailPayload(), market, saveError, saveResult } = {})
       { id: 'music', name: '点歌', state: 'installed' },
       { id: 'plain', name: '朴素插件', state: 'installed' },
     ] },
+    // 统一插件页的左侧菜单就是这份已安装列表
+    '/api/plugins': { items: [
+      { name: 'music', valid: true, manifest: { id: 'music', name: '点歌' } },
+      { name: 'plain', valid: true, manifest: { id: 'plain', name: '朴素插件' } },
+    ] },
     '/api/plugins/music/detail': { ok: true, plugin: detail },
     '/api/plugins/plain/detail': { ok: true, plugin: {
       ...detail,
@@ -107,7 +112,7 @@ function setup({ detail = detailPayload(), market, saveError, saveResult } = {})
 
 test('详情页渲染介绍、版本、作者、权限、触发方式、配置说明与启用状态', async () => {
   const { root, route, node } = setup();
-  await route('#/plugins/detail/music');
+  await route('#/plugins/music/detail');
   for (const fact of ['点歌', 'v1.1.0', 'RubenBot', '已安装 · 未启用', '读消息', '定时任务', '高危', '「点歌 <歌名>」', '冷却（秒）', '触发词']) {
     assert.match(root.textContent, new RegExp(fact.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')),
       `缺少：${fact}。实际：${root.textContent.slice(0, 800)}`);
@@ -118,7 +123,7 @@ test('详情页渲染介绍、版本、作者、权限、触发方式、配置�
   assert.match(root.textContent, /未授权/);
   // 详情菜单列出其它插件，可切换
   const link = node('A', (n) => n.textContent === '朴素插件');
-  assert.equal(link.getAttribute('href'), '#/plugins/detail/plain');
+  assert.equal(link.getAttribute('href'), '#/plugins/plain/detail');
   // 配置说明给出类型、范围、默认值
   assert.match(root.textContent, /字符串列表/);
   assert.match(root.textContent, /范围 0 – 86400/);
@@ -126,7 +131,7 @@ test('详情页渲染介绍、版本、作者、权限、触发方式、配置�
 
 test('schema 驱动表单：控件类型跟随 schema，保存后以回读值回填', async () => {
   const { run, route, node } = setup();
-  await route('#/plugins/detail/music');
+  await route('#/plugins/music/detail');
   const field = (label) => node('INPUT', (n) => n.getAttribute('aria-label') === label);
   // number → number 输入，带 min/max
   const cooldown = field('冷却（秒）');
@@ -177,7 +182,7 @@ test('保存后按服务端回读值回填（归一化、去重、密钥清空�
       secrets: { api_key: true },
     },
   });
-  await route('#/plugins/detail/music');
+  await route('#/plugins/music/detail');
   const cooldown = node('INPUT', (n) => n.getAttribute('aria-label') === '冷却（秒）');
   cooldown.value = '45.5'; await cooldown.fire('input');
   const secret = node('INPUT', (n) => n.getAttribute('aria-label') === '密钥');
@@ -199,7 +204,7 @@ test('列表字段保存后按服务端归一结果重建标签组（去重、�
       secrets: { api_key: true },
     },
   });
-  await route('#/plugins/detail/music');
+  await route('#/plugins/music/detail');
   const add = node('INPUT', (n) => n.getAttribute('aria-label') === '添加触发词');
   add.value = '我想听'; await add.fire('keydown', { key: 'Enter' });
   assert.ok(root.walk().some((n) => n.tagName === 'SPAN' && n.textContent.includes('我想听')));
@@ -211,7 +216,7 @@ test('列表字段保存后按服务端归一结果重建标签组（去重、�
 
 test('保存失败按字段显示错误、保留草稿', async () => {
   const { root, route, node } = setup({ saveError: true });
-  await route('#/plugins/detail/music');
+  await route('#/plugins/music/detail');
   const cooldown = node('INPUT', (n) => n.getAttribute('aria-label') === '冷却（秒）');
   cooldown.value = '999999'; await cooldown.fire('input');
   await node('FORM').fire('submit');
@@ -223,33 +228,35 @@ test('保存失败按字段显示错误、保留草稿', async () => {
 
 test('缺 schema 的插件不崩：显示无可配置项，详情照常', async () => {
   const { root, route } = setup();
-  await route('#/plugins/detail/plain');
+  await route('#/plugins/plain/detail');
   assert.match(root.textContent, /朴素插件/);
   assert.match(root.textContent, /没有声明配置项/);
   assert.equal(root.walk().some((n) => n.tagName === 'FORM'), false);
 });
 
-test('详情请求失败显示重试；市场索引失败时退回本地插件列表', async () => {
-  const { root, run, route } = setup({ market: { items: [] } });
-  // 市场为空时退回 /api/plugins 列表
+test('详情请求失败显示重试；详情不再拉市场索引，菜单就是已安装列表', async () => {
+  const { root, run, route, node } = setup({ market: { items: [] } });
+  // 详情页不再为菜单拉 /api/market：菜单直接用已安装列表，市场挂了也不影响
   run(`api.get = async path => {
     if (path === '/api/market') throw Error('索引不可用');
     if (path === '/api/plugins') return {items: [{name: 'music', manifest: {id: 'music', name: '点歌'}}]};
     throw Error('详情读取失败');
   }`);
-  await route('#/plugins/detail/music');
+  await route('#/plugins/music/detail');
   assert.match(root.textContent, /读取详情失败/);
   assert.match(root.textContent, /重试/);
+  // 左侧菜单是已安装列表里的插件
+  assert.equal(node('A', (n) => n.textContent === '点歌').getAttribute('href'), '#/plugins/music/detail');
 });
 
 test('仓库链接只放行 http(s)，坏的转义 id 退回第一个插件', async () => {
   const { root, route, node } = setup({
     detail: detailPayload({ repository: 'javascript:alert(1)' }),
   });
-  await route('#/plugins/detail/music');
+  await route('#/plugins/music/detail');
   // 仓库地址不被信任：javascript: 不渲染成链接
   assert.equal(root.walk().some((n) => n.tagName === 'A' && n.textContent === '仓库'), false);
   // 地址栏里手改坏的转义不能让整页崩掉
-  await route('#/plugins/detail/%E0%A4%A');
+  await route('#/plugins/%E0%A4%A/detail');
   assert.match(root.textContent, /点歌/);
 });
