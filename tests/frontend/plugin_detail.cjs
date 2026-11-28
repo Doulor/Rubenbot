@@ -1,4 +1,5 @@
-// 插件详情页：完整信息、schema 驱动表单、保存回读与缺 schema 的兼容。
+// 插件详情页：完整信息与缺 schema 的兼容。详情页里没有配置表单，
+// 配置在统一插件页上方的「配置」子 tab，表单行为由 plugins.cjs 覆盖。
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { loadUI } = require('./dom.cjs');
@@ -68,7 +69,7 @@ function detailPayload(overrides = {}) {
   return { ...base, ...overrides };
 }
 
-function setup({ detail = detailPayload(), market, saveError, saveResult } = {}) {
+function setup({ detail = detailPayload(), market } = {}) {
   const { root, run } = loadUI();
   const records = {
     '/api/market': market || { items: [
@@ -94,13 +95,7 @@ function setup({ detail = detailPayload(), market, saveError, saveResult } = {})
   };
   run(`const records = ${JSON.stringify(records)}; const calls = [];
     window.toasts = [];
-    api.get = async path => { calls.push(path); if (!records[path]) throw Error(path); return records[path]; };
-    api.put = async (path, body) => { calls.push([path, JSON.parse(JSON.stringify(body))]);
-      if (${Boolean(saveError)}) throw Object.assign(Error('插件配置校验失败：cooldown_seconds 不能大于 86400'),
-        {status: 422, fields: [{field: 'cooldown_seconds', message: '不能大于 86400'}]});
-      const saved = ${JSON.stringify(saveResult || null)};
-      return saved || {message: '插件配置已保存，重启 bot 后生效。', hot: false,
-        values: body.values, secrets: {api_key: true}}; };`);
+    api.get = async path => { calls.push(path); if (!records[path]) throw Error(path); return records[path]; };`);
   const route = (href) => run(`location.hash = ${JSON.stringify(href)}; PAGES[currentRoute().page].render(root, currentRoute().param)`);
   const node = (tag, match = () => true) => {
     const found = root.walk().find((n) => n.tagName === tag && match(n));
@@ -129,108 +124,12 @@ test('详情页渲染介绍、版本、作者、权限、触发方式、配置�
   assert.match(root.textContent, /范围 0 – 86400/);
 });
 
-test('schema 驱动表单：控件类型跟随 schema，保存后以回读值回填', async () => {
-  const { run, route, node } = setup();
-  await route('#/plugins/music/detail');
-  const field = (label) => node('INPUT', (n) => n.getAttribute('aria-label') === label);
-  // number → number 输入，带 min/max
-  const cooldown = field('冷却（秒）');
-  assert.equal(cooldown.getAttribute('type'), 'number');
-  assert.equal(cooldown.getAttribute('min'), '0');
-  assert.equal(cooldown.getAttribute('max'), '86400');
-  // boolean → 开关
-  const toggle = node('BUTTON', (n) => n.getAttribute('role') === 'switch' && n.getAttribute('aria-label') === '先试音乐卡片');
-  assert.equal(toggle.getAttribute('aria-checked'), 'false');
-  // options → 下拉；测试宿主不实现 select.value 的选中联动，改看选中项
-  const select = node('SELECT', (n) => n.getAttribute('aria-label') === '音源');
-  const selected = select.walk().find((n) => n.tagName === 'OPTION' && n.getAttribute('selected') !== null);
-  assert.equal(selected.textContent, '网易云');
-  // secret → 密码框且不回显
-  const secret = field('密钥');
-  assert.equal(secret.getAttribute('type'), 'password');
-  assert.equal(secret.value, '');
-  assert.match(secret.getAttribute('placeholder'), /已设置/);
-  // list → chip 编辑器
-  field('添加触发词');
-
-  cooldown.value = '30'; await cooldown.fire('input');
-  await toggle.fire('click');
-  await select.fire('change', { target: { value: 'netease' } });
-  await node('FORM').fire('submit');
-  const call = JSON.parse(run('JSON.stringify(calls.at(-1))'));
-  assert.equal(call[0], '/api/plugins/music/config');
-  assert.deepEqual(call[1], { values: {
-    triggers: ['点歌'], cooldown_seconds: 30, music_card: true, source: 'netease', api_key: '',
-  } });
-  assert.match(run('JSON.stringify(window.toasts)'), /\[\]/);  // 保存成功不弹错误
-  assert.match(node('DIV', (n) => n.getAttribute('role') === 'status').textContent, /已保存/);
-});
-
-test('保存后按服务端回读值回填（归一化、去重、密钥清空）', async () => {
-  const savedValues = {
-    triggers: ['点歌', '我想听'],
-    cooldown_seconds: 45,
-    music_card: false,
-    source: 'netease',
-    api_key: '',
-  };
-  const { route, node } = setup({
-    saveResult: {
-      message: '插件配置已保存并热生效，无需重启。',
-      hot: true,
-      values: savedValues,
-      secrets: { api_key: true },
-    },
-  });
-  await route('#/plugins/music/detail');
-  const cooldown = node('INPUT', (n) => n.getAttribute('aria-label') === '冷却（秒）');
-  cooldown.value = '45.5'; await cooldown.fire('input');
-  const secret = node('INPUT', (n) => n.getAttribute('aria-label') === '密钥');
-  secret.value = '新密钥'; await secret.fire('input');
-  await node('FORM').fire('submit');
-  // 回读值覆盖草稿：数字归一、密钥清空并保留「已设置」占位
-  assert.equal(cooldown.value, '45');
-  assert.equal(secret.value, '');
-  assert.match(secret.getAttribute('placeholder'), /已设置/);
-  assert.match(node('DIV', (n) => n.getAttribute('role') === 'status').textContent, /已保存并热生效/);
-});
-
-test('列表字段保存后按服务端归一结果重建标签组（去重、去空项）', async () => {
-  const { root, route, node } = setup({
-    saveResult: {
-      message: '插件配置已保存，重启 bot 后生效。',
-      hot: false,
-      values: { triggers: ['点歌'], cooldown_seconds: 60, music_card: false, source: 'netease', api_key: '' },
-      secrets: { api_key: true },
-    },
-  });
-  await route('#/plugins/music/detail');
-  const add = node('INPUT', (n) => n.getAttribute('aria-label') === '添加触发词');
-  add.value = '我想听'; await add.fire('keydown', { key: 'Enter' });
-  assert.ok(root.walk().some((n) => n.tagName === 'SPAN' && n.textContent.includes('我想听')));
-  await node('FORM').fire('submit');
-  // 服务端只保留了「点歌」：标签组按回读值重建，草稿里多出来的项不留在界面上
-  const chips = root.walk().filter((n) => n.getAttribute('aria-label')?.startsWith('移除 '));
-  assert.deepEqual(chips.map((n) => n.getAttribute('aria-label')), ['移除 点歌']);
-});
-
-test('保存失败按字段显示错误、保留草稿', async () => {
-  const { root, route, node } = setup({ saveError: true });
-  await route('#/plugins/music/detail');
-  const cooldown = node('INPUT', (n) => n.getAttribute('aria-label') === '冷却（秒）');
-  cooldown.value = '999999'; await cooldown.fire('input');
-  await node('FORM').fire('submit');
-  assert.equal(cooldown.value, '999999');
-  assert.match(node('DIV', (n) => n.getAttribute('role') === 'status').textContent, /校验失败/);
-  const alerts = root.walk().filter((n) => n.getAttribute('role') === 'alert');
-  assert.ok(alerts.some((n) => /不能大于 86400/.test(n.textContent)), '没有按字段显示错误');
-});
-
-test('缺 schema 的插件不崩：显示无可配置项，详情照常', async () => {
+test('缺 schema 的插件不崩：详情照常渲染，详情页里没有配置表单', async () => {
   const { root, route } = setup();
   await route('#/plugins/plain/detail');
   assert.match(root.textContent, /朴素插件/);
-  assert.match(root.textContent, /没有声明配置项/);
+  // 详情页不再放配置表单（配置在上方的「配置」子 tab），所以这里既没有
+  // 「没有声明配置项」的提示，也没有任何表单
   assert.equal(root.walk().some((n) => n.tagName === 'FORM'), false);
 });
 
