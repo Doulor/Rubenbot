@@ -72,6 +72,20 @@ def _database_path(ctx: Any) -> Path:
     return base / "plugin_data" / "rss.sqlite3"
 
 
+def render_prefix(prefix: str, feed_title: str, count: int, feed_url: str) -> str:
+    """提醒前缀的占位符替换：{rss}=源标题、{count}=本轮新文章数、{url}=订阅地址。
+
+    未知占位符原样保留；prefix 为空或全空白返回空串（不发提醒）。
+    """
+    if not prefix or not prefix.strip():
+        return ""
+    return (
+        prefix.replace("{rss}", feed_title)
+        .replace("{count}", str(count))
+        .replace("{url}", feed_url)
+    )
+
+
 def _format_node(title: str, content: str, link: str, max_chars: int) -> str:
     """一篇文章拼成一个转发节点的纯文本内容：标题 + 全文 + 链接。"""
     body = content or ""
@@ -259,12 +273,74 @@ class RssService:
                 if row["fail_count"] >= FAIL_THRESHOLD
                 else ""
             )
-            lines.append(f"- {title} → {where}，上次检查 {when}{warn}")
+            prefix = (row.get("prefix") or "").strip()
+            suffix = f" 提醒「{prefix}」" if prefix else ""
+            lines.append(f"- {title} → {where}，上次检查 {when}{warn}{suffix}")
         return "\n".join(lines)
+
+    async def add_subscription(
+        self,
+        url: str,
+        target_type: str,
+        target_id: str,
+        *,
+        prefix: str = "",
+        created_by: str = "",
+    ) -> dict:
+        """WebUI 订阅：先验证源有效，再入库；水位设到最新一条，不推旧内容。
+
+        源无效时抛 ValueError（"这个源抓不到"），和指令订阅同一路验证。
+        """
+        url = (url or "").strip()
+        if not url.startswith(("http://", "https://")):
+            raise ValueError("订阅链接不对")
+        try:
+            text = await fetch_feed_text(self._fetch_page, url)
+            title, items = parse_feed(text)
+        except Exception as exc:  # noqa: BLE001 - 抓不到/解析不出都算无效源
+            logger.warning("[rss] 订阅验证失败 %s：%s", url, exc)
+            raise ValueError("这个源抓不到") from exc
+        if not items:
+            raise ValueError("这个源抓不到")
+        self.store.add(
+            url,
+            target_type,
+            target_id,
+            feed_title=title,
+            last_seen_guid=items[0]["guid"],
+            created_by=created_by,
+            prefix=prefix,
+        )
+        self.store.set_title(url, title)
+        row = self.store.get(url, target_type, target_id)
+        assert row is not None  # 刚写入的行一定在
+        return row
 
     # ------------------------------------------------------------------
     # 推送（合并转发）
     # ------------------------------------------------------------------
+
+    async def _send_prefix(self, adapter: Any, target_type: str, target_id: str, text: str) -> bool:
+        """在合并转发之前发一条纯文本提醒；失败只记 warning，绝不抛异常。"""
+        if target_type == "group":
+            action, key = "send_group_msg", "group_id"
+        else:
+            action, key = "send_private_msg", "user_id"
+        try:
+            target_num = int(target_id)
+        except (TypeError, ValueError):
+            logger.warning("[rss] 目标 id 不是数字，跳过提醒：%s", target_id)
+            return False
+        call = getattr(adapter, "call_action", None)
+        if not callable(call):
+            logger.warning("[rss] 适配器没有 call_action，发不出提醒")
+            return False
+        try:
+            await call(action, {key: target_num, "message": text})
+        except Exception as exc:  # noqa: BLE001 - 提醒失败不阻塞转发
+            logger.warning("[rss] 提醒发送失败：%s", exc)
+            return False
+        return True
 
     async def _send_forward(
         self,
@@ -358,6 +434,12 @@ class RssService:
                 if adapter is None:
                     logger.warning("[rss] 没有可用适配器，跳过本轮推送")
                     continue
+                # 有提醒前缀：先发纯文本提醒，再发合并转发；提醒失败不阻塞转发。
+                prefix_text = render_prefix(row.get("prefix") or "", title, len(fresh), feed_url)
+                if prefix_text:
+                    await self._send_prefix(
+                        adapter, row["target_type"], row["target_id"], prefix_text
+                    )
                 ok = await self._send_forward(
                     adapter, row["target_type"], row["target_id"], title, fresh
                 )

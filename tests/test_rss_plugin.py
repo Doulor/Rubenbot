@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import sqlite3
 import sys
 import types
 from pathlib import Path
@@ -557,6 +558,158 @@ def test_store_same_feed_multiple_targets(tmp_path):
     assert len(store.list()) == 1
 
 
+def test_store_add_prefix_and_conflict_updates_prefix(tmp_path):
+    store = store_mod.RssStore(tmp_path / "rss.sqlite3")
+    store.add(FEED_URL, "private", "u1", feed_title="测试博客", prefix="{rss}更新了")
+    assert store.get(FEED_URL, "private", "u1")["prefix"] == "{rss}更新了"
+    # 冲突重订阅更新 prefix，同时更新水位
+    store.add(
+        FEED_URL, "private", "u1", feed_title="测试博客", last_seen_guid="guid-9", prefix="新前缀"
+    )
+    row = store.get(FEED_URL, "private", "u1")
+    assert row["prefix"] == "新前缀"
+    assert row["last_seen_guid"] == "guid-9"
+    # set_prefix 不存在的行返回 False
+    assert store.set_prefix(FEED_URL, "private", "nobody", "x") is False
+
+
+def test_store_migrates_old_schema_keeps_existing_rows(tmp_path):
+    """老库（无 prefix 列）初始化后自动补列，线上旧订阅不丢。"""
+    db_path = tmp_path / "old.sqlite3"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE rss_subscriptions (
+            feed_url TEXT NOT NULL,
+            feed_title TEXT NOT NULL DEFAULT '',
+            target_type TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            last_seen_guid TEXT NOT NULL DEFAULT '',
+            last_checked_at REAL NOT NULL DEFAULT 0,
+            fail_count INTEGER NOT NULL DEFAULT 0,
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at REAL NOT NULL DEFAULT 0,
+            PRIMARY KEY (feed_url, target_type, target_id)
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO rss_subscriptions"
+        " (feed_url, feed_title, target_type, target_id, last_seen_guid, created_by)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            "https://7u.nz/rss.xml",
+            "Doulor的小世界",
+            "group",
+            "892360818",
+            "https://7u.nz/diary/42",
+            "2737855297",
+        ),
+    )
+    conn.commit()
+    conn.close()
+    store = store_mod.RssStore(db_path)
+    row = store.get("https://7u.nz/rss.xml", "group", "892360818")
+    assert row is not None
+    assert row["feed_title"] == "Doulor的小世界"
+    assert row["last_seen_guid"] == "https://7u.nz/diary/42"
+    assert row["prefix"] == ""  # 补列后默认为空
+    # 补列后 set_prefix 可用
+    assert store.set_prefix("https://7u.nz/rss.xml", "group", "892360818", "{rss}更新了") is True
+    assert store.get("https://7u.nz/rss.xml", "group", "892360818")["prefix"] == "{rss}更新了"
+
+
+# ----------------------------------------------------------------------
+# 提醒前缀
+# ----------------------------------------------------------------------
+
+
+def test_render_prefix_placeholders():
+    render = plugin_mod.render_prefix
+    assert (
+        render("{rss}发新帖子了", "测试博客", 2, "https://example.com/feed.xml")
+        == "测试博客发新帖子了"
+    )
+    assert (
+        render("{rss}有 {count} 篇新文章：{url}", "测试博客", 3, "https://example.com/feed.xml")
+        == "测试博客有 3 篇新文章：https://example.com/feed.xml"
+    )
+    # 未知占位符原样保留，不报错
+    assert render("{rss} {unknown} {count}", "博客", 1, "https://x/") == "博客 {unknown} 1"
+    # 空 / 全空白 → 不发
+    assert render("", "博客", 1, "https://x/") == ""
+    assert render("   ", "博客", 1, "https://x/") == ""
+
+
+def test_check_with_prefix_sends_reminder_before_forward(tmp_path):
+    mapping = {FEED_URL: RSS_XML}
+    service, store = make_service(tmp_path, make_fetch(mapping))
+    adapter = FakeAdapter()
+    runtime = make_runtime(adapter)
+    event = make_event("/rss 订阅 x", sender="100")
+    asyncio.run(service.command(runtime, event, "订阅 https://example.com/feed.xml"))
+    store.set_prefix(FEED_URL, "private", "100", "{rss}发新帖子了，共 {count} 篇")
+    mapping[FEED_URL] = RSS_XML_NEW
+    reply = asyncio.run(service.command(runtime, event, "检查"))
+    assert reply == "已检查，新推 1 条"
+    names = [name for name, _ in adapter.actions]
+    assert names.index("send_private_msg") < names.index("send_private_forward_msg")
+    reminder = adapter.forward_calls("send_private_msg")
+    assert len(reminder) == 1
+    assert reminder[0]["user_id"] == 100
+    assert reminder[0]["message"] == "测试博客发新帖子了，共 1 篇"
+
+
+def test_group_prefix_uses_group_message(tmp_path):
+    mapping = {FEED_URL: RSS_XML}
+    service, store = make_service(tmp_path, make_fetch(mapping))
+    adapter = FakeAdapter()
+    runtime = make_runtime(adapter)
+    event = make_event("/rss 订阅 x", chat_type="group", chat_id="777", sender="u1", role="admin")
+    asyncio.run(service.command(runtime, event, "订阅 https://example.com/feed.xml"))
+    store.set_prefix(FEED_URL, "group", "777", "{rss}更新了")
+    mapping[FEED_URL] = RSS_XML_NEW
+    asyncio.run(service.command(runtime, event, "检查"))
+    calls = adapter.forward_calls("send_group_msg")
+    assert len(calls) == 1
+    assert calls[0]["group_id"] == 777
+    assert calls[0]["message"] == "测试博客更新了"
+
+
+def test_prefix_send_failure_does_not_block_forward(tmp_path):
+    """提醒发失败只记 warning，转发照发、水位照推。"""
+
+    class FailingPrefixAdapter(FakeAdapter):
+        async def call_action(self, name, params=None):
+            if name == "send_private_msg":
+                raise RuntimeError("boom")
+            return await super().call_action(name, params)
+
+    mapping = {FEED_URL: RSS_XML}
+    service, store = make_service(tmp_path, make_fetch(mapping))
+    adapter = FailingPrefixAdapter()
+    runtime = make_runtime(adapter)
+    event = make_event("/rss 订阅 x", sender="100")
+    asyncio.run(service.command(runtime, event, "订阅 https://example.com/feed.xml"))
+    store.set_prefix(FEED_URL, "private", "100", "{rss}更新了")
+    mapping[FEED_URL] = RSS_XML_NEW
+    reply = asyncio.run(service.command(runtime, event, "检查"))
+    assert reply == "已检查，新推 1 条"
+    assert len(adapter.forward_calls("send_private_forward_msg")) == 1
+    assert store.get(FEED_URL, "private", "100")["last_seen_guid"] == "guid-3"
+
+
+def test_list_shows_prefix_when_set(tmp_path):
+    mapping = {FEED_URL: RSS_XML}
+    service, store = make_service(tmp_path, make_fetch(mapping))
+    runtime = make_runtime(FakeAdapter())
+    event = make_event("/rss 订阅 x", sender="100")
+    asyncio.run(service.command(runtime, event, "订阅 https://example.com/feed.xml"))
+    store.set_prefix(FEED_URL, "private", "100", "{rss}更新了")
+    reply = asyncio.run(service.command(runtime, event, "列表"))
+    assert "提醒「{rss}更新了」" in reply
+
+
 # ----------------------------------------------------------------------
 # WebUI 订阅列表接口
 # ----------------------------------------------------------------------
@@ -579,6 +732,7 @@ def _webui_client(tmp_path, *, enabled=True):
     cfg.persona_path = str(tmp_path / "SOUL.md")
     store = MemoryStore(":memory:")
     state = WebState(config=cfg, store=store, config_path=tmp_path / "config.yaml")
+    service = None
     if enabled:
         manager = PluginManager(cfg, store)
         manager.extras["rss_db_path"] = str(tmp_path / "rss.sqlite3")
@@ -589,7 +743,10 @@ def _webui_client(tmp_path, *, enabled=True):
             FEED_URL, "group", "123456", feed_title="测试博客", created_by="111"
         )
         state.plugins = manager
-    return TestClient(create_app(state))
+    client = TestClient(create_app(state))
+    # 测试里用它 mock 抓源（service._fetch_page），不真联网。
+    client._rss_service = service
+    return client
 
 
 def test_webui_list_subscriptions(tmp_path):
@@ -601,6 +758,7 @@ def test_webui_list_subscriptions(tmp_path):
     assert items[0]["feed_url"] == FEED_URL
     assert items[0]["target_type"] == "group"
     assert items[0]["target_id"] == "123456"
+    assert items[0]["prefix"] == ""
 
 
 def test_webui_delete_subscription(tmp_path):
@@ -629,6 +787,142 @@ def test_webui_list_when_plugin_disabled(tmp_path):
         client.delete(
             "/api/plugins/rss/subscriptions",
             params={"feed_url": FEED_URL, "target_type": "group", "target_id": "123456"},
+        ).status_code
+        == 409
+    )
+
+
+def test_webui_create_subscription(tmp_path):
+    client = _webui_client(tmp_path)
+    client._rss_service._fetch_page = make_fetch({FEED_URL: RSS_XML})
+    resp = client.post(
+        "/api/plugins/rss/subscriptions",
+        json={
+            "feed_url": FEED_URL,
+            "target_type": "private",
+            "target_id": "100",
+            "prefix": "{rss}更新了",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    item = resp.json()["item"]
+    assert item["feed_url"] == FEED_URL
+    assert item["feed_title"] == "测试博客"
+    assert item["prefix"] == "{rss}更新了"
+    # 水位设到最新一条，不推旧内容
+    assert item["last_seen_guid"] == "guid-2"
+    assert len(client.get("/api/plugins/rss/subscriptions").json()["items"]) == 2
+
+
+def test_webui_create_invalid_feed_400(tmp_path):
+    client = _webui_client(tmp_path)
+    client._rss_service._fetch_page = make_fetch({})
+    resp = client.post(
+        "/api/plugins/rss/subscriptions",
+        json={"feed_url": "https://example.com/bad.xml", "target_type": "group", "target_id": "777"},
+    )
+    assert resp.status_code == 400
+    assert "这个源抓不到" in resp.json()["error"]
+    assert len(client.get("/api/plugins/rss/subscriptions").json()["items"]) == 1
+
+
+def test_webui_create_rejects_bad_input(tmp_path):
+    client = _webui_client(tmp_path)
+    # target_type 只能是 group/private
+    resp = client.post(
+        "/api/plugins/rss/subscriptions",
+        json={"feed_url": FEED_URL, "target_type": "channel", "target_id": "777"},
+    )
+    assert resp.status_code == 400
+    # feed_url 必须是 http(s)
+    resp = client.post(
+        "/api/plugins/rss/subscriptions",
+        json={"feed_url": "ftp://example.com/feed.xml", "target_type": "group", "target_id": "777"},
+    )
+    assert resp.status_code == 400
+    # target_id 不能为空
+    resp = client.post(
+        "/api/plugins/rss/subscriptions",
+        json={"feed_url": FEED_URL, "target_type": "group", "target_id": ""},
+    )
+    assert resp.status_code == 400
+
+
+def test_webui_patch_prefix(tmp_path):
+    client = _webui_client(tmp_path)
+    resp = client.patch(
+        "/api/plugins/rss/subscriptions",
+        json={
+            "feed_url": FEED_URL,
+            "target_type": "group",
+            "target_id": "123456",
+            "prefix": "{rss}发新帖子了",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["item"]["prefix"] == "{rss}发新帖子了"
+    assert (
+        client.get("/api/plugins/rss/subscriptions").json()["items"][0]["prefix"]
+        == "{rss}发新帖子了"
+    )
+
+
+def test_webui_patch_empty_prefix_clears(tmp_path):
+    client = _webui_client(tmp_path)
+    client.patch(
+        "/api/plugins/rss/subscriptions",
+        json={
+            "feed_url": FEED_URL,
+            "target_type": "group",
+            "target_id": "123456",
+            "prefix": "{rss}发新帖子了",
+        },
+    )
+    resp = client.patch(
+        "/api/plugins/rss/subscriptions",
+        json={
+            "feed_url": FEED_URL,
+            "target_type": "group",
+            "target_id": "123456",
+            "prefix": "",
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["item"]["prefix"] == ""
+
+
+def test_webui_patch_missing_subscription_404(tmp_path):
+    client = _webui_client(tmp_path)
+    resp = client.patch(
+        "/api/plugins/rss/subscriptions",
+        json={
+            "feed_url": "https://nope.example/x.xml",
+            "target_type": "group",
+            "target_id": "123456",
+            "prefix": "x",
+        },
+    )
+    assert resp.status_code == 404
+
+
+def test_webui_create_and_patch_when_plugin_disabled(tmp_path):
+    client = _webui_client(tmp_path, enabled=False)
+    assert (
+        client.post(
+            "/api/plugins/rss/subscriptions",
+            json={"feed_url": FEED_URL, "target_type": "group", "target_id": "777"},
+        ).status_code
+        == 409
+    )
+    assert (
+        client.patch(
+            "/api/plugins/rss/subscriptions",
+            json={
+                "feed_url": FEED_URL,
+                "target_type": "group",
+                "target_id": "777",
+                "prefix": "x",
+            },
         ).status_code
         == 409
     )

@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS rss_subscriptions (
     fail_count INTEGER NOT NULL DEFAULT 0,
     created_by TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL DEFAULT 0,
+    prefix TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (feed_url, target_type, target_id)
 );
 CREATE INDEX IF NOT EXISTS idx_rss_subscriptions_feed
@@ -44,6 +45,12 @@ class RssStore:
     def _init_schema(self) -> None:
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+            # 老库迁移：prefix 列是后加的，没有才补列，旧订阅行不动。
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(rss_subscriptions)")}
+            if "prefix" not in columns:
+                conn.execute(
+                    "ALTER TABLE rss_subscriptions ADD COLUMN prefix TEXT NOT NULL DEFAULT ''"
+                )
 
     def add(
         self,
@@ -54,19 +61,21 @@ class RssStore:
         feed_title: str = "",
         last_seen_guid: str = "",
         created_by: str = "",
+        prefix: str = "",
     ) -> None:
-        """新增一条订阅；已存在时只更新标题与去重水位，不重置失败计数。"""
+        """新增一条订阅；已存在时只更新标题、去重水位与提醒前缀，不重置失败计数。"""
         now = time.time()
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO rss_subscriptions
                     (feed_url, feed_title, target_type, target_id,
-                     last_seen_guid, last_checked_at, created_by, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     last_seen_guid, last_checked_at, created_by, created_at, prefix)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (feed_url, target_type, target_id) DO UPDATE SET
                     feed_title = excluded.feed_title,
-                    last_seen_guid = excluded.last_seen_guid
+                    last_seen_guid = excluded.last_seen_guid,
+                    prefix = excluded.prefix
                 """,
                 (
                     feed_url,
@@ -77,8 +86,19 @@ class RssStore:
                     now,
                     created_by,
                     now,
+                    prefix,
                 ),
             )
+
+    def set_prefix(self, feed_url: str, target_type: str, target_id: str, prefix: str) -> bool:
+        """改一条订阅的提醒前缀；返回是否真的改到了行。"""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE rss_subscriptions SET prefix = ?"
+                " WHERE feed_url = ? AND target_type = ? AND target_id = ?",
+                (prefix, feed_url, target_type, target_id),
+            )
+            return cur.rowcount > 0
 
     def remove(self, feed_url: str, target_type: str, target_id: str) -> bool:
         """删除一条订阅；返回是否真的删掉了行。"""

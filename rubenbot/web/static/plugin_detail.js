@@ -482,10 +482,184 @@ function pluginDetailBody(data) {
   return [overview, h("div", { class: "grid grid-2" }, intro, triggers), h("div", { class: "grid grid-2" }, permissions, docs), configCard];
 }
 
-/** RSS 插件专属：订阅列表（读插件订阅表）+ 页面上删除。 */
+/** RSS 插件专属：按订阅源分组的订阅管理（新增表单 + 提醒前缀 + 删除）。 */
 async function renderRssSubscriptions(editor) {
   const mount = h("div", {}, skeleton(2));
   editor.appendChild(mount);
+
+  /** 新增订阅表单：地址 + 目标类型 + 目标号码 + 可选提醒前缀。 */
+  function buildAddForm() {
+    const draft = { feed_url: "", target_type: "group", target_id: "", prefix: "" };
+    const urlInput = textField("", (value) => { draft.feed_url = value; }, { placeholder: "https://example.com/feed.xml", mono: true });
+    const typeSelect = selectField("group", [
+      { value: "group", label: "群" },
+      { value: "private", label: "私聊" },
+    ], (value) => { draft.target_type = value; });
+    const idInput = textField("", (value) => { draft.target_id = value; }, { placeholder: "群号或 QQ 号" });
+    const prefixInput = textField("", (value) => { draft.prefix = value; }, { placeholder: "{rss}发新帖子了" });
+    const submit = h(
+      "button",
+      {
+        class: "btn",
+        type: "button",
+        onclick: async (ev) => {
+          const btn = ev.currentTarget;
+          const feed_url = draft.feed_url.trim();
+          const target_id = draft.target_id.trim();
+          if (!feed_url || !target_id) {
+            toast("订阅地址和目标号码都要填", "error");
+            return;
+          }
+          btn.disabled = true;
+          try {
+            await api.post("/api/plugins/rss/subscriptions", {
+              feed_url,
+              target_type: draft.target_type,
+              target_id,
+              prefix: draft.prefix,
+            });
+            toast("订阅已添加");
+            await load();
+          } catch (err) {
+            if (err instanceof Unauthorized) return;
+            toast(`添加失败：${err.message}`, "error");
+            btn.disabled = false;
+          }
+        },
+      },
+      "添加订阅"
+    );
+    return card("新增订阅", {
+      body: h(
+        "div",
+        { style: { display: "grid", gap: "10px" } },
+        h("div", { class: "field" }, h("span", { class: "field-label" }, "订阅地址"), urlInput),
+        h(
+          "div",
+          { style: { display: "grid", gridTemplateColumns: "1fr 2fr", gap: "10px" } },
+          h("div", { class: "field" }, h("span", { class: "field-label" }, "目标类型"), typeSelect),
+          h("div", { class: "field" }, h("span", { class: "field-label" }, "目标号码"), idInput)
+        ),
+        h(
+          "div",
+          { class: "field" },
+          h("span", { class: "field-label" }, "提醒前缀（可选）"),
+          prefixInput,
+          h("span", { class: "field-hint" }, "{rss}=网站名称、{count}=本轮新文章数、{url}=订阅地址；留空不发提醒")
+        ),
+        h("div", {}, submit)
+      ),
+    });
+  }
+
+  /** 一条订阅行：目标 + 上次抓取 + 失败警告 + 提醒前缀编辑 + 删除。 */
+  function buildSubRow(sub) {
+    const target = sub.target_type === "group" ? `群 ${sub.target_id}` : `私聊 ${sub.target_id}`;
+    const failed = (sub.fail_count || 0) >= 5;
+    const prefixInput = h("input", {
+      class: "input",
+      type: "text",
+      style: { flex: "1", minWidth: 0 },
+      value: sub.prefix || "",
+      placeholder: "{rss}发新帖子了",
+      onkeydown: (event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          savePrefix();
+        }
+      },
+    });
+    const savePrefix = async () => {
+      saveBtn.disabled = true;
+      try {
+        await api.patch("/api/plugins/rss/subscriptions", {
+          feed_url: sub.feed_url,
+          target_type: sub.target_type,
+          target_id: String(sub.target_id),
+          prefix: prefixInput.value,
+        });
+        toast("提醒前缀已保存");
+        await load();
+      } catch (err) {
+        if (err instanceof Unauthorized) return;
+        toast(`保存失败：${err.message}`, "error");
+        saveBtn.disabled = false;
+      }
+    };
+    const saveBtn = h(
+      "button",
+      { class: "btn btn-sm", type: "button", onclick: savePrefix },
+      "保存"
+    );
+    const deleteBtn = h(
+      "button",
+      {
+        class: "btn btn-sm btn-danger",
+        type: "button",
+        onclick: async (ev) => {
+          const btn = ev.currentTarget;
+          btn.disabled = true;
+          try {
+            const qs = new URLSearchParams({
+              feed_url: sub.feed_url,
+              target_type: sub.target_type,
+              target_id: String(sub.target_id),
+            });
+            await api.del(`/api/plugins/rss/subscriptions?${qs}`);
+            await load();
+          } catch (err) {
+            if (err instanceof Unauthorized) return;
+            toast(`删除失败：${err.message}`, "error");
+            btn.disabled = false;
+          }
+        },
+      },
+      "删除"
+    );
+    return h(
+      "div",
+      { style: { display: "grid", gap: "6px", padding: "10px 0", borderTop: "1px solid var(--border)" } },
+      h(
+        "div",
+        { style: { display: "flex", gap: "10px", alignItems: "center" } },
+        h(
+          "div",
+          { style: { flex: "1", minWidth: 0 } },
+          h("div", { style: { fontWeight: 600 } }, target),
+          h(
+            "div",
+            { class: "field-hint" },
+            `上次抓取 ${fmtRelative(sub.last_checked_at)}${failed ? " · 连续失败，已停推" : ""}`
+          )
+        ),
+        deleteBtn
+      ),
+      h(
+        "div",
+        { style: { display: "flex", gap: "8px", alignItems: "center" } },
+        prefixInput,
+        saveBtn
+      )
+    );
+  }
+
+  /** 一个订阅源一张卡片：源名和地址只写一次，下面列出所有订阅者。 */
+  function buildGroupCard(feedUrl, rows) {
+    return card(rows[0].feed_title || feedUrl, {
+      hint: `${rows.length} 个订阅`,
+      body: h(
+        "div",
+        { style: { display: "grid" } },
+        h(
+          "div",
+          { class: "field-hint", style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } },
+          feedUrl
+        ),
+        ...rows.map((sub) => buildSubRow(sub))
+      ),
+    });
+  }
+
   const load = async () => {
     let payload;
     try {
@@ -493,78 +667,35 @@ async function renderRssSubscriptions(editor) {
     } catch (err) {
       if (err instanceof Unauthorized) return;
       mount.replaceChildren(
-        card("订阅列表", {
+        card("订阅管理", {
           body: h("p", { class: "field-hint" }, `订阅列表读不到：${err.message}`),
         })
       );
       return;
     }
     const items = payload.items || [];
+    const groups = new Map();
+    for (const sub of items) {
+      if (!groups.has(sub.feed_url)) groups.set(sub.feed_url, []);
+      groups.get(sub.feed_url).push(sub);
+    }
+    const children = [buildAddForm()];
     if (!items.length) {
-      mount.replaceChildren(
+      children.push(
         card("订阅列表", {
-          body: h("p", { class: "field-hint" }, "还没有订阅。私聊或群里发 /rss 订阅 <地址> 添加。"),
+          body: h(
+            "p",
+            { class: "field-hint" },
+            "还没有订阅。在上面填地址、目标和提醒前缀添加；也可以在私聊或群里发 /rss 订阅 <地址> 添加。"
+          ),
         })
       );
-      return;
+    } else {
+      for (const [feedUrl, rows] of groups) {
+        children.push(buildGroupCard(feedUrl, rows));
+      }
     }
-    mount.replaceChildren(
-      card("订阅列表", {
-        hint: `${items.length} 条`,
-        body: h(
-          "div",
-          { style: { display: "grid", gap: "8px" } },
-          ...items.map((sub) => {
-            const target = sub.target_type === "group" ? `群 ${sub.target_id}` : `私聊 ${sub.target_id}`;
-            const failed = (sub.fail_count || 0) >= 5;
-            return h(
-              "div",
-              { style: { display: "flex", gap: "10px", alignItems: "center" } },
-              h(
-                "div",
-                { style: { flex: "1", minWidth: 0 } },
-                h("div", { style: { fontWeight: 600 } }, sub.feed_title || sub.feed_url),
-                h(
-                  "div",
-                  { class: "field-hint", style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } },
-                  sub.feed_url
-                ),
-                h(
-                  "div",
-                  { class: "field-hint" },
-                  `推到 ${target} · 上次抓取 ${fmtRelative(sub.last_checked_at)}${failed ? " · 连续失败，已停推" : ""}`
-                )
-              ),
-              h(
-                "button",
-                {
-                  class: "btn btn-sm btn-danger",
-                  type: "button",
-                  onclick: async (ev) => {
-                    const btn = ev.currentTarget;
-                    btn.disabled = true;
-                    try {
-                      const qs = new URLSearchParams({
-                        feed_url: sub.feed_url,
-                        target_type: sub.target_type,
-                        target_id: String(sub.target_id),
-                      });
-                      await api.del(`/api/plugins/rss/subscriptions?${qs}`);
-                      await load();
-                    } catch (err) {
-                      if (err instanceof Unauthorized) return;
-                      toast(`删除失败：${err.message}`, "error");
-                      btn.disabled = false;
-                    }
-                  },
-                },
-                "删除"
-              )
-            );
-          })
-        ),
-      })
-    );
+    mount.replaceChildren(...children);
   };
   await load();
 }

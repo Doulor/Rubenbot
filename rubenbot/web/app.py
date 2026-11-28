@@ -1382,6 +1382,62 @@ def create_app(state: WebState):
             raise ApiError(404, "订阅不存在")
         return {"ok": True, "message": "订阅已删除"}
 
+    @app.post("/api/plugins/rss/subscriptions")
+    async def rss_subscriptions_create(request: Request):
+        """RSS 插件新增订阅：先验证源有效，再入库（水位设到最新，不推旧内容）。"""
+        require_session(request)
+        service = _rss_service()
+        if service is None:
+            raise ApiError(409, "RSS 插件未启用，无法添加订阅")
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001 - 空 body/非法 JSON 都按未提交处理
+            body = {}
+        body = body or {}
+        feed_url = str(body.get("feed_url") or "").strip()
+        target_type = str(body.get("target_type") or "").strip()
+        target_id = str(body.get("target_id") or "").strip()
+        prefix = body.get("prefix")
+        prefix = "" if prefix is None else str(prefix)
+        if not feed_url.startswith(("http://", "https://")):
+            raise ApiError(400, "订阅链接必须是 http(s) 地址")
+        if target_type not in ("group", "private"):
+            raise ApiError(400, "target_type 只能是 group 或 private")
+        if not target_id:
+            raise ApiError(400, "缺少 target_id")
+        try:
+            item = await service.add_subscription(
+                feed_url, target_type, target_id, prefix=prefix, created_by="webui"
+            )
+        except ValueError as exc:
+            raise ApiError(400, str(exc)) from exc
+        return {"ok": True, "item": item}
+
+    @app.patch("/api/plugins/rss/subscriptions")
+    async def rss_subscriptions_update_prefix(request: Request):
+        """RSS 插件改一条订阅的提醒前缀：prefix 为空字符串表示清除。"""
+        require_session(request)
+        service = _rss_service()
+        if service is None:
+            raise ApiError(409, "RSS 插件未启用，无法修改订阅")
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001 - 空 body/非法 JSON 都按未提交处理
+            body = {}
+        body = body or {}
+        feed_url = str(body.get("feed_url") or "").strip()
+        target_type = str(body.get("target_type") or "").strip()
+        target_id = str(body.get("target_id") or "").strip()
+        if not feed_url or target_type not in ("group", "private") or not target_id:
+            raise ApiError(400, "缺少 feed_url / target_type / target_id")
+        if "prefix" not in body:
+            raise ApiError(400, "缺少 prefix")
+        prefix = body.get("prefix")
+        prefix = "" if prefix is None else str(prefix)
+        if not service.store.set_prefix(feed_url, target_type, target_id, prefix):
+            raise ApiError(404, "订阅不存在")
+        return {"ok": True, "item": service.store.get(feed_url, target_type, target_id)}
+
     @app.get("/api/market")
     def market_snapshot(request: Request):
         """市场页数据：来源标注 + 本地/索引合并后的卡片列表。"""
